@@ -83,6 +83,50 @@ invalidation must be qualified by each adapter. Synthetic test stores establish
 no OS behavior. A session/account generation and its stale-after-await checks
 belong to the later account owner, not this primitive account library.
 
+## Journal, owner and first-device setup
+
+`journal::AccountJournal` is the durable state an account owner needs, stated as
+domain operations: the trusted anchor; the original signed event bytes, the
+resulting verified head and the sticky integrity stop committed together; the
+recorded device identity; and a versioned, opaque, native-protected pending-setup
+blob with its stage. It is not a key-value store, and a head is never durable
+without the bytes that produced it.
+
+`owner::AccountOwner` replays persisted original history from the anchor against
+the remembered head. It honours a persisted stop (retaining the last verified
+state and never clearing remembered heads), loads the native device with
+`load_matching`, requires those keys to be an active device in verified history
+with `materials_ready`, and only then mints an opaque generation-bound
+`AccountCapability`. That capability is offline, last-verified authority; it is
+not a current home or checker verdict. A verified removal, stop, key invalidation
+or explicit lock advances the shared generation, and operations recheck it after
+every await. A missing or mismatched native key, or restored state without it,
+returns a typed admission-required result and never regenerates identity or
+resets a remembered head.
+
+Incoming history is verified in memory and then persisted as original bytes plus
+the resulting head in one commit; invalid input persists the stop and keeps the
+last good head. The first-device setup state machine stages the exact signed
+bytes and protected pending material, resumes at `Prepared` or `HomePending`
+without regenerating genesis or code, and derives home ordering from the journal
+holding the staged anchor and bytes. It reconciles an uncertain home response
+against the exact signed bytes, keeps a kit-save confirmation made before
+ordering, and deletes pending code/recovery material only once both home ordering
+and an explicit kit-save confirmation hold. An opened save destination is not
+success. Home ordering requires that the home acknowledged the ordered events
+**and** the three private objects (recovery record and both personal-key seals);
+the three objects are not proven by the signed head alone.
+
+`storage::DeviceJournal` implements the contract over the device-local SQLite
+journal (`libs/storage`), which stores only typed opaque rows and keeps no
+dependency on this library. Production still needs a native pending-blob
+protector, private-object delivery and a real home/checker lane; the in-memory
+journal and identity protector are test-only and provide no protection. As a
+known limit, linking `DeviceJournal` makes every consumer of this library link
+the bundled SQLite device store, including verifiers that never touch it;
+revisit by hiding it behind a feature or moving it to the client before hosted
+consumers are added.
+
 ## Account-control encoding, version 1
 
 All integers are unsigned big-endian. Keys/signatures are their fixed-width raw

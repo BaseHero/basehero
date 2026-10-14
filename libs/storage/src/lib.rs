@@ -1,8 +1,12 @@
 //! Device-local SQLite ownership and open-time compatibility checks.
 //!
-//! This adapter stores local note deltas and pending-work references. It is
-//! not connected to the app and holds no user data. Pending local work is not
-//! an authenticated network event. Authority and rebuildable indexes stay apart.
+//! This adapter stores the device's local note deltas and pending-work
+//! references, and the typed opaque account journal (anchor, signed events,
+//! head, sticky stop, device identity, pending setup). It is not connected to
+//! the app and holds no user data. Pending local work is not an authenticated
+//! network event. Authority and rebuildable indexes stay apart.
+
+pub mod account;
 
 use std::{collections::HashMap, path::Path, time::Duration};
 
@@ -43,6 +47,10 @@ pub enum StoreError {
     InvalidUpdate,
     #[error("local request id reused with different content")]
     RequestConflict,
+    #[error("stored account state is inconsistent")]
+    CorruptAccount,
+    #[error("account head has no matching stored signed bytes")]
+    HeadWithoutBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,32 +229,88 @@ fn ensure_supported(found: u32) -> Result<(), OpenError> {
     })
 }
 
+/// One ordered migration step per layout change, with the target version. Each
+/// step and its version marker commit together, so a failed step leaves the
+/// prior layout intact. Step `(0, 2)` keeps the original empty/v1 note layout.
+type Migration = fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>;
+const MIGRATIONS: &[(u32, u32, Migration)] = &[(0, 2, migrate_v1_to_v2), (2, 3, migrate_v2_to_v3)];
+
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let found = version(&transaction)?;
-    ensure_supported(found)?;
-    if found < 2 {
-        // v1 contained no content tables. Create both related tables and change
-        // the marker in one transaction: failed opens retain the old layout.
-        transaction.execute_batch(
-            "CREATE TABLE note_updates (
-                id INTEGER PRIMARY KEY,
-                base BLOB NOT NULL CHECK(length(base)=32),
-                audience BLOB NOT NULL CHECK(length(audience)=32),
-                note BLOB NOT NULL CHECK(length(note)=32),
-                request BLOB NOT NULL CHECK(length(request)=16),
-                delta BLOB NOT NULL,
-                UNIQUE(base,audience,note,request)
-            );
-            CREATE INDEX note_updates_scope ON note_updates(base,audience,note,id);
-            CREATE TABLE pending_note_work (
-                update_id INTEGER PRIMARY KEY REFERENCES note_updates(id) DEFERRABLE INITIALLY DEFERRED
-            );"
-        )?;
-        transaction.pragma_update(None, "user_version", LOCAL_DATA_VERSION)?;
+    // `open` already refused newer data before changing the journal mode. Each
+    // pass re-reads the version under the write lock: a concurrent opener that
+    // advanced the layout is seen here, never by running a step on newer data.
+    loop {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = version(&transaction)?;
+        ensure_supported(current)?;
+        if current >= LOCAL_DATA_VERSION {
+            return Ok(());
+        }
+        let Some((_, target, step)) = MIGRATIONS
+            .iter()
+            .find(|(from, to, _)| *from <= current && current < *to)
+        else {
+            return Err(OpenError::NewerData {
+                found: current,
+                supported: LOCAL_DATA_VERSION,
+            });
+        };
+        step(&transaction)?;
+        transaction.pragma_update(None, "user_version", *target)?;
+        transaction.commit()?;
     }
-    transaction.commit()?;
-    Ok(())
+}
+
+fn migrate_v1_to_v2(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // v1 contained no content tables. Create both related tables together.
+    transaction.execute_batch(
+        "CREATE TABLE note_updates (
+            id INTEGER PRIMARY KEY,
+            base BLOB NOT NULL CHECK(length(base)=32),
+            audience BLOB NOT NULL CHECK(length(audience)=32),
+            note BLOB NOT NULL CHECK(length(note)=32),
+            request BLOB NOT NULL CHECK(length(request)=16),
+            delta BLOB NOT NULL,
+            UNIQUE(base,audience,note,request)
+        );
+        CREATE INDEX note_updates_scope ON note_updates(base,audience,note,id);
+        CREATE TABLE pending_note_work (
+            update_id INTEGER PRIMARY KEY REFERENCES note_updates(id) DEFERRABLE INITIALLY DEFERRED
+        );",
+    )
+}
+
+fn migrate_v2_to_v3(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // Device-local account journal: typed opaque rows only, no bh-account types.
+    transaction.execute_batch(
+        "CREATE TABLE account_state (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            anchor BLOB NOT NULL CHECK(length(anchor)=32),
+            head_position INTEGER NOT NULL CHECK(head_position>=0),
+            head_hash BLOB NOT NULL CHECK(length(head_hash)=32),
+            stopped INTEGER NOT NULL CHECK(stopped IN (0,1))
+        );
+        CREATE TABLE account_events (
+            id INTEGER PRIMARY KEY NOT NULL,
+            bytes BLOB NOT NULL
+        );
+        CREATE TABLE account_device (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            handle BLOB NOT NULL CHECK(length(handle)=32),
+            signing BLOB NOT NULL CHECK(length(signing)=32),
+            control BLOB NOT NULL CHECK(length(control)=32),
+            receiving BLOB NOT NULL CHECK(length(receiving)=1216),
+            policy INTEGER NOT NULL CHECK(policy BETWEEN 0 AND 255),
+            kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 255)
+        );
+        CREATE TABLE account_pending_setup (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            version INTEGER NOT NULL CHECK(version BETWEEN 0 AND 65535),
+            stage INTEGER NOT NULL CHECK(stage BETWEEN 0 AND 255),
+            kit_saved INTEGER NOT NULL CHECK(kit_saved IN (0,1)),
+            blob BLOB NOT NULL
+        );",
+    )
 }
 
 #[cfg(test)]

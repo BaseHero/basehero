@@ -378,6 +378,9 @@ name = "bh-account"
 version = "0.1.0"
 dependencies = [
  "bh-crypto",
+ "bh-storage",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]
@@ -522,6 +525,7 @@ version = "0.1.0"
 dependencies = [
  "bh-core",
  "rusqlite",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

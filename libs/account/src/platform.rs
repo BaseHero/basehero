@@ -29,6 +29,7 @@ pub enum DeviceKeyStoreKind {
     MacDataProtectionKeychainV1,
 }
 
+#[derive(Clone)]
 pub struct StoredDevice {
     pub handle: KeyHandle,
     pub keys: DevicePublicKeys,

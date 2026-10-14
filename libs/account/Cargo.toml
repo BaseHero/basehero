@@ -11,6 +11,11 @@ path = "src/lib.rs"
 
 [dependencies]
 bh-crypto.workspace = true
+bh-storage.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
