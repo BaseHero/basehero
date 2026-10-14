@@ -1,0 +1,144 @@
+# Model response, accounting and Tinfoil transport
+
+This library provides bounded chat-completion decoding, per-attempt accounting
+state, an opt-in Tinfoil encrypted transport (`tinfoil-route`) and the opt-in NEAR
+gateway-trust/OHTTP framing increment (`near-route`). NEAR quote and model
+verification, E2EE request dispatch, gateway receipt authentication, durable
+reservations and the activity UI are not implemented here.
+
+## Response boundary
+
+`response::ResponseDecoder` consumes **already authenticated and decrypted** SSE
+bytes. Its limits bound the entire wire body, individual lines/events, retained
+content and number of tools. UTF-8 and SSE delimiters may span arbitrary chunks.
+It supports one choice and the `stop` / `tool_calls` finish reasons. A successful
+`finish()` requires the finish reason and `[DONE]`; EOF alone is not success.
+Truncation, refusal, malformed messages and exceeded bounds fail closed.
+
+`push()` emits provisional text only. A caller may display it while explicitly
+showing the run is incomplete, but must not persist it as a successful answer.
+Tool proposals are available only from the validated final completion; the caller
+must still check tool name, argument schema and current authority before execution.
+`Completion::json()` parses JSON, **not** the requested JSON schema. The caller
+validates that schema before using the value. Arbitrary JSON repair is not done.
+Provider-body usage is an observation, not a trusted billing receipt.
+
+## Accounting boundary
+
+Use one `accounting::Attempt` for each dispatch, including retries:
+
+1. The owning service durably reserves costs and records an attempt under current
+   authority before dispatch. This library does not provide that storage or policy.
+2. Mark dispatched **before** the transport can send its first byte. A connection
+   loss after this point is potentially billable, not proof of zero cost.
+3. Serialize Stop with publication. Check `may_deliver()` under that same lock
+   immediately before emitting any text or tool. Stop changes local delivery
+   eligibility immediately; it does not promise remote inference or billing stopped.
+4. Keep usage from the response body as a protected observation. Only a trusted
+   provider-facing accounting path may call `reconcile`, after authenticating a
+   receipt and associating it with the exact dispatch. This method is not an
+   endpoint accepting arbitrary client settlements. It does not verify receipts.
+5. A failed uncertain attempt cannot be retried until reconciliation. `may_retry`
+   is only one prerequisite: a new attempt still needs authority and reservation.
+   Stopped or completed attempts do not request retries. Never redispatch the
+   same attempt. Late receipts cannot restart stopped delivery.
+
+Receipt replay on the same attempt is idempotent; conflicting settlements are
+errors, not overwrites. The caller owns stable dispatch identity, crash recovery,
+receipt binding and preventing duplicate insertion into its durable ledger.
+There is deliberately no automatic fallback, retry loop or allowance enforcement.
+
+`Rates` computes checked integer nano-USD estimates. Input tokens include cached
+tokens; the cached subset gets its own rate. Rounding happens once, upwards to a
+nano-dollar. Keep rate versions with the authoritative ledger; an estimate is not
+an invoice. `Settlement::Pending` is never silently converted to zero cost.
+
+`billing()` exposes only route and settlement; its owning gateway separately adds
+permitted funding-account/base scope and the actual pinned provider model. It
+must not add actor, conversation, work kind, prompt or task identifiers.
+`summarize` groups distinct attempts by work kind for **authorized encrypted
+activity data**, not ordinary operational records. Its known totals and pending
+count must both be displayed. The caller selects the time window (for example,
+a week) and seals private attribution for authorized readers. This library
+neither authenticates that attribution nor implements report-reader permissions.
+
+## NEAR route (gateway trust and OHTTP framing)
+
+The `near-route` feature adds `near_route`. `verify_key_config` checks the
+gateway's Ed25519 signature over the raw OHTTP key-configuration bytes against a
+signer the caller obtained from verified gateway evidence, then parses the
+configuration with strict `X25519` + `HKDF-SHA256` + `AES128-GCM` checks. Every
+failure is a fixed, content-free kind.
+
+`encapsulate` encodes one inner request as BHTTP and seals it as the draft
+`chunked-ohttp` exchange the pinned NEAR Python SDK and Cloud Gateway use: HPKE
+Base mode, varint chunk lengths, and a final chunk with `final` AAD. The scheme
+and authority are fixed; only an origin-form path is accepted. The only caller
+value on the outer request is the ordinary relay credential, and inner
+field-encryption headers never move outside the ciphertext. `decapsulate` opens
+the chunked response with the exported-secret HKDF scheme and parses the BHTTP
+response.
+
+This increment performs no network I/O, issues no nonce and verifies no
+hardware. The caller still owns gateway quote/model attestation, authority,
+allowed-provider and model selection, the single durable dispatch and trusted
+accounting. Tests use synthetic, explicitly unattested keys with real HPKE and
+Ed25519, and run the pinned gateway's own `ohttp`/`bhttp` 0.7.2 server code
+offline (a dev-dependency); they prove protocol and ordering, not hardware
+validity or live gateway behaviour. Response decryption is buffered per bounded
+reply in this increment; streaming stays a later increment.
+
+## Tinfoil route
+
+The caller creates `tinfoil_route::Gateway::new(https_url)` and invokes
+`start(ChatRequest, proxy_credential, WorkKind, Limits)` for a **new** authorized,
+reserved attempt. `StreamHandle::next()` yields provisional text and only after
+real `[DONE]` yields final tools or structured text. `stop().await` suppresses
+subsequent delivery promptly, even while headers/chunks stall. `billing()` remains
+Pending once dispatch is possible. Dropping the handle/transport does not prove
+remote inference or charges stopped. A caller must not retry an uncertain charge
+until its trusted accounting path reconciles the original attempt.
+
+This route fixes the provider host, repository and model internally. SDK
+`SecureClient::new_with_proxy(...).verify()` performs full standard verification
+before dispatch; only its active verification document supplies the attested HPKE
+key. The official EHBP client seals the complete JSON and decrypts the raw
+stream. The SDK's relaxed SSE parser drops `[DONE]`, and its high-level transport
+can silently replay key mismatches, so neither is used here. Reqwest 0.13 has
+redirects disabled and `retry::never()`; one `execute()` is made per explicit
+attempt. The owned gateway TLS config explicitly selects rustls aws-lc-rs with
+hybrid-first X25519MLKEM768, safe protocols and native certificate roots, even
+when the SDK has selected ring globally for its own verification. The gateway
+holds its provider credential, while the credential passed
+here authenticates to the ordinary proxy. There is no public arbitrary-key,
+GroundTruth or HTTP fixture constructor. Errors use fixed redacted kinds; neither
+provider-body usage nor a client-visible header is an accounting receipt.
+
+The HTTP fixture and independently encrypted local server in feature tests use a
+**synthetic key, not hardware verification**. Fixtures enter through the same
+private verification/dispatch/error runner as production; only their verifier
+future is synthetic. A controlled pending-verification Stop remains NotDispatched.
+Real provider streaming behavior, model format compliance, gateway meter/receipt
+timing and deployed delivery remain
+unverified. `Completion::json()` is only JSON parsing, not schema validation.
+
+## Checks
+
+This is a member of the root Cargo workspace. From the product root:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --offline -p basehero-models --all-targets -- -D warnings
+cargo test --locked --offline -p basehero-models
+cargo test --locked --offline -p basehero-models --features tinfoil-route
+cargo clippy --locked --offline -p basehero-models --all-targets --features tinfoil-route -- -D warnings
+cargo test --locked --offline -p basehero-models --features near-route
+cargo clippy --locked --offline -p basehero-models --all-targets --features near-route -- -D warnings
+bash scripts/check.sh
+```
+
+All tests are offline. The feature tests additionally exercise real EHBP
+crypto/streaming and real HPKE/Ed25519 gateway framing against local synthetic
+fixtures, not live provider verification, remote cancellation, actual bills or
+deployment. The NEAR tests do not verify a quote, a model or a response
+signature.

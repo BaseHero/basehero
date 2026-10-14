@@ -1,0 +1,49 @@
+[package]
+name = "basehero-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tinfoil = { workspace = true, optional = true }
+tinfoil-ehbp = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread"] }
+futures-util = { workspace = true, optional = true }
+# Directly named only in the feature-gated, independent enclave-side tests;
+# already transitive requirements of the pinned EHBP transport.
+hpke = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+# NEAR OHTTP framing; already transitive via hpke.
+hkdf = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+# Ed25519 verify for the gateway-signed OHTTP key config (libsodium, as the SDK).
+bh-crypto = { workspace = true, optional = true }
+
+[features]
+tinfoil-route = [
+  "dep:tinfoil", "dep:tinfoil-ehbp", "dep:reqwest", "dep:rustls", "dep:rustls-native-certs",
+  "dep:tokio", "dep:futures-util",
+  "dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex",
+]
+near-route = [
+  "dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex",
+  "dep:hkdf", "dep:sha2", "dep:bh-crypto",
+]
+
+[dev-dependencies]
+# Run the pinned NEAR gateway's own ohttp/bhttp 0.7.2 server code offline.
+ohttp.workspace = true
+bhttp.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "bh-sync-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bh-sync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+bh-crypto.workspace = true
+
+# Only the minimal exported Wasm buffer interface needs unsafe export attributes.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

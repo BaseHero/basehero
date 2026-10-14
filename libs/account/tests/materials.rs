@@ -1,0 +1,585 @@
+#[path = "support/native.rs"]
+mod native;
+use native::open_for_receiver;
+
+use bh_account::{
+    AccountEvent, AccountId, DevicePublicKeys, Error, VerifiedAccount,
+    crypto::{KemKey, SigningKey},
+    personal::{PersonalKey, PreparedPublication, SealPurpose, prepare_publication},
+    recovery::{
+        Password, PreparedRecoveryRecord, RecoveryCode, RecoveryKeys, open_record, prepare_record,
+    },
+};
+
+struct Fixture {
+    first: DevicePublicKeys,
+    ordinary: SigningKey,
+    control: SigningKey,
+    receiver: KemKey,
+    recovery: RecoveryKeys,
+    code: RecoveryCode,
+    password: Password,
+    genesis: AccountEvent,
+    state: VerifiedAccount,
+    record: PreparedRecoveryRecord,
+    publication: PreparedPublication,
+    personal: PersonalKey,
+    commitment: AccountEvent,
+    published: AccountEvent,
+}
+fn initial() -> Fixture {
+    let ordinary = SigningKey::generate();
+    let control = SigningKey::generate();
+    let receiver = KemKey::generate();
+    let first =
+        DevicePublicKeys::new(ordinary.public(), control.public(), receiver.public()).unwrap();
+    let recovery = RecoveryKeys::generate();
+    let code = RecoveryCode::generate();
+    let password = Password::new("pa\0ssé").unwrap();
+    let draft = AccountEvent::genesis(first.clone(), recovery.public());
+    let genesis = draft.finish(control.sign(draft.signing_bytes())).unwrap();
+    let mut state =
+        VerifiedAccount::from_genesis(AccountId::of_genesis(&genesis).unwrap(), genesis.as_bytes())
+            .unwrap();
+    let record = prepare_record(&state, &recovery, &password, &code).unwrap();
+    assert!(!state.materials_ready().unwrap());
+    assert!(open_record(&state, record.as_bytes(), &password, &code).is_err());
+    let draft = state
+        .prepare_recovery_record(first.id(), record.digest())
+        .unwrap();
+    let commitment = draft.finish(control.sign(draft.signing_bytes())).unwrap();
+    state.apply(commitment.as_bytes()).unwrap();
+    let personal = PersonalKey::generate();
+    let publication = prepare_publication(&state, &personal).unwrap();
+    assert!(
+        open_for_receiver(
+            &state,
+            publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &receiver
+        )
+        .is_err()
+    );
+    let draft = state
+        .publish_personal_key(
+            first.id(),
+            publication.public(),
+            publication.device_digest(),
+            publication.recovery_digest(),
+        )
+        .unwrap();
+    let published = draft.finish(control.sign(draft.signing_bytes())).unwrap();
+    state.apply(published.as_bytes()).unwrap();
+    assert!(state.materials_ready().unwrap());
+    Fixture {
+        first,
+        ordinary,
+        control,
+        receiver,
+        recovery,
+        code,
+        password,
+        genesis,
+        state,
+        record,
+        publication,
+        personal,
+        commitment,
+        published,
+    }
+}
+// Independent incoming encoder: does not call SigningRequest or AccountEvent::draft.
+fn incoming(
+    state: &VerifiedAccount,
+    author: &DevicePublicKeys,
+    signer: &SigningKey,
+    position: u64,
+    previous: [u8; 32],
+    tag: u8,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut wire = b"BaseHero account event\0".to_vec();
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&position.to_be_bytes());
+    wire.extend_from_slice(&previous);
+    wire.extend_from_slice(&state.id().0);
+    wire.extend_from_slice(&author.id().0);
+    wire.push(tag);
+    wire.extend_from_slice(body);
+    wire.extend_from_slice(&signer.sign(&wire));
+    wire
+}
+fn successor(f: &Fixture, tag: u8, body: &[u8], signer: &SigningKey) -> Vec<u8> {
+    incoming(
+        &f.state,
+        &f.first,
+        signer,
+        f.state.head().position + 1,
+        f.state.head().hash,
+        tag,
+        body,
+    )
+}
+fn stopped(mut state: VerifiedAccount, wire: &[u8]) {
+    let head = state.head();
+    assert!(state.apply(wire).is_err());
+    assert_eq!(state.head(), head);
+    assert!(state.is_stopped());
+    assert_eq!(state.materials_ready(), Err(Error::Stopped));
+}
+
+#[test]
+fn signed_initial_materials_roundtrip_replay_and_no_public_secret_metadata() {
+    let f = initial();
+    let restored = open_record(&f.state, f.record.as_bytes(), &f.password, &f.code).unwrap();
+    assert_eq!(restored.public().signing(), f.recovery.public().signing());
+    assert_eq!(
+        restored.public().receiving(),
+        f.recovery.public().receiving()
+    );
+    assert_eq!(
+        open_for_receiver(
+            &f.state,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .unwrap()
+        .public(),
+        f.personal.public()
+    );
+    assert_eq!(
+        open_for_receiver(
+            &f.state,
+            f.publication.recovery_seal(),
+            SealPurpose::Recovery,
+            restored.receiver()
+        )
+        .unwrap()
+        .public(),
+        f.personal.public()
+    );
+    assert_eq!(
+        VerifiedAccount::replay(
+            f.state.id(),
+            &[
+                f.genesis.as_bytes(),
+                f.commitment.as_bytes(),
+                f.published.as_bytes()
+            ],
+            f.state.head()
+        )
+        .unwrap()
+        .head(),
+        f.state.head()
+    );
+    assert_ne!(
+        f.recovery.public().signing(),
+        RecoveryKeys::generate().public().signing()
+    );
+    for public in [
+        f.genesis.as_bytes(),
+        f.commitment.as_bytes(),
+        f.published.as_bytes(),
+    ] {
+        for private in [
+            f.code.expose().as_slice(),
+            &f.record.as_bytes()[98..178],
+            &f.record.as_bytes()[178..210],
+            &f.record.as_bytes()[210..242],
+            f.publication.device_seal(),
+            f.publication.recovery_seal(),
+        ] {
+            assert!(!public.windows(private.len()).any(|w| w == private));
+        }
+    }
+}
+
+#[test]
+fn record_rejects_changed_credentials_or_private_record_or_foreign_account() {
+    let f = initial();
+    for password in ["pa\0ss", "pa\0sse", "pa\0ssé "] {
+        assert!(
+            open_record(
+                &f.state,
+                f.record.as_bytes(),
+                &Password::new(password).unwrap(),
+                &f.code
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        open_record(
+            &f.state,
+            f.record.as_bytes(),
+            &f.password,
+            &RecoveryCode::from_raw(&[0; 16])
+        )
+        .is_err()
+    );
+    let mut tampered = f.record.as_bytes().to_vec();
+    for offset in [0, 8, 11, 42, 74, 98, 177, 178, 210] {
+        tampered.copy_from_slice(f.record.as_bytes());
+        tampered[offset] ^= 1;
+        assert!(open_record(&f.state, &tampered, &f.password, &f.code).is_err());
+    }
+    let mut trailing = f.record.as_bytes().to_vec();
+    trailing.push(0);
+    assert!(open_record(&f.state, &trailing, &f.password, &f.code).is_err());
+    let foreign = initial();
+    assert!(open_record(&foreign.state, f.record.as_bytes(), &f.password, &f.code).is_err());
+    let mut wrong_digest = f.record.digest();
+    wrong_digest[0] ^= 1;
+    let mut changed = VerifiedAccount::from_genesis(f.state.id(), f.genesis.as_bytes()).unwrap();
+    let bad_commit = incoming(
+        &changed,
+        &f.first,
+        &f.control,
+        2,
+        changed.head().hash,
+        3,
+        &wrong_digest,
+    );
+    changed.apply(&bad_commit).unwrap();
+    let publish = incoming(
+        &changed,
+        &f.first,
+        &f.control,
+        3,
+        changed.head().hash,
+        4,
+        &[
+            f.publication.public().as_slice(),
+            &f.publication.device_digest(),
+            &f.publication.recovery_digest(),
+        ]
+        .concat(),
+    );
+    changed.apply(&publish).unwrap();
+    assert!(open_record(&changed, f.record.as_bytes(), &f.password, &f.code).is_err());
+    assert!(Password::new("").is_err());
+    assert!(Password::new(&"x".repeat(1025)).is_err());
+}
+
+#[test]
+fn private_home_proof_depends_on_code_alone_and_token_on_both_inputs() {
+    let f = initial();
+    let prefix = VerifiedAccount::from_genesis(f.state.id(), f.genesis.as_bytes()).unwrap();
+    let password_changed = prepare_record(
+        &prefix,
+        &f.recovery,
+        &Password::new("other-password").unwrap(),
+        &f.code,
+    )
+    .unwrap();
+    assert_eq!(
+        &f.record.as_bytes()[210..242],
+        &password_changed.as_bytes()[210..242]
+    );
+    assert_ne!(
+        &f.record.as_bytes()[178..210],
+        &password_changed.as_bytes()[178..210]
+    );
+    let mut alternate_code = *f.code.expose();
+    alternate_code[0] ^= 1;
+    let code_changed = prepare_record(
+        &prefix,
+        &f.recovery,
+        &f.password,
+        &RecoveryCode::from_raw(&alternate_code),
+    )
+    .unwrap();
+    assert_ne!(
+        &f.record.as_bytes()[210..242],
+        &code_changed.as_bytes()[210..242]
+    );
+    assert_ne!(
+        &f.record.as_bytes()[178..210],
+        &code_changed.as_bytes()[178..210]
+    );
+}
+
+#[test]
+fn personal_seals_reject_slot_purpose_recipient_account_and_removed_first_device() {
+    let f = initial();
+    assert!(
+        open_for_receiver(
+            &f.state,
+            f.publication.device_seal(),
+            SealPurpose::Recovery,
+            &f.receiver
+        )
+        .is_err()
+    );
+    assert!(
+        open_for_receiver(
+            &f.state,
+            f.publication.recovery_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .is_err()
+    );
+    assert!(
+        open_for_receiver(
+            &f.state,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &KemKey::generate()
+        )
+        .is_err()
+    );
+    let mut tampered = f.publication.device_seal().to_vec();
+    for offset in [0, 8, 10, 12, 43, 75, 107, 1227, 1251, 1298] {
+        tampered.copy_from_slice(f.publication.device_seal());
+        tampered[offset] ^= 1;
+        assert!(
+            open_for_receiver(&f.state, &tampered, SealPurpose::FirstDevice, &f.receiver).is_err()
+        );
+    }
+    tampered.push(0);
+    assert!(open_for_receiver(&f.state, &tampered, SealPurpose::FirstDevice, &f.receiver).is_err());
+    assert!(
+        open_for_receiver(
+            &initial().state,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .is_err()
+    );
+    let mut removed = f.state.clone();
+    removed.apply(&successor(&f, 2, &[], &f.control)).unwrap();
+    assert!(
+        open_for_receiver(
+            &removed,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn hostile_initial_controls_fail_closed_but_partial_old_histories_remain_valid() {
+    let f = initial();
+    let genesis = VerifiedAccount::from_genesis(f.state.id(), f.genesis.as_bytes()).unwrap();
+    let digest = f.record.digest();
+    let key = f.publication.public();
+    let publication_body = [
+        key.as_slice(),
+        &f.publication.device_digest(),
+        &f.publication.recovery_digest(),
+    ]
+    .concat();
+    assert!(!genesis.materials_ready().unwrap());
+    assert!(
+        genesis
+            .publish_personal_key(
+                f.first.id(),
+                key,
+                f.publication.device_digest(),
+                f.publication.recovery_digest()
+            )
+            .is_err()
+    );
+    stopped(
+        genesis.clone(),
+        &incoming(
+            &genesis,
+            &f.first,
+            &f.control,
+            2,
+            genesis.head().hash,
+            4,
+            &publication_body,
+        ),
+    );
+    stopped(
+        genesis.clone(),
+        &incoming(
+            &genesis,
+            &f.first,
+            &f.ordinary,
+            2,
+            genesis.head().hash,
+            3,
+            &digest,
+        ),
+    );
+    stopped(
+        genesis.clone(),
+        &incoming(
+            &genesis,
+            &f.first,
+            &f.control,
+            2,
+            genesis.head().hash,
+            5,
+            &[],
+        ),
+    );
+    for (tag, body) in [(3, digest.as_slice()), (4, publication_body.as_slice())] {
+        let wrong = incoming(
+            &genesis,
+            &f.first,
+            &SigningKey::generate(),
+            2,
+            genesis.head().hash,
+            tag,
+            body,
+        );
+        stopped(genesis.clone(), &wrong);
+    }
+    for body in [&digest[..31], [digest.as_slice(), &[0]].concat().as_slice()] {
+        stopped(
+            genesis.clone(),
+            &incoming(
+                &genesis,
+                &f.first,
+                &f.control,
+                2,
+                genesis.head().hash,
+                3,
+                body,
+            ),
+        );
+    }
+    let mut after_record = genesis.clone();
+    after_record.apply(f.commitment.as_bytes()).unwrap();
+    assert!(!after_record.materials_ready().unwrap());
+    stopped(
+        after_record.clone(),
+        &incoming(
+            &after_record,
+            &f.first,
+            &f.control,
+            3,
+            after_record.head().hash,
+            3,
+            &digest,
+        ),
+    );
+    stopped(
+        f.state.clone(),
+        &successor(&f, 4, &publication_body, &f.control),
+    );
+    stopped(f.state.clone(), &successor(&f, 3, &digest, &f.control));
+    let mut compromised_view = f.state.clone();
+    assert!(
+        compromised_view
+            .apply(&successor(&f, 3, &digest, &f.control))
+            .is_err()
+    );
+    assert_eq!(
+        open_record(&compromised_view, f.record.as_bytes(), &f.password, &f.code).err(),
+        Some(Error::Stopped)
+    );
+    assert!(
+        open_for_receiver(
+            &compromised_view,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .is_err()
+    );
+    let other = SigningKey::generate();
+    stopped(
+        f.state.clone(),
+        &successor(&f, 4, &publication_body, &other),
+    );
+    let mut wrong_public = after_record.clone();
+    let foreign_public = PersonalKey::generate().public();
+    let wrong_body = [
+        foreign_public.as_slice(),
+        &f.publication.device_digest(),
+        &f.publication.recovery_digest(),
+    ]
+    .concat();
+    wrong_public
+        .apply(&incoming(
+            &wrong_public,
+            &f.first,
+            &f.control,
+            3,
+            wrong_public.head().hash,
+            4,
+            &wrong_body,
+        ))
+        .unwrap();
+    assert!(
+        open_for_receiver(
+            &wrong_public,
+            f.publication.device_seal(),
+            SealPurpose::FirstDevice,
+            &f.receiver
+        )
+        .is_err()
+    );
+    let mut wrong_version = incoming(
+        &genesis,
+        &f.first,
+        &f.control,
+        2,
+        genesis.head().hash,
+        3,
+        &digest,
+    );
+    wrong_version[23] = 2; // first byte of the signed protocol version is at offset 23
+    stopped(genesis.clone(), &wrong_version);
+    let mut malformed = publication_body.clone();
+    malformed.push(0);
+    stopped(
+        after_record.clone(),
+        &incoming(
+            &after_record,
+            &f.first,
+            &f.control,
+            3,
+            after_record.head().hash,
+            4,
+            &malformed,
+        ),
+    );
+    let second = DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    let body = [
+        second.signing().as_slice(),
+        second.control(),
+        second.receiving(),
+    ]
+    .concat();
+    let mut partial = genesis.clone();
+    partial
+        .apply(&incoming(
+            &partial,
+            &f.first,
+            &f.control,
+            2,
+            partial.head().hash,
+            1,
+            &body,
+        ))
+        .unwrap();
+    assert!(!partial.materials_ready().unwrap());
+    stopped(
+        partial.clone(),
+        &incoming(
+            &partial,
+            &f.first,
+            &f.control,
+            3,
+            partial.head().hash,
+            3,
+            &digest,
+        ),
+    );
+}

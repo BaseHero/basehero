@@ -1,0 +1,25 @@
+{
+  "name": "bh-note-editor",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/editor.mjs --bundle --format=esm --platform=browser --target=es2022 --minify --define:localStorage=undefined --define:sessionStorage=undefined --outfile=../ui/note-editor.js",
+    "test": "node --test test/*.test.mjs",
+    "test:unit": "node --test test/schema.test.mjs",
+    "test:browser": "node --test test/browser.test.mjs"
+  },
+  "dependencies": {
+    "@tiptap/core": "3.31.4",
+    "@tiptap/extension-task-item": "3.31.4",
+    "@tiptap/extension-task-list": "3.31.4",
+    "@tiptap/pm": "3.31.4",
+    "@tiptap/starter-kit": "3.31.4",
+    "@tiptap/y-tiptap": "3.0.10",
+    "yjs": "13.6.33"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "playwright": "1.58.2"
+  }
+}

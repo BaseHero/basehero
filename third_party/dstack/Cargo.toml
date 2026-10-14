@@ -1,0 +1,35 @@
+# Minimal workspace manifest for pinned upstream dstack event-log source.
+# Original dstack/Cargo.toml identifies its workspace package as MIT despite
+# Apache-2.0 SPDX headers on the manifest and sources and Apache root LICENSE.
+# We retain the source's Apache-2.0 attribution; see README.md for adaptations.
+[workspace]
+members = ["cc-eventlog", "dstack-types", "size-parser"]
+resolver = "2"
+
+[workspace.package]
+version = "0.6.0"
+authors = ["Kevin Wang <wy721@qq.com>", "Leechael <Leechael@github.com>"]
+edition = "2021"
+license = "Apache-2.0"
+homepage = "https://github.com/Dstack-TEE/dstack"
+repository = "https://github.com/Dstack-TEE/dstack"
+
+[workspace.dependencies]
+dstack-types = { path = "dstack-types" }
+size-parser = { path = "size-parser" }
+anyhow = "1.0.97"
+ciborium = "0.2"
+ez-hash = "=1.1.0"
+fs-err = "3.1.0"
+hex = "0.4.3"
+insta = "1.42.2"
+or-panic = "1.0"
+scale = { package = "parity-scale-codec", version = "3.7.4", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde-human-bytes = "0.1.2"
+serde_jcs = "0.2.0"
+serde_json = "=1.0.154"
+serde_with = "3.14.0"
+sha2 = "0.10.8"
+sha3 = "0.10.8"
+thiserror = "=2.0.21"

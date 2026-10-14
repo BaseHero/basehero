@@ -1,0 +1,12 @@
+/* Only a bound note host loads this stylesheet and the bundled editor module. */
+.note-controls { display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--line); padding: 8px 0; }
+.note-controls[hidden] { display: none; }
+.note-controls button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 0; color: var(--text); font: 500 12px var(--mono); padding: 6px 10px; }
+.note-controls button:focus-visible { outline: 2px solid var(--yellow); }
+.note-content { min-height: 180px; padding: 12px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.note-content .ProseMirror { min-height: 180px; outline: none; }
+.note-content .ProseMirror:focus-visible { outline: 2px solid var(--yellow); outline-offset: 4px; }
+.note-content .note-placeholder { display: inline-block; padding: 4px 8px; border: 1px solid var(--line); background: var(--panel-2); font: 500 12px var(--mono); }
+.note-content a { color: var(--text); text-decoration: underline; }
+.note-content ul[data-type="taskList"] { list-style: none; padding-left: 16px; }
+[data-status] { font: 500 12px var(--mono); color: var(--text-2); border-top: 1px solid var(--line); padding-top: 8px; }

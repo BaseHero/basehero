@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = ["libs/*", "services/*", "apps/client/src-tauri", "tests/system", "tests/crypto-worker"]
+default-members = ["libs/*", "services/*", "tests/system"]
+exclude = ["third_party/dstack"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+bh-account = { path = "libs/account" }
+bh-core = { path = "libs/core" }
+bh-crypto = { path = "libs/crypto" }
+bh-mac-local-auth = { path = "libs/mac-local-auth" }
+bh-confidential-policy = { path = "libs/confidential-policy" }
+cc-eventlog = { path = "third_party/dstack/cc-eventlog" }
+dcap-qvl = { version = "=0.7.0", default-features = false, features = ["std", "ring", "default-x509"] }
+ez-hash = { version = "=1.1.0", default-features = false, features = ["sha2"] }
+parity-scale-codec = "=3.7.5"
+bh-release = { path = "libs/release" }
+bh-storage = { path = "libs/storage" }
+bh-sync = { path = "libs/sync" }
+brotli = "=8.0.4"
+block2 = "=0.6.2"
+dom_query = "=0.28.0"
+dom_smoothie = "=0.18.2"
+encoding_rs = "=0.8.42"
+flate2 = "=1.1.10"
+html-to-markdown-rs = "=3.17.2"
+ipnet = "=2.12.2"
+lol_html = "=2.9.0"
+# Minimal macOS LAContext binding; objc2-foundation/block2 are already locked.
+objc2 = "=0.6.5"
+objc2-foundation = "=0.3.2"
+objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAPublicDefines", "block2"] }
+pkg-config = "=0.3.32"
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Already in the lockfile; Apple's SecItem data-protection and SecAccessControl wrappers.
+security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_15"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
+rustls-native-certs = "=0.8.5"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tauri = { version = "=2.12.1", default-features = false, features = ["wry"] }
+tauri-build = { version = "=2.7.1", default-features = false }
+tempfile = "=3.27.0"
+thiserror = "=2.0.21"
+# Verification and EHBP stay on the same pinned releases; the model route is optional.
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs", rev = "91e8aef8fbc34129b68de8667ece5bd9ef7b7110" }
+tinfoil-ehbp = { git = "https://github.com/tinfoilsh/encrypted-http-body-protocol", rev = "93cc1fa1ad61e19f9a34fb23cb5b5d5635d3edb0", default-features = false, features = ["rustls-no-provider"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+url = "=2.5.8"
+futures-util = "=0.3.34"
+# Independent enclave-side encryption in offline model transport tests.
+hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
+# NEAR OHTTP response key derivation; already transitive via hpke.
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+aes-gcm = "=0.10.3"
+rand = { version = "=0.9.5", default-features = false, features = ["os_rng", "std_rng"] }
+hex = "=0.4.3"
+# Dev-only for the offline NEAR interop tests: run the pinned gateway's exact
+# ohttp/bhttp 0.7.2 server code (already on our hpke 0.13 stack).
+ohttp = { version = "=0.7.2", default-features = false, features = ["client", "server", "rust-hpke", "stream"] }
+bhttp = "=0.7.2"
+futures = "=0.3.34"
+yrs = "=0.28.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

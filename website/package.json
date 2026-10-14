@@ -1,0 +1,14 @@
+{
+  "name": "@basehero/website",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js && node scripts/check.mjs",
+    "check": "npm run build && npm test",
+    "preview": "npm run build && WRANGLER_SEND_METRICS=false wrangler dev --local --config dist/wrangler.jsonc",
+    "deploy": "npm run check && node scripts/deploy.mjs"
+  },
+  "devDependencies": { "wrangler": "4.150.0" }
+}

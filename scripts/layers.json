@@ -1,0 +1,5 @@
+{
+  "order": ["foundation", "libs", "services", "apps", "tests"],
+  "foundation": ["libs/core", "libs/crypto"],
+  "prefixes": {"libs/": "libs", "services/": "services", "apps/": "apps", "tests/": "tests"}
+}

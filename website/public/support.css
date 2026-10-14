@@ -1,0 +1,54 @@
+.support-page { max-width: 780px; padding-top: 60px; padding-bottom: 35px; }
+.support-page h1, .flow-page h1 { font-size: 52px; line-height: 1.08; letter-spacing: -1.5px; margin-bottom: 22px; }
+.support-lede { font-size: 23px; max-width: 680px; margin-bottom: 38px; }
+.support-page section { margin: 30px 0; }
+.support-page h2, .flow-card h2 { font-size: 27px; letter-spacing: -.5px; margin-bottom: 14px; }
+.support-page section p { font-size: 19px; }
+.support-preview { background: var(--side); border: 1px solid var(--rule); border-radius: 0; padding: 18px; font-size: 13px; color: var(--muted); margin-top: 40px; }
+.support-preview a { display: block; margin-top: 8px; text-decoration: underline; text-underline-offset: 3px; }
+.flow-page { padding-top: 50px; padding-bottom: 30px; }
+.flow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.flow-card { background: var(--panel); padding: 30px; border: 1px solid var(--rule); border-radius: 0; scroll-margin-top: 20px; }
+.flow-card:target { outline: 3px solid var(--accent); outline-offset: 3px; }
+.flow-label { font-size: 12px; color: var(--muted); font-weight: 650; letter-spacing: 1px; margin-bottom: 24px; }
+.flow-card > p:not(.flow-label) { margin-bottom: 20px; }
+.flow-card .muted { color: var(--muted); font-size: 15px; margin-top: 18px; }
+.flow-card .text-link { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.email-subject { font-size: 14px; border-bottom: 1px solid var(--rule); padding-bottom: 15px; }
+.privacy-title { font-size: 64px; line-height: 1.02; letter-spacing: -2.2px; color: var(--bg); }
+.who-table { max-width: 960px; margin: 0 auto; border: 1px solid var(--rule); border-radius: 0; background: var(--panel); overflow: hidden; }
+.who-row { display: grid; grid-template-columns: 1.4fr 1fr .7fr; gap: 16px; align-items: center; padding: 20px 26px; border-top: 1px solid var(--rule); }
+.who-head { border-top: 0; background: var(--side); font-size: 13px; font-weight: 700; color: var(--muted); }
+.who-row b { display: block; font-size: 18px; }
+.who-row small { display: block; color: var(--muted); font-size: 14px; margin-top: 2px; }
+.who-row .yes, .who-row .no { display: flex; align-items: center; gap: 10px; font-weight: 650; }
+.who-row i { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 0; font-style: normal; font-size: 15px; }
+.who-row .yes i { background: var(--panel-2); color: var(--text); }
+.who-row .no i { background: var(--ink); color: var(--mark); }
+.details-inner { max-width: 800px; margin: 0 auto; }
+.details-inner h2 { margin-bottom: 26px; }
+.full-claim { display: grid; gap: 18px; border-left: 4px solid var(--agent); padding: 4px 0 4px 24px; }
+.full-claim p { font-size: 18px; line-height: 1.6; }
+.beta-mini { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; background: var(--accent-soft); border-radius: 0; padding-top: 40px; padding-bottom: 40px; max-width: 1160px; margin-bottom: 30px; }
+.beta-mini h2 { font-size: 34px; }
+@media (max-width: 720px) {
+  .privacy-title { font-size: 44px; letter-spacing: -1.4px; }
+  .who-table { border-radius: 0; }
+  .who-row { grid-template-columns: 1fr 1fr; padding: 16px 18px; gap: 10px 14px; }
+  .who-row > span:first-child { grid-column: 1 / -1; }
+  .who-head > span:first-child { display: none; }
+  .who-row b { font-size: 17px; }
+  .who-row .yes, .who-row .no { font-size: 15px; }
+  .full-claim { padding-left: 16px; }
+  .full-claim p { font-size: 17px; }
+  .beta-mini { margin: 0 14px 20px; padding: 28px 20px; border-radius: 0; }
+  .beta-mini h2 { font-size: 28px; }
+  .support-page, .flow-page { padding-top: 35px; }
+  .support-page h1, .flow-page h1 { font-size: 39px; letter-spacing: -1px; }
+  .support-lede { font-size: 21px; }
+  .support-page section p { font-size: 18px; }
+  .flow-grid { grid-template-columns: 1fr; gap: 18px; }
+  .flow-card { padding: 25px; }
+  .flow-card h2 { font-size: 28px; }
+  .masthead > .text-link { display: inline; font-size: 14px; text-align: right; }
+}

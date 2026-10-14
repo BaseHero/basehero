@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy — BaseHero</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23ffc20e' d='M5 5h22v22H5z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="tokens.css">
+  <script src="theme.js?v=dispatch-2"></script>
+  <link rel="stylesheet" href="website.css?v=dispatch-2">
+  <link rel="stylesheet" href="story.css?v=dispatch-5">
+  <link rel="stylesheet" href="showcase.css?v=dispatch-5">
+  <link rel="stylesheet" href="support.css?v=dispatch-2">
+  <script>document.documentElement.className = 'js';</script>
+  <script src="site.js?v=10" defer></script>
+  <link rel="stylesheet" href="dispatch.css?v=dispatch-5">
+</head>
+<body>
+  <header class="masthead"><div class="wrap masthead-inner"><a class="brand" href="./">Base<span>Hero</span><span class="brand-square" aria-hidden="true"></span></a><nav aria-label="Main"><a class="text-link" href="./">Home</a><a class="button small" href="./#beta">Join the beta list <span aria-hidden="true">↗</span></a></nav></div></header>
+  <main>
+    <section class="privacy-section">
+      <div class="wrap section-space">
+        <div class="privacy-top">
+          <div class="privacy-heading reveal">
+            <p class="eyebrow">PRIVACY</p>
+            <h1 class="privacy-title">Private by design.</h1>
+            <p class="privacy-promise">BaseHero is designed so we can’t see your data. You choose who else can.</p>
+          </div>
+          <figure class="privacy-flow reveal" data-flow='["Dinner at Sam’s, Friday at 7?","Leo lands at 6. Who’s picking him up?","Trip budget: €300 each. OK?"]' data-stage="read">
+            <div class="flow-nodes">
+              <div class="flow-node person"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2.5"/><path d="M11 18h2"/></svg></span><b>Ana’s phone</b><p class="flow-bubble" data-flow-from>Dinner at Sam’s, Friday at 7?</p></div>
+              <div class="connector c1" aria-hidden="true"><i></i></div>
+              <div class="flow-node cloud"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .5-8A6 6 0 0 0 6 9.5 4.3 4.3 0 0 0 7 18z"/></svg></span><b>Our cloud</b><p class="flow-bubble locked"><span class="lock-mini" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span><span class="sr-only">Encrypted message</span><span data-flow-cloud aria-hidden="true">Gk7Xq2 vR/ 9mRz+p, Lw4nB8 Tq 3=</span></p><small>Locked. We can’t open it.</small></div>
+              <div class="connector c2" aria-hidden="true"><i></i></div>
+              <div class="flow-node person"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="10" rx="1.5"/><path d="M3 19h18"/></svg></span><b>Sam’s laptop</b><p class="flow-bubble" data-flow-to>Dinner at Sam’s, Friday at 7?</p></div>
+            </div>
+            <figcaption><span>Encrypted on Ana’s phone. Opened on Sam’s laptop. Unreadable to us in between.</span> <button type="button" class="motion-toggle" hidden>Pause</button></figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="who-sees section-space wrap" aria-labelledby="who-sees-title">
+      <div class="center-heading reveal"><p class="eyebrow">AT A GLANCE</p><h2 id="who-sees-title">Who can see what.</h2></div>
+      <div class="who-table reveal" role="table" aria-label="Who can see what">
+        <div class="who-row who-head" role="row"><span role="columnheader">What</span><span role="columnheader">You and the people you share with</span><span role="columnheader">BaseHero</span></div>
+        <div class="who-row" role="row"><span role="rowheader"><b>What you write, keep and share</b><small>Notes, chats, plans and files</small></span><span role="cell" class="yes"><i aria-hidden="true">✓</i> Yes</span><span role="cell" class="no"><i aria-hidden="true">✕</i> No</span></div>
+        <div class="who-row" role="row"><span role="rowheader"><b>What you ask Hero</b><small>Using our private AI and search</small></span><span role="cell" class="yes"><i aria-hidden="true">✓</i> Yes</span><span role="cell" class="no"><i aria-hidden="true">✕</i> No</span></div>
+      </div>
+    </section>
+
+    <section class="details section-space wrap" aria-labelledby="details-title">
+      <div class="details-inner reveal">
+        <p class="eyebrow">THE DETAILS</p>
+        <h2 id="details-title">Our privacy promise, in full.</h2>
+        <div class="full-claim" data-claim-full>
+          <p data-claim="core"><strong>BaseHero is end-to-end encrypted.</strong> What you store or share is encrypted on your devices, and nothing we hold can open it, not even all of it together. When Hero or your base’s tools work on it in our cloud, they do so only inside confidential hardware your devices check, so we still can’t read it.</p>
+          <p data-claim="services"><strong>Our private services,</strong> Hero’s AI, web search and the work it does in our cloud, run on confidential hardware that your device checks before sending anything, so we can’t read what you send them.</p>
+          <p data-claim="own"><strong>Or bring your own:</strong> use your own AI or search provider and it sees what you send it, not us. Host a base yourself and its data and membership stay on your server.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="beta-mini wrap reveal"><h2>Ready to bring the whole picture?</h2><a class="button" href="./#beta">About the beta list <span aria-hidden="true">↗</span></a></section>
+  </main>
+  <footer class="wrap"><a class="brand" href="./">Base<span>Hero</span><span class="brand-square" aria-hidden="true"></span></a><p>A little help with the things that matter.</p></footer>
+</body>
+</html>

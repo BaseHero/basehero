@@ -1,0 +1,7 @@
+**/target/
+/result
+/.wrangler/
+/apps/client/src-tauri/gen/*
+!/apps/client/src-tauri/gen/android/
+**/node_modules/
+/apps/client/editor/test/browser.bundle.js

@@ -1,0 +1,509 @@
+//! Offline Intel TDX quote and dstack runtime-log verification. A measured value
+//! is neither current policy authorization nor a possession proof for the bound
+//! keys. Caller must own nonce issuance/replay, trusted time, signed policy,
+//! authenticated channel and job authority separately.
+#![forbid(unsafe_code)]
+
+use bh_confidential_policy::{Build, Role};
+use cc_eventlog::{TdxEvent, replay_events, tdx::validate_v2_preimages};
+use dcap_qvl::{QuoteClaims, QuoteCollateralV3, QuotePolicy, verify::QuoteVerifier};
+
+/// Max raw bytes before any untrusted JSON or quote parser. The archived quote
+/// is 5006 bytes, collateral 16072, and separate dstack log fixture < 19 KiB.
+/// 1 MiB per input permits larger real logs/collateral without unbounded parsing;
+/// the caller must also bound transport bytes. No live host size proof yet.
+pub const MAX_INPUT_BYTES: usize = 1_048_576;
+const MAX_EVENTS: usize = 4096;
+const MAX_RUNTIME_PAYLOAD: usize = 65_536;
+const DOMAIN: &[u8] = b"basehero.tdx-report.v1\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    TooLarge,
+    Encoding,
+    TimeUnavailable,
+    TimeUncertain,
+    Quote,
+    Binding,
+    EventLog,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "confidential attestation: {self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
+/// Serialized QVL `QuoteCollateralV3` and dstack JSON array of TDX events.
+/// They are untrusted, and never fetched by this crate.
+pub struct Evidence<'a> {
+    pub quote: &'a [u8],
+    pub collateral: &'a [u8],
+    pub event_log: &'a [u8],
+}
+/// Expected public keys and a fresh verifier-owned nonce. Never derive these
+/// from the quote or trust an issuer-supplied expected key/nonce.
+pub struct Expected {
+    pub signing: [u8; 32],
+    pub receiving: [u8; 1216],
+    pub nonce: [u8; 32],
+    pub role: Role,
+}
+/// Absolute seconds from a trusted caller adapter. `None` means unavailable;
+/// max uncertainty is a trusted caller limit, not an untrusted proof field.
+#[derive(Clone, Copy)]
+pub struct Time {
+    pub earliest: u64,
+    pub latest: u64,
+    pub max_uncertainty_secs: u64,
+}
+
+/// Only `verify` can construct this value. Immutable, and deliberately not a
+/// readiness/authorization token. Feed build + machine separately to the signed
+/// policy gate, with the same intended role and trusted time bounds; success there
+/// alone still authorizes no key release or job operation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Measured {
+    signing: [u8; 32],
+    receiving: [u8; 1216],
+    build: Build,
+    machine: [u8; 32],
+}
+impl Measured {
+    pub fn signing(&self) -> &[u8; 32] {
+        &self.signing
+    }
+    pub fn receiving(&self) -> &[u8; 1216] {
+        &self.receiving
+    }
+    pub fn build(&self) -> &Build {
+        &self.build
+    }
+    pub fn machine(&self) -> &[u8; 32] {
+        &self.machine
+    }
+}
+
+/// Issuer/verifier convention: SHA-256 of ASCII `basehero.tdx-report.v1`, NUL,
+/// then exactly 32 signing-key bytes, 1216 X-Wing receiving-key bytes, 32 nonce
+/// bytes (no variable-length framing). Raw report_data is the digest followed by
+/// 32 zero bytes. This binds bytes, not private-key possession or nonce freshness.
+pub fn report_data(signing: &[u8; 32], receiving: &[u8; 1216], nonce: &[u8; 32]) -> [u8; 64] {
+    let mut hash = bh_crypto::Sha256::new();
+    hash.update(DOMAIN);
+    hash.update(signing);
+    hash.update(receiving);
+    hash.update(nonce);
+    let mut report = [0; 64];
+    report[..32].copy_from_slice(&hash.finalize());
+    report
+}
+
+fn check_size(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        Err(Error::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+fn checked_time(time: Option<Time>) -> Result<Time, Error> {
+    let time = time.ok_or(Error::TimeUnavailable)?;
+    if time.latest < time.earliest || time.latest - time.earliest > time.max_uncertainty_secs {
+        return Err(Error::TimeUncertain);
+    }
+    Ok(time)
+}
+fn quote_claims(quote: &[u8], collateral: &[u8], time: Time) -> Result<QuoteClaims, Error> {
+    check_size(quote)?;
+    check_size(collateral)?;
+    let collateral: QuoteCollateralV3 =
+        serde_json::from_slice(collateral).map_err(|_| Error::Encoding)?;
+    // Explicit ring config, even if another dependency enables QVL's rustcrypto
+    // feature via Cargo feature unification. No report/PCCS network feature.
+    let verifier = QuoteVerifier::new_prod().with_config::<dcap_qvl::configs::RingConfig>();
+    let appraisal = |now| {
+        QuotePolicy::strict(now)
+            .allow_smt(true)
+            .allow_dynamic_platform(true)
+            .allow_cached_keys(true)
+    };
+    // Check both ends: latest alone would accept a not-yet-valid certificate at
+    // earliest. QVL checks Intel signatures, chains, CRLs, TCB and time at each.
+    let first = verifier
+        .verify_with_policy(quote, &collateral, time.earliest, &appraisal(time.earliest))
+        .map_err(|_| Error::Quote)?;
+    if time.latest != time.earliest {
+        verifier
+            .verify_with_policy(quote, &collateral, time.latest, &appraisal(time.latest))
+            .map_err(|_| Error::Quote)?;
+    }
+    Ok(first)
+}
+fn compose(log: &[u8], rtmr3: &[u8; 48]) -> Result<[u8; 32], Error> {
+    check_size(log)?;
+    let events: Vec<TdxEvent> = serde_json::from_slice(log).map_err(|_| Error::Encoding)?;
+    if events.len() > MAX_EVENTS
+        || events.iter().any(|e| {
+            e.event_payload.len() > MAX_RUNTIME_PAYLOAD
+                || e.event.len() > 256
+                || e.digest.len() > 48
+                || e.preimage.as_ref().is_some_and(|p| p.len() > 131_072)
+        })
+    {
+        return Err(Error::TooLarge);
+    }
+    validate_v2_preimages(&events).map_err(|_| Error::EventLog)?;
+    let mut runtime = Vec::new();
+    let mut compose = None;
+    for event in &events {
+        if event.is_runtime_event() && event.imr != 3 {
+            return Err(Error::EventLog);
+        }
+        if event.imr != 3 {
+            continue;
+        }
+        let entry = event.to_runtime_event().ok_or(Error::EventLog)?;
+        if event.digest.as_slice() != entry.sha384_digest() {
+            return Err(Error::EventLog);
+        }
+        if entry.event == "compose-hash" {
+            let hash: [u8; 32] = entry
+                .payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::EventLog)?;
+            if compose.replace(hash).is_some() {
+                return Err(Error::EventLog);
+            }
+        }
+        runtime.push(entry);
+    }
+    if replay_events::<ez_hash::Sha384>(&runtime, None) != *rtmr3 {
+        return Err(Error::EventLog);
+    }
+    compose.ok_or(Error::EventLog)
+}
+
+/// Full offline verifier. Validation bounds precede parsing/cloning; all errors
+/// are fixed and content-free. No successful archived fixture matches a newly
+/// issued key/nonce and the separate log; that combined proof awaits a host test.
+pub fn verify(
+    evidence: Evidence<'_>,
+    expected: &Expected,
+    time: Option<Time>,
+) -> Result<Measured, Error> {
+    check_size(evidence.quote)?;
+    check_size(evidence.collateral)?;
+    check_size(evidence.event_log)?;
+    let time = checked_time(time)?;
+    let claims = quote_claims(evidence.quote, evidence.collateral, time)?;
+    assemble(&claims, evidence.event_log, expected)
+}
+
+// Accept only claims returned by QVL in `verify`; private so there is no
+// consumer-facing route from a parsed/self-asserted quote to a measured value.
+fn assemble(
+    claims: &QuoteClaims,
+    event_log: &[u8],
+    expected: &Expected,
+) -> Result<Measured, Error> {
+    let td = claims.report.as_td10().ok_or(Error::Quote)?;
+    if claims.platform.pck.ppid.len() != 16 {
+        return Err(Error::Quote);
+    }
+    if td.td_attributes[0] != 0 || td.td_attributes[3] & 0x20 != 0 {
+        return Err(Error::Quote);
+    }
+    if td.report_data != report_data(&expected.signing, &expected.receiving, &expected.nonce) {
+        return Err(Error::Binding);
+    }
+    let compose_sha256 = compose(event_log, &td.rt_mr3)?;
+    Ok(Measured {
+        signing: expected.signing,
+        receiving: expected.receiving,
+        build: Build {
+            role: expected.role,
+            compose_sha256,
+            boot: [
+                td.mr_td.to_vec(),
+                td.rt_mr0.to_vec(),
+                td.rt_mr1.to_vec(),
+                td.rt_mr2.to_vec(),
+            ],
+        },
+        machine: bh_crypto::sha256(&claims.platform.pck.ppid),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dcap_qvl::quote::Quote;
+    use parity_scale_codec::Decode;
+    const QUOTE: &[u8] = include_bytes!("../tests/fixtures/tdx_quote");
+    const COLLATERAL: &[u8] = include_bytes!("../tests/fixtures/tdx_quote_collateral.json");
+    const DSTACK: &[u8] = include_bytes!("../tests/fixtures/tdx-lite-getquote.json");
+    fn interval(a: u64, b: u64) -> Time {
+        Time {
+            earliest: a,
+            latest: b,
+            max_uncertainty_secs: 60,
+        }
+    }
+    #[test]
+    fn archived_intel_path_is_real_but_expired_now() {
+        let claims =
+            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_001)).unwrap();
+        assert!(claims.report.as_td10().is_some());
+        assert_eq!(claims.platform.pck.ppid.len(), 16);
+        // At each boundary a verdict at the opposite end must not substitute
+        // for an interval verdict. QVL sees both the valid and invalid endpoint.
+        let spanning_expiry = Time {
+            earliest: 1_751_328_000,
+            latest: claims.earliest_expiration_date + 1,
+            max_uncertainty_secs: u64::MAX,
+        };
+        assert_eq!(
+            quote_claims(QUOTE, COLLATERAL, spanning_expiry).err(),
+            Some(Error::Quote)
+        );
+        let spanning_issuance = Time {
+            earliest: claims.latest_issue_date.saturating_sub(86400 * 365),
+            latest: 1_751_328_000,
+            max_uncertainty_secs: u64::MAX,
+        };
+        assert_eq!(
+            quote_claims(QUOTE, COLLATERAL, spanning_issuance).err(),
+            Some(Error::Quote)
+        );
+        assert!(quote_claims(QUOTE, COLLATERAL, interval(1_791_849_600, 1_791_849_601)).is_err());
+        let mut tampered = QUOTE.to_vec();
+        tampered[120] ^= 1;
+        assert!(
+            quote_claims(
+                &tampered,
+                COLLATERAL,
+                interval(1_751_328_000, 1_751_328_001)
+            )
+            .is_err()
+        );
+        assert!(
+            quote_claims(
+                QUOTE,
+                COLLATERAL,
+                interval(1_751_328_000 - 86400 * 365, 1_751_328_000)
+            )
+            .is_err()
+        );
+    }
+    fn log_and_register() -> (Vec<TdxEvent>, [u8; 48]) {
+        let fixture: serde_json::Value = serde_json::from_slice(DSTACK).unwrap();
+        let raw = hex::decode(fixture["quote"].as_str().unwrap()).unwrap();
+        let quote = Quote::decode(&mut raw.as_slice()).unwrap(); // parse only; NEVER authenticate
+        let register = quote.report.as_td10().unwrap().rt_mr3;
+        let events = serde_json::from_str(fixture["event_log"].as_str().unwrap()).unwrap();
+        (events, register)
+    }
+    fn replay(events: &[TdxEvent], register: &[u8; 48]) -> Result<[u8; 32], Error> {
+        compose(&serde_json::to_vec(events).unwrap(), register)
+    }
+    #[test]
+    fn distinct_dstack_log_replays_but_is_not_verified_quote() {
+        let (events, register) = log_and_register();
+        assert_eq!(
+            hex::encode(replay(&events, &register).unwrap()),
+            "60618cd0c23d15d921b788b8fc3a0d024ac72295185da3ba41d5a065bc7aa833"
+        );
+        let mut bad = register;
+        bad[0] ^= 1;
+        assert_eq!(replay(&events, &bad), Err(Error::EventLog));
+        assert_eq!(compose(b"[]", &register), Err(Error::EventLog));
+        assert_eq!(compose(b"not json", &register), Err(Error::Encoding));
+    }
+    #[test]
+    fn v2_runtime_requires_canonical_digest_preimage() {
+        let (mut events, _) = log_and_register();
+        let pos = events
+            .iter()
+            .position(|e| e.event == "compose-hash")
+            .unwrap();
+        events[pos].version = cc_eventlog::EventLogVersion::V2;
+        events[pos].digest = events[pos].digest();
+        events[pos].fill_preimage();
+        let runtime: Vec<_> = events
+            .iter()
+            .filter_map(TdxEvent::to_runtime_event)
+            .collect();
+        let register = replay_events::<ez_hash::Sha384>(&runtime, None);
+        // This register is synthetic and never a verified TDX quote.
+        assert!(replay(&events, &register).is_ok());
+        let mut bad = events.clone();
+        bad[pos].preimage = None;
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events;
+        bad[pos].preimage = Some("bad hex".into());
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+    }
+    // Synthetic post-QVL test: start from a real archived QVL verdict, then
+    // replace report fields and PPID in memory. This is NOT an Intel-signed
+    // quote for our fresh keys and cannot be used as a full attestation proof.
+    fn synthetic_inputs() -> (QuoteClaims, Vec<u8>, Expected) {
+        let mut claims =
+            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_001)).unwrap();
+        let (events, register) = log_and_register();
+        let expected = Expected {
+            signing: [1; 32],
+            receiving: [2; 1216],
+            nonce: [3; 32],
+            role: Role::Runner,
+        };
+        let dcap_qvl::quote::Report::TD10(td) = &mut claims.report else {
+            panic!("archived TD10 fixture changed")
+        };
+        td.rt_mr3 = register;
+        td.report_data = report_data(&expected.signing, &expected.receiving, &expected.nonce);
+        td.mr_td = [0x11; 48];
+        td.rt_mr0 = [0x22; 48];
+        td.rt_mr1 = [0x33; 48];
+        td.rt_mr2 = [0x44; 48];
+        claims.platform.pck.ppid = (0..16).collect();
+        (claims, serde_json::to_vec(&events).unwrap(), expected)
+    }
+    #[test]
+    fn synthetic_post_qvl_assembly_binds_every_key_and_maps_all_measurements() {
+        let (claims, log, expected) = synthetic_inputs();
+        let measured = assemble(&claims, &log, &expected).unwrap();
+        assert_eq!(measured.signing(), &expected.signing);
+        assert_eq!(measured.receiving(), &expected.receiving);
+        assert_eq!(measured.build().role, Role::Runner);
+        assert_eq!(
+            measured.build().boot,
+            [
+                [0x11; 48].to_vec(),
+                [0x22; 48].to_vec(),
+                [0x33; 48].to_vec(),
+                [0x44; 48].to_vec()
+            ]
+        );
+        assert_eq!(
+            hex::encode(measured.build().compose_sha256),
+            "60618cd0c23d15d921b788b8fc3a0d024ac72295185da3ba41d5a065bc7aa833"
+        );
+        assert_eq!(
+            hex::encode(measured.machine()),
+            "be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991"
+        );
+        // Binding comparisons must survive even though every other field has a
+        // matching synthetic register and otherwise valid measurement.
+        let mut altered = Expected {
+            signing: expected.signing,
+            receiving: expected.receiving,
+            nonce: expected.nonce,
+            role: expected.role,
+        };
+        altered.signing[0] ^= 1;
+        assert_eq!(assemble(&claims, &log, &altered), Err(Error::Binding));
+        altered.signing = expected.signing;
+        altered.receiving[0] ^= 1;
+        assert_eq!(assemble(&claims, &log, &altered), Err(Error::Binding));
+        altered.receiving = expected.receiving;
+        altered.nonce[0] ^= 1;
+        assert_eq!(assemble(&claims, &log, &altered), Err(Error::Binding));
+        let mut bad = claims.clone();
+        if let dcap_qvl::quote::Report::TD10(td) = &mut bad.report {
+            td.report_data[63] = 1;
+        }
+        assert_eq!(assemble(&bad, &log, &expected), Err(Error::Binding));
+    }
+    #[test]
+    fn synthetic_post_qvl_attributes_and_ppid_refuse() {
+        let (claims, log, expected) = synthetic_inputs();
+        for (index, bit) in [(0, 1), (0, 0x80), (3, 0x20)] {
+            let mut bad = claims.clone();
+            if let dcap_qvl::quote::Report::TD10(td) = &mut bad.report {
+                td.td_attributes[index] |= bit;
+            }
+            assert_eq!(assemble(&bad, &log, &expected), Err(Error::Quote));
+        }
+        let mut bad = claims.clone();
+        bad.platform.pck.ppid.pop();
+        assert_eq!(assemble(&bad, &log, &expected), Err(Error::Quote));
+        let mut other_role = Expected {
+            signing: expected.signing,
+            receiving: expected.receiving,
+            nonce: expected.nonce,
+            role: Role::Checker,
+        };
+        assert_eq!(
+            assemble(&claims, &log, &other_role).unwrap().build().role,
+            Role::Checker
+        );
+        other_role.role = Role::KeyService;
+        assert_eq!(
+            assemble(&claims, &log, &other_role).unwrap().build().role,
+            Role::KeyService
+        );
+    }
+    #[test]
+    fn synthetic_matching_register_still_requires_exactly_one_compose_event() {
+        let (events, register) = log_and_register();
+        assert!(replay(&events, &register).is_ok());
+        let pos = events
+            .iter()
+            .position(|e| e.imr == 3 && e.event == "compose-hash")
+            .unwrap();
+        let mut missing = events.clone();
+        missing.remove(pos);
+        let register_for = |items: &[TdxEvent]| {
+            let runtime: Vec<_> = items
+                .iter()
+                .filter_map(TdxEvent::to_runtime_event)
+                .collect();
+            replay_events::<ez_hash::Sha384>(&runtime, None)
+        };
+        let missing_register = register_for(&missing);
+        assert_eq!(replay(&missing, &missing_register), Err(Error::EventLog));
+        let mut duplicate = events;
+        duplicate.push(duplicate[pos].clone());
+        let duplicate_register = register_for(&duplicate);
+        assert_eq!(
+            replay(&duplicate, &duplicate_register),
+            Err(Error::EventLog)
+        );
+        // Both registers above were recomputed, not taken from a signed quote.
+    }
+    #[test]
+    fn runtime_preimages_digests_composition_and_count_fail_closed() {
+        let (events, register) = log_and_register();
+        let pos = events
+            .iter()
+            .position(|e| e.imr == 3 && e.event == "compose-hash")
+            .unwrap();
+        let mut bad = events.clone();
+        bad[pos].event_payload[0] ^= 1;
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad[pos].digest[0] ^= 1;
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad.push(events[pos].clone());
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad.remove(pos);
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad[pos].digest.clear();
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad[pos].event_type = 123;
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad[pos].imr = 2;
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
+        let mut bad = events.clone();
+        bad[pos].event_payload = vec![3; MAX_RUNTIME_PAYLOAD + 1];
+        assert_eq!(replay(&bad, &register), Err(Error::TooLarge));
+        let many = vec![events[pos].clone(); MAX_EVENTS + 1];
+        assert_eq!(replay(&many, &register), Err(Error::TooLarge));
+    }
+}

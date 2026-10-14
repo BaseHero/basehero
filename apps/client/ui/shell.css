@@ -1,0 +1,9 @@
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; background: var(--panel); color: var(--text); font: 16px/1.66 var(--sans); }
+header { display: flex; gap: 24px; align-items: center; min-height: 56px; padding-left: max(20px, env(safe-area-inset-left)); padding-top: env(safe-area-inset-top); background: var(--bar); color: var(--on-bar); font: 500 13px var(--mono); }
+header strong { align-self: stretch; display: grid; place-items: center; padding: 18px 24px; background: var(--yellow); color: var(--on-yellow); }
+main { flex: 1; width: min(100%, 800px); padding: 48px max(24px, env(safe-area-inset-left)); }
+h1 { font-size: clamp(34px, 5vw, 44px); font-stretch: 80%; line-height: 1.1; margin: 24px 0; }
+.label, footer { font: 500 12px/1.6 var(--mono); letter-spacing: .05em; }
+.label { color: var(--text-2); }
+footer { border-top: 1px solid var(--line); padding: 12px 20px max(12px, env(safe-area-inset-bottom)); background: var(--panel-2); }

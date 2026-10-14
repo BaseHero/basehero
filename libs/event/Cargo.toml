@@ -1,0 +1,16 @@
+[package]
+name = "bh-event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bh-account.workspace = true
+bh-core.workspace = true
+bh-crypto.workspace = true
+bh-sync.workspace = true
+
+[lints]
+workspace = true
