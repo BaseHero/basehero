@@ -77,6 +77,19 @@
             includeEmulator = false;
             includeSystemImages = false;
           };
+          # A second SDK view for the real-app WebDriver tests: the emulator and
+          # one x86_64 Google APIs system image, kept out of the ordinary
+          # `android` shell so an ABI-specific download is opt-in.
+          androidEmulatorPackages = androidPkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ "36" ];
+            buildToolsVersions = [ "35.0.0" ];
+            includeNDK = true;
+            ndkVersions = [ "29.0.14206865" ];
+            includeEmulator = true;
+            includeSystemImages = true;
+            systemImageTypes = [ "google_apis" ];
+            abiVersions = [ "x86_64" ];
+          };
           sdk = "${android.androidsdk}/libexec/android-sdk";
           ndk = "${sdk}/ndk/29.0.14206865";
           llvm = "${ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin";
@@ -157,6 +170,27 @@
             LIBSODIUM_STATIC = "1";
             shellHook = cargoCacheHook "android";
             GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${sdk}/build-tools/35.0.0/aapt2";
+          };
+          # x86_64 emulator builds and the real-app WebDriver tests. The Rust
+          # target lives in rust-toolchain.toml; this shell adds the ABI's
+          # linker and the emulator system image.
+          androidEmulator = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              rust
+              pkg-config
+              cargo-tauri
+              nodejs_22
+              jdk17
+              androidEmulatorPackages.androidsdk
+            ];
+            ANDROID_HOME = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk";
+            ANDROID_SDK_ROOT = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk";
+            NDK_HOME = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865";
+            JAVA_HOME = pkgs.jdk17.home;
+            CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang";
+            CC_x86_64_linux_android = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang";
+            AR_x86_64_linux_android = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar";
+            GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidEmulatorPackages.androidsdk}/libexec/android-sdk/build-tools/35.0.0/aapt2";
           };
         }
       );

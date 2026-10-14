@@ -55,6 +55,9 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 tauri = { version = "=2.12.1", default-features = false, features = ["wry"] }
 tauri-build = { version = "=2.7.1", default-features = false }
+# W3C driver for real-app tests; the client enables it only through its
+# non-default `webdriver` feature, so release builds never link it.
+tauri-plugin-webdriver = "=0.2.3"
 tempfile = "=3.27.0"
 thiserror = "=2.0.21"
 # Verification and EHBP stay on the same pinned releases; the model route is optional.

@@ -64,6 +64,7 @@ try {
     for (const p of members) if (!selected.has(p.name) && dependencies(p).some(d => selected.has(d))) { selected.add(p.name); changed = true; }
   } while (changed);
   const names = [...selected].sort();
+  const webdriver = global || paths.some(p => p.startsWith('apps/client/src-tauri/'));
   // note_to_yjs bridges core's note into the bundled editor, so core changes (bh-core),
   // the shared schema and interop fixtures all reach the editor's Rust-to-Yjs tests.
   const editor = global
@@ -87,11 +88,12 @@ try {
     ...(global && byName.has('bh-sync-worker') || selected.has('bh-sync-worker') || paths.some(p => p.startsWith('tests/sync-worker/') || p.startsWith('services/sync-worker/')) ? ['wasm-sync'] : []),
     ...(paths.some(p => p.startsWith('website/')) ? ['website'] : []),
   ];
-  if (args.includes('--plan')) { console.log(JSON.stringify({ crates: names, js })); process.exit(0); }
+  if (args.includes('--plan')) { console.log(JSON.stringify({ crates: names, js, webdriver })); process.exit(0); }
   if (args.includes('--list')) { console.log(names.join('\n')); process.exit(0); }
   if (!args.includes('--check')) throw new Error('specify --list or --check');
   const shell = (cmd, argv) => { console.error(`Affected: ${cmd} ${argv.join(' ')}`); const r = spawnSync(cmd, argv, { cwd: root, stdio: 'inherit' }); if (r.status !== 0) process.exit(r.status || 1); };
   if (paths.length) {
+    if (webdriver) shell('node', ['scripts/webdriver-exclusion.mjs']);
     shell('cargo', ['fmt', '--all', '--check']);
     if (names.length) {
       const portable = names.filter(n => !dir.get(n).startsWith('apps/') && n !== 'bh-crypto-worker-test');

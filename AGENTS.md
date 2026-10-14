@@ -40,6 +40,15 @@ From this directory, in `nix develop` or with README prerequisites installed:
 - Wasm portable core: `bash scripts/check.sh wasm`.
 - Worker Wasm hash/Ed25519 verifier (pinned libsodium and local workerd): `bash scripts/check.sh wasm-crypto`.
 - Internal Worker SQLite DO adapter (native-signed local fixtures, pinned Wasm and workerd): `bash scripts/check.sh wasm-sync`.
+- Real-app WebDriver tests (opt-in; not in the default or affected checks). The
+  driver lives behind the client's non-default `webdriver` feature and never in a
+  release artifact: `bash scripts/check.sh webdriver` is the portable half (the
+  default feature graph contains no `tauri-plugin-webdriver` for any target, and
+  the Android emulator gate is unit-tested both ways); `webdriver-linux` runs the
+  setup shell under Xvfb, `webdriver-macos` runs it on macOS, and
+  `webdriver-android` runs it on an x86_64 emulator from
+  `nix develop .#androidEmulator`, which carries the emulator and system image
+  the ordinary `android` shell deliberately does not.
 - Website: its independent README defines its own build and checks.
 
 Run affected checks while editing, then the full check once before handoff.

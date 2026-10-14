@@ -60,3 +60,9 @@ with zipfile.ZipFile(sys.argv[1]) as apk:
     assert not signatures, signatures
 print('unsigned release APK (apksigner: missing signature manifest)')
 PY
+
+# Whatever produced this APK, the release artifact must carry no WebDriver
+# plugin: no plugin classes in the dex, no native-lib markers, no manifest
+# entries. A build that accidentally enabled the default feature or leaked the
+# Gradle module fails here.
+node scripts/check-webdriver-markers.mjs "$apk" --expect absent

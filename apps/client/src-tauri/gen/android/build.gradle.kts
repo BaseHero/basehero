@@ -16,6 +16,20 @@ allprojects {
     }
 }
 
+// Only feature builds include this module. Keep the app's release dependency
+// versions when the published plugin requests newer appcompat/material versions
+// that require a newer Android toolchain. Never downgrade release's other libs.
+if (findProject(":tauri-plugin-webdriver") != null) {
+    allprojects {
+        configurations.all {
+            resolutionStrategy.eachDependency {
+                if (requested.group == "androidx.appcompat") useVersion("1.7.1")
+                if (requested.group == "com.google.android.material") useVersion("1.12.0")
+            }
+        }
+    }
+}
+
 tasks.register("clean").configure {
     delete("build")
 }

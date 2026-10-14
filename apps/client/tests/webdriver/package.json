@@ -1,0 +1,10 @@
+{
+  "name": "bh-client-webdriver-tests",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Real-app WebDriver tests for the BaseHero client (setup shell).",
+  "dependencies": {
+    "webdriverio": "10.0.2"
+  }
+}

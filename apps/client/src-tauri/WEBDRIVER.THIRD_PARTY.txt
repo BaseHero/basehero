@@ -1,0 +1,53 @@
+WebDriver feature: Cargo.lock dependency inventory
+
+These 43 package/version pairs were added to Cargo.lock when the optional,
+non-default `webdriver` test feature was introduced. This is an inventory of
+locked registry packages, including platform-specific dependencies; it is not
+a claim that all 43 are linked on every platform or included in release builds.
+Licences below are the declarations in the packages' Cargo metadata, not bundled
+licence texts. The crates' distributions contain their own applicable terms.
+
+Package                         Version    Declared licence
+alloc-no-stdlib                 3.0.0      BSD-3-Clause
+alloc-stdlib                    0.3.0      BSD-3-Clause
+axum                            0.8.9      MIT
+axum-core                       0.5.6      MIT
+brotli                          9.0.0      BSD-3-Clause AND MIT
+brotli-decompressor             6.0.1      BSD-3-Clause/MIT
+cfg-expr                        0.20.10    MIT OR Apache-2.0
+dbus                            0.9.12     Apache-2.0/MIT
+gdkx11                          0.18.2     MIT
+gdkx11-sys                      0.18.2     MIT
+gio-sys                         0.22.8     MIT
+glib                            0.22.10    MIT
+glib-macros                     0.22.9     MIT
+glib-sys                        0.22.8     MIT
+gobject-sys                     0.22.6     MIT
+httpdate                        1.0.3      MIT OR Apache-2.0
+libappindicator                 0.9.0      Apache-2.0 OR MIT
+libappindicator-sys             0.9.0      Apache-2.0 OR MIT
+libdbus-sys                     0.2.7      Apache-2.0/MIT
+libloading                      0.7.4      ISC
+matchit                         0.8.4      MIT AND BSD-3-Clause
+objc2-core-video                0.3.2      Zlib OR Apache-2.0 OR MIT
+objc2-javascript-core           0.3.2      Zlib OR Apache-2.0 OR MIT
+objc2-security                  0.3.2      Zlib OR Apache-2.0 OR MIT
+serde_path_to_error             0.1.20     MIT OR Apache-2.0
+system-deps                     7.0.8      MIT OR Apache-2.0
+target-lexicon                  0.13.5     Apache-2.0 WITH LLVM-exception
+tauri-plugin                    2.7.1      Apache-2.0 OR MIT
+tauri-plugin-webdriver          0.2.3      MIT
+tray-icon                       0.25.1     MIT OR Apache-2.0
+webview2-com                    0.38.2     MIT
+webview2-com-sys                0.38.2     MIT
+windows                         0.61.3     MIT OR Apache-2.0
+windows-collections             0.2.0      MIT OR Apache-2.0
+windows-core                    0.61.2     MIT OR Apache-2.0
+windows-future                  0.2.1      MIT OR Apache-2.0
+windows-link                    0.1.3      MIT OR Apache-2.0
+windows-numerics                0.2.0      MIT OR Apache-2.0
+windows-result                  0.3.4      MIT OR Apache-2.0
+windows-strings                 0.4.2      MIT OR Apache-2.0
+windows-threading               0.1.0      MIT OR Apache-2.0
+x11                             2.21.0     MIT
+x11-dl                          2.21.0     MIT

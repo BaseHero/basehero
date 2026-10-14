@@ -68,6 +68,30 @@ test('manifest, lock, config and build inputs conservatively select all packages
   }
 });
 
+test('webdriver release gate is selected for global inputs and native client, not UI-only files', t => {
+  for (const [path, selected] of [
+    ['Cargo.toml', true], ['Cargo.lock', true], ['rust-toolchain.toml', true],
+    ['scripts/other.mjs', true], ['apps/client/src-tauri/src/lib.rs', true],
+    ['apps/client/ui/theme.js', false],
+  ]) {
+    const f = fixture(t);
+    f.put(path, path === 'Cargo.toml' ? '[workspace]\nmembers = ["libs/*", "services/*", "apps/client/src-tauri", "tests/system"]\nresolver = "2"\n# changed\n' : '# changed\n');
+    f.git('add', '.'); f.git('commit', '-qm', path);
+    const plan = f.run('node', [script, '--base', f.base, '--head', 'HEAD', '--plan']);
+    assert.equal(plan.status, 0, plan.stderr);
+    assert.equal(JSON.parse(plan.stdout).webdriver, selected, path);
+  }
+});
+
+test('affected check fails when the selected webdriver release gate fails', t => {
+  const f = fixture(t);
+  f.put('scripts/webdriver-exclusion.mjs', 'throw Error("webdriver exclusion gate ran")\n');
+  f.git('add', '.'); f.git('commit', '-qm', 'failing release gate');
+  const result = f.run('node', [script, '--base', f.base, '--head', 'HEAD', '--check']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /webdriver exclusion gate ran/);
+});
+
 test('dependency layers reject library to service and service to app including dev/build edges', t => {
   const f = fixture(t);
   const check = () => f.run('node', [script, '--layers']);

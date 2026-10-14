@@ -3,9 +3,15 @@
 #[cfg(target_os = "macos")]
 mod native;
 
+#[cfg(feature = "webdriver")]
+mod webdriver;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "webdriver")]
+    let builder = webdriver::register(builder);
+    builder
         .run(tauri::generate_context!())
         .expect("client runtime failed");
 }

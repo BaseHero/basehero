@@ -15,7 +15,8 @@ case "${1:-portable}" in
     '
     cargo fmt --all --check
     node scripts/affected.mjs --layers
-    node --test scripts/affected.test.mjs
+    node --test scripts/affected.test.mjs scripts/webdriver-exclusion.test.mjs scripts/check-webdriver-markers.test.mjs
+    node scripts/webdriver-exclusion.mjs
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
     # Security socket fixtures need test-owned addresses inside a Linux network namespace.
@@ -68,8 +69,26 @@ case "${1:-portable}" in
     cargo run --locked --offline -p bh-sync-worker --example fixtures > tests/sync-worker/fixtures.json
     nix develop .#cryptoWorker --command bash scripts/check-sync-worker.sh
     ;;
+  webdriver)
+    # Portable half of the WebDriver checks: the default feature graph never
+    # contains the plugin, and its Android gate is unit-tested both ways.
+    node scripts/webdriver-exclusion.mjs
+    node --test scripts/webdriver-exclusion.test.mjs scripts/check-webdriver-markers.test.mjs
+    cargo test --locked -p bh-client --features webdriver
+    cargo clippy --locked -p bh-client --features webdriver --all-targets -- -D warnings
+    ;;
+  webdriver-linux)
+    bash apps/client/tests/webdriver/run-linux.sh
+    ;;
+  webdriver-macos)
+    bash apps/client/tests/webdriver/run-macos.sh
+    ;;
+  webdriver-android)
+    # Run from `nix develop .#androidEmulator`.
+    bash apps/client/tests/webdriver/run-android.sh
+    ;;
   *)
-    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-crypto|wasm|wasm-crypto|wasm-sync]" >&2
+    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-crypto|wasm|wasm-crypto|wasm-sync|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
     exit 2
     ;;
 esac
