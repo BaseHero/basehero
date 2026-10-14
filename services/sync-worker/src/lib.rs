@@ -2,8 +2,8 @@
 //! No account authority, host freshness, channel authentication or trusted clock is
 //! established here. The DO adapter supplies persisted rows, never caller rows.
 use bh_sync::{
-    BaseId, Commitment, Digest, GateState, Head, OpaqueEvent, Operation, SignedApproval,
-    TimeWindow, plan_consumption,
+    BaseId, BodyObject, Commitment, Digest, GateState, Head, OpaqueEvent, Operation,
+    SignedApproval, TimeWindow, plan_consumption,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
@@ -36,6 +36,14 @@ struct Row {
 enum RequestOperation {
     Append { event: String },
     Read { objects: Vec<String> },
+    Stage { body: String },
+    Readbodies { objects: Vec<String> },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BodyRow {
+    commitment: String,
+    body: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +57,13 @@ struct Request {
     latest: u64,
     head: Option<Row>,
     selected: Vec<Row>,
+    /// Stored bytes the adapter found under an append's referenced body. Rust
+    /// re-derives the commitment from these bytes; a caller value is ignored.
+    #[serde(default)]
+    staged_body: Option<String>,
+    /// Stored bodies selected for a body read, in request order.
+    #[serde(default)]
+    bodies: Vec<BodyRow>,
 }
 #[derive(Serialize)]
 struct ResultPlan {
@@ -57,6 +72,7 @@ struct ResultPlan {
     sequence: u64,
     append: Option<String>,
     ack: Option<String>,
+    stage: Option<String>,
 }
 
 fn canonical_hex(value: &str) -> bool {
@@ -166,6 +182,14 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
     }
     let approval = SignedApproval::decode(&unhex_bytes(&request.approval, 290)?).map_err(|_| ())?;
     let binding = Digest(unhex(&request.binding)?);
+    let staged_body = request
+        .staged_body
+        .as_deref()
+        .map(|body| {
+            let bytes = unhex_bytes(body, 65536)?;
+            Ok::<_, ()>(BodyObject::new(bytes).map_err(|_| ())?.commitment())
+        })
+        .transpose()?;
     let operation = match request.operation {
         RequestOperation::Append { event } => {
             Operation::Append(OpaqueEvent::decode(&unhex_bytes(&event, 65574)?).map_err(|_| ())?)
@@ -177,6 +201,17 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
                 .collect::<Result<_, _>>()?,
         )
         .map_err(|_| ())?,
+        RequestOperation::Stage { body } => {
+            let bytes = unhex_bytes(&body, 65536)?;
+            Operation::stage_body(BodyObject::new(bytes).map_err(|_| ())?)
+        }
+        RequestOperation::Readbodies { objects } => {
+            let objects = objects
+                .iter()
+                .map(|s| unhex(s).map(Digest))
+                .collect::<Result<_, _>>()?;
+            Operation::read_bodies(objects).map_err(|_| ())?
+        }
     };
     let existing = match &operation {
         Operation::Append(event) => {
@@ -205,6 +240,22 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
             }
             None
         }
+        Operation::ReadBodies(selection) => {
+            // The adapter supplies stored bytes; the kernel re-derives each
+            // commitment from those bytes rather than trusting the request.
+            if request.bodies.len() != selection.objects().len() {
+                return Err(());
+            }
+            for (record, digest) in request.bodies.iter().zip(selection.objects()) {
+                let bytes = unhex_bytes(&record.body, 65536)?;
+                let body = BodyObject::new(bytes).map_err(|_| ())?;
+                if body.commitment() != *digest || unhex::<32>(&record.commitment)? != digest.0 {
+                    return Err(());
+                }
+            }
+            None
+        }
+        Operation::StageBody(_) => None,
     };
     let result = plan_consumption(
         &state,
@@ -215,6 +266,7 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
             latest: request.latest,
         },
         existing,
+        staged_body,
         binding,
     )
     .map_err(|_| ())?;
@@ -224,6 +276,7 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
         sequence: result.next.sequence,
         append: result.append.map(|c| hex(&c.encode())),
         ack: result.ack.map(|c| hex(&c.encode())),
+        stage: result.stage.map(|d| hex(&d.0)),
     };
     let bytes = serde_json::to_vec(&output).map_err(|_| ())?;
     if bytes.len() > MAX_OUTPUT {

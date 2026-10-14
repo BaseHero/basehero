@@ -11,7 +11,9 @@ bh-sync.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
+bh-account.workspace = true
 bh-crypto.workspace = true
+bh-event.workspace = true
 tempfile.workspace = true
 
 [lints]

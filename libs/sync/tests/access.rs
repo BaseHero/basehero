@@ -1,7 +1,18 @@
 use bh_sync::*;
 
+fn body(n: u8) -> BodyObject {
+    BodyObject::new(vec![n; 1024]).unwrap()
+}
+fn event_with_body(id: u8, seed: u8) -> OpaqueEvent {
+    // A real descriptor's first 32 envelope bytes are its body commitment. These
+    // fixtures keep that invariant so the kernel's referenced-body check passes.
+    let body = body(seed);
+    let mut envelope = body.commitment().0.to_vec();
+    envelope.extend(vec![seed; 1024 - 32]);
+    OpaqueEvent::new(EventId([id; 32]), envelope).unwrap()
+}
 fn event(n: u8) -> OpaqueEvent {
-    OpaqueEvent::new(EventId([n; 32]), vec![n; 1024]).unwrap()
+    event_with_body(n, n)
 }
 fn fixture() -> (GateState, bh_crypto::SigningKey) {
     let seed = bh_crypto::Secret::from_slice(&[7; 32]).unwrap();
@@ -51,6 +62,13 @@ fn time() -> TimeWindow {
     }
 }
 
+fn body_ref(operation: &Operation) -> Option<Digest> {
+    match operation {
+        Operation::Append(event) => referenced_body(event).ok(),
+        Operation::StageBody(body) => Some(body.commitment()),
+        Operation::Read(_) | Operation::ReadBodies(_) => None,
+    }
+}
 fn plan_consumption(
     state: &GateState,
     approval: &SignedApproval,
@@ -58,7 +76,15 @@ fn plan_consumption(
     time: TimeWindow,
     existing: Option<Commitment>,
 ) -> Result<Consumption, AccessError> {
-    bh_sync::plan_consumption(state, approval, operation, time, existing, Digest([6; 32]))
+    bh_sync::plan_consumption(
+        state,
+        approval,
+        operation,
+        time,
+        existing,
+        body_ref(operation),
+        Digest([6; 32]),
+    )
 }
 
 #[test]
@@ -67,7 +93,7 @@ fn response_cannot_be_redirected_by_a_copied_approval() {
     let op = Operation::read(vec![event(1).digest()]).unwrap();
     let grant = approval(&state, &op, &key);
     assert_eq!(
-        bh_sync::plan_consumption(&state, &grant, &op, time(), None, Digest([9; 32])),
+        bh_sync::plan_consumption(&state, &grant, &op, time(), None, None, Digest([9; 32])),
         Err(AccessError::Operation)
     );
 }
@@ -227,6 +253,125 @@ fn read_selection_is_bounded_and_committed() {
     assert_ne!(
         Operation::read(vec![Digest([1; 32])]).unwrap().digest(),
         Operation::read(vec![Digest([2; 32])]).unwrap().digest()
+    );
+}
+
+#[test]
+fn body_operations_have_distinct_bounded_domains() {
+    assert_eq!(Operation::read_bodies(vec![]), Err(AccessError::Selection));
+    assert_eq!(
+        Operation::read_bodies(vec![Digest([1; 32]); 65]),
+        Err(AccessError::Selection)
+    );
+    assert_eq!(
+        Operation::read_bodies(vec![Digest([1; 32]); 2]),
+        Err(AccessError::Selection)
+    );
+    let one = Operation::read_bodies(vec![body(1).commitment()]).unwrap();
+    let two = Operation::read_bodies(vec![body(2).commitment()]).unwrap();
+    assert_ne!(one.digest(), two.digest());
+    // Same underlying object, different operation domain: an event-read approval
+    // cannot authorise a body read, and staging is distinct from reading.
+    let commitment = body(1).commitment();
+    let event_read_same_object = Operation::read(vec![commitment]).unwrap();
+    assert_ne!(one.digest(), event_read_same_object.digest());
+    assert_ne!(Operation::stage_body(body(1)).digest(), one.digest());
+}
+
+#[test]
+fn append_fails_closed_unless_the_referenced_body_is_staged() {
+    let (state, key) = fixture();
+    let op = Operation::Append(event(2));
+    let grant = approval(&state, &op, &key);
+    let referenced = referenced_body(&event(2)).unwrap();
+    assert_eq!(
+        bh_sync::plan_consumption(&state, &grant, &op, time(), None, None, Digest([6; 32])),
+        Err(AccessError::Body)
+    );
+    assert_eq!(
+        bh_sync::plan_consumption(
+            &state,
+            &grant,
+            &op,
+            time(),
+            None,
+            Some(Digest([9; 32])),
+            Digest([6; 32])
+        ),
+        Err(AccessError::Body)
+    );
+    let plan = bh_sync::plan_consumption(
+        &state,
+        &grant,
+        &op,
+        time(),
+        None,
+        Some(referenced),
+        Digest([6; 32]),
+    )
+    .unwrap();
+    assert_eq!(plan.append.unwrap().event_id(), event(2).id());
+}
+
+#[test]
+fn body_stage_and_read_consume_sequence_without_moving_head() {
+    let (state, key) = fixture();
+    let stage = Operation::stage_body(body(5));
+    let plan = plan_consumption(
+        &state,
+        &approval(&state, &stage, &key),
+        &stage,
+        time(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(plan.next.sequence, state.sequence + 1);
+    assert_eq!(plan.next.head, state.head);
+    assert_eq!(plan.stage, Some(body(5).commitment()));
+    assert_eq!(plan.append, None);
+    let read = Operation::read_bodies(vec![body(5).commitment()]).unwrap();
+    let read_plan = plan_consumption(
+        &plan.next,
+        &approval(&plan.next, &read, &key),
+        &read,
+        time(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(read_plan.next.sequence, state.sequence + 2);
+    assert_eq!(read_plan.next.head, state.head);
+    assert_eq!(read_plan.append, None);
+    assert_eq!(read_plan.ack, None);
+    assert_eq!(read_plan.stage, None);
+    // A copied event-read approval does not bind this body read.
+    let event_read = Operation::read(vec![body(5).commitment()]).unwrap();
+    assert_eq!(
+        plan_consumption(
+            &plan.next,
+            &approval(&plan.next, &event_read, &key),
+            &read,
+            time(),
+            None
+        ),
+        Err(AccessError::Operation)
+    );
+}
+
+#[test]
+fn stale_or_misbound_body_approvals_never_consume() {
+    let (state, key) = fixture();
+    let stage = Operation::stage_body(body(6));
+    let grant = approval(&state, &stage, &key);
+    let mut later = state;
+    later.sequence += 1;
+    assert_eq!(
+        plan_consumption(&later, &grant, &stage, time(), None),
+        Err(AccessError::Stale)
+    );
+    let other = Operation::stage_body(body(7));
+    assert_eq!(
+        plan_consumption(&state, &grant, &other, time(), None),
+        Err(AccessError::Operation)
     );
 }
 

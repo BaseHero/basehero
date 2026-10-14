@@ -14,7 +14,11 @@ impl Clock for TestClock {
 fn sqlite_commit_failure_releases_no_ack_and_rolls_back_insert_and_gate() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("commit.db");
-    let event = OpaqueEvent::new(EventId([5; 32]), vec![7; 1024]).unwrap();
+    // The descriptor's first 32 envelope bytes are the detached body commitment.
+    let staged = BodyObject::new(vec![7; 1024]).unwrap();
+    let mut envelope = staged.commitment().0.to_vec();
+    envelope.extend(vec![9; 1024 - 32]);
+    let event = OpaqueEvent::new(EventId([5; 32]), envelope).unwrap();
     let seed = bh_crypto::Secret::from_slice(&[8; 32]).unwrap();
     let key = bh_crypto::SigningKey::from_seed(&seed);
     let initial = GateState {
@@ -25,6 +29,17 @@ fn sqlite_commit_failure_releases_no_ack_and_rolls_back_insert_and_gate() {
         checker_key: key.public(),
     };
     let mut db = Database::create(&path, initial).unwrap();
+    // The referenced body must be durably staged before the descriptor append.
+    db.connection
+        .execute(
+            "INSERT INTO bodies (base, commitment, body) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                initial.base.0.as_slice(),
+                staged.commitment().0.as_slice(),
+                staged.bytes()
+            ],
+        )
+        .unwrap();
     db.connection.execute_batch("CREATE TABLE parent(id INTEGER PRIMARY KEY);
         CREATE TABLE fail_commit(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
     let operation = Operation::Append(event);

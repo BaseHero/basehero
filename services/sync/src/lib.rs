@@ -6,8 +6,8 @@
 #![forbid(unsafe_code)]
 
 use bh_sync::{
-    AccessError, BaseId, Commitment, Digest, EventId, GateState, Head, OpaqueEvent, Operation,
-    SignedApproval, TimeWindow, plan_consumption,
+    AccessError, BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent,
+    Operation, SignedApproval, TimeWindow, plan_consumption, referenced_body,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::Path;
@@ -15,7 +15,7 @@ use std::path::Path;
 #[cfg(test)]
 mod commit_test;
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// No request-controlled time or callback can be used as a production clock.
 /// To prove commit-before-expiry, `latest` must bound the remaining transaction
@@ -36,6 +36,8 @@ pub enum Refusal {
 pub enum Outcome {
     Ack(Commitment),
     Read(Vec<Vec<u8>>),
+    Staged(Digest),
+    ReadBodies(Vec<Vec<u8>>),
 }
 /// Only for trusted lane reconciliation after a response was lost. This row is
 /// not an attested receipt or a substitute for a host-authenticated durable outcome.
@@ -76,6 +78,10 @@ impl Database {
             base BLOB NOT NULL, event_id BLOB NOT NULL, position INTEGER NOT NULL UNIQUE,
             event_digest BLOB NOT NULL UNIQUE, commitment BLOB NOT NULL, body BLOB NOT NULL,
             PRIMARY KEY(base, event_id)
+        );
+        CREATE TABLE bodies (
+            base BLOB NOT NULL, commitment BLOB NOT NULL, body BLOB NOT NULL,
+            PRIMARY KEY(base, commitment)
         );",
         )
         .map_err(sql)?;
@@ -99,10 +105,15 @@ impl Database {
         })
     }
 
-    /// Refuses newer or uninitialized schemas *before* any mutation.
+    /// Refuses newer or uninitialized schemas *before* any mutation. There is no
+    /// upgrade path: a version-1 file can hold descriptors whose bodies were never
+    /// written, and accepting it would create the dangling state this format forbids.
     pub fn open(path: &Path) -> Result<Self, Refusal> {
         let connection = connect(path)?;
-        if version(&connection)? != SCHEMA || !table_exists(&connection, "gate")? {
+        if version(&connection)? != SCHEMA
+            || !table_exists(&connection, "gate")?
+            || !table_exists(&connection, "bodies")?
+        {
             return Err(Refusal::Unavailable);
         }
         let db = Self {
@@ -175,7 +186,14 @@ impl Database {
             Operation::Append(event) => {
                 lookup(&tx, before, Some(event.id()), None)?.map(|(c, _)| c)
             }
-            Operation::Read(_) => None,
+            _ => None,
+        };
+        let staged_body = match operation {
+            Operation::Append(event) => {
+                let reference = referenced_body(event).map_err(|_| Refusal::Unavailable)?;
+                stored_body(&tx, before.base, reference)?.map(|body| body.commitment())
+            }
+            _ => None,
         };
         let plan = plan_consumption(
             &before,
@@ -183,6 +201,7 @@ impl Database {
             operation,
             clock.window()?,
             existing,
+            staged_body,
             response_binding,
         )
         .map_err(Refusal::Access)?;
@@ -208,6 +227,34 @@ impl Database {
                     bytes.push(body);
                 }
                 Outcome::Read(bytes)
+            }
+            Operation::StageBody(body) => {
+                let commitment = plan.stage.ok_or(Refusal::Unavailable)?;
+                // Repeat staging of identical bytes keeps one row and does not fork.
+                let changed = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO bodies (base, commitment, body) VALUES (?1, ?2, ?3)",
+                        params![
+                            before.base.0.as_slice(),
+                            commitment.0.as_slice(),
+                            body.bytes()
+                        ],
+                    )
+                    .map_err(sql)?;
+                if changed == 0 {
+                    // An existing row must still hash to the same commitment.
+                    stored_body(&tx, before.base, commitment)?.ok_or(Refusal::Unavailable)?;
+                }
+                Outcome::Staged(commitment)
+            }
+            Operation::ReadBodies(selection) => {
+                let mut bodies = Vec::with_capacity(selection.objects().len());
+                for digest in selection.objects() {
+                    let body =
+                        stored_body(&tx, before.base, *digest)?.ok_or(Refusal::Unavailable)?;
+                    bodies.push(body.bytes().to_vec());
+                }
+                Outcome::ReadBodies(bodies)
             }
         };
         // Compare the entire prior gate, including the pinned checker and incarnation,
@@ -331,6 +378,31 @@ fn lookup(
         return Err(Refusal::Unavailable);
     };
     record.map(|record| validate(tx, state, record)).transpose()
+}
+/// Load one staged body, re-deriving its commitment from the stored bytes. A
+/// missing row is reported as absent; an unparseable or mismatched row refuses.
+fn stored_body(
+    tx: &Transaction<'_>,
+    base: BaseId,
+    commitment: Digest,
+) -> Result<Option<BodyObject>, Refusal> {
+    let stored: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT body FROM bodies WHERE base=?1 AND commitment=?2",
+            params![base.0.as_slice(), commitment.0.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    stored
+        .map(|bytes| {
+            let body = BodyObject::new(bytes).map_err(|_| Refusal::Unavailable)?;
+            if body.commitment() != commitment {
+                return Err(Refusal::Unavailable);
+            }
+            Ok(body)
+        })
+        .transpose()
 }
 fn lookup_position(
     tx: &Transaction<'_>,

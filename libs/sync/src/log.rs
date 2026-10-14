@@ -101,6 +101,52 @@ impl BaseId {
     }
 }
 
+/// Opaque padded ciphertext body (a detached payload-object). Construction checks
+/// the padded size only; the commitment is computed here from the exact bytes and
+/// is never accepted from a caller.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BodyObject {
+    bytes: Vec<u8>,
+}
+impl fmt::Debug for BodyObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyObject")
+            .field("bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+impl BodyObject {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, Error> {
+        if !PADDED_SIZES.contains(&bytes.len()) {
+            return Err(Error::Size);
+        }
+        Ok(Self { bytes })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// `H("bh/payload-object/v1\0" || P:u32 || B)`, the same commitment the
+    /// encrypted-envelope codec writes as the first 32 descriptor bytes.
+    pub fn commitment(&self) -> Digest {
+        let size = (self.bytes.len() as u32).to_be_bytes();
+        hash(b"bh/payload-object/v1\0", &[&size, &self.bytes])
+    }
+}
+
+/// The detached body commitment an event's descriptor references: exactly its
+/// first 32 envelope bytes. This reads no other byte and exposes no audience or
+/// author field. The codec writes the body commitment here; an event that is not
+/// such a descriptor still has its first 32 bytes treated as the reference.
+pub fn referenced_body(event: &OpaqueEvent) -> Result<Digest, Error> {
+    let first: [u8; 32] = event
+        .envelope()
+        .get(..32)
+        .ok_or(Error::Size)?
+        .try_into()
+        .map_err(|_| Error::Size)?;
+    Ok(Digest(first))
+}
+
 /// Common body-free record. It exposes no content kind, epoch, author or audience.
 /// An untrusted sequencer can construct this: callers MUST also verify the
 /// original encrypted author binding and controls before applying a body.

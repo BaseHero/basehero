@@ -536,7 +536,9 @@ dependencies = [
 name = "bh-sync-service"
 version = "0.1.0"
 dependencies = [
+ "bh-account",
  "bh-crypto",
+ "bh-event",
  "bh-sync",
  "rusqlite",
  "tempfile",

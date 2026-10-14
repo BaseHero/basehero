@@ -5,7 +5,7 @@
 //! Storage adapters must atomically compare the complete input state, apply the
 //! plan and durably commit before releasing bytes or an acknowledgement.
 
-use crate::log::{Input, hash};
+use crate::log::{BodyObject, Input, hash, referenced_body};
 use crate::{BaseId, Commitment, Digest, Error, Head, OpaqueEvent, VERSION};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,6 +20,8 @@ pub enum AccessError {
     Exhausted,
     Unavailable,
     Uncertain,
+    /// The descriptor's referenced detached body is not durably staged.
+    Body,
 }
 
 /// A read names exact immutable ciphertext commitments, not an audience handle.
@@ -29,6 +31,12 @@ pub enum AccessError {
 pub enum Operation {
     Append(OpaqueEvent),
     Read(ReadSelection),
+    /// Stage one immutable padded body by the commitment the kernel derives from
+    /// its bytes. Repeating the exact bytes is idempotent in the adapter.
+    StageBody(BodyObject),
+    /// Read 1-64 exact immutable body commitments. This never reuses the event
+    /// read approval domain.
+    ReadBodies(BodySelection),
 }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReadSelection(Vec<Digest>);
@@ -37,30 +45,51 @@ impl ReadSelection {
         &self.0
     }
 }
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BodySelection(Vec<Digest>);
+impl BodySelection {
+    pub fn objects(&self) -> &[Digest] {
+        &self.0
+    }
+}
+fn validate_selection(objects: &[Digest]) -> Result<(), AccessError> {
+    if objects.is_empty()
+        || objects.len() > 64
+        || objects
+            .iter()
+            .enumerate()
+            .any(|(i, value)| objects[..i].contains(value))
+    {
+        return Err(AccessError::Selection);
+    }
+    Ok(())
+}
+fn read_bytes(objects: &[Digest]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + objects.len() * 32);
+    bytes.extend((objects.len() as u16).to_be_bytes());
+    for object in objects {
+        bytes.extend(object.0);
+    }
+    bytes
+}
 impl Operation {
     pub fn read(objects: Vec<Digest>) -> Result<Self, AccessError> {
-        if objects.is_empty()
-            || objects.len() > 64
-            || objects
-                .iter()
-                .enumerate()
-                .any(|(i, value)| objects[..i].contains(value))
-        {
-            return Err(AccessError::Selection);
-        }
+        validate_selection(&objects)?;
         Ok(Self::Read(ReadSelection(objects)))
+    }
+    pub fn stage_body(body: BodyObject) -> Self {
+        Self::StageBody(body)
+    }
+    pub fn read_bodies(objects: Vec<Digest>) -> Result<Self, AccessError> {
+        validate_selection(&objects)?;
+        Ok(Self::ReadBodies(BodySelection(objects)))
     }
     pub fn digest(&self) -> Digest {
         match self {
             Self::Append(event) => hash(b"bh/append/v1\0", &[&event.digest().0]),
-            Self::Read(selection) => {
-                let mut bytes = Vec::with_capacity(2 + selection.0.len() * 32);
-                bytes.extend((selection.0.len() as u16).to_be_bytes());
-                for object in &selection.0 {
-                    bytes.extend(object.0);
-                }
-                hash(b"bh/read/v1\0", &[&bytes])
-            }
+            Self::Read(selection) => hash(b"bh/read/v1\0", &[&read_bytes(&selection.0)]),
+            Self::StageBody(body) => hash(b"bh/body-stage/v1\0", &[&body.commitment().0]),
+            Self::ReadBodies(selection) => hash(b"bh/body-read/v1\0", &[&read_bytes(&selection.0)]),
         }
     }
 }
@@ -184,11 +213,16 @@ pub struct Consumption {
     pub append: Option<Commitment>,
     /// Original row on exact replay; never a newly assigned position.
     pub ack: Option<Commitment>,
+    /// New immutable body to persist, keyed by its kernel-derived commitment.
+    /// Absent for every operation except a fresh body stage.
+    pub stage: Option<Digest>,
 }
 
 /// Pure, side-effect-free check. `existing` must come from the adapter's committed
-/// replay index for this event id, not from the request. The adapter owns index
-/// integrity and availability; a missing archival lookup is NOT evidence of absence.
+/// replay index for this event id, not from the request. `staged_body` must be the
+/// commitment the adapter found under the descriptor's referenced body, not a
+/// caller assertion. The adapter owns index integrity and availability; a missing
+/// archival lookup is NOT evidence of absence.
 /// Every retry needs current authorization, including retrieval of a lost Ack.
 pub fn plan_consumption(
     state: &GateState,
@@ -196,6 +230,7 @@ pub fn plan_consumption(
     operation: &Operation,
     time: TimeWindow,
     existing: Option<Commitment>,
+    staged_body: Option<Digest>,
     response_binding: Digest,
 ) -> Result<Consumption, AccessError> {
     signed.check(state)?;
@@ -212,7 +247,7 @@ pub fn plan_consumption(
     let mut next = *state;
     next.sequence = next.sequence.checked_add(1).ok_or(AccessError::Exhausted)?;
     match operation {
-        Operation::Read(_) => {
+        Operation::Read(_) | Operation::ReadBodies(_) => {
             if existing.is_some() {
                 return Err(AccessError::ReplayConflict);
             }
@@ -220,9 +255,22 @@ pub fn plan_consumption(
                 next,
                 append: None,
                 ack: None,
+                stage: None,
             })
         }
+        Operation::StageBody(body) => Ok(Consumption {
+            next,
+            append: None,
+            ack: None,
+            stage: Some(body.commitment()),
+        }),
         Operation::Append(event) => {
+            // A committed descriptor must never dangle: fail closed unless the
+            // adapter found exactly the body the first 32 envelope bytes name.
+            let referenced = referenced_body(event).map_err(|_| AccessError::Operation)?;
+            if staged_body != Some(referenced) {
+                return Err(AccessError::Body);
+            }
             if let Some(original) = existing {
                 if original.base() != state.base
                     || original.head().position == 0
@@ -238,6 +286,7 @@ pub fn plan_consumption(
                     next,
                     append: None,
                     ack: Some(original),
+                    stage: None,
                 });
             }
             let committed = Commitment::order(state.base, state.head, event)
@@ -247,6 +296,7 @@ pub fn plan_consumption(
                 next,
                 append: Some(committed),
                 ack: Some(committed),
+                stage: None,
             })
         }
     }

@@ -34,7 +34,7 @@ async function send(mf, action, payload = {}) {
 const consume = (mf, request, time = fixture.time) => send(mf, 'consume', { request, time });
 const inspect = async mf => (await send(mf, 'inspect')).result;
 async function provision(mf) {
-  assert.deepEqual(await send(mf, 'provision', { gate: fixture.gate }), { status: 200, result: { ok: true } });
+  assert.deepEqual(await send(mf, 'provision', { gate: fixture.gate, bodies: fixture.bodies }), { status: 200, result: { ok: true } });
 }
 function refused(reply) { assert.deepEqual(reply, { status: 403, result: { refusal: 'Unavailable' } }); }
 
@@ -145,6 +145,112 @@ test('DO SQL trigger abort rolls back append, gate and replay index; racing gran
     assert.equal(state.rows.length, 1);
     assert.equal(state.gate.sequence, 1);
   } finally { await racing.dispose(); }
+});
+
+test('detached body stages, the descriptor append requires it, and an exact body read returns it', async () => {
+  const path = mkdtempSync(join(tmpdir(), 'bh-sync-do-'));
+  let mf = new Miniflare(config(path));
+  try {
+    await provision(mf);
+    // Commit the base genesis first; its referenced body is seeded.
+    assert.equal((await consume(mf, op('append', fixture.append, { event: fixture.event }))).status, 200);
+    assert.deepEqual(await consume(mf, op('stage', fixture.stage_after_genesis, { body: fixture.stage_body })),
+      { status: 200, result: { commitment: fixture.stage_body_commitment } });
+    // An event-read grant at the same gate cannot carry the body read.
+    refused(await consume(mf, op('readbodies', fixture.read, { objects: [fixture.read_body_object] })));
+    // A corrupt stored body under the reference cannot authorise the append.
+    assert.equal((await send(mf, 'tamperBody', { column: fixture.stage_body_commitment, value: fixture.mismatched_body })).status, 200);
+    refused(await consume(mf, op('append', fixture.append_body, { event: fixture.body_event })));
+    assert.equal((await send(mf, 'tamperBody', { column: fixture.stage_body_commitment, value: fixture.stage_body })).status, 200);
+    assert.deepEqual(await consume(mf, op('append', fixture.append_body, { event: fixture.body_event })),
+      { status: 200, result: { ack: fixture.body_commitment } });
+    const beforeRestart = await inspect(mf);
+    assert.equal(beforeRestart.gate.position, 2);
+    assert.equal(beforeRestart.gate.sequence, 3);
+    assert.equal(beforeRestart.rows.length, 2);
+    assert.equal(beforeRestart.bodies.length, fixture.bodies.length + 1);
+    // A restart keeps both the staged body and the committed descriptor, and the
+    // still-unconsumed read grant works against the persisted gate.
+    await mf.dispose();
+    mf = new Miniflare(config(path));
+    const read = op('readbodies', fixture.read_bodies, { objects: [fixture.read_body_object] });
+    assert.deepEqual(await consume(mf, read), { status: 200, result: { bodies: [fixture.stage_body] } });
+    assert.equal((await inspect(mf)).gate.sequence, 4);
+  } finally { await mf.dispose(); rmSync(path, { recursive: true, force: true }); }
+});
+
+test('a descriptor append without its referenced body is refused after the genesis', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    // Commit the real genesis first, so ordering cannot be the reason for refusal.
+    assert.equal((await consume(mf, op('append', fixture.append, { event: fixture.event }))).status, 200);
+    const before = await inspect(mf);
+    refused(await consume(mf, op('append', fixture.append_missing_body, { event: fixture.missing_body_event })));
+    assert.deepEqual(await inspect(mf), before);
+  } finally { await mf.dispose(); }
+});
+
+test('an unknown request kind is refused and changes nothing', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    const before = await inspect(mf);
+    refused(await consume(mf, op('Stage', fixture.stage, { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), before);
+  } finally { await mf.dispose(); }
+});
+
+test('wrong-size or mismatched bodies and replayed body grants refuse unchanged', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    const before = await inspect(mf);
+    // A wrong-size body is refused before any plan/approval is reached.
+    refused(await consume(mf, op('stage', fixture.stage, { body: '00' })));
+    // A grant bound to the staged body cannot stage a different same-sized body,
+    // and a tampered grant signature is refused.
+    refused(await consume(mf, op('stage', fixture.stage, { body: fixture.mismatched_body })));
+    refused(await consume(mf, op('stage', fixture.stage + '00', { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), before);
+    assert.equal((await consume(mf, op('stage', fixture.stage, { body: fixture.stage_body }))).status, 200);
+    const afterStage = await inspect(mf);
+    refused(await consume(mf, op('stage', fixture.stage, { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), afterStage);
+  } finally { await mf.dispose(); }
+});
+
+test('staging the same body twice is idempotent; restaging over a corrupt row is refused', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    assert.equal((await consume(mf, op('stage', fixture.stage, { body: fixture.stage_body }))).status, 200);
+    assert.equal((await consume(mf, op('stage', fixture.stage_twice, { body: fixture.stage_body }))).status, 200);
+    const after = await inspect(mf);
+    assert.equal(after.bodies.filter(b => b.commitment === fixture.stage_body_commitment).length, 1);
+    assert.equal(after.gate.sequence, 2);
+    assert.equal(after.gate.position, 0);
+    // Corrupt the stored row with a same-size different body; a restage must not
+    // return a false staged receipt, and must leave the gate unchanged.
+    assert.equal((await send(mf, 'tamperBody', { column: fixture.stage_body_commitment, value: fixture.mismatched_body })).status, 200);
+    const damaged = await inspect(mf);
+    refused(await consume(mf, op('stage', fixture.stage_thrice, { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), damaged);
+    assert.equal(damaged.gate.sequence, 2);
+  } finally { await mf.dispose(); }
+});
+
+test('a corrupt stored body refuses a body read at a valid gate', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    assert.equal((await consume(mf, op('stage', fixture.stage, { body: fixture.stage_body }))).status, 200);
+    // Same-size corruption: only the kernel re-derivation can catch it.
+    assert.equal((await send(mf, 'tamperBody', { column: fixture.stage_body_commitment, value: fixture.mismatched_body })).status, 200);
+    const damaged = await inspect(mf);
+    refused(await consume(mf, op('readbodies', fixture.read_bodies_after_stage, { objects: [fixture.read_body_object] })));
+    assert.deepEqual(await inspect(mf), damaged);
+  } finally { await mf.dispose(); }
 });
 
 test('final linked Wasm has only audited libsodium imports', () => {

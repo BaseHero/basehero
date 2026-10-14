@@ -15,6 +15,7 @@ publish = false
 bh-account = { path = "libs/account" }
 bh-core = { path = "libs/core" }
 bh-crypto = { path = "libs/crypto" }
+bh-event = { path = "libs/event" }
 bh-mac-local-auth = { path = "libs/mac-local-auth" }
 bh-confidential-policy = { path = "libs/confidential-policy" }
 cc-eventlog = { path = "third_party/dstack/cc-eventlog" }

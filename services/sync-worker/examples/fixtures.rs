@@ -1,7 +1,8 @@
 //! Native-only deterministic signing material, never included in the Worker module.
 use bh_crypto::{Secret, SigningKey};
 use bh_sync::{
-    Approval, BaseId, Commitment, Digest, GateState, Head, OpaqueEvent, Operation, SignedApproval,
+    Approval, BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent,
+    Operation, SignedApproval,
 };
 use serde_json::json;
 fn hex(bytes: &[u8]) -> String {
@@ -25,9 +26,22 @@ fn grant(key: &SigningKey, gate: GateState, operation: &Operation, sequence: u64
     }
     .encode())
 }
+/// A descriptor whose first 32 envelope bytes are `commitment`, matching the real
+/// codec's detached-body reference.
+fn descriptor(id: [u8; 32], commitment: [u8; 32], seed: u8) -> OpaqueEvent {
+    let mut envelope = commitment.to_vec();
+    envelope.extend(vec![seed; 1024 - 32]);
+    OpaqueEvent::new(EventId(id), envelope).unwrap()
+}
+fn body(seed: u8) -> BodyObject {
+    BodyObject::new(vec![seed; 1024]).unwrap()
+}
 fn main() {
     let key = SigningKey::from_seed(&Secret::from_slice(&[42; 32]).unwrap());
-    let event = OpaqueEvent::new(bh_sync::EventId([3; 32]), vec![0xa5; 1024]).unwrap();
+    let body_a = body(0xb1);
+    let body_b = body(0xb2);
+    let body_c = body(0xb3);
+    let event = descriptor([3; 32], body_a.commitment().0, 0xa5);
     let base = BaseId::from_genesis(&event);
     let gate = GateState {
         base,
@@ -44,10 +58,10 @@ fn main() {
         sequence: 1,
         ..gate
     };
-    let conflicting = OpaqueEvent::new(event.id(), vec![0x3c; 1024]).unwrap();
-    let second = OpaqueEvent::new(bh_sync::EventId([4; 32]), vec![0x4c; 1024]).unwrap();
+    let conflicting = descriptor(event.id().0, body_a.commitment().0, 0x3c);
+    let second = descriptor([4; 32], body_b.commitment().0, 0x4c);
     let second_commitment = Commitment::order(base, commitment.head(), &second).unwrap();
-    let third = OpaqueEvent::new(bh_sync::EventId([6; 32]), vec![0x6d; 1024]).unwrap();
+    let third = descriptor([6; 32], body_c.commitment().0, 0x6d);
     let third_commitment = Commitment::order(base, second_commitment.head(), &third).unwrap();
     let after_second = GateState {
         head: second_commitment.head(),
@@ -75,6 +89,33 @@ fn main() {
         not_before: 10,
         expires: 20,
     };
+    // Detached-body fixtures. `staged` is seeded and exercised through the real
+    // stage/append/read operations; `missing` is deliberately never staged. The
+    // main body fixture appends the genesis first, then stages, then appends.
+    let staged = body(0xb4);
+    let staged_event = descriptor([8; 32], staged.commitment().0, 0x8e);
+    let staged_commitment = Commitment::order(base, commitment.head(), &staged_event).unwrap();
+    let missing = body(0xb5);
+    let missing_event = descriptor([9; 32], missing.commitment().0, 0x9f);
+    let stage_op = Operation::stage_body(staged.clone());
+    let read_bodies_op = Operation::read_bodies(vec![staged.commitment()]).unwrap();
+    let after_stage = GateState {
+        sequence: 2,
+        ..after
+    };
+    let after_body_append = GateState {
+        head: staged_commitment.head(),
+        sequence: 3,
+        ..after
+    };
+    let stage_twice_gate = GateState {
+        sequence: 1,
+        ..gate
+    };
+    let stage_thrice_gate = GateState {
+        sequence: 2,
+        ..gate
+    };
     let printed = json!({
         "gate": { "base":hex(&base.0),"position":0,"hash":hex(&Head::EMPTY.hash.0),
             "incarnation":hex(&gate.incarnation),"sequence":0,"checker_key":hex(&key.public()) },
@@ -94,6 +135,26 @@ fn main() {
         "replay_first_after_clean":grant(&key, after_clean_retry, &append, 5),
         "read_first_after_third":grant(&key, after_clean_retry, &read, 5),
         "wrong_key":hex(&SignedApproval { approval:wrong_key,signature:other_key.sign(&wrong_key.signing_bytes()) }.encode()),
+        "bodies": [
+            {"commitment":hex(&body_a.commitment().0),"body":hex(body_a.bytes())},
+            {"commitment":hex(&body_b.commitment().0),"body":hex(body_b.bytes())},
+            {"commitment":hex(&body_c.commitment().0),"body":hex(body_c.bytes())},
+        ],
+        "stage":grant(&key, gate, &stage_op, 1),
+        "stage_after_genesis":grant(&key, after, &stage_op, 2),
+        "stage_twice":grant(&key, stage_twice_gate, &stage_op, 2),
+        "stage_thrice":grant(&key, stage_thrice_gate, &stage_op, 3),
+        "read_bodies_after_stage":grant(&key, stage_twice_gate, &read_bodies_op, 2),
+        "stage_body":hex(staged.bytes()),
+        "stage_body_commitment":hex(&staged.commitment().0),
+        "mismatched_body":hex(body_b.bytes()),
+        "append_body":grant(&key, after_stage, &Operation::Append(staged_event.clone()), 3),
+        "body_event":hex(&staged_event.encode()),
+        "body_commitment":hex(&staged_commitment.encode()),
+        "read_bodies":grant(&key, after_body_append, &read_bodies_op, 4),
+        "read_body_object":hex(&staged.commitment().0),
+        "missing_body_event":hex(&missing_event.encode()),
+        "append_missing_body":grant(&key, after, &Operation::Append(missing_event.clone()), 2),
         "time":{"earliest":10,"latest":11},
         "binding":hex(&[7;32]),
     });

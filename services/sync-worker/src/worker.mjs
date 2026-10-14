@@ -65,6 +65,10 @@ export class BaseLog extends DurableObject {
         // than silently round the persisted position, sequence or time bounds.
         if (![before.position, before.sequence, time.earliest, time.latest].every(
           n => Number.isSafeInteger(n) && n >= 0)) throw new Error('integer bound');
+        // Dispatch exactly four kinds; never let an unknown label fall through
+        // to a default operation or a wrong body write.
+        if (!['append', 'read', 'stage', 'readbodies'].includes(request.kind))
+          throw new Error('unknown kind');
         const head = before.position === 0 ? null : stored(sql,
           only(sql, 'SELECT position,event_id,event_digest,commitment,event FROM events WHERE position=?', before.position));
         if (before.position === 0 && maybe(sql, 'SELECT position FROM events LIMIT 1')) throw new Error('unexpected genesis row');
@@ -75,16 +79,38 @@ export class BaseLog extends DurableObject {
             : [];
         if (selection.some(r => request.kind === 'read' && !r)) throw new Error('missing read');
         const selected = selection.filter(Boolean).map(r => stored(sql, r));
+        // The first 32 envelope bytes of an appended descriptor name its body.
+        const stagedBody = request.kind === 'append' && typeof request.event === 'string'
+          ? maybe(sql, 'SELECT body FROM bodies WHERE commitment=?', request.event.slice(76, 140))?.body ?? null
+          : null;
+        const bodyRows = request.kind === 'readbodies' && Array.isArray(request.objects)
+          ? request.objects.map(d => maybe(sql, 'SELECT commitment,body FROM bodies WHERE commitment=?', d))
+          : [];
+        if (bodyRows.some(r => !r)) throw new Error('missing body');
+        const operation = request.kind === 'append' ? { kind: 'append', event: request.event }
+          : request.kind === 'read' ? { kind: 'read', objects: request.objects }
+            : request.kind === 'readbodies' ? { kind: 'readbodies', objects: request.objects }
+              : { kind: 'stage', body: request.body };
         const plan = wasmPlan(instance, {
           version: 1, gate: before, approval: request.grant,
-          operation: request.kind === 'append' ? { kind: 'append', event: request.event }
-            : { kind: 'read', objects: request.objects },
+          operation,
           binding, earliest: time.earliest, latest: time.latest, head, selected,
+          staged_body: stagedBody, bodies: bodyRows.filter(Boolean),
         });
         if (![plan.position, plan.sequence].every(n => Number.isSafeInteger(n) && n >= 0))
           throw new Error('result integer bound');
         let bodies;
         if (request.kind === 'read') bodies = selected.map(r => r.event);
+        if (request.kind === 'readbodies') bodies = bodyRows.map(r => r.body);
+        if (plan.stage) {
+          // Follow the Rust plan, not the request label. Repeat staging of
+          // identical bytes keeps one row; a pre-existing row must match the
+          // exact canonical bytes or the false receipt is refused.
+          const inserted = sql.exec('INSERT OR IGNORE INTO bodies(commitment,body) VALUES(?,?)',
+            plan.stage, request.body).rowsWritten;
+          if (!inserted && maybe(sql, 'SELECT body FROM bodies WHERE commitment=?', plan.stage)?.body !== request.body)
+            throw new Error('stored body mismatch');
+        }
         if (plan.append) {
           // Canonical bytes produced by Rust Commitment::order, not JS crypto.
           const id = plan.append.slice(148, 212);
@@ -97,7 +123,9 @@ export class BaseLog extends DurableObject {
           plan.position, plan.hash, plan.sequence, request.grant, plan.ack,
           before.base, before.position, before.hash, before.incarnation, before.sequence, before.checker_key);
         if (changed.rowsWritten !== 1) throw new Error('gate compare');
-        return plan.ack ? { ack: plan.ack } : { bodies };
+        return plan.ack ? { ack: plan.ack }
+          : plan.stage ? { commitment: plan.stage }
+            : { bodies };
       });
       // transactionSync has committed; sync waits for outstanding DO writes.
       // Do not release any Ack/ciphertext before this resolves.

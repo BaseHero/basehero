@@ -80,11 +80,12 @@ remembered-head verification remain indispensable.
 
 ## Exact operation approvals
 
-The implemented operations are append of one opaque event, and read of 1–64
-**exact immutable ciphertext commitments**. A read selection cannot contain
-repeated objects. Its order is part of the request. No reusable download URL or
-connection-wide authority follows from a read approval. Common-header range
-transport, presence and attachment publication are not implemented here.
+The implemented operations are append of one opaque event, read of 1–64 **exact
+immutable ciphertext commitments**, staging one detached padded body, and reading
+1–64 exact stored bodies. A read selection cannot contain repeated objects. Its
+order is part of the request. No reusable download URL or connection-wide
+authority follows from a read approval. Common-header range transport, presence
+and attachment publication are not implemented here.
 
 ```
 append_digest = H("bh/append/v1\0" || event_digest)
@@ -132,6 +133,36 @@ including reads, separately from common-log positions. Storage accepts only its
 next sequence, expected head, incarnation and pinned checker key. This avoids an
 unbounded spent-nonce table. It deliberately serializes operations within the
 single-base execution lane; throughput/batching is not claimed here.
+
+## Detached bodies and descriptor closure
+
+An encrypted event's first 32 envelope bytes commit its detached padded body `B`:
+`body_commitment = H("bh/payload-object/v1\0" || P:u32 || B)`, where `P` is one of
+1024, 4096, 16384 or 65536 bytes. The kernel computes that commitment from the
+exact bytes handed to it and never accepts a caller-supplied commitment. It reads
+only those first 32 envelope bytes, no other descriptor field, so this path
+exposes no audience, author, epoch or content kind.
+
+Two further operations use the same approval, one access sequence, response
+binding and trusted time window, under their own domains:
+
+```
+stage_digest     = H("bh/body-stage/v1\0" || body_commitment)
+body_read_digest = H("bh/body-read/v1\0" || u16 count || body_commitments_in_order)
+```
+
+Staging persists one immutable body; staging the exact bytes again is idempotent
+and does not fork. A body read selects 1–64 exact commitments and returns the
+stored bytes; its selection is bounded and repeat-free, and corrupt stored bytes
+refuse. Event append/read approvals are never reused for body operations, and the
+reverse; each requires its own approval.
+
+A descriptor append fails closed unless the adapter found the exact body its first
+32 envelope bytes name already durably staged, and it acknowledges only after the
+descriptor's durable commit. An unreferenced staged body left by a failed append
+is an acceptable orphan; an acknowledged descriptor with no durable body is not.
+Bodies stay in the ordinary store until archival is designed; this interface does
+not choose where they are archived or when they are deleted.
 
 ## Ordering, removal and uncertain outcomes
 
