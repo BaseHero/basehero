@@ -26,6 +26,7 @@ const KEM_SECRET: usize = 32;
 const KEM_CIPHERTEXT: usize = 1120;
 const KEM_SHARED: usize = 32;
 const SHA256_BYTES: usize = 32;
+const SHA512_BYTES: usize = 64;
 const AEAD_NONCE: usize = 24;
 const AEAD_TAG: usize = 16;
 const KDF_CONTEXT: usize = 8;
@@ -50,6 +51,8 @@ unsafe extern "C" {
     fn sodium_memcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
     fn randombytes_buf(buf: *mut c_void, len: usize);
     fn crypto_hash_sha256_bytes() -> usize;
+    fn crypto_hash_sha512_bytes() -> usize;
+    fn crypto_hash_sha512(out: *mut u8, data: *const u8, len: u64) -> i32;
     fn crypto_hash_sha256_statebytes() -> usize;
     fn crypto_hash_sha256_init(state: *mut Sha256State) -> i32;
     fn crypto_hash_sha256_update(state: *mut Sha256State, data: *const u8, len: u64) -> i32;
@@ -155,6 +158,7 @@ fn init() {
         unsafe {
             assert!(sodium_init() >= 0, "libsodium initialization failed");
             assert_eq!(crypto_hash_sha256_bytes(), SHA256_BYTES);
+            assert_eq!(crypto_hash_sha512_bytes(), SHA512_BYTES);
             assert_eq!(
                 crypto_hash_sha256_statebytes(),
                 mem::size_of::<Sha256State>()
@@ -307,6 +311,18 @@ pub fn sha256(data: &[u8]) -> [u8; SHA256_BYTES] {
     let mut state = Sha256::new();
     state.update(data);
     state.finalize()
+}
+
+/// SHA-512 for Roughtime's signed Merkle inclusion proof.
+pub fn sha512(data: &[u8]) -> [u8; SHA512_BYTES] {
+    init();
+    let mut out = [0; SHA512_BYTES];
+    // SAFETY: libsodium is initialized, the output has the checked 64-byte
+    // size and data is readable for the checked input length.
+    let result =
+        unsafe { crypto_hash_sha512(out.as_mut_ptr(), data.as_ptr(), input_len(data.len())) };
+    assert_eq!(result, 0);
+    out
 }
 
 pub fn random<const N: usize>() -> [u8; N] {
@@ -773,6 +789,19 @@ mod tests {
                 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
                 0xf2, 0x00, 0x15, 0xad,
             ]
+        );
+    }
+
+    #[test]
+    fn sha512_fips_180_4_vectors() {
+        let hex = |bytes: [u8; 64]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex(sha512(b"")),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        assert_eq!(
+            hex(sha512(b"abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
         );
     }
 

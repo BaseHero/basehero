@@ -503,6 +503,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bh-qualified-time"
+version = "0.1.0"
+dependencies = [
+ "bh-confidential-attestation",
+ "bh-confidential-policy",
+ "bh-crypto",
+ "hex",
+ "serde_json",
+]
+
+[[package]]
 name = "bh-release"
 version = "0.1.0"
 dependencies = [
