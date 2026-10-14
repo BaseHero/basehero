@@ -197,6 +197,134 @@ fn signed_initial_materials_roundtrip_replay_and_no_public_secret_metadata() {
 }
 
 #[test]
+fn signed_device_delivery_requires_active_sender_recipient_and_current_publication() {
+    let mut f = initial();
+    let ordinary2 = SigningKey::generate();
+    let control2 = SigningKey::generate();
+    let receiver2 = KemKey::generate();
+    let second =
+        DevicePublicKeys::new(ordinary2.public(), control2.public(), receiver2.public()).unwrap();
+    let draft = f.state.add_device(f.first.id(), second.clone()).unwrap();
+    let added = draft.finish(f.control.sign(draft.signing_bytes())).unwrap();
+    let object = native::seal_for_device(
+        &f.state,
+        &f.personal,
+        &f.first,
+        &f.ordinary,
+        &second,
+        &added,
+    )
+    .unwrap();
+    f.state.apply(added.as_bytes()).unwrap();
+    let opened = native::open_device(&f.state, &object, &second, &receiver2).unwrap();
+    assert_eq!(opened.public(), f.personal.public());
+    for offset in [
+        0,
+        8,
+        10,
+        11,
+        43,
+        75,
+        107,
+        1227,
+        1251,
+        object.len() - 65,
+        object.len() - 1,
+    ] {
+        let mut tampered = object.clone();
+        tampered[offset] ^= 1;
+        assert!(
+            native::open_device(&f.state, &tampered, &second, &receiver2).is_err(),
+            "tampered {offset}"
+        );
+    }
+    assert!(
+        native::open_device(&f.state, f.publication.device_seal(), &second, &receiver2).is_err()
+    );
+    let wrong = KemKey::generate();
+    assert!(
+        native::open_device(&f.state, &object, &second, &wrong).is_err(),
+        "wrong native receiver"
+    );
+    assert!(
+        native::open_device(&f.state, &object, &f.first, &f.receiver).is_err(),
+        "not the opener's recipient"
+    );
+    let resign = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut copy = object.clone();
+        change(&mut copy);
+        let n = copy.len();
+        let signature = f.ordinary.sign(&copy[..n - 64]);
+        copy[n - 64..].copy_from_slice(&signature);
+        copy
+    };
+    let wrong_domain = resign(&|b| b[0] ^= 1);
+    assert!(
+        native::open_device(&f.state, &wrong_domain, &second, &receiver2).is_err(),
+        "domain checked even with valid signature"
+    );
+    let wrong_purpose = resign(&|b| b[8 + 10] = 1);
+    assert!(native::open_device(&f.state, &wrong_purpose, &second, &receiver2).is_err());
+    let recovery_purpose = resign(&|b| b[8 + 10] = 2);
+    assert!(native::open_device(&f.state, &recovery_purpose, &second, &receiver2).is_err());
+    let stale_personal = resign(&|b| b[8 + 43] ^= 1);
+    assert!(native::open_device(&f.state, &stale_personal, &second, &receiver2).is_err());
+    let wrong_recipient = resign(&|b| b[8 + 75] ^= 1);
+    assert!(native::open_device(&f.state, &wrong_recipient, &second, &receiver2).is_err());
+    // A valid signature and valid AEAD can still carry the wrong personal seed;
+    // opening must reconstruct the public receiver and compare it to history.
+    let wrong_seed = resign(&|b| {
+        let (ct, shared) = bh_account::crypto::encapsulate(second.receiving()).unwrap();
+        let key = bh_account::crypto::derive_key(&shared, b"BHPSEA01", 1);
+        let personal_id = bh_account::crypto::hash(
+            &[b"BH personal key id v1\0".as_slice(), &f.personal.public()].concat(),
+        );
+        let recipient_hash = bh_account::crypto::hash(
+            &[b"BH personal recipient v1\0".as_slice(), second.receiving()].concat(),
+        );
+        let ad = [
+            b"BH personal seed seal v1\0".as_slice(),
+            &1u16.to_be_bytes(),
+            &[3u8],
+            &f.state.id().0,
+            &personal_id,
+            &recipient_hash,
+        ]
+        .concat();
+        let (nonce, ciphertext) = bh_account::crypto::aead_seal(&key, &ad, &[99; 32]).unwrap();
+        b[8 + 107..8 + 1227].copy_from_slice(&ct);
+        b[8 + 1227..8 + 1251].copy_from_slice(&nonce);
+        b[8 + 1251..8 + 1299].copy_from_slice(&ciphertext);
+    });
+    assert!(native::open_device(&f.state, &wrong_seed, &second, &receiver2).is_err());
+    let mut recipient_removed = f.state.clone();
+    let draft = recipient_removed.remove_self(second.id()).unwrap();
+    let removed = draft.finish(control2.sign(draft.signing_bytes())).unwrap();
+    recipient_removed.apply(removed.as_bytes()).unwrap();
+    assert!(
+        recipient_removed.active_device(f.first.id()).is_ok(),
+        "sender remains active"
+    );
+    assert!(
+        native::open_device(&recipient_removed, &object, &second, &receiver2).is_err(),
+        "verified recipient removal refuses an otherwise-valid delivery"
+    );
+    let draft = f.state.remove_self(f.first.id()).unwrap();
+    f.state
+        .apply(
+            draft
+                .finish(f.control.sign(draft.signing_bytes()))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(
+        native::open_device(&f.state, &object, &second, &receiver2).is_err(),
+        "inactive sender"
+    );
+}
+
+#[test]
 fn record_rejects_changed_credentials_or_private_record_or_foreign_account() {
     let f = initial();
     for password in ["pa\0ss", "pa\0sse", "pa\0ssé "] {

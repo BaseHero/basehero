@@ -419,6 +419,12 @@ impl VerifiedAccount {
         self.running()?;
         Ok(self.record_digest.is_some() && self.personal.is_some())
     }
+    /// The current verified publication (the initial one until rotation is
+    /// implemented). Never infer it from a home-supplied object.
+    pub(crate) fn personal_publication(&self) -> Result<&PersonalPublication, Error> {
+        self.running()?;
+        self.personal.as_ref().ok_or(Error::IncompleteMaterials)
+    }
     pub(crate) fn initial_materials(&self) -> Result<(&[u8; 32], &PersonalPublication), Error> {
         if !self.materials_ready()? {
             return Err(Error::IncompleteMaterials);

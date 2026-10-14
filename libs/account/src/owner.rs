@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crypto::SecretBytes;
-use crate::history::{AccountId, DeviceId, Error, Head, SigningRequest, VerifiedAccount};
+use crate::history::{
+    AccountId, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, VerifiedAccount,
+};
 use crate::journal::{
     AccountJournal, JournalError, JournaledDevice, PENDING_SETUP_VERSION, PendingSetupProtector,
     PendingSetupRecord, ProtectorError, SetupStage,
@@ -369,6 +371,48 @@ where
                 Err(OwnerError::Invalid(error))
             }
         }
+    }
+
+    /// Build a device admission request against the verified, active owner.
+    /// The caller must still obtain the exact second-key signature and order it.
+    pub fn prepare_add_device(
+        &self,
+        capability: &AccountCapability,
+        keys: DevicePublicKeys,
+    ) -> Result<SigningRequest, OwnerError> {
+        self.check(capability)?;
+        let loaded = self.loaded.as_ref().expect("checked");
+        loaded
+            .account
+            .add_device(capability.device, keys)
+            .map_err(OwnerError::Invalid)
+    }
+
+    /// Sign a private delivery to the device in an exact signed pending add.
+    /// The session must remain live through durable staging of add and seal;
+    /// this offline operation does not itself prove hosted admission.
+    pub async fn seal_personal_for_device(
+        &mut self,
+        capability: &AccountCapability,
+        personal_key: &personal::PersonalKey,
+        recipient: &DevicePublicKeys,
+        admission: &AccountEvent,
+    ) -> Result<Vec<u8>, OwnerError> {
+        self.check(capability)?;
+        let loaded = self.loaded.as_ref().expect("checked");
+        let state = loaded.account.clone();
+        let device = loaded.device.clone().ok_or(OwnerError::NotActive)?;
+        let result = personal::seal_for_device(
+            &state,
+            personal_key,
+            &device,
+            recipient,
+            admission,
+            &mut self.store,
+        )
+        .await;
+        self.check(capability)?;
+        result.map_err(OwnerError::Invalid)
     }
 
     /// Build an immediate self-removal request for this active device. It does

@@ -1,23 +1,27 @@
 //! Two authenticated initial personal-seed envelopes, not later QR/rotation delivery.
 use crate::crypto::{self, KemKey, Secret, SecretBytes};
 use crate::{
-    Error, VerifiedAccount,
+    AccountEvent, DeviceId, DevicePublicKeys, Error, VerifiedAccount,
     platform::{DeviceKeyStore, StoredDevice},
 };
 
 const PREFIX: &[u8; 8] = b"BHPERS01";
 const SIZE: usize = 1299;
+const DELIVERY_PREFIX: &[u8; 8] = b"BHPDEL01";
+const DELIVERY_SIZE: usize = 8 + SIZE + 32 + 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealPurpose {
     FirstDevice,
     Recovery,
+    Device,
 }
 impl SealPurpose {
     fn tag(self) -> u8 {
         match self {
             Self::FirstDevice => 1,
             Self::Recovery => 2,
+            Self::Device => 3,
         }
     }
 }
@@ -162,7 +166,7 @@ fn checked<'a>(
     purpose: SealPurpose,
     recipient: &[u8; 1216],
 ) -> Result<Checked<'a>, Error> {
-    let (_, publication) = state.initial_materials()?;
+    let publication = state.personal_publication()?;
     if envelope.len() != SIZE
         || &envelope[..8] != PREFIX
         || &envelope[8..10] != 1u16.to_be_bytes().as_slice()
@@ -173,15 +177,20 @@ fn checked<'a>(
     let expected = match purpose {
         SealPurpose::FirstDevice => state.first_device()?.receiving(),
         SealPurpose::Recovery => state.recovery_keys()?.receiving(),
+        SealPurpose::Device => recipient,
     };
     if recipient != expected {
         return Err(Error::InvalidCredentials);
     }
+    // Device delivery is signed in its domain-separated outer frame, not one
+    // of the two initial committed slots.
     let signed_digest = match purpose {
-        SealPurpose::FirstDevice => publication.device_digest(),
-        SealPurpose::Recovery => publication.recovery_digest(),
+        SealPurpose::FirstDevice => Some(publication.device_digest()),
+        SealPurpose::Recovery => Some(publication.recovery_digest()),
+        SealPurpose::Device => None,
     };
-    if !crypto::constant_time_eq(&commitment(envelope), signed_digest) {
+    if signed_digest.is_some_and(|digest| !crypto::constant_time_eq(&commitment(envelope), digest))
+    {
         return Err(Error::InvalidCredentials);
     }
     let key_id = id(publication.public());
@@ -271,4 +280,103 @@ pub fn open_for_recovery(
     let shared = crypto::decapsulate(receiver, &checked.ciphertext)
         .map_err(|_| Error::InvalidCredentials)?;
     finish(state, envelope, SealPurpose::Recovery, &checked, &shared)
+}
+
+/// Sign an account-private delivery of the CURRENT ordinary personal key to a
+/// device named by the exact signed *pending* add. The native ordinary signer is
+/// not a control approval; the home serves the object only after it orders that
+/// add. A caller must fence late asynchronous results.
+pub async fn seal_for_device(
+    state: &VerifiedAccount,
+    key: &PersonalKey,
+    sender: &StoredDevice,
+    recipient: &DevicePublicKeys,
+    admission: &AccountEvent,
+    store: &mut impl DeviceKeyStore,
+) -> Result<Vec<u8>, Error> {
+    if *state.personal_publication()?.public() != key.public() {
+        return Err(Error::InvalidCredentials);
+    }
+    if state.active_device(sender.keys.id())? != &sender.keys {
+        return Err(Error::InvalidCredentials);
+    }
+    // Stage before home ordering, but only for keys committed by the exact
+    // authenticated pending add. It must be a successor of this verified view.
+    let draft = state.add_device(sender.keys.id(), recipient.clone())?;
+    let raw = admission.as_bytes();
+    if raw.len() != draft.signing_bytes().len() + 64 || !raw.starts_with(draft.signing_bytes()) {
+        return Err(Error::InvalidCredentials);
+    }
+    let signature: [u8; 64] = raw[raw.len() - 64..]
+        .try_into()
+        .map_err(|_| Error::Malformed)?;
+    draft.finish(signature)?;
+    store
+        .load_matching(sender)
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    let seed = key.0.export_seed();
+    let envelope = seal(
+        state,
+        key,
+        SealPurpose::Device,
+        recipient.receiving(),
+        &seed,
+    )?;
+    let mut frame = Vec::with_capacity(DELIVERY_SIZE);
+    frame.extend_from_slice(DELIVERY_PREFIX);
+    frame.extend_from_slice(&envelope);
+    frame.extend_from_slice(&sender.keys.id().0);
+    let signature = store
+        .sign_content(sender.handle.clone(), frame.clone())
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    crypto::verify(sender.keys.signing(), &frame, &signature)
+        .map_err(|_| Error::InvalidCredentials)?;
+    frame.extend_from_slice(&signature);
+    Ok(frame)
+}
+
+/// Verify the complete signed device-delivery frame against this history before
+/// asking the native key store to open its X-Wing encapsulation. Not a recovery
+/// or first-device bootstrap opener; never fall back to their slots.
+pub async fn open_for_device(
+    state: &VerifiedAccount,
+    frame: &[u8],
+    device: &StoredDevice,
+    store: &mut impl DeviceKeyStore,
+) -> Result<PersonalKey, Error> {
+    if frame.len() != DELIVERY_SIZE || &frame[..8] != DELIVERY_PREFIX {
+        return Err(Error::Malformed);
+    }
+    if state.active_device(device.keys.id())? != &device.keys {
+        return Err(Error::InvalidCredentials);
+    }
+    let sender = DeviceId(
+        frame[8 + SIZE..8 + SIZE + 32]
+            .try_into()
+            .map_err(|_| Error::Malformed)?,
+    );
+    let signer = state.active_device(sender)?;
+    let signature: [u8; 64] = frame[DELIVERY_SIZE - 64..]
+        .try_into()
+        .map_err(|_| Error::Malformed)?;
+    crypto::verify(signer.signing(), &frame[..DELIVERY_SIZE - 64], &signature)
+        .map_err(|_| Error::BadSignature)?;
+    let envelope = &frame[8..8 + SIZE];
+    let checked = checked(
+        state,
+        envelope,
+        SealPurpose::Device,
+        device.keys.receiving(),
+    )?;
+    store
+        .load_matching(device)
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    let shared = store
+        .decapsulate(device.handle.clone(), checked.ciphertext)
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    finish(state, envelope, SealPurpose::Device, &checked, &shared)
 }

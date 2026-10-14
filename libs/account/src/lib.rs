@@ -9,6 +9,7 @@ pub use bh_crypto as crypto;
 mod history;
 pub mod journal;
 pub mod owner;
+pub mod pairing;
 pub mod personal;
 pub mod platform;
 pub mod recovery;

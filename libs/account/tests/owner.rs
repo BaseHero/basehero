@@ -77,6 +77,226 @@ impl Harness {
     }
 }
 
+#[test]
+fn qr_proof_for_another_account_cannot_prepare_this_owners_admission() {
+    use bh_account::crypto::{KemKey, SigningKey};
+    use bh_account::pairing::{PairError, Reply, ShowingSession, verify_showing};
+    let a = Harness::new();
+    let a_setup = complete(&a);
+    let a_journal = a.stored();
+    let b = Harness::new();
+    let b_setup = complete(&b);
+    let mut b_owner = b.owner();
+    let b_capability = activate(&mut b_owner);
+    let a_showing = a.journal().device().unwrap().unwrap().keys;
+    let session = ShowingSession::new(a_setup.anchor, a_showing.id());
+    let qr = session.qr().unwrap();
+    let original: Vec<&[u8]> = a_journal.history.iter().map(Vec::as_slice).collect();
+    assert!(verify_showing(&qr, &original, a_journal.head).unwrap() == a_showing);
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&qr, scanner, b"Fold").unwrap())
+        .unwrap();
+    let before_signs = b.store.state().sign_calls;
+    assert_eq!(
+        session.prepare(&b_owner, &b_capability).err(),
+        Some(PairError::WrongContext)
+    );
+    assert_eq!(
+        b.store.state().sign_calls,
+        before_signs,
+        "never asked B's key to sign"
+    );
+    assert_eq!(b.stored().head, b_setup.head, "nothing admitted in B");
+    assert_eq!(
+        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, ()>(())),
+        Err(PairError::NoReply)
+    );
+}
+
+#[test]
+fn qr_for_another_active_showing_device_cannot_prepare_local_owners_admission() {
+    use bh_account::crypto::{KemKey, SigningKey};
+    use bh_account::pairing::{PairError, Reply, ShowingSession, verify_showing};
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    let other = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    let add = owner
+        .prepare_add_device(&capability, other.clone())
+        .unwrap();
+    let signed = ready(owner.sign_control(&capability, &add)).unwrap();
+    owner.apply_incoming(&[signed.as_bytes()]).unwrap();
+    let stored = h.stored();
+    let original: Vec<&[u8]> = stored.history.iter().map(Vec::as_slice).collect();
+    let session = ShowingSession::new(stored.anchor, other.id());
+    let qr = session.qr().unwrap();
+    assert!(verify_showing(&qr, &original, stored.head).unwrap() == other);
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&qr, scanner, b"Fold").unwrap())
+        .unwrap();
+    let before_signs = h.store.state().sign_calls;
+    assert_eq!(
+        session.prepare(&owner, &capability).err(),
+        Some(PairError::WrongContext)
+    );
+    assert_eq!(h.store.state().sign_calls, before_signs);
+    assert_eq!(h.stored().head, stored.head, "no second admission");
+    assert_eq!(
+        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, ()>(())),
+        Err(PairError::NoReply)
+    );
+}
+
+#[test]
+fn showing_owner_signs_add_and_seals_current_personal_before_any_ordering() {
+    use bh_account::crypto::{KemKey, SigningKey};
+    use bh_account::pairing::{Reply, ShowingSession};
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let status = begin(&mut owner);
+    let initial_seal = owner.pending_home_objects().unwrap().device_seal;
+    owner.confirm_home_ordered(status.head).unwrap();
+    owner.confirm_kit_saved().unwrap();
+    let state = bh_account::VerifiedAccount::replay(
+        status.anchor,
+        &status
+            .submission
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>(),
+        status.head,
+    )
+    .unwrap();
+    let native = h.journal().device().unwrap().unwrap();
+    let first = bh_account::platform::StoredDevice {
+        handle: native.handle,
+        keys: native.keys,
+        policy: native.policy,
+        kind: native.kind,
+    };
+    let personal = ready(bh_account::personal::open_for_receiver(
+        &state,
+        &initial_seal,
+        &first,
+        &mut h.store.clone(),
+    ))
+    .unwrap();
+    let capability = activate(&mut owner);
+    let session = ShowingSession::new(status.anchor, first.keys.id());
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), scanner.clone(), b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&owner, &capability).unwrap();
+    let admission = ready(owner.sign_control(&capability, &request)).unwrap();
+    let delivery =
+        ready(owner.seal_personal_for_device(&capability, &personal, &scanner, &admission))
+            .unwrap();
+    assert_eq!(delivery.len(), 1403);
+    let mut staged = None;
+    session
+        .stage(admission.as_bytes(), &delivery, |add, seal| {
+            staged = Some((add.to_vec(), seal.to_vec()));
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert_eq!(staged.unwrap(), (admission.as_bytes().to_vec(), delivery));
+    assert_eq!(
+        h.stored().head,
+        status.head,
+        "neither callback nor signatures order an admission"
+    );
+}
+
+#[test]
+fn pairing_approval_uses_the_real_owner_and_cancellation_fences_late_native_signature() {
+    use bh_account::crypto::{KemKey, SigningKey};
+    use bh_account::pairing::{PairError, Reply, ShowingSession};
+    let h = Harness::new();
+    let status = complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    let stored = h.journal().device().unwrap().unwrap();
+    let session = ShowingSession::new(status.anchor, stored.keys.id());
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), scanner.clone(), b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&owner, &capability).unwrap();
+    let event = ready(owner.sign_control(&capability, &request)).unwrap();
+    let mut forged = event.as_bytes().to_vec();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    assert_eq!(
+        session.stage(&forged, b"fixture seal", |_, _| Ok::<_, ()>(())),
+        Err(PairError::ChangedRequest)
+    );
+    assert_eq!(
+        session.stage(event.as_bytes(), b"fixture seal", |_, _| Err::<(), _>(())),
+        Err(PairError::StageFailed),
+        "a failed durable stage leaves the session live for retry"
+    );
+    let mut captured = Vec::new();
+    session
+        .stage(event.as_bytes(), b"fixture seal", |add, seal| {
+            captured = [add, seal].concat();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(captured.starts_with(event.as_bytes()));
+    assert_eq!(h.stored().head, status.head, "only staging, not ordering");
+    assert_eq!(
+        session.stage(event.as_bytes(), b"fixture seal", |_, _| Ok::<_, ()>(())),
+        Err(PairError::Ended)
+    );
+
+    let session = ShowingSession::new(status.anchor, stored.keys.id());
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), scanner, b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&owner, &capability).unwrap();
+    let generation = h.generation.current();
+    session.cancel();
+    let late = ready(owner.sign_control(&capability, &request)).unwrap();
+    assert_eq!(
+        generation,
+        h.generation.current(),
+        "cancel is not account-wide lock"
+    );
+    assert_eq!(
+        session.stage(late.as_bytes(), b"seal", |_, _| Ok::<_, ()>(())),
+        Err(PairError::Ended)
+    );
+}
+
 fn password() -> Password {
     Password::new("correct horse battery staple").unwrap()
 }

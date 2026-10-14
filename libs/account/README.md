@@ -127,6 +127,26 @@ the bundled SQLite device store, including verifiers that never touch it;
 revisit by hiding it behind a feature or moving it to the client before hosted
 consumers are added.
 
+## Portable QR pairing increment
+
+`pairing` supplies a bounded 122-byte QR codec, a one-message secret-keyed
+scanner proof and an in-memory showing session. The scanner verifies the showing
+`DeviceId` against signed history replayed from the QR anchor. Only a verified
+reply can enter the showing device's owner-controlled `add_device` request; two
+distinct valid replies end the session. Session cancellation fences a late
+second-key signature without invalidating the entire account capability. A
+synchronous staging callback runs only while the session remains live; no
+persistent admission row or host ordering is implemented yet.
+
+A separate, domain-prefixed account-private `personal::SealPurpose::Device`
+delivery is X-Wing-sealed to the recipient and signed with the sender's ordinary
+native key. It requires an exact signed pending add on creation and complete
+verified active-recipient/active-sender history on opening; it cannot reuse the
+two first-device/recovery slots. This does not persist the current personal
+holder or establish freshness of an unseen newer home view. No camera, relay,
+private-object service or actual platform pairing has been tested here. Pairing
+only delivers the ordinary personal key, never hidden-base material.
+
 ## Account-control encoding, version 1
 
 All integers are unsigned big-endian. Keys/signatures are their fixed-width raw
