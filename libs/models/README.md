@@ -2,9 +2,9 @@
 
 This library provides bounded chat-completion decoding, per-attempt accounting
 state, an opt-in Tinfoil encrypted transport (`tinfoil-route`) and the opt-in NEAR
-gateway-trust/quote-verification/OHTTP framing increments (`near-route`). NEAR
-model verification, E2EE request dispatch, gateway receipt authentication, durable
-reservations and the activity UI are not implemented here.
+gateway-trust/quote-verification/OHTTP framing and offline model-verification
+increments (`near-route`). E2EE request dispatch, gateway receipt authentication,
+durable reservations and the activity UI are not implemented here.
 
 ## Response boundary
 
@@ -88,9 +88,9 @@ attestation report for the reviewed deployment; they are research configuration,
 not policy decisions. Any NEAR redeploy, including a configuration-only change,
 refuses this route until the pins are rechecked and revised, exactly as an
 identity rotation does. The source-commit pin is recorded for the separate
-online provenance step and is not itself verified offline. NEAR model metadata
-and CPU/GPU/NRAS verification, E2EE dispatch, transport and accounting are later
-increments. All tests are offline and the quote/assembly tests are synthetic:
+online provenance step and is not itself verified offline. NEAR model verification
+is described below; E2EE dispatch, transport and accounting are later increments.
+All tests are offline and the gateway quote/assembly tests are synthetic:
 the QVL appraisal runs on an archived, expired Intel quote and every successful
 assembly mutates that verdict (or uses a synthetic event log) in memory, so they
 prove ordering, binding and policy, not a fresh hardware attestation or a live
@@ -112,6 +112,48 @@ Ed25519, and run the pinned gateway's own `ohttp`/`bhttp` 0.7.2 server code
 offline (a dev-dependency); they prove protocol and ordering, not hardware
 validity or live gateway behaviour. Response decryption is buffered per bounded
 reply in this increment; streaming stays a later increment.
+
+## NEAR fixed-model offline verification
+
+`near_model::verify` accepts only already-authenticated, decrypted OHTTP response
+bytes for the fixed `z-ai/glm-5.3-flash` metadata and report endpoints. The caller
+must issue the fresh report nonce, request `provider=near` with no aliasing and
+Ed25519, provide offline Intel collateral for every candidate, a trusted bounded
+time interval, independently approved SHA-256 hashes of the measured app-compose,
+and a separately fetched NVIDIA NRAS overall JWT plus trusted NVIDIA JWKS for
+each candidate. It accepts no empty candidate set and rejects the *whole* set if
+any candidate fails. Only this verifier builds a `VerifiedModelKey`; it cannot
+be substituted by a raw byte key. The approved hashes are a deployment-admission
+input, **not** hashes learned from the untrusted report, and are not configured
+by this library. No actual model deployment has been approved here.
+
+Each CPU quote receives strict UpToDate QVL policy at both ends of the trusted
+time interval, including Intel signature/collateral checks; there is no model
+OutOfDate exception. It must be non-debug, bind `signing_address || fresh_nonce`
+and any advertised report data, match the required Ed25519 model key, and replay
+the dstack RTMR3 `compose-hash` to the quoted `mr_config_id` and an independently
+approved compose hash. NVIDIA evidence is required: its payload nonce must match
+the CPU's client nonce. The already-obtained NRAS JWT must have a valid ES384
+signature against a **caller-supplied trusted NVIDIA-origin JWKS**, pinned issuer,
+matching `eat_nonce`, true overall result, required `iat`/`nbf` no later than the
+trusted interval's upper bound and `exp` after that bound. NVIDIA's public NRAS
+overall-claims samples omit `aud`; this verifier does not require it. JWT headers
+never nominate a key URL. The future online transport must POST each exact
+payload to NRAS and fetch the JWKS from NVIDIA's pinned endpoint; this crate
+does not do so.
+The caller still owns provenance checking/admission for the measured deployment,
+transport, authorization, and later response-signature checks. A compose-hash
+allowlist is not itself Sigstore source-provenance verification. Any unlisted
+candidate or configuration closes the whole route; a hash from an untrusted
+report never approves itself. Changes in NEAR's model deployment therefore
+need independent admission before they can be used.
+
+Tests follow NEAR's published report shape and dstack event names, with an
+archived Intel quote/collateral. Successful model assemblies alter QVL claims
+in memory, with synthetic report/event-log, model keys and self-signed ES384
+NRAS token/JWKS shaped after NVIDIA's public overall-claims samples. They prove
+bindings and ordering, not fresh hardware, NVIDIA's real signature, online
+provenance or a usable model route.
 
 ## Tinfoil route
 
@@ -165,5 +207,6 @@ bash scripts/check.sh
 All tests are offline. The feature tests additionally exercise real EHBP
 crypto/streaming and real HPKE/Ed25519 gateway framing against local synthetic
 fixtures, not live provider verification, remote cancellation, actual bills or
-deployment. The NEAR tests do not verify a quote, a model or a response
-signature.
+deployment. The NEAR tests exercise real QVL on archived Intel material and
+synthetic model assembly/ES384 JWT verification, not a fresh model quote or
+response signature.

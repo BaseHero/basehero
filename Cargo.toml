@@ -75,6 +75,9 @@ sha2 = "=0.10.9"
 aes-gcm = "=0.10.3"
 rand = { version = "=0.9.5", default-features = false, features = ["os_rng", "std_rng"] }
 hex = "=0.4.3"
+# NRAS ES384 JWT verification using already-locked permissive crypto/encoding crates.
+p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa"] }
+base64 = "=0.22.1"
 # Dev-only for the offline NEAR interop tests: run the pinned gateway's exact
 # ohttp/bhttp 0.7.2 server code (already on our hpke 0.13 stack).
 ohttp = { version = "=0.7.2", default-features = false, features = ["client", "server", "rust-hpke", "stream"] }

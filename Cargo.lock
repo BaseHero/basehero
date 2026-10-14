@@ -420,6 +420,7 @@ name = "basehero-models"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "bh-confidential-attestation",
  "bh-crypto",
  "bhttp",
@@ -430,6 +431,7 @@ dependencies = [
  "hkdf",
  "hpke",
  "ohttp",
+ "p384",
  "rand 0.9.5",
  "reqwest",
  "rustls",
