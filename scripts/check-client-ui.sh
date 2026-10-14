@@ -18,13 +18,17 @@ if [ -z "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
 fi
 export PLAYWRIGHT_BROWSERS_PATH
 
-cd apps/client/tests/browser
-npm ci --ignore-scripts --no-audit --no-fund
-node --test
+(
+  cd apps/client/tests/browser
+  npm ci --ignore-scripts --no-audit --no-fund
+  node --test
+)
 
 # The real EditorView cases run in the same browsers from the same pinned
 # install. The editor owns its sources and test host; this entry runs them
 # rather than keeping a second copy.
-cd ../../editor
-npm ci --ignore-scripts --no-audit --no-fund
-npm run test:browser
+(
+  cd apps/client/editor
+  npm ci --ignore-scripts --no-audit --no-fund
+  npm run test:browser
+)
