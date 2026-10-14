@@ -1,9 +1,9 @@
-import { test } from 'node:test';
+import test, { after, before, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -21,9 +21,21 @@ const server=http.createServer(async(req,res)=>{
     await readFile(req.url==='/note-editor.js'?join(directory,'../../ui/note-editor.js'):req.url==='/note-editor.css'?join(directory,'../../ui/note-editor.css'):join(directory,'browser.bundle.js')));
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-const browser=await chromium.launch({headless:true,executablePath:'/run/current-system/sw/bin/chromium',args:['--no-sandbox']});
+after(async()=>{await new Promise(resolve=>server.close(resolve));});
+
+// The same ten cases run in Chromium and WebKit. Both engines use the browsers
+// pinned by the product flake (PLAYWRIGHT_BROWSERS_PATH), so the versions match
+// everywhere the ui check runs. Chromium approximates an Android WebView and
+// WebKit the macOS WKWebView; neither is a real device.
+for (const [browserName,engine] of [['chromium',chromium],['webkit',webkit]]) {
+describe(`EditorView in ${browserName}`,()=>{
+let browser;
+before(async()=>{
+  if (!process.env.PLAYWRIGHT_BROWSERS_PATH) throw Error('PLAYWRIGHT_BROWSERS_PATH is unset; run via scripts/check.sh ui');
+  browser=await engine.launch({headless:true});
+});
+after(async()=>{await browser?.close();});
 async function page() {const p=await browser.newPage(); await p.goto(`http://127.0.0.1:${server.address().port}/`); await p.waitForFunction(()=>!!window.harness); return p;}
-test.after(async()=>{await browser.close();await new Promise(resolve=>server.close(resolve));});
 
 test('real EditorView types, formats and undoes local edits; incoming is not local',async()=>{
   const p=await page();
@@ -202,3 +214,5 @@ test('incoming unsupported content freezes before live binding; pending local te
   assert.equal((await p.locator('.ProseMirror').textContent()).includes('unsaved'),true);
   await p.close();
 });
+});
+}

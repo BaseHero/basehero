@@ -5,3 +5,4 @@
 !/apps/client/src-tauri/gen/android/
 **/node_modules/
 /apps/client/editor/test/browser.bundle.js
+/apps/client/tests/browser/node_modules/

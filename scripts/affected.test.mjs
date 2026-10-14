@@ -151,6 +151,48 @@ test('editor gate actually runs and fails when the selected editor check is brok
   assert.match(gate.stderr, /editor/);
 });
 
+test('ui path families select the browser gate and editor paths keep their editor gate', t => {
+  const f = fixture(t);
+  f.crate('libs/core', 'bh-core');
+  f.git('add', '.'); f.git('commit', '-qm', 'core fixture member');
+  let from = f.git('rev-parse', 'HEAD');
+  for (const path of [
+    'apps/client/ui/theme.js',
+    'apps/client/tests/browser/smoke.test.mjs',
+    'apps/client/editor/src/schema.mjs',
+    'note-schema/v1.json',
+    'apps/client/src-tauri/tauri.conf.json',
+    'scripts/check-client-ui.sh',
+    'flake.nix',
+  ]) {
+    f.put(path, `changed ${path}\n`);
+    f.git('add', '.'); f.git('commit', '-qm', path);
+    const r = f.run('node', [script, '--base', from, '--head', 'HEAD', '--plan']);
+    assert.equal(r.status, 0, r.stderr);
+    const plan = JSON.parse(r.stdout);
+    assert.ok(plan.js.includes('ui'), `${path}: ${r.stdout}`);
+    if (path.startsWith('apps/client/editor/')) assert.ok(plan.js.includes('editor'), `${path}: ${r.stdout}`);
+    from = f.git('rev-parse', 'HEAD');
+  }
+  f.put('services/api/src/lib.rs', 'pub fn changed() {}\n');
+  f.git('add', '.'); f.git('commit', '-qm', 'unrelated service source');
+  const unrelated = f.run('node', [script, '--base', from, '--head', 'HEAD', '--plan']);
+  assert.equal(unrelated.status, 0, unrelated.stderr);
+  assert.ok(!JSON.parse(unrelated.stdout).js.includes('ui'), unrelated.stdout);
+});
+
+test('ui gate actually runs and fails when the selected browser check is broken', t => {
+  const f = fixture(t);
+  f.put('scripts/check.sh', '#!/usr/bin/env bash\nset -e\ncase "${1:-}" in\n  ui) echo "ui gate invoked" >&2; exit 7 ;;\n  *) exit 0 ;;\nesac\n');
+  f.git('add', '.'); f.git('commit', '-qm', 'ui gate');
+  const base = f.git('rev-parse', 'HEAD');
+  f.put('apps/client/ui/theme.js', 'export const theme = 1;\n');
+  f.git('add', '.'); f.git('commit', '-qm', 'ui change');
+  const gate = f.run('node', [script, '--base', base, '--head', 'HEAD', '--check']);
+  assert.notEqual(gate.status, 0, `${gate.stdout}\n${gate.stderr}`);
+  assert.match(gate.stderr, /ui gate invoked/);
+});
+
 test('sync worker JS changes and selected Rust worker run failing Wasm gate', t => {
   const f = fixture(t);
   f.crate('services/sync-worker', 'bh-sync-worker', `[dependencies]\nlow = { path = "${up(2)}/libs/low" }\n`);

@@ -1,0 +1,13 @@
+{
+  "name": "bh-client-ui-tests",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Browser UI checks for the BaseHero client in Chromium and WebKit.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

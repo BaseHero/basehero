@@ -71,10 +71,19 @@ try {
     || paths.some(p => p.startsWith('apps/client/editor/')
       || p === 'apps/client/ui/note-editor.js' || p === 'apps/client/ui/note-editor.css'
       || p === 'note-schema/v1.json' || p.startsWith('tests/interop/'));
+  // The browser gate drives the real ui/, the editor, the shared schema and the
+  // served CSP, so any of those paths (or anything global) must run it.
+  const ui = global
+    || paths.some(p => p.startsWith('apps/client/ui/')
+      || p.startsWith('apps/client/tests/browser/')
+      || p.startsWith('apps/client/editor/')
+      || p === 'note-schema/v1.json'
+      || p === 'apps/client/src-tauri/tauri.conf.json');
   const js = [
     ...(global || paths.some(p => p.startsWith('apps/client/')) ? ['client'] : []),
     ...(global || selected.has('bh-core') || paths.some(p => p.startsWith('tests/interop/') || p.startsWith('apps/client/')) ? ['interop'] : []),
     ...(editor ? ['editor'] : []),
+    ...(ui ? ['ui'] : []),
     ...(global && byName.has('bh-sync-worker') || selected.has('bh-sync-worker') || paths.some(p => p.startsWith('tests/sync-worker/') || p.startsWith('services/sync-worker/')) ? ['wasm-sync'] : []),
     ...(paths.some(p => p.startsWith('website/')) ? ['website'] : []),
   ];
@@ -97,6 +106,7 @@ try {
     }
     if (js.includes('wasm-sync')) shell('bash', ['scripts/check.sh', 'wasm-sync']);
     if (js.includes('editor')) shell('bash', ['scripts/check.sh', 'editor']);
+    if (js.includes('ui')) shell('bash', ['scripts/check.sh', 'ui']);
     if (js.includes('client')) shell('node', ['--test', ...readdirSync(resolve(root, 'apps/client/tests')).filter(p => p.endsWith('.test.mjs')).map(p => `apps/client/tests/${p}`)]);
     if (js.includes('interop')) { shell('npm', ['ci', '--prefix', 'tests/interop', '--ignore-scripts', '--no-audit', '--no-fund']); shell('npm', ['test', '--prefix', 'tests/interop']); }
     if (js.includes('website')) { shell('npm', ['ci', '--prefix', 'website', '--ignore-scripts', '--no-audit', '--no-fund']); shell('npm', ['run', 'check', '--prefix', 'website']); }

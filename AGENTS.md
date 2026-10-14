@@ -14,20 +14,26 @@ speculative crates.
 
 From this directory, in `nix develop` or with README prerequisites installed:
 
-- Affected checks: `node scripts/affected.mjs --base <commit> --head HEAD --check` (Cargo metadata discovers changed crates and reverse dependents; client JS, interop, bundled editor, sync-worker Wasm and website checks follow relevant changes). `node scripts/affected.mjs --layers` checks one-way workspace dependencies.
+- Affected checks: `node scripts/affected.mjs --base <commit> --head HEAD --check` (Cargo metadata discovers changed crates and reverse dependents; client JS, client UI browser, interop, bundled editor, sync-worker Wasm and website checks follow relevant changes). `node scripts/affected.mjs --layers` checks one-way workspace dependencies.
 - Cross-library tests: `cargo test --locked -p bh-system-tests`.
 - Default full check: `bash scripts/check.sh` (Rust format, portable clippy/tests,
   bundled-shell asset/security checks, Tiptap/Yjs/yrs interop fixture, bundled
-  editor build, shared-schema/cross-language tests and real EditorView browser
-  tests when Linux Chromium is available; requires npm. Linux also needs
-  unprivileged user and network namespaces for isolated public-web socket tests;
-  macOS skips those tests.
+  editor build, shared-schema/cross-language tests, and the Chromium/WebKit client
+  UI checks including the real EditorView cases; requires npm. On Linux it also
+  needs unprivileged user and network namespaces for isolated public-web socket
+  tests; macOS skips those tests.
 - Unknown-content compatibility gate: `cd tests/interop && npm ci && npm run proof:unknown`
   is a recorded expected failure, not part of the green default. Never ship a
   lossy schema/binding to make that gate appear green.
-- Bundled editor (schema fixtures, Rust-to-Yjs bridge, bundle build, unit and
-  rendered browser tests): `bash scripts/check.sh editor`.
+- Bundled editor (schema fixtures, Rust-to-Yjs bridge, bundle build and unit
+  tests): `bash scripts/check.sh editor`.
 - Native client: `bash scripts/check.sh desktop`.
+- Client UI in browsers: `bash scripts/check.sh ui` serves the real `apps/client/ui`
+  and drives it in Chromium and WebKit with the shell's own CSP and a pre-app IPC
+  stub, then runs the real EditorView cases from `apps/client/editor/test/` in the
+  same two engines. Chromium approximates an Android WebView and WebKit the macOS
+  WKWebView; neither is real-device acceptance. Browsers come from the product
+  flake's pinned nixpkgs. The shell suite is in `apps/client/tests/browser/`.
 - Android libraries: `nix develop .#android --command bash scripts/check.sh android`.
 - Android crypto/release link proof (separate from fast default checks):
   `nix develop .#android --command bash scripts/check.sh android-crypto`.

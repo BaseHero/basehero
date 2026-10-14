@@ -25,6 +25,7 @@ case "${1:-portable}" in
       echo 'Skipped isolated-network security tests (require Linux).' >&2
     fi
     node --test apps/client/tests/*.test.mjs
+    bash scripts/check.sh ui
     npm ci --prefix tests/interop --ignore-scripts --no-audit --no-fund
     npm test --prefix tests/interop
     bash scripts/check.sh editor
@@ -36,11 +37,11 @@ case "${1:-portable}" in
     node apps/client/editor/test/notices.mjs
     npm run build --prefix apps/client/editor
     npm run test:unit --prefix apps/client/editor
-    if [ "$(uname -s)" = Linux ] && command -v chromium >/dev/null; then
-      npm run test:browser --prefix apps/client/editor
-    else
-      echo 'Skipped EditorView browser tests (require Chromium on Linux).' >&2
-    fi
+    ;;
+  ui)
+    # Real ui/ in Chromium and WebKit: the bundled shell screen and the real
+    # EditorView cases; the browser tests are not a fixture.
+    bash scripts/check-client-ui.sh
     ;;
   desktop)
     cargo clippy --locked -p bh-client --all-targets -- -D warnings
@@ -68,7 +69,7 @@ case "${1:-portable}" in
     nix develop .#cryptoWorker --command bash scripts/check-sync-worker.sh
     ;;
   *)
-    echo "usage: bash scripts/check.sh [portable|editor|desktop|android|android-crypto|wasm|wasm-crypto|wasm-sync]" >&2
+    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-crypto|wasm|wasm-crypto|wasm-sync]" >&2
     exit 2
     ;;
 esac

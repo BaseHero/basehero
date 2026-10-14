@@ -38,13 +38,22 @@ Tauri CLI:
 ```sh
 nix develop                       # or nix develop path:. in a source-only copy
 node scripts/affected.mjs --base <commit> --head HEAD --check  # affected checks
-bash scripts/check.sh             # format, portable clippy/tests, shell, editor checks
-bash scripts/check.sh editor      # bundled editor fixtures, bundle build and browser tests
+bash scripts/check.sh             # format, portable clippy/tests, shell, UI and editor checks
+bash scripts/check.sh ui          # client UI in Chromium and WebKit only
+bash scripts/check.sh editor      # bundled editor fixtures, bundle build and unit tests
 bash scripts/check.sh desktop     # native Tauri clippy + build
 bash scripts/check.sh wasm        # portable core check
 bash scripts/check.sh wasm-crypto # Worker-Wasm crypto check (Nix)
 cargo run --locked -p bh-client   # run the desktop shell
 ```
+
+The UI check runs the real `apps/client/ui` in Chromium and WebKit with the
+shell's content security policy, and then the real EditorView cases from
+`apps/client/editor/test/` in the same two engines. Chromium approximates an
+Android WebView and WebKit the macOS WKWebView; neither is real-device
+acceptance. The engines come from the product flake's pinned nixpkgs (a one-time
+substitution, not Playwright's own downloader); `scripts/check-client-ui.sh`
+resolves them unless `PLAYWRIGHT_BROWSERS_PATH` is already set.
 
 On Linux, the default check also runs isolated public-web socket tests and needs
 unprivileged user and network namespaces; macOS skips those tests. Default Cargo
