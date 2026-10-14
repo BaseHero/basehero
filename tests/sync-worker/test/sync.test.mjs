@@ -206,7 +206,7 @@ test('wrong-size or mismatched bodies and replayed body grants refuse unchanged'
   try {
     await provision(mf);
     const before = await inspect(mf);
-    // A wrong-size body is refused before any plan/approval is reached.
+    // A wrong-size body is refused before planning or approval.
     refused(await consume(mf, op('stage', fixture.stage, { body: '00' })));
     // A grant bound to the staged body cannot stage a different same-sized body,
     // and a tampered grant signature is refused.
