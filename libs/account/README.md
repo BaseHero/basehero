@@ -120,8 +120,8 @@ the three objects are not proven by the signed head alone.
 `storage::DeviceJournal` implements the contract over the device-local SQLite
 journal (`libs/storage`), which stores only typed opaque rows and keeps no
 dependency on this library. Production still needs a native pending-blob
-protector, private-object delivery and a real home/checker lane; the in-memory
-journal and identity protector are test-only and provide no protection. As a
+protector, private-object delivery and a real home/checker lane; the identity
+protector is test-only and provides no protection. As a
 known limit, linking `DeviceJournal` makes every consumer of this library link
 the bundled SQLite device store, including verifiers that never touch it;
 revisit by hiding it behind a feature or moving it to the client before hosted

@@ -303,7 +303,10 @@ where
         }
 
         let capability = AccountCapability {
-            generation: self.generation.current(),
+            // The generation captured before the native load, never a fresh read:
+            // a concurrent advance after the recheck must leave this capability
+            // stale, not be absorbed into freshly-minted authority.
+            generation,
             account: account.id(),
             device: device_id,
             head: account.head(),

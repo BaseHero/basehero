@@ -6,7 +6,7 @@
 //! setup blob is opaque here and is protected by the account owner, not the
 //! journal. This is deliberately not a generic key-value store.
 
-use crate::crypto::SecretBytes;
+use crate::crypto::{Secret, SecretBytes};
 use crate::history::{AccountId, DevicePublicKeys, Head};
 use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle};
 
@@ -119,4 +119,99 @@ pub trait PendingSetupProtector {
 pub enum ProtectorError {
     Unavailable,
     Failed,
+}
+
+/// Length of the nonce prefix in the pending-setup seal framing (XChaCha20-Poly1305).
+pub const PENDING_SETUP_NONCE_LEN: usize = 24;
+
+/// Associated data for the pending-setup seal. It fixes the purpose and framing
+/// version, so a blob sealed here cannot be opened under another domain or
+/// version. Keep the trailing version in step with `PENDING_SETUP_VERSION`.
+pub const PENDING_SETUP_SEAL_AD: &[u8] = b"BaseHero pending setup v1";
+
+/// Seal pending-setup plaintext under a native-held 32-byte wrapping key.
+///
+/// Framing is the 24-byte nonce followed by the AEAD ciphertext; open must use
+/// the same framing and associated data. This is shared framing, not a protector:
+/// a native adapter owns the wrapping key and its storage, and only that adapter
+/// decides whether a key exists.
+pub fn seal_pending_setup(
+    wrapping: &Secret<32>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ProtectorError> {
+    let (nonce, ciphertext) = crate::crypto::aead_seal(wrapping, PENDING_SETUP_SEAL_AD, plaintext)
+        .map_err(|_| ProtectorError::Failed)?;
+    let mut out = Vec::with_capacity(PENDING_SETUP_NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Open a blob produced by [`seal_pending_setup`]. A wrong key, altered bytes,
+/// a truncated blob or a future framing are all `Failed`. A missing wrapping key
+/// is the adapter's `Unavailable`, never a silent regeneration here.
+pub fn open_pending_setup(
+    wrapping: &Secret<32>,
+    blob: &[u8],
+) -> Result<SecretBytes, ProtectorError> {
+    if blob.len() < PENDING_SETUP_NONCE_LEN {
+        return Err(ProtectorError::Failed);
+    }
+    let (nonce, ciphertext) = blob.split_at(PENDING_SETUP_NONCE_LEN);
+    let nonce: [u8; PENDING_SETUP_NONCE_LEN] =
+        nonce.try_into().map_err(|_| ProtectorError::Failed)?;
+    crate::crypto::aead_open(wrapping, &nonce, PENDING_SETUP_SEAL_AD, ciphertext)
+        .map_err(|_| ProtectorError::Failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_setup_seal_round_trips_and_rejects_tampering() {
+        let wrapping = Secret::<32>::random();
+        let plaintext = b"BHPEND01 pending setup material";
+        let blob = seal_pending_setup(&wrapping, plaintext).expect("seal");
+        assert_eq!(
+            blob.len(),
+            PENDING_SETUP_NONCE_LEN + plaintext.len() + 16,
+            "framing is nonce plus AEAD ciphertext"
+        );
+        assert_ne!(
+            blob.as_slice(),
+            plaintext,
+            "plaintext is not stored verbatim"
+        );
+        assert_eq!(
+            open_pending_setup(&wrapping, &blob).expect("open").expose(),
+            plaintext
+        );
+
+        // A different wrapping key and any altered byte are refused.
+        let other = Secret::<32>::random();
+        assert!(matches!(
+            open_pending_setup(&other, &blob),
+            Err(ProtectorError::Failed)
+        ));
+        for index in [0, PENDING_SETUP_NONCE_LEN, blob.len() - 1] {
+            let mut tampered = blob.clone();
+            tampered[index] ^= 1;
+            assert!(matches!(
+                open_pending_setup(&wrapping, &tampered),
+                Err(ProtectorError::Failed)
+            ));
+        }
+        assert!(matches!(
+            open_pending_setup(&wrapping, &blob[..PENDING_SETUP_NONCE_LEN - 1]),
+            Err(ProtectorError::Failed)
+        ));
+        assert!(matches!(
+            open_pending_setup(&wrapping, &blob[..PENDING_SETUP_NONCE_LEN]),
+            Err(ProtectorError::Failed)
+        ));
+
+        // A fresh nonce makes two seals of the same plaintext differ.
+        assert_ne!(seal_pending_setup(&wrapping, plaintext).unwrap(), blob);
+    }
 }

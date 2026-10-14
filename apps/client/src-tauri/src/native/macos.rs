@@ -6,6 +6,7 @@
 use bh_account::{
     DevicePublicKeys,
     crypto::{self, KemKey, Secret, SecretBytes, SigningKey},
+    journal::{PendingSetupProtector, ProtectorError, open_pending_setup, seal_pending_setup},
     platform::{
         ControlKeyPolicy, DeviceKeyStore, DeviceKeyStoreKind, KeyHandle, KeyStoreError,
         StoredDevice,
@@ -26,6 +27,9 @@ const ORDINARY: &str = "ordinary";
 const RECEIVER: &str = "receiver";
 const CONTROL: &str = "control";
 const VERSION: u8 = 1;
+const PENDING_SETUP_SERVICE: &str = "app.basehero.client.pending-setup.login-v1"; // M1 only
+const PENDING_SETUP_ACCOUNT: &str = "wrapping-key";
+const WRAPPING_KEY_LEN: usize = 32;
 
 /// Only the three roles under one fresh 256-bit namespace can form a device.
 /// The caller must persist the returned handle *and* original verified account
@@ -391,11 +395,76 @@ impl DeviceKeyStore for MacLoginKeyStore {
     }
 }
 
+/// M1 only: native protection for the pending first-device setup blob, alongside
+/// `MacLoginKeyStore`. The wrapping key is a random 32-byte generic-password item
+/// in the ordinary login keychain under its own service, never the
+/// data-protection store and never selected as a fallback from M2.
+///
+/// It guards the staged setup material at rest against another app or a copied
+/// device database. It is deliberately NOT bound to Touch ID or a passcode and
+/// gives no protection against code running as the same Mac user; that is the
+/// stated M1 limit, not a key-release guarantee, so no LocalAuthentication prompt
+/// is involved. Opening never creates a key: a missing item is `Unavailable`,
+/// because silently generating a replacement would make the staged blob
+/// unopenable.
+///
+/// The owner has no hook when the pending setup is cleared, so the single
+/// wrapping-key item is reused across later setups on this Mac; deleting it after
+/// setup completes is left to a later increment.
+pub(super) struct MacPendingSetupProtector;
+
+fn pending_setup_options() -> PasswordOptions {
+    // Ordinary file-based login keychain, like the M1 device keys: no
+    // kSecUseDataProtectionKeychain and no synchronizable attribute.
+    PasswordOptions::new_generic_password(PENDING_SETUP_SERVICE, PENDING_SETUP_ACCOUNT)
+}
+
+fn read_wrapping_key() -> Result<Option<Secret<32>>, ProtectorError> {
+    // Adopt the returned allocation immediately, including every error path.
+    let item = match generic_password(pending_setup_options()) {
+        Ok(bytes) => SecretBytes::from_vec(bytes),
+        Err(error) if error.code() == -25300 => return Ok(None), // errSecItemNotFound
+        Err(_) => return Err(ProtectorError::Failed),
+    };
+    let bytes = item.expose();
+    if bytes.len() != WRAPPING_KEY_LEN {
+        return Err(ProtectorError::Failed);
+    }
+    Secret::from_slice(bytes)
+        .map(Some)
+        .map_err(|_| ProtectorError::Failed)
+}
+
+fn create_wrapping_key() -> Result<Secret<32>, ProtectorError> {
+    let key = Secret::<32>::random();
+    let bytes = SecretBytes::from_parts(&[key.expose()]).map_err(|_| ProtectorError::Failed)?;
+    set_generic_password_options(bytes.expose(), pending_setup_options())
+        .map_err(|_| ProtectorError::Failed)?;
+    Ok(key)
+}
+
+impl PendingSetupProtector for MacPendingSetupProtector {
+    fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ProtectorError> {
+        let wrapping = match read_wrapping_key()? {
+            Some(key) => key,
+            None => create_wrapping_key()?,
+        };
+        seal_pending_setup(&wrapping, plaintext)
+    }
+
+    fn open(&mut self, blob: &[u8]) -> Result<SecretBytes, ProtectorError> {
+        let wrapping = read_wrapping_key()?.ok_or(ProtectorError::Unavailable)?;
+        open_pending_setup(&wrapping, blob)
+    }
+}
+
 // Compile-time trait conformance; no keychain call or platform prompt occurs.
 const _: fn() = || {
     fn check<T: DeviceKeyStore>() {}
     check::<MacKeyStore>(); // retained M2 route, not selected
     check::<MacLoginKeyStore>(); // M1 route, likewise not wired yet
+    fn check_protector<T: PendingSetupProtector>() {}
+    check_protector::<MacPendingSetupProtector>(); // M1, not constructed at startup
 };
 
 #[cfg(test)]
