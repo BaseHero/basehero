@@ -68,6 +68,10 @@ pub struct StagedArtifact {
 }
 
 impl StagedArtifact {
+    #[cfg(test)]
+    pub(crate) fn test_verified(file: std::fs::File, version: u64) -> Self {
+        Self { file, version }
+    }
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -646,6 +650,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let _ = fd;
         // The disk worker is parked after the anonymous file exists. This timer
         // must still run on the only executor thread, even before cancellation.
         timeout(

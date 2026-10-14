@@ -8,6 +8,8 @@
 //! `bh-storage::DeviceDatabase::open`, not to release metadata.
 
 pub mod download;
+#[cfg(any(target_os = "macos", test))]
+pub mod mac_installer;
 
 use std::io::{self, Read};
 
