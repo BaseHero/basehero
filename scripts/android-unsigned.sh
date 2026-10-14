@@ -13,8 +13,13 @@ case "${1:-}" in
   *) echo "usage: bash scripts/android-unsigned.sh [build|check]" >&2; exit 2 ;;
 esac
 
+python3 -m unittest discover -s scripts -p test_android_storage_boundary.py
+
 : "${ANDROID_HOME:?run in nix develop .#android}"
 test -f "$apk"
+merged="$project/app/build/intermediates/merged_manifest/universalRelease/processUniversalReleaseMainManifest/AndroidManifest.xml"
+test -f "$merged"
+python3 scripts/android_storage_boundary.py "$apk" "$ANDROID_HOME/build-tools/35.0.0/aapt" "$merged"
 python3 - "$apk" "$ANDROID_HOME/build-tools/35.0.0/aapt" <<'PY'
 import json
 import re

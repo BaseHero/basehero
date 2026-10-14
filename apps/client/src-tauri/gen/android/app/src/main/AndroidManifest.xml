@@ -6,6 +6,9 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/app_data_extraction_rules"
+        android:fullBackupContent="@xml/app_full_backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.bh_client"
@@ -24,14 +27,5 @@
             </intent-filter>
         </activity>
 
-        <provider
-          android:name="androidx.core.content.FileProvider"
-          android:authorities="${applicationId}.fileprovider"
-          android:exported="false"
-          android:grantUriPermissions="true">
-          <meta-data
-            android:name="android.support.FILE_PROVIDER_PATHS"
-            android:resource="@xml/file_paths" />
-        </provider>
     </application>
 </manifest>

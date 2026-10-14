@@ -1,17 +1,38 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile, access } from "node:fs/promises";
+import { readFile, access, readdir } from "node:fs/promises";
 
 const root = new URL("../", import.meta.url);
 const config = JSON.parse(await readFile(new URL("src-tauri/tauri.conf.json", root), "utf8"));
 const html = await readFile(new URL("ui/index.html", root), "utf8");
 const js = await readFile(new URL("ui/theme.js", root), "utf8");
 
+function capabilitiesIn(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  return parsed.capabilities ?? [parsed];
+}
+
 test("shell bundles its assets and has no privileged capabilities", async () => {
   assert.equal(config.identifier, "app.basehero.client");
   assert.equal(config.build.frontendDist, "../ui");
   assert.equal(config.build.devUrl, undefined);
   assert.deepEqual(config.app.security.capabilities, []);
+
+  // tauri-build watches src-tauri/capabilities; the directory must exist and
+  // every capability in it must grant nothing. A missing directory makes
+  // bh-client rebuild with no changes.
+  const capabilitiesDir = new URL("src-tauri/capabilities/", root);
+  const entries = await readdir(capabilitiesDir, { recursive: true });
+  const capabilityFiles = entries.filter((name) => /\.(json|toml|json5)$/.test(name));
+  assert(capabilityFiles.length > 0, "capabilities/ must hold the committed zero-permission capability");
+  for (const name of capabilityFiles) {
+    assert(name.endsWith(".json"), `capability ${name} must be JSON so the check can parse it`);
+    const parsed = JSON.parse(await readFile(new URL(name, capabilitiesDir), "utf8"));
+    for (const capability of capabilitiesIn(parsed)) {
+      assert.deepEqual(capability.permissions, [], `${name} must grant no permission`);
+    }
+  }
+
   for (const match of html.matchAll(/(?:src|href)="([^"]+)"/g)) {
     assert(!match[1].includes(":") && !match[1].startsWith("/"));
     await access(new URL("ui/" + match[1], root));
