@@ -353,8 +353,10 @@ name = "basehero-models"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "bh-confidential-attestation",
  "bh-crypto",
  "bhttp",
+ "dcap-qvl",
  "futures",
  "futures-util",
  "hex",

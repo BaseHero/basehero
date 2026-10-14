@@ -2,8 +2,8 @@
 
 This library provides bounded chat-completion decoding, per-attempt accounting
 state, an opt-in Tinfoil encrypted transport (`tinfoil-route`) and the opt-in NEAR
-gateway-trust/OHTTP framing increment (`near-route`). NEAR quote and model
-verification, E2EE request dispatch, gateway receipt authentication, durable
+gateway-trust/quote-verification/OHTTP framing increments (`near-route`). NEAR
+model verification, E2EE request dispatch, gateway receipt authentication, durable
 reservations and the activity UI are not implemented here.
 
 ## Response boundary
@@ -62,13 +62,39 @@ count must both be displayed. The caller selects the time window (for example,
 a week) and seals private attribution for authorized readers. This library
 neither authenticates that attribution nor implements report-reader permissions.
 
-## NEAR route (gateway trust and OHTTP framing)
+## NEAR route (gateway trust, quote verification and OHTTP framing)
 
-The `near-route` feature adds `near_route`. `verify_key_config` checks the
-gateway's Ed25519 signature over the raw OHTTP key-configuration bytes against a
-signer the caller obtained from verified gateway evidence, then parses the
-configuration with strict `X25519` + `HKDF-SHA256` + `AES128-GCM` checks. Every
-failure is a fixed, content-free kind.
+The `near-route` feature adds `near_route` and `near_gateway`. `near_gateway::verify`
+appraises the NEAR Cloud Gateway's Intel TDX quote with a separate NEAR policy
+(strict, with `allow_status(OutOfDate)` and unbounded platform/QE grace accepted
+for this gateway by product policy, recording the actual status and advisories),
+binds the verifier's fresh nonce and the pinned service signer in NEAR's
+`signer || nonce` report-data layout, binds the pinned measured app-compose
+SHA-256 to both the quoted `mr_config_id` and the `compose-hash` replayed from
+the dstack RTMR3 log through the shared `bh-confidential-attestation` helper,
+and is the only constructor of `GatewaySigner`.
+`verify_key_config` then checks the gateway's
+Ed25519 signature over the raw OHTTP key-configuration bytes against that
+quote-verified signer, then parses the configuration with strict `X25519` +
+`HKDF-SHA256` + `AES128-GCM` checks. The OHTTP attestation's advertised
+`signing_key` must equal the same signer. Every failure is a fixed,
+content-free kind.
+
+`near_gateway` performs no network I/O, fetches no Intel PCS collateral and reads
+no wall clock: the caller supplies bounded raw quote/collateral/event-log/
+app-compose bytes, a fresh verifier-owned nonce and a trusted conservative time
+interval. The signer and measured-app-compose pins were observed in NEAR's
+attestation report for the reviewed deployment; they are research configuration,
+not policy decisions. Any NEAR redeploy, including a configuration-only change,
+refuses this route until the pins are rechecked and revised, exactly as an
+identity rotation does. The source-commit pin is recorded for the separate
+online provenance step and is not itself verified offline. NEAR model metadata
+and CPU/GPU/NRAS verification, E2EE dispatch, transport and accounting are later
+increments. All tests are offline and the quote/assembly tests are synthetic:
+the QVL appraisal runs on an archived, expired Intel quote and every successful
+assembly mutates that verdict (or uses a synthetic event log) in memory, so they
+prove ordering, binding and policy, not a fresh hardware attestation or a live
+gateway.
 
 `encapsulate` encodes one inner request as BHTTP and seals it as the draft
 `chunked-ohttp` exchange the pinned NEAR Python SDK and Cloud Gateway use: HPKE
@@ -79,8 +105,7 @@ field-encryption headers never move outside the ciphertext. `decapsulate` opens
 the chunked response with the exported-secret HKDF scheme and parses the BHTTP
 response.
 
-This increment performs no network I/O, issues no nonce and verifies no
-hardware. The caller still owns gateway quote/model attestation, authority,
+This increment performs no network I/O. The caller still owns authority,
 allowed-provider and model selection, the single durable dispatch and trusted
 accounting. Tests use synthetic, explicitly unattested keys with real HPKE and
 Ed25519, and run the pinned gateway's own `ohttp`/`bhttp` 0.7.2 server code

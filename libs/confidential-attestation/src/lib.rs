@@ -6,7 +6,9 @@
 
 use bh_confidential_policy::{Build, Role};
 use cc_eventlog::{TdxEvent, replay_events, tdx::validate_v2_preimages};
-use dcap_qvl::{QuoteClaims, QuoteCollateralV3, QuotePolicy, verify::QuoteVerifier};
+use dcap_qvl::{
+    QuoteClaims, QuoteCollateralV3, QuotePolicy, quote::TDReport10, verify::QuoteVerifier,
+};
 
 /// Max raw bytes before any untrusted JSON or quote parser. The archived quote
 /// is 5006 bytes, collateral 16072, and separate dstack log fixture < 19 KiB.
@@ -113,7 +115,21 @@ fn checked_time(time: Option<Time>) -> Result<Time, Error> {
     }
     Ok(time)
 }
-fn quote_claims(quote: &[u8], collateral: &[u8], time: Time) -> Result<QuoteClaims, Error> {
+/// Bounded QVL appraisal using the pinned production ring config and the
+/// caller's policy at **both** ends of `time`. `policy` must build a strict
+/// policy from each trusted instant; this helper supplies no default. It returns
+/// unbound QVL claims: no report_data binding, measurement acceptance, key
+/// possession or authority. The caller owns all of those separately.
+pub fn quote_claims_with_policy<F>(
+    quote: &[u8],
+    collateral: &[u8],
+    time: Time,
+    policy: F,
+) -> Result<QuoteClaims, Error>
+where
+    F: Fn(u64) -> QuotePolicy,
+{
+    let time = checked_time(Some(time))?;
     check_size(quote)?;
     check_size(collateral)?;
     let collateral: QuoteCollateralV3 =
@@ -121,25 +137,49 @@ fn quote_claims(quote: &[u8], collateral: &[u8], time: Time) -> Result<QuoteClai
     // Explicit ring config, even if another dependency enables QVL's rustcrypto
     // feature via Cargo feature unification. No report/PCCS network feature.
     let verifier = QuoteVerifier::new_prod().with_config::<dcap_qvl::configs::RingConfig>();
-    let appraisal = |now| {
-        QuotePolicy::strict(now)
-            .allow_smt(true)
-            .allow_dynamic_platform(true)
-            .allow_cached_keys(true)
-    };
     // Check both ends: latest alone would accept a not-yet-valid certificate at
     // earliest. QVL checks Intel signatures, chains, CRLs, TCB and time at each.
     let first = verifier
-        .verify_with_policy(quote, &collateral, time.earliest, &appraisal(time.earliest))
+        .verify_with_policy(quote, &collateral, time.earliest, &policy(time.earliest))
         .map_err(|_| Error::Quote)?;
     if time.latest != time.earliest {
         verifier
-            .verify_with_policy(quote, &collateral, time.latest, &appraisal(time.latest))
+            .verify_with_policy(quote, &collateral, time.latest, &policy(time.latest))
             .map_err(|_| Error::Quote)?;
     }
     Ok(first)
 }
-fn compose(log: &[u8], rtmr3: &[u8; 48]) -> Result<[u8; 32], Error> {
+
+/// This crate's own runner policy: strict UpToDate at both ends, accepting the
+/// platform flags, as the reference SDK does.
+fn worker_policy(now: u64) -> QuotePolicy {
+    QuotePolicy::strict(now)
+        .allow_smt(true)
+        .allow_dynamic_platform(true)
+        .allow_cached_keys(true)
+}
+fn quote_claims(quote: &[u8], collateral: &[u8], time: Time) -> Result<QuoteClaims, Error> {
+    quote_claims_with_policy(quote, collateral, time, worker_policy)
+}
+
+/// Reject a report that is not TD1.0/1.5, a PPID that is not 16 bytes, or TD
+/// attributes that enable debug or migration. Returns the TD1.0/1.5 body so the
+/// caller can bind its own keys and measurements. The returned report is an
+/// authenticated QVL claim, not an accepted measurement or authority.
+pub fn check_td10(claims: &QuoteClaims) -> Result<&TDReport10, Error> {
+    let td = claims.report.as_td10().ok_or(Error::Quote)?;
+    if claims.platform.pck.ppid.len() != 16 {
+        return Err(Error::Quote);
+    }
+    if td.td_attributes[0] != 0 || td.td_attributes[3] & 0x20 != 0 {
+        return Err(Error::Quote);
+    }
+    Ok(td)
+}
+/// Bounded dstack RTMR3 replay. Returns only the one `compose-hash` payload after
+/// folding the imr-3 log into `rtmr3`; it performs no report_data binding,
+/// measurement acceptance, image policy or authority of its own.
+pub fn compose(log: &[u8], rtmr3: &[u8; 48]) -> Result<[u8; 32], Error> {
     check_size(log)?;
     let events: Vec<TdxEvent> = serde_json::from_slice(log).map_err(|_| Error::Encoding)?;
     if events.len() > MAX_EVENTS
@@ -207,17 +247,11 @@ fn assemble(
     event_log: &[u8],
     expected: &Expected,
 ) -> Result<Measured, Error> {
-    let td = claims.report.as_td10().ok_or(Error::Quote)?;
-    if claims.platform.pck.ppid.len() != 16 {
-        return Err(Error::Quote);
-    }
-    if td.td_attributes[0] != 0 || td.td_attributes[3] & 0x20 != 0 {
-        return Err(Error::Quote);
-    }
-    if td.report_data != report_data(&expected.signing, &expected.receiving, &expected.nonce) {
+    let td10 = check_td10(claims)?;
+    if td10.report_data != report_data(&expected.signing, &expected.receiving, &expected.nonce) {
         return Err(Error::Binding);
     }
-    let compose_sha256 = compose(event_log, &td.rt_mr3)?;
+    let compose_sha256 = compose(event_log, &td10.rt_mr3)?;
     Ok(Measured {
         signing: expected.signing,
         receiving: expected.receiving,
@@ -225,10 +259,10 @@ fn assemble(
             role: expected.role,
             compose_sha256,
             boot: [
-                td.mr_td.to_vec(),
-                td.rt_mr0.to_vec(),
-                td.rt_mr1.to_vec(),
-                td.rt_mr2.to_vec(),
+                td10.mr_td.to_vec(),
+                td10.rt_mr0.to_vec(),
+                td10.rt_mr1.to_vec(),
+                td10.rt_mr2.to_vec(),
             ],
         },
         machine: bh_crypto::sha256(&claims.platform.pck.ppid),
@@ -239,6 +273,7 @@ fn assemble(
 mod tests {
     use super::*;
     use dcap_qvl::quote::Quote;
+    use dcap_qvl::{Policy as _, TcbStatus};
     use parity_scale_codec::Decode;
     const QUOTE: &[u8] = include_bytes!("../tests/fixtures/tdx_quote");
     const COLLATERAL: &[u8] = include_bytes!("../tests/fixtures/tdx_quote_collateral.json");
@@ -472,6 +507,111 @@ mod tests {
         );
         // Both registers above were recomputed, not taken from a signed quote.
     }
+    #[test]
+    fn public_qvl_helper_takes_the_caller_policy_and_keeps_both_time_ends() {
+        let lenient = |now: u64| {
+            QuotePolicy::strict(now)
+                .allow_smt(true)
+                .allow_dynamic_platform(true)
+                .allow_cached_keys(true)
+        };
+        let claims = quote_claims_with_policy(
+            QUOTE,
+            COLLATERAL,
+            interval(1_751_328_000, 1_751_328_001),
+            lenient,
+        )
+        .unwrap();
+        assert!(claims.report.as_td10().is_some());
+        // There is no default relaxed policy: plain strict rejects the archived
+        // quote, so the caller's builder is what decides.
+        assert_eq!(
+            quote_claims_with_policy(
+                QUOTE,
+                COLLATERAL,
+                interval(1_751_328_000, 1_751_328_001),
+                QuotePolicy::strict,
+            )
+            .err(),
+            Some(Error::Quote)
+        );
+        // The caller's policy is applied at each end, not only the latest: the
+        // earliest instant is valid but the latest is past collateral expiry, so
+        // a helper that appraised only the earliest end would wrongly return Ok.
+        let spanning = Time {
+            earliest: 1_751_328_000,
+            latest: claims.earliest_expiration_date + 1,
+            max_uncertainty_secs: u64::MAX,
+        };
+        assert_eq!(
+            quote_claims_with_policy(QUOTE, COLLATERAL, spanning, lenient).err(),
+            Some(Error::Quote)
+        );
+        // Bounds stay inside the public helper.
+        assert_eq!(
+            quote_claims_with_policy(
+                &vec![0u8; MAX_INPUT_BYTES + 1],
+                COLLATERAL,
+                interval(1_751_328_000, 1_751_328_001),
+                lenient,
+            )
+            .err(),
+            Some(Error::TooLarge)
+        );
+        // The helper itself bounds trusted time, so a direct public caller
+        // cannot smuggle in an inverted or over-wide interval.
+        for uncertain in [interval(1_751_328_001, 1_751_328_000), interval(0, 61)] {
+            assert_eq!(
+                quote_claims_with_policy(QUOTE, COLLATERAL, uncertain, lenient).err(),
+                Some(Error::TimeUncertain)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_policy_rejects_real_out_of_date_levels() {
+        let claims =
+            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_001)).unwrap();
+        let now = 1_751_328_000;
+
+        // A real merged `OutOfDate` verdict converges with an `OutOfDate`
+        // platform level whose Intel `tcb_date_tag` is in the past. The worker
+        // policy still requires UpToDate; only the gateway policy accepts it.
+        let mut platform = claims.clone();
+        platform.tcb.status = TcbStatus::OutOfDate;
+        platform.platform.tcb_level.tcb_status = TcbStatus::OutOfDate;
+        assert!(platform.platform.tcb_date_tag < now);
+        assert!(worker_policy(now).validate(&platform).is_err());
+
+        // Separately, a real `OutOfDate` QE level with a real past `tcb_date`.
+        let mut qe = claims.clone();
+        qe.tcb.status = TcbStatus::OutOfDate;
+        qe.qe.tcb_level.tcb_status = TcbStatus::OutOfDate;
+        assert!(worker_policy(now).validate(&qe).is_err());
+    }
+
+    #[test]
+    fn shared_td10_check_rejects_debug_migration_and_wrong_ppid_and_compose_is_public() {
+        fn td10(claims: &QuoteClaims) -> &dcap_qvl::quote::TDReport10 {
+            check_td10(claims).unwrap()
+        }
+        let claims =
+            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_001)).unwrap();
+        assert_eq!(td10(&claims).rt_mr3.len(), 48);
+        for (index, bit) in [(0, 1u8), (3, 0x20u8)] {
+            let mut bad = claims.clone();
+            if let dcap_qvl::quote::Report::TD10(td) = &mut bad.report {
+                td.td_attributes[index] |= bit;
+            }
+            assert_eq!(check_td10(&bad).err(), Some(Error::Quote));
+        }
+        let mut bad = claims.clone();
+        bad.platform.pck.ppid.pop();
+        assert_eq!(check_td10(&bad).err(), Some(Error::Quote));
+        let (events, register) = log_and_register();
+        assert!(compose(&serde_json::to_vec(&events).unwrap(), &register).is_ok());
+    }
+
     #[test]
     fn runtime_preimages_digests_composition_and_count_fail_closed() {
         let (events, register) = log_and_register();

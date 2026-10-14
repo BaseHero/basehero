@@ -2,6 +2,8 @@
 
 pub mod accounting;
 #[cfg(feature = "near-route")]
+pub mod near_gateway;
+#[cfg(feature = "near-route")]
 pub mod near_route;
 pub mod response;
 #[cfg(feature = "tinfoil-route")]

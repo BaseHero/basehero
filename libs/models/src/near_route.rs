@@ -1,10 +1,10 @@
-//! Fixed NEAR Cloud Gateway trust and OHTTP/BHTTP framing.
+//! Fixed NEAR Cloud Gateway OHTTP/BHTTP framing.
 //!
 //! This module verifies an Ed25519-signed OHTTP key configuration against a
-//! quote-verified gateway signer and encapsulates/decapsulates the draft
-//! `chunked-ohttp` exchange the pinned NEAR Python SDK and Cloud Gateway both
-//! use. It performs no network I/O, issues no nonce and verifies no hardware:
-//! the caller owns attestation, authority, accounting and the single dispatch.
+//! [`GatewaySigner`] produced only by `near_gateway::verify` from a verified
+//! gateway quote, and encapsulates/decapsulates the draft `chunked-ohttp`
+//! exchange the pinned NEAR Python SDK and Cloud Gateway both use. It performs no
+//! network I/O: the caller owns authority, accounting and the single dispatch.
 //! Test keys are synthetic and prove protocol/ordering, never hardware.
 
 use aes_gcm::{
@@ -61,9 +61,9 @@ impl fmt::Display for NearError {
 }
 impl std::error::Error for NearError {}
 
-/// A quote-bound gateway signing key (Ed25519, 32 bytes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GatewaySigner(pub [u8; 32]);
+/// A quote-bound gateway signing key (Ed25519, 32 bytes). Defined and built in
+/// `near_gateway` so the only production constructor is verified evidence.
+pub use crate::near_gateway::GatewaySigner;
 
 /// Parsed OHTTP key configuration restricted to X25519 + HKDF-SHA256 +
 /// AES128-GCM. Only `verify_key_config` constructs it.
@@ -105,15 +105,17 @@ pub struct BhttpResponse {
     pub body: Vec<u8>,
 }
 
-/// Verify the Ed25519 signature over the raw key-config bytes against a
-/// gateway signer, then parse with strict suite checks.
+/// Verify the Ed25519 signature over the raw key-config bytes against a gateway
+/// signer built only by `near_gateway::verify`, then parse with strict suite
+/// checks. The OHTTP attestation's advertised `signing_key` must also equal that
+/// signer (checked by the adapter).
 pub fn verify_key_config(
     raw: &[u8],
     signature: &[u8],
     signer: &GatewaySigner,
 ) -> Result<GatewayKeyConfig, NearError> {
     let signature: &[u8; 64] = signature.try_into().map_err(|_| NearError::InvalidSigner)?;
-    bh_crypto::verify(&signer.0, raw, signature).map_err(|_| NearError::InvalidSigner)?;
+    bh_crypto::verify(signer.public_key(), raw, signature).map_err(|_| NearError::InvalidSigner)?;
     parse_key_config(raw)
 }
 

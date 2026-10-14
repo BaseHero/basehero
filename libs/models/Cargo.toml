@@ -27,6 +27,11 @@ hkdf = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 # Ed25519 verify for the gateway-signed OHTTP key config (libsodium, as the SDK).
 bh-crypto = { workspace = true, optional = true }
+# NEAR gateway quote verification. Reuses the bounded, provider-neutral QVL
+# appraisal and RTMR3 replay helpers in bh-confidential-attestation; the NEAR
+# policy and result types live here.
+bh-confidential-attestation = { path = "../confidential-attestation", optional = true }
+dcap-qvl = { workspace = true, optional = true }
 
 [features]
 tinfoil-route = [
@@ -37,6 +42,7 @@ tinfoil-route = [
 near-route = [
   "dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex",
   "dep:hkdf", "dep:sha2", "dep:bh-crypto",
+  "dep:bh-confidential-attestation", "dep:dcap-qvl",
 ]
 
 [dev-dependencies]

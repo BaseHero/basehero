@@ -96,7 +96,7 @@ fn fixture_with_suites(suites: &[(u16, u16)]) -> Fixture {
         config_bytes.extend_from_slice(&aead.to_be_bytes());
     }
     let signing = SigningKey::generate();
-    let signer = GatewaySigner(signing.public());
+    let signer = GatewaySigner::for_tests(signing.public());
     let signature = sign_config(&signing, &config_bytes);
     let config = verify_key_config(&config_bytes, &signature, &signer).unwrap();
     Fixture {
@@ -400,7 +400,7 @@ fn key_config_rejects_signature_signer_and_format_substitutions() {
         Err(NearError::InvalidSigner)
     );
 
-    let other = GatewaySigner(SigningKey::generate().public());
+    let other = GatewaySigner::for_tests(SigningKey::generate().public());
     assert_eq!(
         verify_key_config(&fixture.config_bytes, &fixture.signature, &other),
         Err(NearError::InvalidSigner)
@@ -906,7 +906,7 @@ fn interop_with_gateway_ohttp_072_server() {
         .unwrap();
         let raw = config.encode().unwrap();
         let signing = SigningKey::generate();
-        let signer = GatewaySigner(signing.public());
+        let signer = GatewaySigner::for_tests(signing.public());
         let ours = verify_key_config(&raw, &signing.sign(&raw), &signer).unwrap();
 
         let server = ohttp::Server::new(config).unwrap();
