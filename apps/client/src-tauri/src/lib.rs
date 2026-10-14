@@ -2,13 +2,14 @@
 
 #[cfg(target_os = "macos")]
 mod native;
+mod note_host;
 
 #[cfg(feature = "webdriver")]
 mod webdriver;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    let builder = note_host::builder();
     #[cfg(feature = "webdriver")]
     let builder = webdriver::register(builder);
     builder

@@ -1,16 +1,20 @@
 //! Device-local SQLite ownership and open-time compatibility checks.
 //!
-//! This adapter stores the device's local note deltas and pending-work
-//! references, and the typed opaque account journal (anchor, signed events,
-//! head, sticky stop, device identity, pending setup). It is not connected to
-//! the app and holds no user data. Pending local work is not an authenticated
-//! network event. Authority and rebuildable indexes stay apart.
+//! This adapter stores the device's local note deltas, pending-work references,
+//! each sealed pending outbound package and its exact ordered acknowledgement,
+//! and the typed opaque account journal (anchor, signed events, head, sticky
+//! stop, device identity, pending setup). The native app holds a database when
+//! a session installs one; no production session supplies a note binding yet.
+//! Pending local work is not an authenticated network event. Authority and
+//! rebuildable indexes stay apart.
 
 pub mod account;
+pub mod coordinator;
 
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use bh_core::{LOCAL_DATA_VERSION, check_local_data_version, note::Note};
+use bh_sync::{BodyObject, Commitment, EventId, OpaqueEvent, referenced_body};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
@@ -51,6 +55,14 @@ pub enum StoreError {
     CorruptAccount,
     #[error("account head has no matching stored signed bytes")]
     HeadWithoutBytes,
+    #[error("pending update not found")]
+    MissingPending,
+    #[error("invalid sealed package")]
+    InvalidPackage,
+    #[error("ordered acknowledgement conflicts with stored package or acknowledgement")]
+    AckConflict,
+    #[error("stored outbox package is inconsistent")]
+    CorruptOutbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +77,16 @@ pub struct PendingNoteUpdate {
     pub update_id: i64,
     pub key: NoteKey,
     pub bytes: Vec<u8>,
+}
+
+/// Immutable package: retain even after an Ack to reconcile duplicate receipts.
+/// Acknowledgement input is a checked, exact `Commitment`; its provenance and
+/// current service authority must be established by the caller before using it.
+pub struct StoredNotePackage {
+    pub event_id: EventId,
+    pub descriptor: OpaqueEvent,
+    pub body: Vec<u8>,
+    pub ack: Option<Commitment>,
 }
 
 impl DeviceDatabase {
@@ -190,6 +212,111 @@ impl DeviceDatabase {
         })
     }
 
+    /// Reserve a fresh wire identity and seal *once*, while holding the write
+    /// lock. The caller supplies real authority/keys to the encoder; it receives
+    /// this exact pending row, not an inferred account session. Failed commits
+    /// publish no package. Reopening never re-invokes the encoder for this row.
+    pub fn package_note_update(
+        &mut self,
+        update_id: i64,
+        seal: impl FnOnce(EventId, &PendingNoteUpdate) -> Result<(OpaqueEvent, BodyObject), StoreError>,
+    ) -> Result<StoredNotePackage, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx.query_row(
+            "SELECT u.base,u.audience,u.note,u.delta FROM note_updates u JOIN pending_note_work p ON p.update_id=u.id WHERE u.id=?1",
+            [update_id], |r| Ok((r.get::<_, Vec<u8>>(0)?,r.get::<_, Vec<u8>>(1)?,r.get::<_, Vec<u8>>(2)?,r.get::<_, Vec<u8>>(3)?)),
+        ).optional()?;
+        let existing = read_package(&tx, update_id)?;
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        let (base, audience, note, bytes) = row.ok_or(StoreError::MissingPending)?;
+        let key = NoteKey {
+            base: base.try_into().map_err(|_| StoreError::CorruptOutbox)?,
+            audience: audience.try_into().map_err(|_| StoreError::CorruptOutbox)?,
+            note: note.try_into().map_err(|_| StoreError::CorruptOutbox)?,
+        };
+        let pending = PendingNoteUpdate {
+            update_id,
+            key,
+            bytes,
+        };
+        let id = EventId(bh_crypto::random::<32>());
+        let (descriptor, body) = seal(id, &pending)?;
+        if id.0 == [0; 32]
+            || descriptor.id() != id
+            || referenced_body(&descriptor).map_err(|_| StoreError::InvalidPackage)?
+                != body.commitment()
+        {
+            return Err(StoreError::InvalidPackage);
+        }
+        tx.execute(
+            "INSERT INTO note_outbox(update_id,event_id,descriptor,body) VALUES (?1,?2,?3,?4)",
+            params![
+                update_id,
+                id.0.as_slice(),
+                descriptor.encode(),
+                body.bytes()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(StoredNotePackage {
+            event_id: id,
+            descriptor,
+            body: body.bytes().to_vec(),
+            ack: None,
+        })
+    }
+
+    /// Match the complete ordered record to the immutable descriptor before
+    /// retiring the pending row. A duplicate Ack must match byte-for-byte.
+    pub fn acknowledge_note_update(
+        &mut self,
+        update_id: i64,
+        ack: &Commitment,
+    ) -> Result<bool, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = read_package(&tx, update_id)?.ok_or(StoreError::MissingPending)?;
+        if ack.base().0
+            != tx
+                .query_row(
+                    "SELECT base FROM note_updates WHERE id=?1",
+                    [update_id],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )?
+                .as_slice()
+            || ack.verify_body(&stored.descriptor).is_err()
+        {
+            return Err(StoreError::AckConflict);
+        }
+        if let Some(existing) = stored.ack {
+            return if existing.encode() == ack.encode() {
+                Ok(false)
+            } else {
+                Err(StoreError::AckConflict)
+            };
+        }
+        // The caller verifies the ordered chain and authenticates the receipt;
+        // this store checks only exact byte identity against its sealed package.
+        tx.execute(
+            "UPDATE note_outbox SET ack=?2 WHERE update_id=?1",
+            params![update_id, ack.encode()],
+        )?;
+        if tx.execute(
+            "DELETE FROM pending_note_work WHERE update_id=?1",
+            [update_id],
+        )? != 1
+        {
+            return Err(StoreError::CorruptOutbox);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn pending_note_updates(&self) -> Result<Vec<PendingNoteUpdate>, StoreError> {
         let mut stmt = self.connection.prepare("SELECT u.id,u.base,u.audience,u.note,u.delta FROM note_updates u JOIN pending_note_work p ON p.update_id=u.id ORDER BY u.id")?;
         let rows = stmt.query_map([], |row| {
@@ -218,6 +345,50 @@ impl DeviceDatabase {
     }
 }
 
+fn read_package(
+    connection: &Connection,
+    update_id: i64,
+) -> Result<Option<StoredNotePackage>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT event_id,descriptor,body,ack FROM note_outbox WHERE update_id=?1",
+            [update_id],
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, descriptor, body, ack)) = row else {
+        return Ok(None);
+    };
+    let event_id = EventId(id.try_into().map_err(|_| StoreError::CorruptOutbox)?);
+    let descriptor = OpaqueEvent::decode(&descriptor).map_err(|_| StoreError::CorruptOutbox)?;
+    let object = BodyObject::new(body).map_err(|_| StoreError::CorruptOutbox)?;
+    if descriptor.id() != event_id
+        || referenced_body(&descriptor).map_err(|_| StoreError::CorruptOutbox)?
+            != object.commitment()
+    {
+        return Err(StoreError::CorruptOutbox);
+    }
+    let ack = ack
+        .map(|bytes| Commitment::decode(&bytes).map_err(|_| StoreError::CorruptOutbox))
+        .transpose()?;
+    if ack.is_some_and(|record| record.verify_body(&descriptor).is_err()) {
+        return Err(StoreError::CorruptOutbox);
+    }
+    Ok(Some(StoredNotePackage {
+        event_id,
+        descriptor,
+        body: object.bytes().to_vec(),
+        ack,
+    }))
+}
+
 fn version(connection: &Connection) -> Result<u32, OpenError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
@@ -233,7 +404,11 @@ fn ensure_supported(found: u32) -> Result<(), OpenError> {
 /// step and its version marker commit together, so a failed step leaves the
 /// prior layout intact. Step `(0, 2)` keeps the original empty/v1 note layout.
 type Migration = fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>;
-const MIGRATIONS: &[(u32, u32, Migration)] = &[(0, 2, migrate_v1_to_v2), (2, 3, migrate_v2_to_v3)];
+const MIGRATIONS: &[(u32, u32, Migration)] = &[
+    (0, 2, migrate_v1_to_v2),
+    (2, 3, migrate_v2_to_v3),
+    (3, 4, migrate_v3_to_v4),
+];
 
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
     // `open` already refused newer data before changing the journal mode. Each
@@ -310,6 +485,20 @@ fn migrate_v2_to_v3(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result
             kit_saved INTEGER NOT NULL CHECK(kit_saved IN (0,1)),
             blob BLOB NOT NULL
         );",
+    )
+}
+
+fn migrate_v3_to_v4(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // Ordinary bases only. Hidden content must never use these plaintext note
+    // tables; its isolated encrypted domain requires a separate migration.
+    transaction.execute_batch(
+        "CREATE TABLE note_outbox (
+        update_id INTEGER PRIMARY KEY REFERENCES note_updates(id),
+        event_id BLOB NOT NULL UNIQUE CHECK(length(event_id)=32),
+        descriptor BLOB NOT NULL,
+        body BLOB NOT NULL,
+        ack BLOB
+    );",
     )
 }
 

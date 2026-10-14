@@ -21,6 +21,9 @@ tauri-build.workspace = true
 
 [dependencies]
 tauri.workspace = true
+bh-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tauri-plugin-webdriver = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

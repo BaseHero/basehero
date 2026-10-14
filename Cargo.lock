@@ -460,7 +460,10 @@ version = "0.1.0"
 dependencies = [
  "bh-account",
  "bh-mac-local-auth",
+ "bh-storage",
  "security-framework",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-webdriver",
@@ -621,7 +624,11 @@ dependencies = [
 name = "bh-storage"
 version = "0.1.0"
 dependencies = [
+ "bh-account",
  "bh-core",
+ "bh-crypto",
+ "bh-event",
+ "bh-sync",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.21",

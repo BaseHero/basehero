@@ -12,24 +12,30 @@ function capabilitiesIn(parsed) {
   return parsed.capabilities ?? [parsed];
 }
 
-test("shell bundles its assets and has no privileged capabilities", async () => {
+test("shell bundles its assets and grants only the scoped native note commands", async () => {
   assert.equal(config.identifier, "app.basehero.client");
   assert.equal(config.build.frontendDist, "../ui");
   assert.equal(config.build.devUrl, undefined);
-  assert.deepEqual(config.app.security.capabilities, []);
+  assert.deepEqual(config.app.security.capabilities, ["basehero-client-notes"]);
+  const build = await readFile(new URL("src-tauri/build.rs", root), "utf8");
+  for (const command of ["note_binding", "note_open", "note_commit", "note_close"]) {
+    assert(build.includes(`"${command}"`), `app command ${command} needs an ACL manifest`);
+  }
 
-  // tauri-build watches src-tauri/capabilities; the directory must exist and
-  // every capability in it must grant nothing. A missing directory makes
-  // bh-client rebuild with no changes.
+  // Explicit app-manifest commands require individual permissions. No plugin
+  // permissions (especially core:default), broad default or remote origins.
   const capabilitiesDir = new URL("src-tauri/capabilities/", root);
   const entries = await readdir(capabilitiesDir, { recursive: true });
   const capabilityFiles = entries.filter((name) => /\.(json|toml|json5)$/.test(name));
-  assert(capabilityFiles.length > 0, "capabilities/ must hold the committed zero-permission capability");
+  assert.deepEqual(capabilityFiles, ["shell.json"]);
   for (const name of capabilityFiles) {
     assert(name.endsWith(".json"), `capability ${name} must be JSON so the check can parse it`);
     const parsed = JSON.parse(await readFile(new URL(name, capabilitiesDir), "utf8"));
     for (const capability of capabilitiesIn(parsed)) {
-      assert.deepEqual(capability.permissions, [], `${name} must grant no permission`);
+      assert.equal(capability.identifier, "basehero-client-notes");
+      assert.deepEqual(capability.windows, ["main", "note-*"]);
+      assert.deepEqual(capability.permissions, ["allow-note-binding", "allow-note-open", "allow-note-commit", "allow-note-close"]);
+      assert.equal(capability.remote, undefined);
     }
   }
 

@@ -8,11 +8,15 @@ publish.workspace = true
 
 [dependencies]
 bh-core.workspace = true
+bh-sync.workspace = true
+bh-crypto.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+bh-account.workspace = true
+bh-event.workspace = true
 
 [lints]
 workspace = true

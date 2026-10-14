@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-note-commit"
+description = "Enables the note_commit command without any pre-configured scope."
+commands.allow = ["note_commit"]
+
+[[permission]]
+identifier = "deny-note-commit"
+description = "Denies the note_commit command without any pre-configured scope."
+commands.deny = ["note_commit"]

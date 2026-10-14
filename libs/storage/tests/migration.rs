@@ -66,6 +66,7 @@ fn fresh_open_applies_every_migration_step() {
         "account_events",
         "account_device",
         "account_pending_setup",
+        "note_outbox",
     ] {
         assert!(table_exists(&connection, table), "missing {table}");
     }
@@ -104,6 +105,54 @@ fn opens_v2_with_existing_notes_and_adds_account_tables() {
     assert_eq!(version(&connection), LOCAL_DATA_VERSION);
     assert!(table_exists(&connection, "account_state"));
     assert!(table_exists(&connection, "account_events"));
+}
+
+#[test]
+fn v3_to_v4_preserves_pending_notes_and_account_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.sqlite");
+    {
+        let mut db = DeviceDatabase::open(&path).unwrap();
+        let mut note = bh_core::note::Note::new();
+        let delta = note.append_paragraph("existing");
+        let key = bh_storage::NoteKey {
+            base: [1; 32],
+            audience: [2; 32],
+            note: [3; 32],
+        };
+        db.apply_local_update(key, [4; 16], &delta).unwrap();
+        db.commit_account_verified([9; 32], &[b"genesis"], 1, [5; 32], false)
+            .unwrap();
+    }
+    // Recreate the previously shipped v3 layout exactly: the only v4 schema
+    // addition is note_outbox. Keep the actual note and account rows untouched.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE note_outbox; PRAGMA user_version=3")
+        .unwrap();
+    drop(conn);
+    let db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.pending_note_updates().unwrap().len(), 1);
+    assert_eq!(db.account_history().unwrap(), vec![b"genesis".to_vec()]);
+    assert_eq!(db.account_state().unwrap().unwrap().head_position, 1);
+    assert_eq!(version(&Connection::open(&path).unwrap()), 4);
+}
+
+#[test]
+fn failed_v4_migration_rolls_back_marker_and_keeps_v3_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3-failed.sqlite");
+    drop(DeviceDatabase::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE note_outbox; PRAGMA user_version=3; CREATE TABLE note_outbox (bogus INTEGER)",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(DeviceDatabase::open(&path).is_err());
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(version(&conn), 3);
+    assert!(table_exists(&conn, "account_state"));
+    assert!(table_exists(&conn, "note_updates"));
 }
 
 #[test]

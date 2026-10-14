@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "basehero-client-shell",
-  "description": "The BaseHero client shell. It is deliberately granted no IPC permissions. This file keeps tauri-build's capabilities watch path present so bh-client is not rebuilt on every build.",
-  "windows": ["main"],
-  "permissions": []
+  "identifier": "basehero-client-notes",
+  "description": "Only the bound note interface on the client window; no core or plugin permissions.",
+  "windows": ["main", "note-*"],
+  "permissions": ["allow-note-binding", "allow-note-open", "allow-note-commit", "allow-note-close"]
 }

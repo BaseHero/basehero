@@ -84,10 +84,13 @@ The client identifier is `app.basehero.client` and must remain stable across upd
 
 ## Developer boundaries
 
-The shell currently shows a setup screen; the libraries are not a complete app
-account or hosted sync flow. `libs/storage` keeps transactional note
-updates and pending local work; those are not signed network event IDs.
-The bundled note editor is not mounted by the shell; it classifies canonical
+The native host mounts the bundled note editor only when a note is bound to
+its window. No production account session supplies a binding yet, so the shell
+still shows setup; the libraries are not a complete app account or hosted sync
+flow. `libs/storage` keeps transactional note updates and pending local work
+(those are not signed network event IDs), each sealed pending outbound package
+and its exact ordered acknowledgement. Native note commands open and commit
+bound notes before acknowledging the editor. The editor classifies canonical
 Yjs state against `note-schema/v1.json`, displays unsupported notes read-only
 with inert placeholders, and uses a real EditorView for supported ones. Rust
 checks the same inventory.
