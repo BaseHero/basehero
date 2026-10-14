@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["libs/*", "services/*", "apps/client/src-tauri", "tests/system", "tests/crypto-worker"]
+members = ["libs/*", "services/*", "apps/client/src-tauri", "apps/client/plugins/device-keys", "tests/system", "tests/crypto-worker"]
 default-members = ["libs/*", "services/*", "tests/system"]
 exclude = ["third_party/dstack"]
 
@@ -13,6 +13,9 @@ publish = false
 
 [workspace.dependencies]
 bh-account = { path = "libs/account" }
+# Android's JNI bridge uses the same jni/ndk-context releases already locked by Tauri.
+jni = "=0.21.1"
+ndk-context = "=0.1.1"
 bh-core = { path = "libs/core" }
 bh-crypto = { path = "libs/crypto" }
 bh-event = { path = "libs/event" }

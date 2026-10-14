@@ -51,6 +51,13 @@ case "${1:-portable}" in
   android)
     cargo build --locked --target aarch64-linux-android -p bh-core -p bh-storage -p bh-client --lib
     ;;
+  android-device-keys)
+    cargo clippy --locked --target aarch64-linux-android -p bh-device-keys --all-targets -- -D warnings
+    cargo check --locked --target aarch64-linux-android -p bh-device-keys
+    # The Android shell has target libsodium only; host tests need the default shell.
+    nix develop --command cargo test --locked -p bh-device-keys
+    apps/client/src-tauri/gen/android/gradlew -p apps/client/plugins/device-keys/android testDebugUnitTest assembleRelease --no-daemon
+    ;;
   android-crypto)
     artifacts=$(mktemp)
     trap 'rm -f "$artifacts"' EXIT
@@ -88,7 +95,7 @@ case "${1:-portable}" in
     bash apps/client/tests/webdriver/run-android.sh
     ;;
   *)
-    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-crypto|wasm|wasm-crypto|wasm-sync|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
+    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-device-keys|android-crypto|wasm|wasm-crypto|wasm-sync|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
     exit 2
     ;;
 esac

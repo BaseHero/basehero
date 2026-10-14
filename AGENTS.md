@@ -37,6 +37,10 @@ From this directory, in `nix develop` or with README prerequisites installed:
 - Android libraries: `nix develop .#android --command bash scripts/check.sh android`.
 - Android crypto/release link proof (separate from fast default checks):
   `nix develop .#android --command bash scripts/check.sh android-crypto`.
+- Inactive Android device-key plugin (not a client dependency):
+  `nix develop .#android --command bash scripts/check.sh android-device-keys`
+  checks the target crate and standalone Android library module. This is source
+  and JVM evidence, not Keystore/biometric runtime evidence.
 - Wasm portable core: `bash scripts/check.sh wasm`.
 - Worker Wasm hash/Ed25519 verifier (pinned libsodium and local workerd): `bash scripts/check.sh wasm-crypto`.
 - Internal Worker SQLite DO adapter (native-signed local fixtures, pinned Wasm and workerd): `bash scripts/check.sh wasm-sync`.

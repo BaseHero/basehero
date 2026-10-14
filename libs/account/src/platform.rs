@@ -27,6 +27,7 @@ pub enum ControlKeyPolicy {
 pub enum DeviceKeyStoreKind {
     MacLoginKeychainV1,
     MacDataProtectionKeychainV1,
+    AndroidKeystoreV1,
 }
 
 #[derive(Clone)]

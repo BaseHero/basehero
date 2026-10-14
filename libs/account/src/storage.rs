@@ -54,6 +54,7 @@ fn kind_code(kind: DeviceKeyStoreKind) -> u8 {
     match kind {
         DeviceKeyStoreKind::MacLoginKeychainV1 => 0,
         DeviceKeyStoreKind::MacDataProtectionKeychainV1 => 1,
+        DeviceKeyStoreKind::AndroidKeystoreV1 => 2,
     }
 }
 
@@ -61,6 +62,7 @@ fn kind_from_code(code: u8) -> Option<DeviceKeyStoreKind> {
     match code {
         0 => Some(DeviceKeyStoreKind::MacLoginKeychainV1),
         1 => Some(DeviceKeyStoreKind::MacDataProtectionKeychainV1),
+        2 => Some(DeviceKeyStoreKind::AndroidKeystoreV1),
         _ => None,
     }
 }
@@ -165,5 +167,26 @@ impl AccountJournal for DeviceJournal {
         self.database
             .clear_pending_setup()
             .map_err(|_| JournalError::Storage)
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn android_lineage_round_trips_without_becoming_a_mac_store() {
+        let android = DeviceKeyStoreKind::AndroidKeystoreV1;
+        assert_eq!(kind_code(android), 2);
+        assert_eq!(kind_from_code(2), Some(android));
+        assert_eq!(
+            kind_from_code(0),
+            Some(DeviceKeyStoreKind::MacLoginKeychainV1)
+        );
+        assert_eq!(
+            kind_from_code(1),
+            Some(DeviceKeyStoreKind::MacDataProtectionKeychainV1)
+        );
+        assert_eq!(kind_from_code(3), None);
     }
 }

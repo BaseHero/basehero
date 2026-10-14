@@ -528,6 +528,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bh-device-keys"
+version = "0.1.0"
+dependencies = [
+ "bh-account",
+ "bh-crypto",
+ "jni 0.21.1",
+ "ndk-context",
+ "tauri",
+]
+
+[[package]]
 name = "bh-event"
 version = "0.1.0"
 dependencies = [
