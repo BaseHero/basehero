@@ -6,6 +6,12 @@
 .note-content { min-height: 180px; padding: 12px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .note-content .ProseMirror { min-height: 180px; outline: none; }
 .note-content .ProseMirror:focus-visible { outline: 2px solid var(--yellow); outline-offset: 4px; }
+/* A window's own selection remains locatable after that window loses focus. */
+.note-content .bh-own-selection { background: var(--yellow); color: #111; }
+.note-content .bh-own-cursor { display: inline-block; height: 1em; border-left: 2px solid var(--yellow); margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
+/* Other open windows on this device only; never stored or synced. */
+.note-content .bh-peer-selection { background: #5aa9d366; }
+.note-content .bh-peer-cursor { display: inline-block; height: 1em; border-left: 2px solid #5aa9d3; margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
 .note-content .note-placeholder { display: inline-block; padding: 4px 8px; border: 1px solid var(--line); background: var(--panel-2); font: 500 12px var(--mono); }
 .note-content a { color: var(--text); text-decoration: underline; }
 .note-content ul[data-type="taskList"] { list-style: none; padding-left: 16px; }

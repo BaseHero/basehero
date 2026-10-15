@@ -25,7 +25,10 @@ use jni::{
     objects::{JByteArray, JClass, JObject, JValue},
 };
 
-use crate::{decode_record, encode_record};
+use crate::{
+    decode_record, encode_record,
+    identity::{self, IdentityIo},
+};
 
 const CLASS: &str = "app.basehero.devicekeys.DeviceKeysBridge";
 type Response = Result<SecretBytes, KeyStoreError>;
@@ -72,7 +75,7 @@ fn handle_name(handle: &KeyHandle) -> String {
 }
 
 // Tao gives ndk-context the *Application*, never an Activity. It is used only
-// for loading this packaged class. T113 later binds its resumed Activity via
+// for loading this packaged class. App integration binds its resumed Activity via
 // attachActivity/detachActivity; every operation acquires a fresh local reference.
 fn bridge_class<'a>(
     env: &mut JNIEnv<'a>,
@@ -177,7 +180,7 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
                 JValue::Object(&r),
                 JValue::Long(id),
             ],
-            "readControl" => vec![
+            "readControl" | "readControlPublic" => vec![
                 JValue::Object(activity.as_obj()),
                 JValue::Object(&h),
                 JValue::Long(id),
@@ -192,7 +195,7 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
         let sig = match method {
             "create" => "(Landroid/app/Activity;Ljava/lang/String;[B[B[BJ)V",
             "readOrdinary" => "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;J)V",
-            "readControl" => "(Landroid/app/Activity;Ljava/lang/String;J)V",
+            "readControl" | "readControlPublic" => "(Landroid/app/Activity;Ljava/lang/String;J)V",
             _ => "(Landroid/app/Activity;[BJ)V",
         };
         let result = env.call_static_method(klass, method, sig, &args);
@@ -274,7 +277,25 @@ fn verified_receiver(handle: &KeyHandle) -> Result<KemKey, KeyStoreError> {
     Ok(key)
 }
 
-/// Not constructed until T113 integrates and qualifies the packaged plugin.
+struct NativeIdentityIo;
+impl IdentityIo for NativeIdentityIo {
+    fn ordinary(&mut self, handle: &KeyHandle) -> Result<SigningKey, KeyStoreError> {
+        verified_signing(handle, "ordinary")
+    }
+    fn receiver(&mut self, handle: &KeyHandle) -> Result<KemKey, KeyStoreError> {
+        verified_receiver(handle)
+    }
+    fn control(&mut self, handle: &KeyHandle) -> Result<SigningKey, KeyStoreError> {
+        verified_signing(handle, "control")
+    }
+    fn control_public(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+        let record = call("readControlPublic", &[], Some(&handle_name(handle)), None)?;
+        let public = decode_record(record.expose(), 32)?;
+        public.try_into().map_err(|_| KeyStoreError::StorageFailure)
+    }
+}
+
+/// Constructed only when app integration qualifies the packaged plugin.
 pub struct AndroidKeyStore;
 impl DeviceKeyStore for AndroidKeyStore {
     async fn create(&mut self, policy: ControlKeyPolicy) -> Result<StoredDevice, KeyStoreError> {
@@ -317,11 +338,7 @@ impl DeviceKeyStore for AndroidKeyStore {
         })
     }
     async fn load(&mut self, handle: KeyHandle) -> Result<StoredDevice, KeyStoreError> {
-        let signing = verified_signing(&handle, "ordinary")?;
-        let receiver = verified_receiver(&handle)?;
-        let control = verified_signing(&handle, "control")?;
-        let keys = DevicePublicKeys::new(signing.public(), control.public(), receiver.public())
-            .map_err(|_| KeyStoreError::WrongKey)?;
+        let keys = identity::load_keys(&mut NativeIdentityIo, &handle)?;
         Ok(StoredDevice {
             handle,
             keys,
@@ -341,7 +358,7 @@ impl DeviceKeyStore for AndroidKeyStore {
         handle: KeyHandle,
         message: Vec<u8>,
     ) -> Result<[u8; 64], KeyStoreError> {
-        Ok(verified_signing(&handle, "control")?.sign(&message))
+        identity::sign_control(&mut NativeIdentityIo, &handle, &message)
     }
     async fn decapsulate(
         &mut self,

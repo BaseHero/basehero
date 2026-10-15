@@ -65,8 +65,11 @@ pub trait DeviceKeyStore {
     /// before returning. Never silently weaken the requested control policy.
     async fn create(&mut self, policy: ControlKeyPolicy) -> Result<StoredDevice, KeyStoreError>;
 
-    /// Restore the same public keys/policy from a durable handle. Missing or
-    /// invalidated material never silently generates a replacement identity.
+    /// Restore the same public keys/policy from a durable handle without
+    /// releasing the protected control seed. Public metadata is authenticated
+    /// by native storage and compared with signed account history by the owner.
+    /// Missing or invalidated material never silently generates a replacement
+    /// identity.
     async fn load(&mut self, handle: KeyHandle) -> Result<StoredDevice, KeyStoreError>;
 
     /// Compare the returned handle and public halves before using a saved identity.

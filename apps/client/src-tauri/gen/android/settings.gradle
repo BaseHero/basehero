@@ -1,3 +1,5 @@
 include ':app'
+include ':device-keys'
+project(':device-keys').projectDir = new File(settingsDir, '../../../plugins/device-keys/android')
 
 apply from: 'tauri.settings.gradle'

@@ -72,18 +72,18 @@ fn supported<T: ReadTxn>(node: XmlOut, parent: &str, txn: &T, spec: &Value) -> b
             let Some(rules) = spec["nodes"].get(name) else {
                 return false;
             };
-            let children: Vec<_> = el.children(txn).collect();
             let first_ok = spec["requiredFirst"][name].as_array().is_none_or(|required| {
-                matches!(children.first(), Some(XmlOut::Element(first)) if required.iter().any(|candidate| candidate.as_str() == Some(first.tag())))
+                matches!(el.get(txn, 0), Some(XmlOut::Element(first)) if required.iter().any(|candidate| candidate.as_str() == Some(first.tag())))
             });
             first_ok
                 && el.attributes(txn).all(|(key, value)| match value {
                     Out::Any(any) => attribute_matches(rules, key, &any),
                     _ => false,
                 })
-                && children
-                    .into_iter()
-                    .all(|child| supported(child, name, txn, spec))
+                && (0..el.len(txn)).all(|index| {
+                    el.get(txn, index)
+                        .is_some_and(|child| supported(child, name, txn, spec))
+                })
         }
         XmlOut::Fragment(_) => false,
     }
@@ -102,7 +102,12 @@ pub fn classify_note(bytes: &[u8]) -> Result<bool, crate::note::NoteError> {
         return Ok(true);
     };
     let spec = inventory();
-    Ok(fragment
-        .children(&txn)
-        .all(|child| supported(child, "default", &txn, &spec)))
+    // children() stops at the first primitive in an XML sequence; get()
+    // returns None there. Visit every array position so later content cannot
+    // conceal an unsupported child from the editor compatibility gate.
+    Ok((0..fragment.len(&txn)).all(|index| {
+        fragment
+            .get(&txn, index)
+            .is_some_and(|child| supported(child, "default", &txn, &spec))
+    }))
 }

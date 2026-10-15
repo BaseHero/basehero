@@ -1,8 +1,7 @@
 //! Offline fixed-model attestation verification. Inputs must come from the
 //! authenticated gateway OHTTP channel; neither that authentication nor the
 //! online Intel collateral/NRAS/JWKS/provenance fetch is done here. The caller
-//! owns the fresh nonce, trusted time, independently approved measured compose
-//! hashes and trusted NVIDIA JWKS origin.
+//! owns the fresh nonce, policy snapshot and trusted NVIDIA JWKS origin.
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_confidential_attestation::{
     Error as AttestationError, MAX_INPUT_BYTES, Time, check_td10, compose, quote_claims_with_policy,
@@ -38,17 +37,33 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// Trusted verifier configuration, not derived from the candidate's report.
-/// A deployment without independently approved compose hashes cannot verify.
+/// Policy-derived hashes; no outside caller may nominate an arbitrary hash.
+/// ```compile_fail
+/// let _ = basehero_models::near_model::Expected::new([0; 32], &[[1; 32]]);
+/// ```
 pub struct Expected<'a> {
     nonce: [u8; 32],
-    approved_compose_hashes: &'a [[u8; 32]],
+    approved_compose_hashes: std::borrow::Cow<'a, [[u8; 32]]>,
+    model: String,
 }
 impl<'a> Expected<'a> {
+    pub(crate) fn from_policy(
+        nonce: [u8; 32],
+        snapshot: &crate::provider_policy::Snapshot,
+        model: &str,
+    ) -> Self {
+        Self {
+            nonce,
+            approved_compose_hashes: std::borrow::Cow::Owned(snapshot.model_hashes(model)),
+            model: model.to_owned(),
+        }
+    }
+    #[cfg(test)]
     pub fn new(nonce: [u8; 32], approved_compose_hashes: &'a [[u8; 32]]) -> Self {
         Self {
             nonce,
-            approved_compose_hashes,
+            approved_compose_hashes: std::borrow::Cow::Borrowed(approved_compose_hashes),
+            model: MODEL.to_owned(),
         }
     }
 }
@@ -67,20 +82,39 @@ pub struct NrasEvidence<'a> {
 /// verification of a later response.
 /// ```compile_fail
 /// let _ = basehero_models::near_model::VerifiedModelKey {
-///     public_key: [0; 32], compose_sha256: [0; 32]
+///     public_key: [0; 32], compose_sha256: [0; 32],
+///     model: String::from("z-ai/glm-5.3-flash"), valid_until: u64::MAX
 /// };
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct VerifiedModelKey {
     public_key: [u8; 32],
     compose_sha256: [u8; 32],
+    model: String,
+    valid_until: u64,
 }
 impl VerifiedModelKey {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+    /// Exclusive authenticated minimum of QVL collateral and NRAS validity (Unix seconds).
+    pub fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
     pub fn public_key(&self) -> &[u8; 32] {
         &self.public_key
     }
     pub fn compose_sha256(&self) -> &[u8; 32] {
         &self.compose_sha256
+    }
+    #[cfg(test)]
+    pub(crate) fn for_tests(public_key: [u8; 32]) -> Self {
+        Self {
+            public_key,
+            compose_sha256: [0; 32],
+            model: MODEL.to_owned(),
+            valid_until: u64::MAX,
+        }
     }
 }
 
@@ -159,11 +193,33 @@ fn bounded(input: &[u8]) -> Result<(), Error> {
     }
 }
 
+/// Check bounded metadata and count all returned reports before fetching any
+/// per-candidate collateral or NRAS/JWKS. No returned report is inventory of
+/// replicas. The caller must still pass the same bytes to `verify`, which
+/// reparses and rechecks them; this preflight grants no authorization.
+pub fn preflight_reports(metadata: &[u8], reports: &[u8]) -> Result<usize, Error> {
+    Ok(parse_reports(metadata, reports)?.model_attestations.len())
+}
+fn parse_reports(metadata: &[u8], reports: &[u8]) -> Result<Reports, Error> {
+    bounded(metadata)?;
+    bounded(reports)?;
+    let metadata: MetadataResponse =
+        serde_json::from_slice(metadata).map_err(|_| Error::Metadata)?;
+    if metadata.metadata.provider_type != "vllm" || !metadata.metadata.attestation_supported {
+        return Err(Error::Metadata);
+    }
+    let reports: Reports = serde_json::from_slice(reports).map_err(|_| Error::Evidence)?;
+    if reports.model_attestations.is_empty() || reports.model_attestations.len() > MAX_CANDIDATES {
+        return Err(Error::Evidence);
+    }
+    Ok(reports)
+}
+
 /// Verify every candidate, returning no key if any one is bad. Inputs are
 /// decoded from NEAR's actual metadata/report JSON layout; QVL collateral and
 /// NRAS results are caller-provided, not embedded in that response. This
 /// function neither fetches evidence nor checks Sigstore provenance: the
-/// approved compose hashes are the caller's offline deployment admission gate.
+/// approved compose hashes come only from a signed policy snapshot.
 pub fn verify(
     metadata: &[u8],
     reports: &[u8],
@@ -198,18 +254,9 @@ fn verify_with(
     time: Option<Time>,
     appraise: impl Fn(&[u8], &[u8]) -> Result<QuoteClaims, Error>,
 ) -> Result<Vec<VerifiedModelKey>, Error> {
-    bounded(metadata)?;
-    bounded(reports)?;
-    let metadata: MetadataResponse =
-        serde_json::from_slice(metadata).map_err(|_| Error::Metadata)?;
-    if metadata.metadata.provider_type != "vllm" || !metadata.metadata.attestation_supported {
-        return Err(Error::Metadata);
-    }
-    let reports: Reports = serde_json::from_slice(reports).map_err(|_| Error::Evidence)?;
+    let reports = parse_reports(metadata, reports)?;
     let count = reports.model_attestations.len();
-    if count == 0
-        || count > MAX_CANDIDATES
-        || count != collateral.len()
+    if count != collateral.len()
         || count != nras.len()
         || expected.approved_compose_hashes.is_empty()
     {
@@ -299,10 +346,12 @@ fn assemble(
     if hex_exact::<32>(payload_nonce).map_err(|_| Error::Gpu)? != expected.nonce {
         return Err(Error::Gpu);
     }
-    verify_nras(nras, expected, time)?;
+    let nras_exp = verify_nras(nras, expected, time)?;
     Ok(VerifiedModelKey {
         public_key: key,
         compose_sha256: hash,
+        model: expected.model.clone(),
+        valid_until: claims.earliest_expiration_date.min(nras_exp),
     })
 }
 
@@ -318,7 +367,7 @@ fn claim_time(claims: &serde_json::Value, name: &str) -> Result<u64, Error> {
 /// Verify an already-obtained NRAS overall JWT. Do not fetch keys from `jku`,
 /// `x5u` or a URL in the token. Only ES384 / P-384 keys in the trusted JWKS
 /// are accepted; NRAS detached device claims are not consumed by the SDK.
-fn verify_nras(nras: &NrasEvidence<'_>, expected: &Expected<'_>, time: Time) -> Result<(), Error> {
+fn verify_nras(nras: &NrasEvidence<'_>, expected: &Expected<'_>, time: Time) -> Result<u64, Error> {
     if nras.token.len() > MAX_JWT_BYTES || nras.jwks.len() > MAX_INPUT_BYTES {
         return Err(Error::TooLarge);
     }
@@ -413,7 +462,7 @@ fn verify_nras(nras: &NrasEvidence<'_>, expected: &Expected<'_>, time: Time) -> 
     if iat > time.latest || nbf > time.latest || exp <= time.latest || exp <= iat {
         return Err(Error::Gpu);
     }
-    Ok(())
+    Ok(exp)
 }
 
 #[cfg(test)]

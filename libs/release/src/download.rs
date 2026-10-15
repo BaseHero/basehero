@@ -109,16 +109,12 @@ impl Transport {
         metadata_limit: usize,
         artifact_limit: u64,
     ) -> Result<Self, DownloadError> {
-        let mut roots = RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            roots.add(cert).map_err(|_| DownloadError::Configuration)?;
-        }
         Self::with_roots(
             metadata_url,
             artifact_base,
             metadata_limit,
             artifact_limit,
-            roots,
+            bh_tls_roots::browser_roots(),
         )
     }
 

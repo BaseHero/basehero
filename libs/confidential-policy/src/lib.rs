@@ -95,7 +95,36 @@ impl std::error::Error for Error {}
 
 struct Accepted {
     policy: Policy,
-    payload: Vec<u8>,
+    snapshot: Snapshot,
+}
+
+/// Exact signed, bounded durable record, bound to the app trust root.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub root: [u8; 32],
+    pub payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+impl Snapshot {
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// A gate-produced, one-use candidate. No caller can construct or duplicate it.
+pub struct Candidate {
+    accepted: Accepted,
+    gate_id: [u8; 32],
+    revision: u64,
+    advancing: bool,
+}
+impl Candidate {
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.accepted.snapshot
+    }
+    pub fn advancing(&self) -> bool {
+        self.advancing
+    }
 }
 
 /// Volatile policy and time high-water marks. Restart loses these marks.
@@ -111,6 +140,8 @@ pub struct PolicyGate {
     available: bool,
     greatest_earliest: Option<u64>,
     clock_failed: bool,
+    gate_id: [u8; 32],
+    revision: u64,
 }
 
 impl PolicyGate {
@@ -127,6 +158,8 @@ impl PolicyGate {
             available: false,
             greatest_earliest: None,
             clock_failed: false,
+            gate_id: bh_crypto::random(),
+            revision: 0,
         })
     }
 
@@ -141,6 +174,17 @@ impl PolicyGate {
     /// Authenticated but undecodable input disables availability, retaining the
     /// previous generation floor; known feed failures require `mark_unavailable`.
     pub fn push(&mut self, payload: &[u8], signature: &[u8]) -> Result<(), Error> {
+        let candidate = self.prepare_delivery(payload, signature)?;
+        self.publish_delivery(candidate)
+    }
+
+    /// Authenticate and compare against the current floor, without accepting it.
+    /// Authenticated undecodable bytes alone disable availability.
+    pub fn prepare_delivery(
+        &mut self,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<Candidate, Error> {
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::TooLarge);
         }
@@ -150,23 +194,75 @@ impl PolicyGate {
         message.extend_from_slice(payload);
         bh_crypto::verify(&self.root, &message, signature).map_err(|_| Error::Signature)?;
         let policy: Policy = serde_json::from_slice(payload).map_err(|_| {
-            self.available = false;
+            self.mark_unavailable();
             Error::Encoding
         })?;
-        if let Some(current) = &self.accepted {
-            if policy.generation < current.policy.generation {
-                return Err(Error::PolicyRollback);
+        let advancing = match &self.accepted {
+            Some(current) => {
+                if policy.generation < current.policy.generation {
+                    return Err(Error::PolicyRollback);
+                }
+                if policy.generation == current.policy.generation {
+                    if payload != current.snapshot.payload {
+                        return Err(Error::GenerationConflict);
+                    }
+                    false
+                } else {
+                    true
+                }
             }
-            if policy.generation == current.policy.generation && payload != current.payload {
-                return Err(Error::GenerationConflict);
-            }
+            None => true,
+        };
+        Ok(Candidate {
+            accepted: Accepted {
+                policy,
+                snapshot: Snapshot {
+                    root: self.root,
+                    payload: payload.to_vec(),
+                    signature: *signature,
+                },
+            },
+            gate_id: self.gate_id,
+            revision: self.revision,
+            advancing,
+        })
+    }
+
+    /// Publish only a candidate from this unchanged gate. A stale candidate
+    /// cannot reverse an outage or overwrite a newer accepted generation.
+    pub fn publish_delivery(&mut self, candidate: Candidate) -> Result<(), Error> {
+        if candidate.gate_id != self.gate_id || candidate.revision != self.revision {
+            return Err(Error::GenerationConflict);
         }
-        self.accepted = Some(Accepted {
-            policy,
-            payload: payload.to_vec(),
-        });
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(Error::GenerationConflict)?;
+        self.accepted = Some(candidate.accepted);
         self.available = true;
+        self.revision = next_revision;
         Ok(())
+    }
+
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        self.accepted.as_ref().map(|a| a.snapshot.clone())
+    }
+
+    /// Authenticating a durable record restores its generation floor, never its
+    /// availability. A fresh delivery is required for use.
+    pub fn restore_unavailable(
+        root: [u8; 32],
+        limits: Limits,
+        snapshot: &Snapshot,
+    ) -> Result<Self, Error> {
+        let mut gate = Self::new(root, limits)?;
+        if snapshot.root != root {
+            return Err(Error::Signature);
+        }
+        let candidate = gate.prepare_delivery(&snapshot.payload, &snapshot.signature)?;
+        gate.publish_delivery(candidate)?;
+        gate.mark_unavailable();
+        Ok(gate)
     }
 
     /// Report a known delivery outage. Keep the generation floor, but stop
@@ -174,6 +270,12 @@ impl PolicyGate {
     /// Silent withholding is bounded only by the original signed expiry.
     pub fn mark_unavailable(&mut self) {
         self.available = false;
+        if let Some(next) = self.revision.checked_add(1) {
+            self.revision = next;
+        } else {
+            self.gate_id = bh_crypto::random();
+            self.revision = 0;
+        }
     }
 
     /// Check a measured identity against the current signed policy.

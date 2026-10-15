@@ -86,6 +86,89 @@ impl Measured {
     }
 }
 
+/// Immutable strict-worker evidence, not current policy authorization or key possession.
+/// No snapshot/claims constructor exists. Recheck time and current signed policy on use.
+///
+/// ```compile_fail
+/// use bh_confidential_attestation::VerifiedEvidence;
+/// fn forge(evidence: &mut VerifiedEvidence) { evidence.valid_until = u64::MAX; }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedEvidence {
+    measured: Measured,
+    nonce: [u8; 32],
+    valid_from: u64,
+    valid_until: u64,
+}
+impl VerifiedEvidence {
+    pub fn measured(&self) -> &Measured {
+        &self.measured
+    }
+    /// Inclusive lower and exclusive upper bound, in POSIX seconds.
+    pub fn validity(&self) -> (u64, u64) {
+        (self.valid_from, self.valid_until)
+    }
+    pub fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
+    }
+    pub fn check_time(&self, time: Option<Time>) -> Result<(), Error> {
+        let time = checked_time(time)?;
+        if time.earliest < self.valid_from || time.latest >= self.valid_until {
+            return Err(Error::Quote);
+        }
+        Ok(())
+    }
+}
+
+/// One production-Ring QVL appraisal, followed by complete binding/log assembly.
+/// Only this strict-worker API supports retained evidence; provider policies do not.
+pub fn verify_evidence(
+    evidence: Evidence<'_>,
+    expected: &Expected,
+    time: Option<Time>,
+) -> Result<VerifiedEvidence, Error> {
+    check_size(evidence.quote)?;
+    check_size(evidence.collateral)?;
+    check_size(evidence.event_log)?;
+    let time = checked_time(time)?;
+    let claims = quote_claims(
+        evidence.quote,
+        evidence.collateral,
+        Time {
+            latest: time.earliest,
+            ..time
+        },
+    )?;
+    verified_from_claims(&claims, evidence.event_log, expected, time)
+}
+
+fn verified_from_claims(
+    claims: &QuoteClaims,
+    log: &[u8],
+    expected: &Expected,
+    time: Time,
+) -> Result<VerifiedEvidence, Error> {
+    // Pinned dcap-qvl 0.7.0 verify.rs:147-225,1565-1634 aggregates only
+    // authenticated JSON/CRLs and verified cert paths (+ pinned root). WebPKI
+    // 0.103.15+dcap.1 crl/types.rs:166 rejects now >= nextUpdate, whereas certs
+    // and JSON have inclusive expiry. [L,E) is intentionally conservative.
+    // Strict UpToDate excludes both time-dependent out-of-date grace branches
+    // (policy/simple.rs:245-285; tcb_info.rs:172-212). All other proof checks
+    // are immutable. Revisit this argument on QVL/worker-policy changes; it is
+    // NOT valid for arbitrary provider policies or evidence of latest collateral.
+    let verified = VerifiedEvidence {
+        measured: assemble(claims, log, expected)?,
+        nonce: expected.nonce,
+        valid_from: time.earliest.max(claims.latest_issue_date),
+        valid_until: claims.earliest_expiration_date,
+    };
+    verified.check_time(Some(time))?;
+    Ok(verified)
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static QVL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Issuer/verifier convention: SHA-256 of ASCII `basehero.tdx-report.v1`, NUL,
 /// then exactly 32 signing-key bytes, 1216 X-Wing receiving-key bytes, 32 nonce
 /// bytes (no variable-length framing). Raw report_data is the digest followed by
@@ -139,10 +222,14 @@ where
     let verifier = QuoteVerifier::new_prod().with_config::<dcap_qvl::configs::RingConfig>();
     // Check both ends: latest alone would accept a not-yet-valid certificate at
     // earliest. QVL checks Intel signatures, chains, CRLs, TCB and time at each.
+    #[cfg(test)]
+    QVL_CALLS.with(|n| n.set(n.get() + 1));
     let first = verifier
         .verify_with_policy(quote, &collateral, time.earliest, &policy(time.earliest))
         .map_err(|_| Error::Quote)?;
     if time.latest != time.earliest {
+        #[cfg(test)]
+        QVL_CALLS.with(|n| n.set(n.get() + 1));
         verifier
             .verify_with_policy(quote, &collateral, time.latest, &policy(time.latest))
             .map_err(|_| Error::Quote)?;
@@ -269,16 +356,46 @@ fn assemble(
     })
 }
 
+// Crate-private synthetic full assembly. Also source-included by channel unit
+// tests: no production feature or consumer-facing route to fabricate evidence.
+#[cfg(test)]
+pub(crate) fn synthetic_evidence(
+    expected: &Expected,
+    time: Time,
+    legacy: Option<(Build, [u8; 32])>,
+) -> Result<VerifiedEvidence, Error> {
+    let (mut claims, log, _) = tests::synthetic_inputs();
+    let dcap_qvl::quote::Report::TD10(td) = &mut claims.report else {
+        unreachable!()
+    };
+    td.report_data = report_data(&expected.signing, &expected.receiving, &expected.nonce);
+    if legacy.is_some() {
+        // Old state-machine fixtures use a toy epoch. Only their fixture dates
+        // and measurements change; all binding/log assembly still executes.
+        claims.latest_issue_date = 100;
+        claims.earliest_expiration_date = u64::MAX;
+    }
+    let mut verified = verified_from_claims(&claims, &log, expected, time)?;
+    if let Some((build, machine)) = legacy {
+        verified.measured.build = build;
+        verified.measured.machine = machine;
+    }
+    Ok(verified)
+}
+
+#[cfg(test)]
+mod validity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
     use dcap_qvl::quote::Quote;
     use dcap_qvl::{Policy as _, TcbStatus};
     use parity_scale_codec::Decode;
-    const QUOTE: &[u8] = include_bytes!("../tests/fixtures/tdx_quote");
-    const COLLATERAL: &[u8] = include_bytes!("../tests/fixtures/tdx_quote_collateral.json");
+    pub(super) const QUOTE: &[u8] = include_bytes!("../tests/fixtures/tdx_quote");
+    pub(super) const COLLATERAL: &[u8] =
+        include_bytes!("../tests/fixtures/tdx_quote_collateral.json");
     const DSTACK: &[u8] = include_bytes!("../tests/fixtures/tdx-lite-getquote.json");
-    fn interval(a: u64, b: u64) -> Time {
+    pub(super) fn interval(a: u64, b: u64) -> Time {
         Time {
             earliest: a,
             latest: b,
@@ -382,9 +499,9 @@ mod tests {
     // Synthetic post-QVL test: start from a real archived QVL verdict, then
     // replace report fields and PPID in memory. This is NOT an Intel-signed
     // quote for our fresh keys and cannot be used as a full attestation proof.
-    fn synthetic_inputs() -> (QuoteClaims, Vec<u8>, Expected) {
+    pub(super) fn synthetic_inputs() -> (QuoteClaims, Vec<u8>, Expected) {
         let mut claims =
-            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_001)).unwrap();
+            quote_claims(QUOTE, COLLATERAL, interval(1_751_328_000, 1_751_328_000)).unwrap();
         let (events, register) = log_and_register();
         let expected = Expected {
             signing: [1; 32],

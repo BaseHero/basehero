@@ -3,7 +3,7 @@ use bh_account::{AccountId, DeviceId, Head as AccountHead};
 use bh_core::note::Note;
 use bh_crypto::{Secret, SigningKey};
 use bh_event::{Binding, CLASS_CONTENT, Encoded, NOTE, Payload, key_id, seal};
-use bh_storage::{DeviceDatabase, NoteKey, StoreError};
+use bh_storage::{DeviceDatabase, NoteKey, PackagePreparation, StoreError};
 use bh_sync::{BaseId, Commitment, EventId, Head};
 use rusqlite::Connection;
 
@@ -70,6 +70,43 @@ fn setup(path: &std::path::Path) -> (DeviceDatabase, i64, Vec<u8>) {
         .unwrap()
         .update_id;
     (db, id, delta)
+}
+
+#[test]
+fn two_phase_sealing_runs_without_a_container_guard_and_cas_persists_exact_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two-phase.db");
+    let (db, update, delta) = setup(&path);
+    let writer = std::sync::Mutex::new(db);
+    let candidate = match writer.lock().unwrap().prepare_note_package(update).unwrap() {
+        PackagePreparation::Candidate(candidate) => candidate,
+        PackagePreparation::Existing(_) => panic!("fresh pending row has no package"),
+    };
+    let (descriptor, body) = sealed(candidate.event_id, &delta).unwrap();
+    let expected = body.bytes().to_vec();
+    let stored = writer
+        .lock()
+        .unwrap()
+        .publish_note_package(candidate, descriptor, body)
+        .unwrap();
+    assert_eq!(stored.body, expected);
+    match writer.lock().unwrap().prepare_note_package(update).unwrap() {
+        PackagePreparation::Existing(existing) => assert_eq!(existing.body, expected),
+        PackagePreparation::Candidate(_) => panic!("duplicate must retain exact attempt"),
+    }
+}
+
+#[test]
+fn sealing_does_not_hold_a_sqlite_write_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("outbox.sqlite");
+    let (mut db, update, delta) = setup(&path);
+    db.package_note_update(update,|id,_| {
+        let independent=Connection::open(&path).unwrap();
+        independent.busy_timeout(std::time::Duration::from_millis(20)).unwrap();
+        independent.execute("INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",rusqlite::params![[2u8;32].as_slice(),[0u8;32].as_slice(),[3u8;32].as_slice(),[2u8;16].as_slice(),delta.as_slice()]).unwrap();
+        sealed(id,&delta)
+    }).unwrap();
 }
 
 #[test]

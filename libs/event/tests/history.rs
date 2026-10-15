@@ -86,7 +86,7 @@ impl Fixture {
                 kind: GENESIS,
                 data: &data,
             },
-            &first.control,
+            &first.signing,
             &metadata,
             None,
         )
@@ -538,6 +538,21 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         .finish(f.first.control.sign(add.signing_bytes()))
         .unwrap();
     let binding = f.binding(&f.first, CLASS_CONTROL);
+    // A valid inner account addition cannot make an ordinary-key outer
+    // ACCOUNT_CHANGE valid; only genesis uses the ordinary key for controls.
+    let (ordinary, ordinary_order) = f.create(
+        binding,
+        ACCOUNT_CHANGE,
+        add.as_bytes(),
+        &f.first.signing,
+        None,
+    );
+    assert_eq!(
+        f.history
+            .inspect(&ordinary_order, &ordinary.descriptor, &f.metadata)
+            .err(),
+        Some(Outcome::IntegrityStop)
+    );
     let (event, order) = f.create(
         binding,
         ACCOUNT_CHANGE,
@@ -1573,6 +1588,571 @@ fn applied_result_binds_ordered_original_body_and_typed_content() {
     assert_eq!(control.outcome(), Outcome::Accepted);
     assert_eq!(control.head(), order.head());
     assert_eq!(control.descriptor_bytes(), event.descriptor.encode());
+}
+
+#[test]
+fn owned_materialization_deferred_publication_keeps_history_unpublished() {
+    use bh_event::{OwnedNoteTarget, WorkingNote};
+    let mut f = Fixture::new();
+    let (data, edited) = note_delta("owned");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let prepare = |f: &mut Fixture| {
+        f.history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap()
+    };
+    let before = f.history.head();
+    let prepared = prepare(&mut f);
+    let dropped = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: Note::new(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(dropped.note, Some(WorkingNote::Accepted(_))));
+    drop(dropped);
+    assert_eq!(f.history.head(), before);
+    let prepared = prepare(&mut f);
+    let first = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: Note::new(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(f.history.head(), before);
+    let original = first.transition.applied();
+    assert_eq!(original.commitment(), order);
+    assert_eq!(original.descriptor_bytes(), event.descriptor.encode());
+    assert_eq!(original.body_bytes(), event.body);
+    assert!(
+        matches!(original.kind(), bh_event::AppliedKind::NoteAccepted { delta, .. } if delta.expose() == &data[32..])
+    );
+    let applied = f.history.publish_committed(first.transition).unwrap();
+    assert_eq!(applied.head(), order.head());
+    assert_eq!(f.history.head(), order.head());
+    match first.note.unwrap() {
+        WorkingNote::Accepted(note) => assert_eq!(note.state(), edited.state()),
+        _ => panic!("expected accepted"),
+    }
+}
+
+#[test]
+fn owned_successor_loses_publication_race_without_replacing_winner() {
+    let mut f = Fixture::new();
+    let first = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let first = first
+        .finish(f.first.control.sign(first.signing_bytes()))
+        .unwrap();
+    let third = Device::new();
+    let second = f
+        .account
+        .add_device(f.first.keys().id(), third.keys())
+        .unwrap();
+    let second = second
+        .finish(f.first.control.sign(second.signing_bytes()))
+        .unwrap();
+    let prepare = |f: &mut Fixture, data: &[u8]| {
+        let (event, order) = f.create(
+            f.binding(&f.first, CLASS_CONTROL),
+            ACCOUNT_CHANGE,
+            data,
+            &f.first.control,
+            None,
+        );
+        let prepared = f
+            .history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                None,
+            )
+            .unwrap();
+        (f.history.materialize(prepared, None).unwrap(), order)
+    };
+    let (winner, winner_order) = prepare(&mut f, first.as_bytes());
+    let (loser, loser_order) = prepare(&mut f, second.as_bytes());
+    assert_ne!(winner_order.head(), loser_order.head());
+    assert_eq!(f.history.account_head(), f.account.head());
+    f.history.publish_committed(winner.transition).unwrap();
+    let after_winner = (
+        f.history.head(),
+        f.history.account_head(),
+        f.history.metadata_id(),
+        f.history.epoch_id(),
+        f.history.floor(),
+        f.history.is_stopped(),
+    );
+    assert_eq!(after_winner.0, winner_order.head());
+    assert_eq!(after_winner.1, first.head());
+    assert_eq!(
+        f.history.publish_committed(loser.transition).err(),
+        Some(bh_event::PublishError::StaleState)
+    );
+    assert_eq!(
+        (
+            f.history.head(),
+            f.history.account_head(),
+            f.history.metadata_id(),
+            f.history.epoch_id(),
+            f.history.floor(),
+            f.history.is_stopped(),
+        ),
+        after_winner,
+    );
+}
+
+#[test]
+fn owned_wrong_target_and_stale_prestate_return_working_note() {
+    use bh_event::{OwnedNoteTarget, WorkingNote};
+    let mut f = Fixture::new();
+    let (data, _) = note_delta("one");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let stale = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let mut working = Note::new();
+    working.append_paragraph("local work");
+    let identity = working.replica_id();
+    let failed = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [8; 32],
+                note: working,
+            }),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(failed.reason, bh_event::ConsumeError::WrongTarget);
+    let working = failed.target.unwrap().note;
+    assert_eq!(working.replica_id(), identity);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let result = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: working,
+            }),
+        )
+        .unwrap();
+    f.history.publish_committed(result.transition).unwrap();
+    let working = match result.note.unwrap() {
+        WorkingNote::Accepted(n) => n,
+        _ => panic!("accepted"),
+    };
+    let failed = f
+        .history
+        .materialize(
+            stale,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: working,
+            }),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(failed.reason, bh_event::ConsumeError::StaleState);
+    assert_eq!(failed.target.unwrap().note.replica_id(), identity);
+    assert_eq!(f.history.head(), order.head());
+}
+
+#[test]
+fn owned_integrity_stop_blocks_publication() {
+    use bh_event::OwnedNoteTarget;
+    let mut f = Fixture::new();
+    let (data, _) = note_delta("future");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let ready = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: Note::new(),
+            }),
+        )
+        .unwrap();
+    let (mut bad, bad_order) = f.content(&f.first, NOTE, &data);
+    bad.body[30] ^= 1;
+    assert_eq!(
+        f.history
+            .prepare(
+                &bad_order,
+                &bad.descriptor,
+                Some(&bad.body),
+                &f.metadata,
+                Some(&f.epoch)
+            )
+            .err(),
+        Some(Outcome::IntegrityStop)
+    );
+    assert_eq!(
+        f.history.publish_committed(ready.transition).err(),
+        Some(bh_event::PublishError::StaleState)
+    );
+    assert!(f.history.is_stopped());
+    assert_eq!(f.history.head().position, 1);
+}
+
+#[test]
+fn owned_decode_rejection_returns_exact_working_note() {
+    use bh_event::{OwnedNoteTarget, WorkingNote};
+    let mut f = Fixture::new();
+    let mut original = Note::new();
+    original.append_paragraph("retained");
+    let bytes = original.state();
+    let mut bad = vec![7; 32];
+    bad.extend([0xff, 0xff, 0xff]);
+    let (event, order) = f.content(&f.first, NOTE, &bad);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let result = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: original,
+            }),
+        )
+        .unwrap();
+    assert_eq!(f.history.head().position, 1);
+    assert_eq!(
+        result.transition.applied().outcome(),
+        Outcome::ContentRejected
+    );
+    match result.note.unwrap() {
+        WorkingNote::Untouched(note) => assert_eq!(note.state(), bytes),
+        _ => panic!("expected untouched"),
+    }
+    f.history.publish_committed(result.transition).unwrap();
+    assert_eq!(f.history.head(), order.head());
+}
+
+#[test]
+fn owned_control_successor_is_published_only_when_called() {
+    let mut f = Fixture::new();
+    let request = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let add = request
+        .finish(f.first.control.sign(request.signing_bytes()))
+        .unwrap();
+    let (event, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        add.as_bytes(),
+        &f.first.control,
+        None,
+    );
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            None,
+        )
+        .unwrap();
+    let result = f.history.materialize(prepared, None).unwrap();
+    assert!(result.note.is_none());
+    assert_eq!(f.history.account_head(), f.account.head());
+    f.history.publish_committed(result.transition).unwrap();
+    assert_eq!(f.history.account_head(), add.head());
+    assert_eq!(f.history.head(), order.head());
+}
+
+#[test]
+fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
+    use bh_core::note::NoteError;
+    use bh_event::{AppliedKind, OwnedNoteTarget, WorkingNote};
+    let mut f = Fixture::new();
+    // Yjs v1: client 1's String block named "x" is the committed original.
+    let valid = [1, 1, 1, 0, 4, 1, 1, b'x', 1, b'a', 0];
+    let mut data = vec![7; 32];
+    data.extend(valid);
+    let (initial, initial_order) = f.content(&f.first, NOTE, &data);
+    let prepared = f
+        .history
+        .prepare(
+            &initial_order,
+            &initial.descriptor,
+            Some(&initial.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let accepted = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: Note::new(),
+            }),
+        )
+        .unwrap();
+    let committed_delta = match accepted.transition.applied().kind() {
+        AppliedKind::NoteAccepted { delta, .. } => delta.expose().to_vec(),
+        _ => panic!("expected initial delta"),
+    };
+    let note = match accepted.note.unwrap() {
+        WorkingNote::Accepted(note) => note,
+        _ => panic!("expected accepted note"),
+    };
+    let committed = note.state();
+    f.history.publish_committed(accepted.transition).unwrap();
+    assert_eq!(f.history.head(), initial_order.head());
+
+    // Client 2 first inserts z at root y, then uses client 1's primitive
+    // String as a parent. Core must change its Doc before returning Apply.
+    let partial = [1, 2, 2, 0, 4, 1, 1, b'y', 1, b'z', 4, 0, 1, 0, 1, b'b', 0];
+    let mut probe = Note::new();
+    probe.apply_update(&committed_delta).unwrap();
+    assert_eq!(probe.state(), committed);
+    assert!(matches!(
+        probe.apply_update(&partial),
+        Err(NoteError::Apply(_))
+    ));
+    assert_ne!(probe.state(), committed, "fixture must mutate before error");
+
+    let mut data = vec![7; 32];
+    data.extend(partial);
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let result = f
+        .history
+        .materialize(prepared, Some(OwnedNoteTarget { id: [7; 32], note }))
+        .unwrap();
+    assert_eq!(
+        result.transition.applied().outcome(),
+        Outcome::ContentRejected
+    );
+    assert!(matches!(
+        result.transition.applied().kind(),
+        AppliedKind::NoteRejected { note_id } if *note_id == [7; 32]
+    ));
+    assert!(matches!(result.note, Some(WorkingNote::Poisoned)));
+    assert_eq!(f.history.head(), initial_order.head());
+    let mut rebuilt = Note::new();
+    rebuilt.apply_update(&committed_delta).unwrap();
+    assert_eq!(rebuilt.state(), committed);
+    f.history.publish_committed(result.transition).unwrap();
+    assert_eq!(f.history.head(), order.head());
+}
+
+#[test]
+fn owned_many_signed_updates_preserve_note_without_disposable_replay() {
+    use bh_event::{OwnedNoteTarget, WorkingNote};
+    let mut f = Fixture::new();
+    let mut author = Note::new();
+    let mut working = Note::new();
+    let replica = working.replica_id();
+    for i in 0..300 {
+        let mut data = vec![7; 32];
+        data.extend(author.append_paragraph(&format!("paragraph-{i}-{}", "x".repeat(256))));
+        let (event, order) = f.content(&f.first, NOTE, &data);
+        let prepared = f
+            .history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap();
+        let materialized = f
+            .history
+            .materialize(
+                prepared,
+                Some(OwnedNoteTarget {
+                    id: [7; 32],
+                    note: working,
+                }),
+            )
+            .unwrap();
+        working = match materialized.note.unwrap() {
+            WorkingNote::Accepted(note) => note,
+            _ => panic!("expected accepted"),
+        };
+        assert_eq!(
+            working.replica_id(),
+            replica,
+            "each delta must apply to the same owned Doc, not a rebuilt copy"
+        );
+        assert_eq!(
+            materialized.transition.applied().outcome(),
+            Outcome::Accepted
+        );
+        f.history
+            .publish_committed(materialized.transition)
+            .unwrap();
+    }
+    assert_eq!(working.state(), author.state());
+    assert_eq!(f.history.head().position, 301);
+}
+
+// Manual, narrow cost probe: setup builds real signed account/base controls and
+// checks them through History; only the fixed note/clone loops are timed. This
+// does not measure throughput or a host deadline.
+#[test]
+#[ignore = "manual 1000-device signed-account scale probe"]
+fn note_account_copy_scale_probe() {
+    use std::time::Instant;
+
+    for devices in [1, 1000] {
+        let mut f = Fixture::new();
+        let setup = Instant::now();
+        for _ in 1..devices {
+            let keys = DevicePublicKeys::new(
+                SigningKey::generate().public(),
+                SigningKey::generate().public(),
+                KemKey::generate().public(),
+            )
+            .unwrap();
+            let request = f.account.add_device(f.first.keys().id(), keys).unwrap();
+            let add = request
+                .finish(f.first.control.sign(request.signing_bytes()))
+                .unwrap();
+            let (event, order) = f.create(
+                f.binding(&f.first, CLASS_CONTROL),
+                ACCOUNT_CHANGE,
+                add.as_bytes(),
+                &f.first.control,
+                None,
+            );
+            assert_eq!(f.apply(&event, &order, false), Outcome::Accepted);
+            f.account.apply(add.as_bytes()).unwrap();
+        }
+        assert_eq!(f.history.account_head(), f.account.head());
+        let setup_elapsed = setup.elapsed();
+        let mut candidates = Vec::with_capacity(32);
+        let start = Instant::now();
+        for _ in 0..32 {
+            candidates.push(f.history.clone());
+        }
+        let cloned = start.elapsed();
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.account_head() == f.history.account_head())
+        );
+        drop(candidates);
+
+        let (data, _) = note_delta("probe");
+        let events: Vec<_> = (0..32)
+            .map(|_| f.content(&f.first, NOTE, &data).0)
+            .collect();
+        let start = Instant::now();
+        for event in events {
+            let order = Commitment::order(f.base, f.history.head(), &event.descriptor).unwrap();
+            let prepared = f
+                .history
+                .prepare(
+                    &order,
+                    &event.descriptor,
+                    Some(&event.body),
+                    &f.metadata,
+                    Some(&f.epoch),
+                )
+                .unwrap();
+            assert_eq!(
+                f.history
+                    .consume(
+                        prepared,
+                        Some(NoteTarget {
+                            id: [7; 32],
+                            note: &mut f.note,
+                        })
+                    )
+                    .unwrap()
+                    .outcome(),
+                Outcome::Accepted
+            );
+        }
+        eprintln!(
+            "signed-account devices={devices}: setup={setup_elapsed:?}, clone32={cloned:?}, verify-consume32={:?}",
+            start.elapsed()
+        );
+    }
 }
 
 #[test]

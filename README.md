@@ -29,7 +29,8 @@ service entry points; Cargo.lock is committed.
 
 Run commands from this directory. Rust is pinned by `rust-toolchain.toml`.
 Node.js 22 or later and npm are needed for shell, Tiptap/Yjs interoperability
-and bundled-editor checks; the website uses Node.js 24. On Linux, native client
+and bundled-editor checks; the website uses Node.js 24. Python 3 is needed for
+Mac packaging and its portable fixtures (supplied by the default Nix shell). On Linux, native client
 builds need WebKitGTK 4.1, GTK 3, libsoup 3, a C compiler, pkg-config and
 libsodium with X-Wing support. On macOS, install Xcode command-line tools and
 compatible libsodium. The Nix environment supplies the Linux prerequisites and
@@ -82,6 +83,38 @@ testing. With an existing Android toolchain, the library checks need
 needs target libsodium/pkg-config, supplied by this pinned Nix shell.
 The client identifier is `app.basehero.client` and must remain stable across updates.
 
+### Mac application package
+
+On an arm64 Mac with Xcode tools and the pinned Nix development shell, start from
+**committed, source-only exported product files**, not a checkout or a development
+binary. For a repository whose root is this directory:
+
+```sh
+mkdir -p /tmp/basehero-source /tmp/basehero-package
+# Export a committed product tree; do not copy a working directory or target/.
+git archive <product-commit> | tar -xf - -C /tmp/basehero-source
+cd /tmp/basehero-source
+nix develop path:. --command python3 scripts/mac_package.py 42 /tmp/basehero-package
+```
+
+Replace `42` with the release's positive integer version (canonical decimal
+signed-release u64). The script builds Tauri's arm64 app bundle with the committed
+`app.basehero.client` identity and current semver display version, sets
+`CFBundleVersion` to that integer, checks every bundled Mach-O dependency and
+rpath, resolves only in-bundle links, ad-hoc signs and verifies the app, and
+writes `BaseHero-macos-aarch64.app.tar.gz`. It pins Cargo's lock and the
+`aarch64-apple-darwin` target, overrides inherited `CARGO_TARGET_DIR` and
+`CARGO_BUILD_TARGET`/Cargo `build.target`, and keeps compilation cache under
+`target/mac-package/` while clearing only its expected app before each build.
+Output is outside the source export; it fails if output exists. The archive has one `BaseHero.app` top-level directory
+and only real files/directories, as required by the Mac installer. The native
+pinned libsodium is copied into the app when linked, with its ISC notice under
+`Contents/Resources/Licenses`; the system libiconv is used instead of bundling
+Nix's LGPL libiconv. No other external runtime libraries are permitted. Build
+and archive validation do not authorize a release: the separately signed release
+metadata must name the exact archive hash/version/platform/source commit before
+an installed app can use it. Ad-hoc signing is not that release signature.
+
 ## Developer boundaries
 
 The native host mounts the bundled note editor only when a note is bound to
@@ -105,7 +138,8 @@ Except for `sdk/`, BaseHero's original code is licensed under
 [AGPL-3.0-only](LICENSE). If added, code under `sdk/` will be licensed under
 [Apache-2.0](LICENSES/Apache-2.0.txt). Third-party files retain their own
 licences, including the OFL font licences beside the bundled fonts and the
-notices listed with the bundled editor. MotiveSite Inc.
+notices listed with the bundled editor and the pinned libsodium ISC notice in
+`LICENSES/libsodium.txt` when included in a Mac package. MotiveSite Inc.
 also offers a commercial licence; contact licensing@basehero.com.
 
 Copyright © 2026 MotiveSite Inc. BaseHero is a trademark of MotiveSite Inc.;

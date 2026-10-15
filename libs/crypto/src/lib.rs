@@ -7,6 +7,9 @@ use std::{ffi::c_void, mem, ptr::NonNull, sync::OnceLock};
 
 pub type Hash = [u8; 32];
 
+/// Isolated native-only provider wire compatibility; not BaseHero seals.
+pub mod provider_compat;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidLength,

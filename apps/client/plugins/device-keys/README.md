@@ -1,18 +1,29 @@
 # Private Android device-key plugin (inactive)
 
-This crate is an explicit workspace member but **not** a client dependency or
-`default-member`. The Android library module builds standalone with the app's
-existing Gradle wrapper. From `basehero/`:
+This crate is an explicit workspace member and Android-only client dependency,
+but not a `default-member`. The app packages its Android library, registers the
+empty native plugin and binds only its resumed Activity. No account operation
+constructs or calls the adapter yet. The library also builds standalone with
+the app's existing Gradle wrapper. From `basehero/`:
 
 ```sh
 nix develop .#android --command bash scripts/check.sh android-device-keys
 ```
 
-For later shell integration: package `android/` as an Android library dependency,
-link this crate into the app's Rust library and register `bh_device_keys::init()`.
-The shell must also call `DeviceKeysBridge.attachActivity(this)` from its
-`FragmentActivity.onResume()` and `detachActivity(this)` from `onPause()`; this
-is an **unwired hook**, not app registration in this increment. Tao's
+An opt-in, disposable API 36 x86_64 emulator check exercises the library's
+Keystore and BiometricPrompt with an enrolled emulator fingerprint (never a
+physical device):
+
+```sh
+nix develop .#androidEmulator --command bash scripts/check.sh android-device-keys-emulator
+```
+
+Its probe Activity, callback JNI shim and tests live only in the standalone
+module's `androidTest` APK. The test loader is not the app's Rust JNI loader.
+
+The shell calls `DeviceKeysBridge.attachActivity(this)` after
+`FragmentActivity.onResume()` and `detachActivity(this)` before `onPause()`'s
+super call. This is packaging and lifecycle wiring, not key activation. Tao's
 `ndk_context` holds the Application, not an Activity. Every JNI request gets
 the current weakly-bound Activity, promotes it to a GlobalRef just for dispatch,
 and returns `Unavailable` if none is bound. The plugin has no commands or
@@ -44,10 +55,10 @@ framing because the Keystore key never crosses into Rust; `open` never creates
 a replacement key. Control is unavailable before API 30 or without qualifying
 strong biometrics, with no passcode or software fallback.
 
-A library build, cross-compile and JVM tests do **not** establish Keystore,
-biometric, power-loss, backup/transfer or full JNI behavior. Before activating,
-package the module in the app, verify backup/device-transfer exclusions for all
-app state, exercise create/load/sign/decapsulate/pending seal on an emulator,
-check prompt cancellation and enrollment invalidation, and verify app identity
-and availability on target Android versions. Do not assume that a restored blob
+The library's emulator instrumentation exercises its Kotlin Keystore and prompt
+paths, but does not establish power-loss, backup/transfer, full app Rust JNI or
+real-phone behavior. Before activating, verify backup/device-transfer exclusions
+for all app state, exercise create/load/sign/decapsulate through Rust JNI, and
+verify app identity and availability on target Android versions. Do not assume
+that a restored blob
 without its Keystore alias represents the admitted device.

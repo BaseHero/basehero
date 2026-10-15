@@ -2,7 +2,7 @@
 //! opaque rows; verification lives in `bh-account`.
 use bh_storage::DeviceDatabase;
 use bh_storage::StoreError;
-use bh_storage::account::{DeviceIdentityRecord, PendingSetupRow};
+use bh_storage::account::{DeviceIdentityRecord, PendingSetupRow, StagedAdmissionRow};
 use rusqlite::Connection;
 
 fn database() -> (tempfile::TempDir, DeviceDatabase) {
@@ -174,4 +174,103 @@ fn a_first_commit_without_bytes_is_refused() {
         Err(StoreError::HeadWithoutBytes)
     ));
     assert!(database.account_state().unwrap().is_none());
+}
+
+fn staged() -> StagedAdmissionRow {
+    StagedAdmissionRow {
+        position: 4,
+        previous: [7; 32],
+        event: b"signed add".to_vec(),
+        delivery: b"signed seal".to_vec(),
+    }
+}
+
+#[test]
+fn staged_insert_is_atomic_and_never_overwrites_a_previous_row() {
+    let (dir, mut db) = database();
+    let first = staged();
+    db.insert_staged_admission(&first).unwrap();
+    assert!(matches!(
+        db.insert_staged_admission(&first),
+        Err(StoreError::StagedAdmissionExists)
+    ));
+    assert_eq!(db.staged_admission().unwrap(), Some(first.clone()));
+    let mut second = staged();
+    second.event = b"different signed add".to_vec();
+    assert!(matches!(
+        db.insert_staged_admission(&second),
+        Err(StoreError::StagedAdmissionExists)
+    ));
+    let reopened = DeviceDatabase::open(dir.path().join("account.sqlite")).unwrap();
+    assert_eq!(reopened.staged_admission().unwrap(), Some(first));
+}
+
+#[test]
+fn stale_completion_cannot_delete_a_replacement_staged_row() {
+    let (_dir, mut db) = database();
+    let first = staged();
+    db.insert_staged_admission(&first).unwrap();
+    db.clear_staged_admission(&first).unwrap();
+    let mut second = staged();
+    second.event = b"replacement signed add".to_vec();
+    db.insert_staged_admission(&second).unwrap();
+    assert!(matches!(
+        db.clear_staged_admission(&first),
+        Err(StoreError::StagedAdmissionChanged)
+    ));
+    assert_eq!(db.staged_admission().unwrap(), Some(second.clone()));
+    db.clear_staged_admission(&second).unwrap();
+    db.clear_staged_admission(&second).unwrap(); // missing is idempotent
+    assert_eq!(db.staged_admission().unwrap(), None);
+}
+
+#[test]
+fn malformed_staged_row_is_refused_instead_of_truncated() {
+    let (dir, mut db) = database();
+    assert!(matches!(
+        db.insert_staged_admission(&StagedAdmissionRow {
+            position: u64::MAX,
+            ..staged()
+        }),
+        Err(StoreError::CorruptStagedAdmission)
+    ));
+    let other = Connection::open(dir.path().join("account.sqlite")).unwrap();
+    other.execute("INSERT INTO account_staged_admission(id,position,previous,event,delivery) VALUES (1,4,?1,?2,?3)", rusqlite::params![[7u8; 32].as_slice(), b"add", b"seal"]).unwrap();
+    other.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE account_staged_admission SET previous=x'01'; PRAGMA ignore_check_constraints=OFF;").unwrap();
+    assert!(matches!(
+        db.staged_admission(),
+        Err(StoreError::CorruptStagedAdmission)
+    ));
+}
+
+#[test]
+fn staged_load_refuses_invalid_positions_and_empty_payloads_independently() {
+    for (position, event, delivery) in [
+        (0i64, b"add".as_slice(), b"seal".as_slice()),
+        (1, b"add", b"seal"),
+        (4, b"", b"seal"),
+        (4, b"add", b""),
+    ] {
+        let (dir, db) = database();
+        let other = Connection::open(dir.path().join("account.sqlite")).unwrap();
+        other
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        other.execute(
+            "INSERT INTO account_staged_admission(id,position,previous,event,delivery) VALUES (1,?1,?2,?3,?4)",
+            rusqlite::params![position, [7u8; 32].as_slice(), event, delivery],
+        ).unwrap();
+        other
+            .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        assert!(
+            matches!(
+                db.staged_admission(),
+                Err(StoreError::CorruptStagedAdmission)
+            ),
+            "invalid row position={position}, event length={}, delivery length={}",
+            event.len(),
+            delivery.len()
+        );
+    }
 }

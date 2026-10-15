@@ -24,7 +24,16 @@ each the hash of the X-Wing public half derived with `bhKeyId1` from its root.
 The per-use KDF contexts are `bhNote01`, `bhBind01`, `bhCtrl01` (id 0).
 
 Genesis is the only zero-base event; its eventual descriptor digest becomes the
-base ID. Later events bind that final ID. Only signed account genesis, device
+base ID. Its creator device signs with its ordinary signing key, and it names the
+creator's independently verified account head at the moment of creation (not
+necessarily account genesis). `prepare_genesis` seals the introduction and returns
+bytes for external signing; `finish` checks the signature and returns the original
+and base ID. `verify_genesis` checks the original against that account at the named
+head and M, returning the base ID, author and M/K_e key IDs without needing K_e.
+`History::with_account` and `History::replay_with_account` start from that same
+anchored account snapshot. Later
+events bind the final base ID; other control events use the device's second key.
+Only signed account genesis, device
 addition and self-removal are recognised in this slice; an outer control signature
 cannot mutate account history. Self-removal closes this fixed content epoch.
 No replacement-epoch, metadata-key distribution/rotation, private audience,
@@ -41,14 +50,34 @@ the exact body, original and supported control/account semantics but does not
 advance history, account or content. The owned, non-serializable prepared event
 exposes only `note_id() -> Option<[u8; 32]>`: a supported note's authenticated
 ID, or `None` for a control; the decrypted delta remains guarded inside it.
+For device stores, use `History::materialize(&self, prepared,
+Option<OwnedNoteTarget>) -> Result<Materialized, MaterializeError>`. Hand over
+**exclusive ownership** of the working Note selected by the authenticated ID
+(or no Note for controls). A wrong target or stale predecessor returns the Note
+unchanged in the error. A successful update applies once, in place, without
+encoding/replaying the old full Note. `WorkingNote::Accepted` is working state
+until the owner commits and decides to expose it, not a type-enforced UI gate.
+A malformed yrs Decode yields `Untouched` (same working Note), while a yrs
+Apply error drops the possibly changed Note and returns a payload-free `Poisoned`
+marker: reload from committed local state. Both rejections advance common order
+as `ContentRejected` once committed.
+The Note is separately owned from the bounded `Transition`: dropping a transition
+or a failed commit cannot modify the live History. `transition.applied()` binds
+the exact ordered `Commitment` and its encoded bytes, original encoded descriptor,
+body bytes and body commitment, plus the resulting head, floor and outcome.
+`History::publish_committed(transition)` consumes those bounded effects and
+refuses a stale prestate or integrity stop. Only the trusted device-store owner
+may call it, after the real transaction commits this transition's exact originals,
+outcome and progress. The library cannot prove SQLite COMMIT; the store must
+also fence its own target Note revision and, for hidden bases, unlock generation
+before exposing accepted Note state.
+Cold Note loading is a separate store load path (local checkpoint plus per-note
+tail), not an O(delta) promise for a cache miss.
+
 `History::consume(&mut self, prepared, Option<NoteTarget>) ->
-Result<AppliedEvent, ConsumeError>` requires the Note selected by that ID or
-**no Note** for controls. It compares the exact relevant in-memory predecessor
-(base, common head/control, account head, metadata/content epoch IDs, version
-floor, counts and stopped status) before applying a delta on a disposable Note
-or publishing a validated account candidate. Its non-forgeable owned result
-binds the exact ordered `Commitment` and its encoded bytes, original encoded
-descriptor, body bytes and body commitment, plus the resulting head and floor.
+Result<AppliedEvent, ConsumeError>` remains the older compatibility API. It
+compares the same predecessor and applies on a disposable full-state copy before
+advancing History; it is not the device-store per-event path.
 `kind()` distinguishes `NoteAccepted { note_id, delta }` (a wiped-on-drop
 `SecretBytes` with `expose()`), `NoteRejected { note_id }` (no delta), and
 `Control` (no Note). `outcome()` preserves the accepted/rejected classification.
@@ -77,19 +106,18 @@ behavior. No ID is readable in O; the verifier supplies routing only after openi
 B. Authenticated malformed Yjs rejects content while advancing the ordered event
 and retaining the prior Note. This cryptographic result is **not** an unlock or
 current-authority credential.
-The consuming store must persist the **applied result's exact originals and
-commitment**, updated Note (only for `NoteAccepted`), verified cursor, floor and
-outcome in **one transaction**, with a predecessor/generation compare at commit.
-For a hidden base this includes the current unlock-generation check: successful
-historical verification does not authorise a late plaintext write after relock.
-`consume` advances the in-memory History and Note **before** that transaction
-commits. If commit fails or the generation compare loses, discard both advanced
-values (replay or start from a pre-consume clone); never continue consuming from
-the uncommitted state. Do not accept a second raw-byte argument with a `verified`
-flag, or treat this in-memory result as an access credential. The store owns
-durable atomicity; this library does not implement a transaction. Retry by
-reusing the same `Encoded` bytes; sealing again is a new random package;
-serialization identity here is not a durable resend/outbox proof.
+The store persists the **transition's exact originals and commitment**,
+accepted delta or rejection, verified cursor and floor in **one transaction**,
+with a predecessor/generation compare at commit. Publish the transition and
+cache its usable Note only after COMMIT; on failed commit, drop both and reload
+from committed local state, preserving unsent work. The failed Apply Note is
+discarded, even when the rejection itself commits. A hidden base additionally
+fences its current unlock generation: historical verification does not authorise
+a late plaintext write after relock. The store owns durable atomicity; this
+library does not implement a transaction or a second device store. Do not accept
+a second raw-byte argument with a `verified` flag, or treat this result as an
+access credential. Retry using the same `Encoded` bytes; resealing is a new
+random package, not durable resend/outbox proof.
 The encoder resolves key availability before copying payload bytes. Its owned
 padded payload and binding scratch use `SecretBytes::from_parts`, which wipes those
 owned allocations on drop, including error paths. Borrowed input, intermediate

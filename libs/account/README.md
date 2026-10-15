@@ -34,6 +34,7 @@ not hold personal/base content keys and does not authorize a hosted operation.
 5. `apply_batch` verifies an ordered successor history atomically in memory. Store
    its original bytes and resulting head together before exposing the result.
    Never advance a durable checkpoint solely from a server/checker acknowledgement.
+   For an owned single-event candidate, `applied` avoids copying the projection. It sets no stop, so on error the caller must record the stop itself and not continue from a retained view.
 
 Invalid remote input leaves the previous projection/head unchanged and sets a
 sticky stopped state. Active-key access then fails with `Stopped`, not
@@ -67,7 +68,11 @@ keys, durable local handles, an exact-request second-key release policy, and X-W
 decapsulation returning only a zeroizing shared secret, never a receiver seed.
 `load_matching` compares the durable handle, keys, store kind and policy before
 account signing or initial device opening; an account owner must separately check
-verified active history and current home authority. The Mac M1 login-keychain
+verified active history and current home authority. Native identity loads read
+handle-bound, authenticated control-public metadata without releasing the control
+seed. Missing or corrupt metadata fails the load; creation must finish
+writing it before returning a handle, and there is no load-time migration. The Mac
+M1 login-keychain
 adapter records `MacLoginKeychainV1` + `AppEnforcedOwnerConfirmation` and asks
 LocalAuthentication for a fresh standard macOS owner confirmation before each
 control action. This is an **M1 app-enforced UI gate**, not
@@ -93,7 +98,13 @@ blob with its stage. It is not a key-value store, and a head is never durable
 without the bytes that produced it.
 
 `owner::AccountOwner` replays persisted original history from the anchor against
-the remembered head. It honours a persisted stop (retaining the last verified
+the remembered head on activation. While active it keeps that verified projection:
+successor batches make one transactional copy, and staged-admission reconciliation
+compares the exact staged bytes with its verified positional hash instead of
+replaying the journal. Its historic signing/control and receiving-key indexes
+include removed devices and reject cross-role signing/control reuse. The projection
+is in memory only; a durable projection tied to the remembered head can be added
+once account-local storage has its own container. It honours a persisted stop (retaining the last verified
 state and never clearing remembered heads), loads the native device with
 `load_matching`, requires those keys to be an active device in verified history
 with `materials_ready`, and only then mints an opaque generation-bound
@@ -130,8 +141,10 @@ consumers are added.
 ## Portable QR pairing increment
 
 `pairing` supplies a bounded 122-byte QR codec, a one-message secret-keyed
-scanner proof and an in-memory showing session. The scanner verifies the showing
-`DeviceId` against signed history replayed from the QR anchor. Only a verified
+scanner proof and an in-memory showing session. The fresh scanner verifies the showing
+`DeviceId` against signed history replayed from the QR anchor. An already
+activated owner's `scanner_status` uses its verified in-process projection;
+the journal-only status path for a fresh scanner still replays signed history. Only a verified
 reply can enter the showing device's owner-controlled `add_device` request; two
 distinct valid replies end the session. Session cancellation fences a late
 second-key signature without invalidating the entire account capability. A

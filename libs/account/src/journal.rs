@@ -8,6 +8,18 @@
 
 use crate::crypto::{Secret, SecretBytes};
 use crate::history::{AccountId, DevicePublicKeys, Head};
+
+/// Exact signed admission and signed recipient-encrypted delivery. The event's
+/// one-based position and predecessor are checked by the account layer, never
+/// inferred from an untrusted relay response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedAdmission {
+    pub position: u64,
+    pub previous: [u8; 32],
+    pub event: Vec<u8>,
+    pub delivery: Vec<u8>,
+}
+
 use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle};
 
 /// Framing version of the owner's pending first-device setup blob.
@@ -78,6 +90,10 @@ pub enum JournalError {
     Storage,
     /// Stored account state is internally inconsistent.
     Corrupt,
+    /// A previous admission remains unresolved; never overwrite its bytes.
+    StagedAdmissionExists,
+    /// A stale completion cannot clear a newer row.
+    StagedAdmissionChanged,
 }
 
 /// Durable state an account owner needs. Implementations commit each mutation
@@ -97,6 +113,28 @@ pub trait AccountJournal {
         stopped: bool,
     ) -> Result<(), JournalError>;
 
+    /// Order a generation advance against writers using the container guard.
+    /// Standalone journals have no external writer to exclude.
+    fn fence(&self, action: impl FnOnce()) -> Result<(), JournalError> {
+        action();
+        Ok(())
+    }
+
+    /// Keep the durable commit and its generation advance in the same guard.
+    /// `fence` runs even when the durable commit fails.
+    fn commit_verified_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        head: Head,
+        stopped: bool,
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        let result = self.commit_verified(anchor, events, head, stopped);
+        fence(result.is_ok());
+        result
+    }
+
     fn device(&self) -> Result<Option<JournaledDevice>, JournalError>;
     fn commit_device(&mut self, device: &JournaledDevice) -> Result<(), JournalError>;
 
@@ -105,6 +143,13 @@ pub trait AccountJournal {
     /// Delete pending setup material. Called only once the journal holds the
     /// staged bytes (home ordered) and the person confirmed the kit saved.
     fn clear_pending_setup(&mut self) -> Result<(), JournalError>;
+
+    /// Atomic insert; refuse a second row even if its bytes match. No send
+    /// until this succeeds. Clearing is permitted only after verified history
+    /// resolves the signed position; cancel does not clear it.
+    fn staged_admission(&self) -> Result<Option<StagedAdmission>, JournalError>;
+    fn insert_staged_admission(&mut self, row: &StagedAdmission) -> Result<(), JournalError>;
+    fn clear_staged_admission(&mut self, expected: &StagedAdmission) -> Result<(), JournalError>;
 }
 
 /// Native protection for the pending setup blob. A production adapter seals it

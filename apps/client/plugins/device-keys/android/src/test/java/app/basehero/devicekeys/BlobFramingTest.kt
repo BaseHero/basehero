@@ -23,6 +23,11 @@ class BlobFramingTest {
         val second = "b".repeat(64)
         assertFalse(BlobFraming.ad(first, "control").contentEquals(BlobFraming.ad(first, "ordinary")))
         assertFalse(BlobFraming.ad(first, "control").contentEquals(BlobFraming.ad(second, "control")))
+        val publicAd = BlobFraming.ad(first, "control-public")
+        assertTrue(publicAd.isNotEmpty())
+        assertFalse(publicAd.contentEquals(BlobFraming.ad(first, "control")))
+        assertFalse(publicAd.contentEquals(BlobFraming.ad(first, "ordinary")))
+        assertFalse(publicAd.contentEquals(BlobFraming.ad(second, "control-public")))
         try { BlobFraming.ad("../", "control"); fail("accepted path traversal") }
         catch (_: IllegalArgumentException) { }
     }

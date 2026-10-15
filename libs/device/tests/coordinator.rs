@@ -1,10 +1,8 @@
 use std::{collections::HashMap, process::Command, time::Instant};
 
 use bh_core::note::Note;
-use bh_storage::{
-    DeviceDatabase, NoteKey,
-    coordinator::{AuthoritySource, Coordinator, HostError, Scope},
-};
+use bh_device::coordinator::{AuthoritySource, Coordinator, HostError, Scope};
+use bh_storage::{DeviceDatabase, NoteKey};
 
 const KEY: NoteKey = NoteKey {
     base: [1; 32],
@@ -31,6 +29,30 @@ fn fixture(db: DeviceDatabase) -> Coordinator<Fixture> {
 }
 fn update(text: &str) -> Vec<u8> {
     Note::new().append_paragraph(text)
+}
+
+#[test]
+fn busy_base_b_never_retries_base_a_snapshot_token() {
+    let mut host = fixture(DeviceDatabase::open(":memory:").unwrap());
+    let mut other = SCOPE;
+    other.key.base = [8; 32];
+    host.authority_mut().0.insert("two".into(), other);
+    let a = host.open("one", KEY.note).unwrap();
+    let b = host.open("two", KEY.note).unwrap();
+    let revision = host.note_revision(KEY);
+    for n in 0..10 {
+        host.commit("two", b.generation, [n; 16], &update("busy"), |_| {})
+            .unwrap();
+        assert_eq!(
+            host.note_revision(KEY),
+            revision,
+            "unrelated base must not invalidate prepared note A"
+        );
+    }
+    let ready = host
+        .open_with_state("one", KEY.note, a.generation + 100, revision, a.state)
+        .unwrap();
+    assert_eq!(ready.state, host.open("one", KEY.note).unwrap().state);
 }
 
 #[test]

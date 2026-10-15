@@ -66,3 +66,4 @@ PY
 # entries. A build that accidentally enabled the default feature or leaked the
 # Gradle module fails here.
 node scripts/check-webdriver-markers.mjs "$apk" --expect absent
+python3 scripts/android_device_keys_packaging.py "$apk"

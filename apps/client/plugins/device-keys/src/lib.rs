@@ -35,7 +35,7 @@ fn decode_record(bytes: &[u8], public_len: usize) -> Result<&[u8], KeyStoreError
     Ok(&bytes[2..])
 }
 
-/// T113 may register this empty private Tauri plugin when it packages the
+/// App integration may register this empty private Tauri plugin when it packages the
 /// Android library. There is deliberately no command handler or JS API: native
 /// account code calls the byte-array JNI bridge directly, not Invoke JSON.
 #[cfg(target_os = "android")]
@@ -45,6 +45,8 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(any(target_os = "android", test))]
+mod identity;
 #[cfg(target_os = "android")]
 pub use android::{AndroidKeyStore, AndroidPendingSetupProtector};
 

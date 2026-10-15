@@ -1,12 +1,12 @@
 //! Portable QR proof and volatile showing session. Nothing here orders an add or
 //! authorizes a scanner from a relay status. The only durable admission is signed
-//! account history; a future storage adapter stages exact signed bytes before send.
+//! account history; the device journal stages exact signed bytes before send.
 use std::sync::Mutex;
 
 use crate::crypto::{self, Secret};
-use crate::journal::{AccountJournal, PendingSetupProtector};
+use crate::journal::{AccountJournal, JournalError, JournaledDevice, PendingSetupProtector};
 use crate::owner::{AccountCapability, AccountOwner, OwnerError};
-use crate::platform::DeviceKeyStore;
+use crate::platform::{ControlKeyPolicy, DeviceKeyStore, KeyStoreError};
 use crate::{AccountId, DeviceId, DevicePublicKeys, Head, SigningRequest, VerifiedAccount};
 
 const DOMAIN: &[u8; 8] = b"BHPAIR01";
@@ -28,6 +28,9 @@ pub enum PairError {
     WrongContext,
     ChangedRequest,
     StageFailed,
+    AlreadyAdded,
+    Journal(JournalError),
+    Device(KeyStoreError),
     Owner(OwnerError),
 }
 impl From<OwnerError> for PairError {
@@ -67,6 +70,92 @@ impl QrCode {
             session: raw[74..90].try_into().unwrap(),
             secret: Secret::from_slice(&raw[90..]).map_err(|_| PairError::Malformed)?,
         })
+    }
+}
+
+/// Keep one journaled scanner identity across attempts, including a refused or
+/// cancelled QR session. A missing native key is an error, never a cue to make a
+/// replacement that could strand an already-admitted identity.
+pub async fn scanner_identity(
+    journal: &mut impl AccountJournal,
+    store: &mut impl DeviceKeyStore,
+    policy: ControlKeyPolicy,
+) -> Result<JournaledDevice, PairError> {
+    if let Some(existing) = journal.device().map_err(PairError::Journal)? {
+        if scanner_status(journal)? != ScannerStatus::Pending {
+            return Err(PairError::AlreadyAdded);
+        }
+        store
+            .load_matching(&crate::platform::StoredDevice {
+                handle: existing.handle.clone(),
+                keys: existing.keys.clone(),
+                policy: existing.policy,
+                kind: existing.kind,
+            })
+            .await
+            .map_err(PairError::Device)?;
+        return Ok(existing);
+    }
+    if journal.load().map_err(PairError::Journal)?.is_some() {
+        return Err(PairError::WrongContext);
+    }
+    let device = store.create(policy).await.map_err(PairError::Device)?;
+    let identity = JournaledDevice {
+        handle: device.handle,
+        keys: device.keys,
+        policy: device.policy,
+        kind: device.kind,
+    };
+    journal
+        .commit_device(&identity)
+        .map_err(PairError::Journal)?;
+    Ok(identity)
+}
+
+/// Status is derived from the journal, not from an unauthenticated relay hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerStatus {
+    Pending,
+    Added,
+    ReadyForDelivery,
+}
+pub fn scanner_status(journal: &impl AccountJournal) -> Result<ScannerStatus, PairError> {
+    let device = journal
+        .device()
+        .map_err(PairError::Journal)?
+        .ok_or(PairError::WrongContext)?;
+    let Some(record) = journal.load().map_err(PairError::Journal)? else {
+        return Ok(ScannerStatus::Pending);
+    };
+    if record.stopped {
+        return Err(PairError::History);
+    }
+    let original: Vec<&[u8]> = record.history.iter().map(Vec::as_slice).collect();
+    let state = VerifiedAccount::replay(record.anchor, &original, record.head)
+        .map_err(|_| PairError::History)?;
+    scanner_status_verified(&state, &device.keys)
+}
+
+/// An already-active owner can answer scanner status from its verified in-process
+/// projection and its loaded device. Fresh scanner flows still verify the
+/// original signed history above.
+pub(crate) fn scanner_status_verified(
+    state: &VerifiedAccount,
+    keys: &DevicePublicKeys,
+) -> Result<ScannerStatus, PairError> {
+    if state.is_stopped() {
+        return Err(PairError::History);
+    }
+    if !state.has_seen_device(keys.id()) {
+        return Ok(ScannerStatus::Pending);
+    }
+    state
+        .active_device(keys.id())
+        .map_err(|_| PairError::History)?;
+    if state.materials_ready().map_err(|_| PairError::History)? {
+        Ok(ScannerStatus::ReadyForDelivery)
+    } else {
+        Ok(ScannerStatus::Added)
     }
 }
 
@@ -235,13 +324,44 @@ impl ShowingSession {
         if self.account != capability.account_id() || self.showing != capability.device_id() {
             return Err(PairError::WrongContext);
         }
-        let request = owner.prepare_add_device(capability, candidate.reply.keys.clone())?;
+        let request = match owner.prepare_add_device(capability, candidate.reply.keys.clone()) {
+            Err(OwnerError::Invalid(crate::history::Error::DuplicateDevice)) => {
+                return Err(PairError::AlreadyAdded);
+            }
+            result => result?,
+        };
         candidate.request = Some((request.signing_bytes().to_vec(), *request.expected_key()));
         Ok(request)
     }
     /// Invoke the caller's synchronous durable stage only while the session is
     /// live. A cancelled or competing reply fences late OS signatures. No network
     /// send is permitted until the stage commits exact signed add and seal bytes.
+    /// Persist through the journal while the session is still live. The
+    /// callback is synchronous under the session lock; cancellation after this
+    /// point ends the QR, not the already-staged admission.
+    pub fn stage_journal<J: AccountJournal, S: DeviceKeyStore, P: PendingSetupProtector>(
+        &self,
+        owner: &mut AccountOwner<J, S, P>,
+        capability: &AccountCapability,
+        signed: &[u8],
+        delivery: &[u8],
+    ) -> Result<(), PairError> {
+        let recipient = {
+            let state = self.state.lock().expect("session lock poisoned");
+            let State::Live {
+                candidate: Some(candidate),
+                ..
+            } = &*state
+            else {
+                return Err(PairError::Ended);
+            };
+            candidate.reply.keys.clone()
+        };
+        self.stage(signed, delivery, |event, seal| {
+            owner.stage_signed_admission(capability, &recipient, event, seal)
+        })
+    }
+
     pub fn stage<E>(
         &self,
         signed: &[u8],

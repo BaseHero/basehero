@@ -37,7 +37,7 @@ object DeviceKeysBridge {
     private val activityBinding = CurrentActivity<FragmentActivity>()
     private val creating = ConcurrentHashMap<Long, () -> Unit>()
 
-    // T113 later calls these from MainActivity.onResume/onPause. Until then JNI
+    // App integration calls these from MainActivity.onResume/onPause. Until then JNI
     // fails Unavailable rather than mistaking Tao's Application for an Activity.
     @JvmStatic fun attachActivity(activity: FragmentActivity) { activityBinding.attach(activity) }
     @JvmStatic fun detachActivity(activity: FragmentActivity) { activityBinding.detach(activity) }
@@ -112,7 +112,7 @@ object DeviceKeysBridge {
 
     private fun cleanup(dir: File, handle: String, normalAlias: String, controlAlias: String) {
         var failed = false
-        for (role in listOf("ordinary", "receiver", "control")) {
+        for (role in listOf("ordinary", "receiver", "control", "control-public")) {
             for (suffix in listOf("", ".tmp")) {
                 val file = File(dir, name(handle, role) + suffix)
                 if (file.exists() && !file.delete()) failed = true
@@ -147,7 +147,7 @@ object DeviceKeysBridge {
                 Build.VERSION.SDK_INT,
                 BiometricManager.from(activity).canAuthenticate(STRONG) == BiometricManager.BIOMETRIC_SUCCESS
             )) throw UnsupportedOperationException()
-            val roles = listOf("ordinary", "receiver", "control")
+            val roles = listOf("ordinary", "receiver", "control", "control-public")
             if (key(normalAlias) != null || key(controlAlias) != null || roles.any {
                 File(directory, name(handle, it)).exists() || File(directory, name(handle, it) + ".tmp").exists()
             }) throw IllegalStateException()
@@ -179,6 +179,14 @@ object DeviceKeysBridge {
             val normal = key(normalAlias) ?: throw Missing()
             persist(directory, handle, "ordinary", encrypt(normal, ad(handle, "ordinary"), ordinary))
             persist(directory, handle, "receiver", encrypt(normal, ad(handle, "receiver"), receiver))
+            // Metadata must be sealed before the control prompt can complete creation.
+            // Invalid inputs fail and roll back, never return a metadata-less handle.
+            require(control.size == 66 && control[0] == 1.toByte() && control[1] == 1.toByte())
+            val publicRecord = control.copyOfRange(0, 34)
+            try {
+                persist(directory, handle, "control-public",
+                    encrypt(normal, ad(handle, "control-public"), publicRecord))
+            } finally { publicRecord.fill(0) }
             val controlAd = ad(handle, "control") // validate without using the auth-bound operation
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, key(controlAlias) ?: throw Missing())
@@ -240,6 +248,14 @@ object DeviceKeysBridge {
         reply(ticket) {
             if (role != "ordinary" && role != "receiver") throw IllegalArgumentException()
             read(activity, handle, role)
+        }
+    }
+
+    /** Read authenticated public metadata without initializing the gated control Cipher. */
+    @JvmStatic fun readControlPublic(activity: Activity, handle: String, ticket: Long) {
+        reply(ticket) {
+            if (!File(directory(activity), name(handle, "control")).isFile) throw Missing()
+            read(activity, handle, "control-public")
         }
     }
 

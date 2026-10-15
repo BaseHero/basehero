@@ -32,6 +32,232 @@ use store::FakeStore;
 
 type Owner = bh_account::owner::AccountOwner<DeviceJournal, FakeStore, PlainProtector>;
 
+#[test]
+fn shared_journal_uses_the_exact_container_connection_and_poison_is_storage() {
+    use std::sync::{Arc, Mutex};
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(":memory:").unwrap(),
+    ));
+    let mut journal = DeviceJournal::from_shared(Arc::clone(&db));
+    assert!(journal.load().unwrap().is_none());
+    let device = bh_account::journal::JournaledDevice {
+        handle: bh_account::platform::KeyHandle([7; 32]),
+        keys: bh_account::DevicePublicKeys::new([1; 32], [2; 32], [3; 1216]).unwrap(),
+        policy: ControlKeyPolicy::AppEnforcedOwnerConfirmation,
+        kind: bh_account::platform::DeviceKeyStoreKind::MacLoginKeychainV1,
+    };
+    journal.commit_device(&device).unwrap();
+    assert!(db.lock().unwrap().device_identity().unwrap().is_some());
+    assert!(journal.device().unwrap().is_some());
+    let poison = Arc::clone(&db);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison database guard");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(matches!(
+        journal.load(),
+        Err(bh_account::journal::JournalError::Storage)
+    ));
+    assert!(matches!(
+        journal.commit_device(&device),
+        Err(bh_account::journal::JournalError::Storage)
+    ));
+}
+
+#[test]
+fn verified_commit_fence_stays_under_guard_even_when_storage_fails() {
+    use std::sync::{Arc, Mutex};
+    let h = Harness::new();
+    let status = complete(&h);
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(&h.path).unwrap(),
+    ));
+    let mut journal = DeviceJournal::from_shared(Arc::clone(&db));
+    let seen = Arc::clone(&db);
+    journal
+        .commit_verified_fenced(status.anchor, &[], status.head, false, |success| {
+            assert!(success);
+            assert!(seen.try_lock().is_err(), "fence must precede guard release");
+        })
+        .unwrap();
+    h.raw().execute_batch("CREATE TRIGGER fail_stop BEFORE UPDATE ON account_state BEGIN SELECT RAISE(FAIL, 'no space'); END;").unwrap();
+    assert!(matches!(
+        journal.commit_verified_fenced(status.anchor, &[], status.head, true, |success| {
+            assert!(!success);
+            assert!(
+                seen.try_lock().is_err(),
+                "failed write must still fence under guard"
+            );
+        }),
+        Err(bh_account::journal::JournalError::Storage)
+    ));
+}
+
+#[test]
+fn poisoned_guard_still_fences_but_reports_storage() {
+    use std::sync::{Arc, Mutex, TryLockError};
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(":memory:").unwrap(),
+    ));
+    let poisoned = Arc::clone(&db);
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoned.lock().unwrap();
+        panic!("poison database guard");
+    })
+    .join();
+    let mut journal = DeviceJournal::from_shared(Arc::clone(&db));
+    let generation = AccountGeneration::new();
+    let before = generation.current();
+    assert!(matches!(
+        journal.fence(|| {
+            assert!(matches!(db.try_lock(), Err(TryLockError::WouldBlock)));
+            generation.advance();
+        }),
+        Err(bh_account::journal::JournalError::Storage)
+    ));
+    assert_ne!(before, generation.current());
+    let before = generation.current();
+    assert!(matches!(
+        journal.commit_verified_fenced(
+            bh_account::AccountId([4; 32]),
+            &[],
+            Head {
+                position: 1,
+                hash: [5; 32]
+            },
+            true,
+            |success| {
+                assert!(!success);
+                assert!(matches!(db.try_lock(), Err(TryLockError::WouldBlock)));
+                generation.advance();
+            }
+        ),
+        Err(bh_account::journal::JournalError::Storage)
+    ));
+    assert_ne!(before, generation.current());
+}
+
+#[test]
+fn writer_guard_orders_capability_check_and_lock_in_both_directions() {
+    use std::sync::{Arc, Mutex, mpsc};
+    let h = Harness::new();
+    complete(&h);
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(&h.path).unwrap(),
+    ));
+    let mut owner = Owner::new(
+        DeviceJournal::from_shared(Arc::clone(&db)),
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    let capability = activate(&mut owner);
+    assert!(capability.is_current());
+    let checked = Arc::clone(&db);
+    DeviceJournal::from_shared(Arc::clone(&db))
+        .fence(|| {
+            assert!(
+                checked.try_lock().is_err(),
+                "generation advance must hold writer guard"
+            )
+        })
+        .unwrap();
+    let guard = db.lock().unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let thread_db = Arc::clone(&db);
+    let generation = h.generation.clone();
+    let task = std::thread::spawn(move || {
+        let store = FakeStore::new(generation.clone());
+        let mut other_owner = Owner::new(
+            DeviceJournal::from_shared(thread_db),
+            store,
+            PlainProtector,
+            generation,
+        );
+        started_tx.send(()).unwrap();
+        other_owner.lock().unwrap();
+        finished_tx.send(()).unwrap();
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(
+        capability.is_current(),
+        "writer can commit while holding the guard"
+    );
+    assert!(
+        finished_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "lock must wait for writer"
+    );
+    drop(guard);
+    finished_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    task.join().unwrap();
+    let _guard = db.lock().unwrap();
+    assert!(
+        !capability.is_current(),
+        "writer starting after lock observes revocation"
+    );
+}
+
+#[test]
+fn verified_removal_and_failed_writes_fence_with_the_shared_guard() {
+    use std::sync::{Arc, Mutex};
+    let h = Harness::new();
+    complete(&h);
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(&h.path).unwrap(),
+    ));
+    let mut owner = Owner::new(
+        DeviceJournal::from_shared(Arc::clone(&db)),
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    let capability = activate(&mut owner);
+    let request = owner.prepare_remove_self(&capability).unwrap();
+    let event = ready(owner.sign_control(&capability, &request)).unwrap();
+    owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    let _guard = db.lock().unwrap();
+    assert!(!capability.is_current());
+    drop(_guard);
+
+    // A failed durable verified commit must invalidate a previously minted writer.
+    let h = Harness::new();
+    complete(&h);
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(&h.path).unwrap(),
+    ));
+    let mut owner = Owner::new(
+        DeviceJournal::from_shared(Arc::clone(&db)),
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    let capability = activate(&mut owner);
+    h.raw().execute_batch("CREATE TRIGGER fail_event BEFORE INSERT ON account_events BEGIN SELECT RAISE(FAIL, 'no space'); END;").unwrap();
+    let request = owner
+        .prepare_add_device(
+            &capability,
+            bh_account::DevicePublicKeys::new([9; 32], [10; 32], [11; 1216]).unwrap(),
+        )
+        .unwrap();
+    let event = ready(owner.sign_control(&capability, &request)).unwrap();
+    assert!(matches!(
+        owner.apply_incoming(&[event.as_bytes()]),
+        Err(OwnerError::Journal(_))
+    ));
+    assert!(!capability.is_current());
+}
+
 /// One temp database path plus shared native-key state across "restarts".
 struct Harness {
     dir: tempfile::TempDir,
@@ -295,6 +521,327 @@ fn pairing_approval_uses_the_real_owner_and_cancellation_fences_late_native_sign
         session.stage(late.as_bytes(), b"seal", |_, _| Ok::<_, ()>(())),
         Err(PairError::Ended)
     );
+}
+
+fn stage_pairing(h: &Harness) -> (Vec<u8>, Vec<u8>, bh_account::DevicePublicKeys) {
+    use bh_account::{
+        crypto::{KemKey, SigningKey},
+        pairing::{Reply, ShowingSession},
+    };
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    let seal = owner.pending_home_objects().unwrap().device_seal;
+    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_kit_saved().unwrap();
+    let native = h.journal().device().unwrap().unwrap();
+    let state = bh_account::VerifiedAccount::replay(
+        setup.anchor,
+        &setup
+            .submission
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>(),
+        setup.head,
+    )
+    .unwrap();
+    let personal = ready(bh_account::personal::open_for_receiver(
+        &state,
+        &seal,
+        &bh_account::platform::StoredDevice {
+            handle: native.handle,
+            keys: native.keys.clone(),
+            policy: native.policy,
+            kind: native.kind,
+        },
+        &mut h.store.clone(),
+    ))
+    .unwrap();
+    let capability = activate(&mut owner);
+    let session = ShowingSession::new(setup.anchor, native.keys.id());
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), scanner.clone(), b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&owner, &capability).unwrap();
+    let signed = ready(owner.sign_control(&capability, &request)).unwrap();
+    let delivery =
+        ready(owner.seal_personal_for_device(&capability, &personal, &scanner, &signed)).unwrap();
+    session
+        .stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery)
+        .unwrap();
+    session.cancel(); // cancellation after staging cannot discard the durable row
+    (signed.as_bytes().to_vec(), delivery, scanner)
+}
+
+#[test]
+fn staged_admission_restarts_and_retries_exact_bytes_without_a_second_signature() {
+    use bh_account::owner::AdmissionResolution;
+    let h = Harness::new();
+    let (event, delivery, _) = stage_pairing(&h);
+    let before_signs = h.store.state().sign_calls;
+    let row = h.journal().staged_admission().unwrap().unwrap();
+    assert_eq!(row.event, event);
+    assert_eq!(row.delivery, delivery);
+    let mut owner = h.owner(); // actual SQLite close/reopen between staging and send
+    activate(&mut owner);
+    assert_eq!(
+        owner.reconcile_staged_admission(None).unwrap(),
+        AdmissionResolution::Checking {
+            event: event.clone()
+        }
+    );
+    assert_eq!(
+        owner.reconcile_staged_admission(Some(&[])).unwrap(),
+        AdmissionResolution::Checking {
+            event: event.clone()
+        }
+    );
+    assert_eq!(h.store.state().sign_calls, before_signs);
+    assert_eq!(
+        h.journal().staged_admission().unwrap().unwrap().event,
+        event
+    );
+    assert_eq!(
+        owner
+            .reconcile_staged_admission(Some(&[event.as_slice()]))
+            .unwrap(),
+        AdmissionResolution::Admitted { delivery }
+    );
+    assert!(h.journal().staged_admission().unwrap().is_none());
+    assert_eq!(
+        h.stored().head,
+        AccountEvent::decode(&event).unwrap().head()
+    );
+    assert_eq!(h.store.state().sign_calls, before_signs);
+}
+
+#[test]
+fn different_verified_successor_is_not_added_and_clears_row() {
+    use bh_account::owner::AdmissionResolution;
+    let h = Harness::new();
+    let (event, _, _) = stage_pairing(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    let request = owner.prepare_remove_self(&capability).unwrap();
+    let other = ready(owner.sign_control(&capability, &request)).unwrap();
+    assert_ne!(other.as_bytes(), event);
+    assert_eq!(
+        owner
+            .reconcile_staged_admission(Some(&[other.as_bytes()]))
+            .unwrap(),
+        AdmissionResolution::NotAdded
+    );
+    assert_eq!(h.stored().head, other.head());
+    assert!(h.journal().staged_admission().unwrap().is_none());
+}
+
+#[test]
+fn reconcile_keeps_exact_row_when_verified_history_commit_fails() {
+    use bh_account::owner::AdmissionResolution;
+    for admitted in [true, false] {
+        let h = Harness::new();
+        let (event, delivery, _) = stage_pairing(&h);
+        let original = h.journal().staged_admission().unwrap();
+        let before = h.stored();
+        let mut owner = h.owner();
+        let capability = activate(&mut owner);
+        let successor = if admitted {
+            event
+        } else {
+            let request = owner.prepare_remove_self(&capability).unwrap();
+            ready(owner.sign_control(&capability, &request))
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        };
+        h.raw()
+            .execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON account_events BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;")
+            .unwrap();
+        assert!(matches!(
+            owner.reconcile_staged_admission(Some(&[successor.as_slice()])),
+            Err(OwnerError::Journal(
+                bh_account::journal::JournalError::Storage
+            ))
+        ));
+        assert!(
+            matches!(
+                owner.reconcile_staged_admission(Some(&[successor.as_slice()])),
+                Err(OwnerError::Stopped)
+            ),
+            "the same owner cannot release a delivery from its uncommitted projection"
+        );
+        assert!(matches!(
+            owner.prepare_remove_self(&capability),
+            Err(OwnerError::Stopped)
+        ));
+        assert_eq!(h.journal().staged_admission().unwrap(), original);
+        drop(owner);
+
+        // Open again with the refusal still installed: neither event nor head
+        // nor staged bytes may have been retired by the failed transaction.
+        let mut resumed = h.owner();
+        activate(&mut resumed);
+        let reopened = h.stored();
+        assert_eq!(reopened.head, before.head);
+        assert_eq!(reopened.history, before.history);
+        assert_eq!(h.journal().staged_admission().unwrap(), original);
+
+        h.raw().execute_batch("DROP TRIGGER fail_history").unwrap();
+        assert_eq!(
+            resumed
+                .reconcile_staged_admission(Some(&[successor.as_slice()]))
+                .unwrap(),
+            if admitted {
+                AdmissionResolution::Admitted { delivery }
+            } else {
+                AdmissionResolution::NotAdded
+            }
+        );
+        assert_eq!(
+            h.stored().head,
+            AccountEvent::decode(&successor).unwrap().head()
+        );
+        assert_eq!(h.stored().history.len(), before.history.len() + 1);
+        assert!(h.journal().staged_admission().unwrap().is_none());
+    }
+}
+
+#[test]
+fn reconcile_keeps_exact_row_on_forged_successor() {
+    let h = Harness::new();
+    let (mut event, _, _) = stage_pairing(&h);
+    let original = h.journal().staged_admission().unwrap();
+    let before = h.stored();
+    let mut owner = h.owner();
+    activate(&mut owner);
+    *event.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        owner.reconcile_staged_admission(Some(&[event.as_slice()])),
+        Err(OwnerError::Invalid(_))
+    ));
+    assert_eq!(h.stored().head, before.head);
+    assert_eq!(h.stored().history, before.history);
+    assert_eq!(h.journal().staged_admission().unwrap(), original);
+}
+
+#[test]
+fn interrupted_clear_is_reconciled_after_restart_from_durable_history() {
+    use bh_account::owner::AdmissionResolution;
+    for admitted in [true, false] {
+        let h = Harness::new();
+        let (event, delivery, _) = stage_pairing(&h);
+        let mut owner = h.owner();
+        let capability = activate(&mut owner);
+        let outcome = if admitted {
+            event.clone()
+        } else {
+            let request = owner.prepare_remove_self(&capability).unwrap();
+            ready(owner.sign_control(&capability, &request))
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        };
+        owner.apply_incoming(&[outcome.as_slice()]).unwrap(); // crash before clear
+        assert!(h.journal().staged_admission().unwrap().is_some());
+        drop(owner);
+        let mut resumed = h.owner();
+        let _ = ready(resumed.activate()).unwrap();
+        assert_eq!(
+            resumed
+                .reconcile_staged_admission(Some(&[outcome.as_slice()]))
+                .unwrap(),
+            if admitted {
+                AdmissionResolution::Admitted { delivery }
+            } else {
+                AdmissionResolution::NotAdded
+            }
+        );
+        assert!(h.journal().staged_admission().unwrap().is_none());
+    }
+}
+
+#[test]
+fn scanner_status_uses_verified_sqlite_facts_not_relay_hints() {
+    use bh_account::pairing::{ScannerStatus, scanner_identity, scanner_status};
+    let showing = Harness::new();
+    let setup = complete(&showing);
+    let mut scanner = Harness::new();
+    let mut journal = scanner.journal();
+    let identity = ready(scanner_identity(
+        &mut journal,
+        &mut scanner.store,
+        ControlKeyPolicy::AppEnforcedOwnerConfirmation,
+    ))
+    .unwrap();
+    assert_eq!(scanner_status(&journal).unwrap(), ScannerStatus::Pending);
+    let showing_record = showing.stored();
+    let original: Vec<&[u8]> = showing_record.history.iter().map(Vec::as_slice).collect();
+    journal
+        .commit_verified(setup.anchor, &original, setup.head, false)
+        .unwrap();
+    assert_eq!(scanner_status(&journal).unwrap(), ScannerStatus::Pending);
+    let mut owner = showing.owner();
+    let capability = activate(&mut owner);
+    let request = owner
+        .prepare_add_device(&capability, identity.keys.clone())
+        .unwrap();
+    let event = ready(owner.sign_control(&capability, &request)).unwrap();
+    journal
+        .commit_verified(setup.anchor, &[event.as_bytes()], event.head(), false)
+        .unwrap();
+    drop(journal);
+    let journal = scanner.journal();
+    assert_eq!(
+        scanner_status(&journal).unwrap(),
+        ScannerStatus::ReadyForDelivery
+    );
+    drop(journal);
+    let mut journal = scanner.journal();
+    assert!(matches!(
+        ready(scanner_identity(
+            &mut journal,
+            &mut scanner.store,
+            ControlKeyPolicy::AppEnforcedOwnerConfirmation
+        )),
+        Err(bh_account::pairing::PairError::AlreadyAdded)
+    ));
+    assert_eq!(scanner.store.state().create_calls, 1);
+    assert_eq!(
+        showing.stored().head,
+        setup.head,
+        "only scanner journal received the verified add"
+    );
+}
+
+#[test]
+fn later_scan_of_an_already_admitted_identity_never_signs_again() {
+    use bh_account::pairing::{PairError, Reply, ShowingSession};
+    let h = Harness::new();
+    let (event, _, scanner) = stage_pairing(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    assert!(matches!(
+        owner.prepare_add_device(&capability, scanner.clone()),
+        Err(OwnerError::Journal(
+            bh_account::journal::JournalError::StagedAdmissionExists
+        ))
+    ));
+    owner.apply_incoming(&[event.as_slice()]).unwrap();
+    owner.reconcile_staged_admission(None).unwrap();
+    let next = ShowingSession::new(h.stored().anchor, capability.device_id());
+    next.receive(&Reply::make(&next.qr().unwrap(), scanner, b"Fold").unwrap())
+        .unwrap();
+    let before = h.store.state().sign_calls;
+    assert!(matches!(
+        next.prepare(&owner, &capability),
+        Err(PairError::AlreadyAdded)
+    ));
+    assert_eq!(h.store.state().sign_calls, before);
 }
 
 fn password() -> Password {
@@ -573,6 +1120,10 @@ fn sticky_stop_survives_restart_and_keeps_remembered_head() {
     let stored = h.stored();
     assert!(stored.stopped);
     assert_eq!(stored.head, before);
+    assert_eq!(
+        owner.scanner_status(),
+        Err(bh_account::pairing::PairError::History)
+    );
 }
 
 #[test]
@@ -722,6 +1273,38 @@ fn activation_requires_ready_materials() {
 }
 
 #[test]
+fn native_key_invalidation_and_integrity_stop_fence_previous_capabilities() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    h.store.state_mut().fail_load = true;
+    assert!(matches!(
+        ready(owner.activate()),
+        Ok(AccountLoad::AdmissionRequired(
+            AdmissionReason::KeyUnavailable
+        ))
+    ));
+    assert!(
+        !capability.is_current(),
+        "native key invalidation revokes old writer"
+    );
+
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    assert!(matches!(
+        owner.apply_incoming(&[b"bad"]),
+        Err(OwnerError::Invalid(_))
+    ));
+    assert!(
+        !capability.is_current(),
+        "integrity stop revokes old writer"
+    );
+}
+
+#[test]
 fn a_failed_stop_write_still_stops_the_session() {
     let h = Harness::new();
     let _ = complete(&h);
@@ -738,6 +1321,10 @@ fn a_failed_stop_write_still_stops_the_session() {
         owner.apply_incoming(&[b"bad"]),
         Err(OwnerError::Journal(_))
     ));
+    assert!(
+        !capability.is_current(),
+        "failed integrity stop still revokes"
+    );
     assert!(matches!(
         owner.prepare_remove_self(&capability),
         Err(OwnerError::Stopped)
@@ -754,6 +1341,7 @@ fn removed_device_denies_the_old_capability() {
     let event = ready(owner.sign_control(&capability, &request)).unwrap();
     let head = owner.apply_incoming(&[event.as_bytes()]).unwrap();
     assert_eq!(head, event.head());
+    assert!(!capability.is_current());
 
     assert!(ready(owner.sign_control(&capability, &request)).is_err());
     drop(owner);
@@ -784,6 +1372,40 @@ fn stale_generation_after_await_is_rejected() {
 }
 
 #[test]
+fn lock_revokes_the_capability_even_when_the_shared_writer_is_poisoned() {
+    use std::sync::{Arc, Mutex};
+    let h = Harness::new();
+    complete(&h);
+    let db = Arc::new(Mutex::new(
+        bh_storage::DeviceDatabase::open(&h.path).unwrap(),
+    ));
+    let mut owner = Owner::new(
+        DeviceJournal::from_shared(Arc::clone(&db)),
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    let capability = activate(&mut owner);
+    assert!(capability.is_current());
+    let poisoned = Arc::clone(&db);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison database guard");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(matches!(
+        owner.lock(),
+        Err(OwnerError::Journal(
+            bh_account::journal::JournalError::Storage
+        ))
+    ));
+    assert!(!capability.is_current());
+}
+
+#[test]
 fn lock_invalidates_the_generation_and_the_capability() {
     let h = Harness::new();
     let _ = complete(&h);
@@ -791,7 +1413,8 @@ fn lock_invalidates_the_generation_and_the_capability() {
     let capability = activate(&mut owner);
     assert_eq!(capability.authority(), Authority::OfflineLastVerified);
     let request = owner.prepare_remove_self(&capability).unwrap();
-    owner.lock();
+    owner.lock().unwrap();
+    assert!(!capability.is_current());
     assert!(matches!(
         ready(owner.sign_control(&capability, &request)),
         Err(OwnerError::NotActive)

@@ -6,8 +6,17 @@ account authority, content keys or signing key. It performs no I/O.
 
 ## Contract
 
-`PolicyGate::push(payload, signature)` verifies exact signed bytes and remembers
-the highest authenticated generation. Delivery is not authorization:
+`PolicyGate::push(payload, signature)` is the legacy **volatile** convenience
+wrapper; it verifies exact signed bytes and remembers the highest authenticated
+generation. A device channel must instead use `prepare_delivery` → atomic durable
+`save(candidate.snapshot())` → `publish_delivery(candidate)` through one shared
+`PolicyContext`. A candidate is bound to the originating gate's root and current
+revision and is consumed on publication. `snapshot()` returns bounded exact signed
+bytes plus the root; `restore_unavailable` re-authenticates and restores only the
+floor, never feed availability. A new authenticated delivery is required after
+restart. Save failures must poison all users until the exact pending candidate is
+committed; the gate alone does not implement persistence or recovery.
+Delivery is not authorization:
 `check_measurements` must run for each policy-dependent operation using fresh
 trusted time and independently verified hardware measurements. A successful
 check is only a release-policy match; it is not an attested-peer capability and
@@ -84,12 +93,13 @@ but stops checks until authenticated non-regressing delivery. Silent withheld
 withdrawals cannot be detected before the original signed expiry. Re-delivery
 never renews expiry. Already released keys cannot be erased by withdrawal.
 
-State is deliberately volatile. A restarted process rejects expired documents
-using independently trusted time, but may match an old **unexpired** document
-without learning a withdrawal it has not received. The tests explicitly preserve
-that limit. This library alone is not recovery authorization, protected durable
-checker state or a solution to host pause/time-source qualification. Do not use
-wall time or a caller-supplied 'current' head to fill those gaps.
+Standalone `PolicyGate::push` state is deliberately volatile; the device channel
+requires the durable wrapper described above. Even with a stored floor, a restarted
+process may receive an old **unexpired** identical signed policy without learning
+an unseen withdrawal. A saved snapshot cannot itself reopen unavailable state.
+This library alone is not recovery authorization, protected durable checker state
+or a solution to host pause/time-source qualification. Host authority must not
+use wall time or a caller-supplied 'current' head to fill those gaps.
 
 Errors have only fixed enum variants and never retain input or dependency error
 strings. That constrains this API's diagnostics; it is not a platform-log canary

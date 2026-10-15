@@ -269,6 +269,12 @@ impl QualifiedClock {
             used_nonces: Default::default(),
         })
     }
+    /// Start a transport refresh by removing the old anchor before any I/O.
+    /// If that operation is cancelled or times out, the previous anchor cannot
+    /// resume serving time. The caller retains exclusive access until it finishes.
+    pub fn mark_unavailable(&mut self) {
+        self.anchors = None;
+    }
     /// A failed refresh invalidates the old anchor: outage must not serve stale time.
     /// Reused nonces (including across refreshes in this boot) refuse; after 4096
     /// nonces construct a fresh clock rather than growing replay state without bound.

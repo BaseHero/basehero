@@ -364,6 +364,43 @@ mod tests {
         }
         (result, dir)
     }
+    // Run on macOS with BH_TEST_MAC_ARCHIVE and BH_TEST_MAC_VERSION set to
+    // a locally packaged archive and its release number.
+    // This supplies a test-only verified handle, not a production release signature.
+    // The installed fixture stays under this crate's worktree, never /Applications.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires BH_TEST_MAC_ARCHIVE from a local source-only Mac build"]
+    fn packaged_mac_archive_is_accepted_by_installer() {
+        let archive = std::env::var("BH_TEST_MAC_ARCHIVE").expect("set BH_TEST_MAC_ARCHIVE");
+        let version = std::env::var("BH_TEST_MAC_VERSION")
+            .expect("set BH_TEST_MAC_VERSION to the locally packaged release number")
+            .parse::<u64>()
+            .expect("integer release number");
+        let mut f = tempfile::tempfile_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        io::copy(&mut fs::File::open(archive).unwrap(), &mut f).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let (dir, app) = fixture();
+        install_blocking(
+            StagedArtifact::test_verified(f, version),
+            &app,
+            ExtractLimits {
+                entries: 1000,
+                bytes: 200 * 1024 * 1024,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!app.join("old").exists());
+        assert!(app.join("Contents/MacOS/bh-client").is_file());
+        let status = std::process::Command::new("codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2"])
+            .arg(dir.path().join("BaseHero.app"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn hostile_archives_refuse_without_modifying_install() {
         let p = plist("app.basehero.client", "2");

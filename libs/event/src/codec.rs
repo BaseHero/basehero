@@ -1,6 +1,8 @@
 use bh_account::{AccountId, DeviceId, Head as AccountHead};
 use bh_core::note::Note;
-use bh_crypto::{KemKey, Secret, SecretBytes, SigningKey, aead_open, aead_seal, derive_key, hash};
+use bh_crypto::{
+    KemKey, Secret, SecretBytes, SigningKey, aead_open, aead_seal, derive_key, hash, verify,
+};
 use bh_sync::{EventId, Head, OpaqueEvent};
 
 pub const CLASS_CONTENT: u8 = 0;
@@ -52,6 +54,50 @@ pub struct Payload<'a> {
 pub struct Encoded {
     pub descriptor: OpaqueEvent,
     pub body: Vec<u8>,
+}
+
+/// Signed externally (for example by a platform key store); sealing and signing
+/// use exactly the same bytes as `seal`. Neither this request nor the codec owns
+/// a device signing key.
+pub struct EventSigningRequest {
+    signed: Binding,
+    bytes: Vec<u8>,
+    expected_key: [u8; 32],
+    body: Vec<u8>,
+    bind_key: Secret<32>,
+}
+impl EventSigningRequest {
+    pub fn signing_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn expected_key(&self) -> &[u8; 32] {
+        &self.expected_key
+    }
+    pub fn finish(self, signature: [u8; 64]) -> Result<Encoded, Error> {
+        verify(&self.expected_key, &self.bytes, &signature).map_err(|_| Error::Invalid)?;
+        let signed_bytes = self.signed.encode_for_verify();
+        let binding_plain = SecretBytes::from_parts(&[
+            &signed_bytes,
+            &signature,
+            &ZERO_PADDING[..BIND_PLAIN - S_LEN - 64],
+        ])
+        .map_err(|_| Error::Invalid)?;
+        let (bind_nonce, bind_cipher) = aead_seal(
+            &self.bind_key,
+            &binding_ad(&self.signed, &self.signed.commitment),
+            binding_plain.expose(),
+        )
+        .map_err(|_| Error::Invalid)?;
+        let mut envelope = self.signed.commitment.to_vec();
+        envelope.extend(bind_nonce);
+        envelope.extend(bind_cipher);
+        debug_assert_eq!(envelope.len(), 1024);
+        Ok(Encoded {
+            descriptor: OpaqueEvent::new(self.signed.event_id, envelope)
+                .map_err(|_| Error::Invalid)?,
+            body: self.body,
+        })
+    }
 }
 
 pub fn key_id(root: &Secret<32>) -> [u8; 32] {
@@ -171,12 +217,24 @@ impl Reader<'_> {
 /// Generates fresh nonce per layer; a resend must reuse the returned exact bytes.
 /// The caller provides locally authenticated account/history fields and random roots.
 pub fn seal(
-    mut signed: Binding,
+    signed: Binding,
     payload: Payload<'_>,
     signer: &SigningKey,
     metadata: &Secret<32>,
     content: Option<&Secret<32>>,
 ) -> Result<Encoded, Error> {
+    let request = prepare_seal(signed, payload, signer.public(), metadata, content)?;
+    let signature = signer.sign(request.signing_bytes());
+    request.finish(signature)
+}
+
+pub(crate) fn prepare_seal(
+    mut signed: Binding,
+    payload: Payload<'_>,
+    expected_key: [u8; 32],
+    metadata: &Secret<32>,
+    content: Option<&Secret<32>>,
+) -> Result<EventSigningRequest, Error> {
     if signed.version != 1
         || signed.highest != 1
         || signed.class > 1
@@ -216,27 +274,12 @@ pub fn seal(
     let signed_bytes = signed.encode_for_verify();
     let mut to_sign = SIGNED_DOMAIN.to_vec();
     to_sign.extend(&signed_bytes);
-    let signature = signer.sign(&to_sign);
-    let binding_plain = SecretBytes::from_parts(&[
-        &signed_bytes,
-        &signature,
-        &ZERO_PADDING[..BIND_PLAIN - S_LEN - 64],
-    ])
-    .map_err(|_| Error::Invalid)?;
-    let bind_key = derive_key(metadata, b"bhBind01", 0);
-    let (bind_nonce, bind_cipher) = aead_seal(
-        &bind_key,
-        &binding_ad(&signed, &signed.commitment),
-        binding_plain.expose(),
-    )
-    .map_err(|_| Error::Invalid)?;
-    let mut envelope = signed.commitment.to_vec();
-    envelope.extend(bind_nonce);
-    envelope.extend(bind_cipher);
-    debug_assert_eq!(envelope.len(), 1024);
-    Ok(Encoded {
-        descriptor: OpaqueEvent::new(signed.event_id, envelope).map_err(|_| Error::Invalid)?,
+    Ok(EventSigningRequest {
+        signed,
+        bytes: to_sign,
+        expected_key,
         body,
+        bind_key: derive_key(metadata, b"bhBind01", 0),
     })
 }
 

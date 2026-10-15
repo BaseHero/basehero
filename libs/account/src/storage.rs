@@ -1,35 +1,41 @@
 //! `AccountJournal` over the device-local SQLite database. Storage keeps opaque
 //! rows; this adapter maps them to account types and never adds verification.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
-use bh_storage::DeviceDatabase;
-use bh_storage::account::{DeviceIdentityRecord, PendingSetupRow};
+use bh_storage::account::{DeviceIdentityRecord, PendingSetupRow, StagedAdmissionRow};
+use bh_storage::{DeviceDatabase, StoreError};
 
 use crate::history::{AccountId, DevicePublicKeys, Head};
 use crate::journal::{
-    AccountJournal, JournalError, JournaledAccount, JournaledDevice, PendingSetupRecord, SetupStage,
+    AccountJournal, JournalError, JournaledAccount, JournaledDevice, PendingSetupRecord,
+    SetupStage, StagedAdmission,
 };
 use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle};
 
-/// One account journal backed by the private `DeviceDatabase` connection.
+/// Account journal using the container's connection and writer guard. Each
+/// synchronous journal operation takes one guard; native key work never does.
 pub struct DeviceJournal {
-    database: DeviceDatabase,
+    database: Arc<Mutex<DeviceDatabase>>,
 }
 
 impl DeviceJournal {
+    /// Standalone journal for tests or a caller that owns its own connection.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         DeviceDatabase::open(path)
-            .map(|database| Self { database })
+            .map(|database| Self::from_shared(Arc::new(Mutex::new(database))))
             .map_err(|_| JournalError::Storage)
     }
 
-    pub fn into_database(self) -> DeviceDatabase {
-        self.database
+    pub fn from_shared(database: Arc<Mutex<DeviceDatabase>>) -> Self {
+        Self { database }
     }
 
-    pub fn database(&self) -> &DeviceDatabase {
-        &self.database
+    fn database(&self) -> Result<MutexGuard<'_, DeviceDatabase>, JournalError> {
+        self.database.lock().map_err(|_| JournalError::Storage)
     }
 }
 
@@ -67,17 +73,33 @@ fn kind_from_code(code: u8) -> Option<DeviceKeyStoreKind> {
     }
 }
 
+fn staged_row(row: &StagedAdmission) -> StagedAdmissionRow {
+    StagedAdmissionRow {
+        position: row.position,
+        previous: row.previous,
+        event: row.event.clone(),
+        delivery: row.delivery.clone(),
+    }
+}
+fn staged_error(error: StoreError) -> JournalError {
+    match error {
+        StoreError::StagedAdmissionExists => JournalError::StagedAdmissionExists,
+        StoreError::StagedAdmissionChanged => JournalError::StagedAdmissionChanged,
+        StoreError::CorruptStagedAdmission => JournalError::Corrupt,
+        _ => JournalError::Storage,
+    }
+}
+
 impl AccountJournal for DeviceJournal {
     fn load(&self) -> Result<Option<JournaledAccount>, JournalError> {
-        let Some(state) = self
-            .database
+        let database = self.database()?;
+        let Some(state) = database
             .account_state()
             .map_err(|_| JournalError::Storage)?
         else {
             return Ok(None);
         };
-        let history = self
-            .database
+        let history = database
             .account_history()
             .map_err(|_| JournalError::Storage)?;
         Ok(Some(JournaledAccount {
@@ -98,14 +120,53 @@ impl AccountJournal for DeviceJournal {
         head: Head,
         stopped: bool,
     ) -> Result<(), JournalError> {
-        self.database
+        self.database()?
             .commit_account_verified(anchor.0, events, head.position, head.hash, stopped)
             .map_err(|_| JournalError::Storage)
     }
 
+    fn fence(&self, action: impl FnOnce()) -> Result<(), JournalError> {
+        match self.database.lock() {
+            Ok(_guard) => {
+                action();
+                Ok(())
+            }
+            Err(poisoned) => {
+                // A poisoned mutex still provides exclusion. Fence stale
+                // capabilities before reporting storage failure.
+                let _guard = poisoned.into_inner();
+                action();
+                Err(JournalError::Storage)
+            }
+        }
+    }
+
+    fn commit_verified_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        head: Head,
+        stopped: bool,
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        let mut database = match self.database.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let _guard = poisoned.into_inner();
+                fence(false);
+                return Err(JournalError::Storage);
+            }
+        };
+        let result = database
+            .commit_account_verified(anchor.0, events, head.position, head.hash, stopped)
+            .map_err(|_| JournalError::Storage);
+        fence(result.is_ok());
+        result
+    }
+
     fn device(&self) -> Result<Option<JournaledDevice>, JournalError> {
         let Some(record) = self
-            .database
+            .database()?
             .device_identity()
             .map_err(|_| JournalError::Storage)?
         else {
@@ -130,14 +191,14 @@ impl AccountJournal for DeviceJournal {
             policy: policy_code(device.policy),
             kind: kind_code(device.kind),
         };
-        self.database
+        self.database()?
             .commit_device_identity(&record)
             .map_err(|_| JournalError::Storage)
     }
 
     fn pending_setup(&self) -> Result<Option<PendingSetupRecord>, JournalError> {
         let Some(row) = self
-            .database
+            .database()?
             .pending_setup()
             .map_err(|_| JournalError::Storage)?
         else {
@@ -158,15 +219,42 @@ impl AccountJournal for DeviceJournal {
             kit_saved: setup.kit_saved,
             blob: setup.blob.clone(),
         };
-        self.database
+        self.database()?
             .commit_pending_setup(&row)
             .map_err(|_| JournalError::Storage)
     }
 
     fn clear_pending_setup(&mut self) -> Result<(), JournalError> {
-        self.database
+        self.database()?
             .clear_pending_setup()
             .map_err(|_| JournalError::Storage)
+    }
+
+    fn staged_admission(&self) -> Result<Option<StagedAdmission>, JournalError> {
+        self.database()?
+            .staged_admission()
+            .map_err(staged_error)
+            .map(|row| {
+                row.map(|row| StagedAdmission {
+                    position: row.position,
+                    previous: row.previous,
+                    event: row.event,
+                    delivery: row.delivery,
+                })
+            })
+    }
+
+    fn insert_staged_admission(&mut self, row: &StagedAdmission) -> Result<(), JournalError> {
+        i64::try_from(row.position).map_err(|_| JournalError::Corrupt)?;
+        self.database()?
+            .insert_staged_admission(&staged_row(row))
+            .map_err(staged_error)
+    }
+
+    fn clear_staged_admission(&mut self, expected: &StagedAdmission) -> Result<(), JournalError> {
+        self.database()?
+            .clear_staged_admission(&staged_row(expected))
+            .map_err(staged_error)
     }
 }
 

@@ -1,4 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(test)]
+thread_local! {
+    static OVERLAP_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SIGNATURE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 use crate::crypto::{hash, verify};
 
@@ -94,7 +100,10 @@ impl DevicePublicKeys {
     fn decode(input: &mut Reader<'_>) -> Result<Self, Error> {
         Self::new(input.array()?, input.array()?, input.array()?)
     }
+    #[cfg(test)] // regression sentinel for accidental historic-key scans
     fn overlaps(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        OVERLAP_CHECKS.with(|checks| checks.set(checks.get() + 1));
         self.signing == other.signing
             || self.signing == other.control
             || self.control == other.signing
@@ -307,6 +316,8 @@ impl AccountEvent {
         }
     }
     fn verify_signature(&self, key: &[u8; 32]) -> Result<(), Error> {
+        #[cfg(test)]
+        SIGNATURE_CHECKS.with(|checks| checks.set(checks.get() + 1));
         let split = self.bytes.len() - SIGNATURE_LEN;
         let sig = self.bytes[split..]
             .try_into()
@@ -335,6 +346,10 @@ pub struct VerifiedAccount {
     heads: BTreeMap<u64, [u8; 32]>,
     // Retain past keys too: key reuse must not resurrect a removed identity.
     devices: BTreeMap<DeviceId, DevicePublicKeys>,
+    // Exact public keys, including those of removed devices. Signing and
+    // control keys share a namespace so swapping their roles cannot reuse one.
+    used_signing: BTreeSet<[u8; 32]>,
+    used_receiving: BTreeSet<[u8; 1216]>,
     active: BTreeMap<DeviceId, DevicePublicKeys>,
     recovery: RecoveryPublicKeys,
     first: DeviceId,
@@ -372,6 +387,8 @@ impl VerifiedAccount {
             heads: BTreeMap::from([(1, event.head().hash)]),
             active: devices.clone(),
             devices,
+            used_signing: BTreeSet::from([first.signing, first.control, recovery.signing]),
+            used_receiving: BTreeSet::from([first.receiving, recovery.receiving]),
             recovery: recovery.as_ref().clone(),
             first: first.id(),
             record_digest: None,
@@ -409,6 +426,18 @@ impl VerifiedAccount {
     pub fn active_device(&self, id: DeviceId) -> Result<&DevicePublicKeys, Error> {
         self.running()?;
         self.active.get(&id).ok_or(Error::NotActive)
+    }
+    /// Include removed identities so a scanner does not treat removal as a
+    /// fresh pending request for the same keys.
+    pub fn has_seen_device(&self, id: DeviceId) -> bool {
+        self.devices.contains_key(&id)
+    }
+    /// Compare an original signed event with this projection's verified chain.
+    /// Useful for reconciling a staged event without replaying its entire prefix.
+    pub(crate) fn verified_event_at(&self, position: u64, bytes: &[u8]) -> bool {
+        self.heads
+            .get(&position)
+            .is_some_and(|head| *head == hash(bytes))
     }
     pub fn active_devices(&self) -> Result<impl Iterator<Item = &DevicePublicKeys>, Error> {
         self.running()?;
@@ -475,7 +504,7 @@ impl VerifiedAccount {
         self.preparing_publication()?;
         if author != self.first
             || public == *self.recovery.receiving()
-            || self.devices.values().any(|d| public == *d.receiving())
+            || self.used_receiving.contains(&public)
         {
             return Err(Error::InvalidSetup);
         }
@@ -534,15 +563,23 @@ impl VerifiedAccount {
         if self.devices.contains_key(&keys.id()) {
             return Err(Error::DuplicateDevice);
         }
-        if self.recovery.overlaps(keys)
-            || self
-                .devices
-                .values()
-                .any(|existing| existing.overlaps(keys))
+        if self.used_signing.contains(keys.signing())
+            || self.used_signing.contains(keys.control())
+            || self.used_receiving.contains(keys.receiving())
         {
             return Err(Error::KeyReuse);
         }
         Ok(())
+    }
+    /// Apply one already ordered event to an owned candidate without copying its
+    /// projection. For shared views use `Arc::unwrap_or_clone(view).applied(bytes)?`,
+    /// which copies only when shared. It sets no stop: on error the candidate is
+    /// discarded, and the caller must record the stop itself and not continue
+    /// from a retained view.
+    pub fn applied(mut self, bytes: &[u8]) -> Result<VerifiedAccount, Error> {
+        self.running()?;
+        self.apply_one(bytes)?;
+        Ok(self)
     }
     /// Apply one already ordered event. A retry of an already-applied event is
     /// not a successor; transport deduplication must reconcile it before replay.
@@ -584,6 +621,9 @@ impl VerifiedAccount {
             Control::Genesis { .. } => return Err(Error::UnsupportedControl),
             Control::AddDevice(keys) => {
                 self.check_new_device(keys)?;
+                self.used_signing.insert(*keys.signing());
+                self.used_signing.insert(*keys.control());
+                self.used_receiving.insert(*keys.receiving());
                 self.devices.insert(keys.id(), keys.as_ref().clone());
                 self.active.insert(keys.id(), keys.as_ref().clone());
             }
@@ -603,10 +643,7 @@ impl VerifiedAccount {
                     || self.record_digest.is_none()
                     || self.personal.is_some()
                     || publication.public == *self.recovery.receiving()
-                    || self
-                        .devices
-                        .values()
-                        .any(|d| publication.public == *d.receiving())
+                    || self.used_receiving.contains(&publication.public)
                 {
                     return Err(Error::InvalidSetup);
                 }
@@ -617,6 +654,15 @@ impl VerifiedAccount {
         self.heads.insert(self.head.position, self.head.hash);
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn signature_checks() -> usize {
+    SIGNATURE_CHECKS.with(|checks| checks.get())
+}
+#[cfg(test)]
+pub(crate) fn reset_signature_checks() {
+    SIGNATURE_CHECKS.with(|checks| checks.set(0));
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -631,5 +677,47 @@ impl<'a> Reader<'a> {
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         self.take(N)?.try_into().map_err(|_| Error::Malformed)
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::crypto::SigningKey;
+
+    #[test]
+    fn thousand_devices_do_not_scan_prior_keys() {
+        let signer = SigningKey::generate();
+        let first =
+            DevicePublicKeys::new(SigningKey::generate().public(), signer.public(), [1; 1216])
+                .unwrap();
+        let recovery = RecoveryPublicKeys::new(SigningKey::generate().public(), [2; 1216]);
+        let draft = AccountEvent::genesis(first.clone(), recovery);
+        let genesis = draft.finish(signer.sign(draft.signing_bytes())).unwrap();
+        let mut account = VerifiedAccount::from_genesis(
+            AccountId::of_genesis(&genesis).unwrap(),
+            genesis.as_bytes(),
+        )
+        .unwrap();
+        assert!(first.overlaps(&first));
+        assert_eq!(OVERLAP_CHECKS.with(|checks| checks.get()), 1);
+        OVERLAP_CHECKS.with(|checks| checks.set(0));
+        for i in 0..1000u32 {
+            let mut receiving = [0u8; 1216];
+            receiving[..4].copy_from_slice(&i.to_be_bytes());
+            receiving[4] = 3;
+            let keys = DevicePublicKeys::new(
+                SigningKey::generate().public(),
+                SigningKey::generate().public(),
+                receiving,
+            )
+            .unwrap();
+            let draft = account.add_device(first.id(), keys).unwrap();
+            let event = draft.finish(signer.sign(draft.signing_bytes())).unwrap();
+            account.apply(event.as_bytes()).unwrap();
+        }
+        let scans = OVERLAP_CHECKS.with(|checks| checks.get());
+        assert_eq!(account.head().position, 1001);
+        assert_eq!(scans, 0, "historic device overlap scans: {scans}");
     }
 }

@@ -17,6 +17,7 @@ thiserror.workspace = true
 tempfile.workspace = true
 bh-account.workspace = true
 bh-event.workspace = true
+yrs.workspace = true
 
 [lints]
 workspace = true

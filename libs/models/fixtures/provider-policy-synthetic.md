@@ -1,0 +1,3 @@
+# Synthetic provider-policy vector (not a deployment approval)
+
+`provider-policy-synthetic.hex` is a deterministic v1 signed envelope, generated with the test-only Ed25519 seed `07` repeated 32 times. Its root is the Ed25519 public key derived from that seed; key ID is ASCII `TESTKEY1`, provider `near`, version 10, issue 90, expiry 500, gateway signer `01` repeated 32 bytes paired only with compose `02` repeated 32 bytes, and model `z-ai/glm-5.3-flash` compose `03` repeated 32 bytes. Build-date 100 and lifetime ceiling 1000 in the matching test trust configuration. This fixture and seed MUST NOT be used as release authority or production deployment values. The fixture test reproduces and verifies the bytes offline.

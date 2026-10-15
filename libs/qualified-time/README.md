@@ -9,7 +9,11 @@ nonces, original raw replies and monotonic send/receipt counter readings for
 each request. The caller is responsible for actually stamping transport,
 secure nonce generation/uniqueness (including failed sends) and confirming
 both servers' independence. This crate detects reuse of previously accepted
-nonces within its boot-local bounded state.
+nonces within its boot-local bounded state. The native Unix host's
+`bh-confidential-host::TimeSampler` supplies the UDP transport, new nonces and
+send/receipt stamps; it still requires trusted configuration and a qualified
+caller-supplied counter. `mark_unavailable` clears the anchor before that
+adapter starts I/O, so cancellation cannot preserve previously qualified time.
 
 `Config` is mandatory: nominal ticks/s, measured conservative drift in ppm,
 server leap-smear-to-POSIX margin in microseconds, maximum anchor age in ticks,

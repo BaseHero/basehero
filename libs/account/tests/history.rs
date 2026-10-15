@@ -167,6 +167,23 @@ fn incoming_signed_additions_cannot_reuse_historic_or_recovery_keys() {
         account.active_device(first.public.id()).err(),
         Some(Error::NotActive)
     );
+    let third = Device::new();
+    account
+        .apply(&incoming(
+            &account,
+            &second,
+            1,
+            &device_bytes(&third.public),
+            &second.control,
+        ))
+        .unwrap();
+    account
+        .apply(&incoming(&account, &third, 2, &[], &third.control))
+        .unwrap();
+    assert_eq!(
+        account.active_device(third.public.id()).err(),
+        Some(Error::NotActive)
+    );
     let fresh = Device::new();
     let recovery = account.recovery_keys().unwrap();
     let cases = [
@@ -177,6 +194,62 @@ fn incoming_signed_additions_cannot_reuse_historic_or_recovery_keys() {
                 *first.public.signing(),
                 *fresh.public.control(),
                 *fresh.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        // Both currently active and removed devices added after genesis must
+        // remain in the index; control keys cannot be reused as signing keys.
+        (
+            DevicePublicKeys::new(
+                *second.public.signing(),
+                *fresh.public.control(),
+                *fresh.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        (
+            DevicePublicKeys::new(
+                *third.public.signing(),
+                *fresh.public.control(),
+                *fresh.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        (
+            DevicePublicKeys::new(
+                *second.public.control(),
+                *fresh.public.control(),
+                *fresh.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        (
+            DevicePublicKeys::new(
+                *third.public.control(),
+                *fresh.public.control(),
+                *fresh.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        (
+            DevicePublicKeys::new(
+                *fresh.public.signing(),
+                *fresh.public.control(),
+                *second.public.receiving(),
+            )
+            .unwrap(),
+            Error::KeyReuse,
+        ),
+        (
+            DevicePublicKeys::new(
+                *fresh.public.signing(),
+                *fresh.public.control(),
+                *third.public.receiving(),
             )
             .unwrap(),
             Error::KeyReuse,
@@ -468,4 +541,113 @@ fn removed_device_cannot_authorize_a_successor_even_with_a_valid_signature() {
     forged[split..].copy_from_slice(&sig);
     assert_eq!(account.apply(&forged), Err(Error::NotActive));
     assert!(account.is_stopped());
+}
+
+#[test]
+fn consumed_application_matches_mutable_application_across_materials_and_membership() {
+    let (first, _, mut mutable) = setup();
+    let second = Device::new();
+    let third = Device::new();
+    let mut personal_body = vec![9; 1216];
+    personal_body.extend([10; 32]);
+    personal_body.extend([11; 32]);
+    let mut consumed = mutable.clone();
+    for (tag, body, author, signer) in [
+        (3, vec![7; 32], &first, &first.control),
+        (4, personal_body, &first, &first.control),
+        (1, device_bytes(&second.public), &first, &first.control),
+        (1, device_bytes(&third.public), &second, &second.control),
+        (2, vec![], &first, &first.control),
+    ] {
+        let bytes = incoming(&mutable, author, tag, &body, signer);
+        mutable.apply(&bytes).unwrap();
+        consumed = consumed.applied(&bytes).unwrap();
+        assert!(consumed.id() == mutable.id());
+        assert_eq!(consumed.head(), mutable.head());
+        assert_eq!(consumed.materials_ready(), mutable.materials_ready());
+        assert!(consumed.recovery_keys().unwrap() == mutable.recovery_keys().unwrap());
+        for device in [&first, &second, &third] {
+            assert_eq!(
+                consumed.active_device(device.public.id()),
+                mutable.active_device(device.public.id())
+            );
+            assert_eq!(
+                consumed.has_seen_device(device.public.id()),
+                mutable.has_seen_device(device.public.id())
+            );
+        }
+        assert_eq!(
+            consumed.active_devices().unwrap().collect::<Vec<_>>(),
+            mutable.active_devices().unwrap().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(mutable.head().position, 6);
+    assert_eq!(
+        consumed.active_device(first.public.id()),
+        Err(Error::NotActive)
+    );
+    assert_eq!(consumed.materials_ready(), Ok(true));
+}
+
+#[test]
+fn consumed_application_refuses_the_same_errors_as_mutable_application() {
+    let (first, _, account) = setup();
+    let second = Device::new();
+    let body = device_bytes(&second.public);
+    let valid = incoming(&account, &first, 1, &body, &first.control);
+    let wrong_account = wire_event(
+        AccountId([3; 32]),
+        2,
+        account.head().hash,
+        first.public.id(),
+        1,
+        &body,
+        &first.control,
+    );
+    let wrong_position = wire_event(
+        account.id(),
+        3,
+        account.head().hash,
+        first.public.id(),
+        1,
+        &body,
+        &first.control,
+    );
+    let wrong_previous = wire_event(
+        account.id(),
+        2,
+        [8; 32],
+        first.public.id(),
+        1,
+        &body,
+        &first.control,
+    );
+    let bad_signature = incoming(&account, &first, 1, &body, &first.ordinary);
+    let reused = DevicePublicKeys::new(
+        *first.public.signing(),
+        *second.public.control(),
+        *second.public.receiving(),
+    )
+    .unwrap();
+    let key_reuse = incoming(&account, &first, 1, &device_bytes(&reused), &first.control);
+    for (bytes, expected) in [
+        (&wrong_account, Error::WrongAccount),
+        (&wrong_position, Error::WrongPredecessor),
+        (&wrong_previous, Error::WrongPredecessor),
+        (&bad_signature, Error::BadSignature),
+        (&key_reuse, Error::KeyReuse),
+    ] {
+        let mut retained = account.clone();
+        assert_eq!(retained.apply(bytes), Err(expected));
+        assert_eq!(account.clone().applied(bytes).err(), Some(expected));
+        assert!(retained.is_stopped());
+    }
+    let mut stopped = account.clone();
+    assert_eq!(stopped.apply(&wrong_account), Err(Error::WrongAccount));
+    assert_eq!(stopped.apply(&valid), Err(Error::Stopped));
+    assert_eq!(
+        stopped.clone().applied(&wrong_account).err(),
+        Some(Error::Stopped)
+    );
+    assert_eq!(stopped.applied(&valid).err(), Some(Error::Stopped));
 }

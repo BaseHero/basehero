@@ -58,6 +58,7 @@ rust {
 }
 
 dependencies {
+    implementation(project(":device-keys"))
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

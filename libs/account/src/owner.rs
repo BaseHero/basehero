@@ -16,7 +16,7 @@ use crate::history::{
 };
 use crate::journal::{
     AccountJournal, JournalError, JournaledDevice, PENDING_SETUP_VERSION, PendingSetupProtector,
-    PendingSetupRecord, ProtectorError, SetupStage,
+    PendingSetupRecord, ProtectorError, SetupStage, StagedAdmission,
 };
 use crate::platform::{DeviceKeyStore, KeyStoreError, StoredDevice};
 use crate::recovery::{Password, RecoveryCode, RecoveryKeys, prepare_record};
@@ -63,6 +63,7 @@ pub enum Authority {
 /// exposed to the WebView. Operations recheck it after every await.
 pub struct AccountCapability {
     generation: u64,
+    current_generation: AccountGeneration,
     account: AccountId,
     device: DeviceId,
     head: Head,
@@ -80,6 +81,10 @@ impl AccountCapability {
     }
     pub fn authority(&self) -> Authority {
         Authority::OfflineLastVerified
+    }
+    /// Check under the shared container writer guard just before COMMIT.
+    pub fn is_current(&self) -> bool {
+        self.generation == self.current_generation.current()
     }
 }
 
@@ -129,6 +134,8 @@ pub enum OwnerError {
     Stale,
     Device(KeyStoreError),
     Invalid(Error),
+    /// No staged admission exists for reconciliation.
+    NoStagedAdmission,
 }
 
 impl From<JournalError> for OwnerError {
@@ -173,6 +180,15 @@ pub struct PendingHomeObjects {
 
 /// Resumable first-device setup summary. `submission` is the exact ordered list
 /// of signed bytes to submit; `head` is the head those bytes produce.
+/// A verified result, or the exact unchanged bytes to retry while the home is
+/// unreachable or has not yet ordered an event at the signed position.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdmissionResolution {
+    Checking { event: Vec<u8> },
+    Admitted { delivery: Vec<u8> },
+    NotAdded,
+}
+
 pub struct SetupStatus {
     pub stage: SetupStage,
     pub kit_saved: bool,
@@ -228,7 +244,7 @@ where
             Ok(account) => account,
             Err(_) => {
                 self.loaded = None;
-                self.generation.advance();
+                self.fence()?;
                 return Ok(AccountLoad::AdmissionRequired(
                     AdmissionReason::CorruptHistory,
                 ));
@@ -243,13 +259,13 @@ where
                 device: None,
                 stopped: true,
             });
-            self.generation.advance();
+            self.fence()?;
             return Ok(AccountLoad::Stopped);
         }
 
         let Some(identity) = self.journal.device()? else {
             self.loaded = None;
-            self.generation.advance();
+            self.fence()?;
             return Ok(AccountLoad::AdmissionRequired(AdmissionReason::NoDevice));
         };
         let expected = stored(&identity);
@@ -266,7 +282,7 @@ where
                     device: Some(expected),
                     stopped: false,
                 });
-                self.generation.advance();
+                self.fence()?;
                 return match error {
                     KeyStoreError::AuthenticationCancelled | KeyStoreError::StorageFailure => {
                         Err(OwnerError::Device(error))
@@ -287,7 +303,7 @@ where
                 device: Some(expected),
                 stopped: false,
             });
-            self.generation.advance();
+            self.fence()?;
             return Ok(AccountLoad::AdmissionRequired(
                 AdmissionReason::DeviceNotActive,
             ));
@@ -298,7 +314,7 @@ where
                 device: Some(expected),
                 stopped: false,
             });
-            self.generation.advance();
+            self.fence()?;
             return Ok(AccountLoad::AdmissionRequired(
                 AdmissionReason::IncompleteMaterials,
             ));
@@ -309,6 +325,7 @@ where
             // a concurrent advance after the recheck must leave this capability
             // stale, not be absorbed into freshly-minted authority.
             generation,
+            current_generation: self.generation.clone(),
             account: account.id(),
             device: device_id,
             head: account.head(),
@@ -322,9 +339,16 @@ where
     }
 
     /// Drop in-memory authority. Durable state is untouched.
-    pub fn lock(&mut self) {
-        self.generation.advance();
+    pub fn lock(&mut self) -> Result<(), OwnerError> {
         self.loaded = None;
+        self.fence()
+    }
+
+    fn fence(&self) -> Result<(), OwnerError> {
+        self.journal.fence(|| {
+            self.generation.advance();
+        })?;
+        Ok(())
     }
 
     /// Apply incoming ordered history. Valid input commits the original bytes and
@@ -342,21 +366,33 @@ where
             )
         };
         let last_head = self.loaded.as_ref().expect("checked").account.head();
-        let mut candidate = self.loaded.as_ref().expect("checked").account.clone();
-        match candidate.apply_batch(events) {
+        // apply_batch makes the one transactional copy and advances this owner
+        // before the journal commit. A failed/uncertain commit must stop this
+        // owner until activation rebuilds from durable signed bytes.
+        let result = self
+            .loaded
+            .as_mut()
+            .expect("checked")
+            .account
+            .apply_batch(events);
+        match result {
             Ok(()) => {
-                let head = candidate.head();
-                self.journal.commit_verified(anchor, events, head, false)?;
+                let loaded = self.loaded.as_ref().expect("checked");
+                let head = loaded.account.head();
                 let removed = device_id
-                    .map(|id| candidate.active_device(id).is_err())
+                    .map(|id| loaded.account.active_device(id).is_err())
                     .unwrap_or(false);
-                self.loaded = Some(Loaded {
-                    account: candidate,
-                    device: self.loaded.as_ref().and_then(|l| l.device.clone()),
-                    stopped: false,
-                });
-                if removed {
-                    self.generation.advance();
+                if let Err(error) =
+                    self.journal
+                        .commit_verified_fenced(anchor, events, head, false, |success| {
+                            if !success || removed {
+                                self.generation.advance();
+                            }
+                        })
+                {
+                    // An uncertain durable result cannot leave a usable owner.
+                    self.loaded.as_mut().expect("checked").stopped = true;
+                    return Err(error.into());
                 }
                 Ok(head)
             }
@@ -366,8 +402,10 @@ where
                 if let Some(loaded) = self.loaded.as_mut() {
                     loaded.stopped = true;
                 }
-                self.generation.advance();
-                self.journal.commit_verified(anchor, &[], last_head, true)?;
+                self.journal
+                    .commit_verified_fenced(anchor, &[], last_head, true, |_| {
+                        self.generation.advance();
+                    })?;
                 Err(OwnerError::Invalid(error))
             }
         }
@@ -381,6 +419,9 @@ where
         keys: DevicePublicKeys,
     ) -> Result<SigningRequest, OwnerError> {
         self.check(capability)?;
+        if self.journal.staged_admission()?.is_some() {
+            return Err(OwnerError::Journal(JournalError::StagedAdmissionExists));
+        }
         let loaded = self.loaded.as_ref().expect("checked");
         loaded
             .account
@@ -413,6 +454,117 @@ where
         .await;
         self.check(capability)?;
         result.map_err(OwnerError::Invalid)
+    }
+
+    /// Stage one exact signed add before network submission. This is called by
+    /// the live pairing session only after its request and signature match.
+    pub fn stage_signed_admission(
+        &mut self,
+        capability: &AccountCapability,
+        recipient: &DevicePublicKeys,
+        signed: &[u8],
+        delivery: &[u8],
+    ) -> Result<(), OwnerError> {
+        self.check(capability)?;
+        let request = self.prepare_add_device(capability, recipient.clone())?;
+        if signed.len() != request.signing_bytes().len() + 64
+            || !signed.starts_with(request.signing_bytes())
+            || delivery.is_empty()
+        {
+            return Err(OwnerError::Invalid(Error::Malformed));
+        }
+        let signature = signed[request.signing_bytes().len()..]
+            .try_into()
+            .map_err(|_| OwnerError::Invalid(Error::Malformed))?;
+        request.finish(signature).map_err(OwnerError::Invalid)?;
+        let head = self.loaded.as_ref().expect("checked").account.head();
+        let position = head
+            .position
+            .checked_add(1)
+            .ok_or(OwnerError::Invalid(Error::PositionOverflow))?;
+        self.journal.insert_staged_admission(&StagedAdmission {
+            position,
+            previous: head.hash,
+            event: signed.to_vec(),
+            delivery: delivery.to_vec(),
+        })?;
+        Ok(())
+    }
+
+    /// On restart or an unknown home result, use only verified ordered history.
+    /// A missing/unreachable successor keeps the original row and exact bytes;
+    /// no control-key signature is requested on this path.
+    pub fn reconcile_staged_admission(
+        &mut self,
+        incoming: Option<&[&[u8]]>,
+    ) -> Result<AdmissionResolution, OwnerError> {
+        let staged = self
+            .journal
+            .staged_admission()?
+            .ok_or(OwnerError::NoStagedAdmission)?;
+        let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
+        if loaded.stopped {
+            return Err(OwnerError::Stopped);
+        }
+        if staged.position <= 1 {
+            return Err(OwnerError::Journal(JournalError::Corrupt));
+        }
+        let head = loaded.account.head();
+        if head.position < staged.position
+            && head.position == staged.position - 1
+            && head.hash != staged.previous
+        {
+            return Err(OwnerError::Journal(JournalError::Corrupt));
+        }
+        // A crash may have landed the verified event but not cleared the row.
+        // Do not reapply a duplicate successor from a retried home response.
+        if head.position < staged.position
+            && let Some(events) = incoming
+            && !events.is_empty()
+        {
+            self.apply_incoming(events)?;
+        }
+        // The owner verified its prefix on activation and each committed
+        // successor afterward. Its per-position signed-event hashes let us
+        // compare the staged original bytes without loading or replaying history.
+        let verified = &self.loaded.as_ref().expect("checked").account;
+        if verified.head().position < staged.position {
+            return Ok(AdmissionResolution::Checking {
+                event: staged.event,
+            });
+        }
+        let outcome = if verified.verified_event_at(staged.position, &staged.event) {
+            AdmissionResolution::Admitted {
+                delivery: staged.delivery.clone(),
+            }
+        } else {
+            AdmissionResolution::NotAdded
+        };
+        self.journal.clear_staged_admission(&staged)?;
+        Ok(outcome)
+    }
+
+    /// Scanner status when this owner has already verified the account history.
+    /// A fresh scanner without an owner must use pairing::scanner_status instead.
+    pub fn scanner_status(
+        &self,
+    ) -> Result<crate::pairing::ScannerStatus, crate::pairing::PairError> {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or(crate::pairing::PairError::WrongContext)?;
+        if loaded.stopped {
+            return Err(crate::pairing::PairError::History);
+        }
+        let device = loaded
+            .device
+            .as_ref()
+            .ok_or(crate::pairing::PairError::WrongContext)?;
+        crate::pairing::scanner_status_verified(&loaded.account, &device.keys)
+    }
+
+    pub fn staged_admission(&self) -> Result<Option<StagedAdmission>, OwnerError> {
+        self.journal.staged_admission().map_err(OwnerError::from)
     }
 
     /// Build an immediate self-removal request for this active device. It does
@@ -817,5 +969,181 @@ impl<'a> BlobReader<'a> {
             return Err(SetupError::Corrupt);
         }
         self.take(len)
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::crypto::{KemKey, Secret, SigningKey};
+    use crate::history::{RecoveryPublicKeys, reset_signature_checks, signature_checks};
+    use crate::journal::{JournaledAccount, ProtectorError};
+    use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle, KeyStoreError};
+
+    struct Journal {
+        account: JournaledAccount,
+        device: JournaledDevice,
+        staged: Option<StagedAdmission>,
+    }
+    impl AccountJournal for Journal {
+        fn load(&self) -> Result<Option<JournaledAccount>, JournalError> {
+            Ok(Some(self.account.clone()))
+        }
+        fn commit_verified(
+            &mut self,
+            _: AccountId,
+            events: &[&[u8]],
+            head: Head,
+            stopped: bool,
+        ) -> Result<(), JournalError> {
+            self.account
+                .history
+                .extend(events.iter().map(|e| e.to_vec()));
+            self.account.head = head;
+            self.account.stopped = stopped;
+            Ok(())
+        }
+        fn device(&self) -> Result<Option<JournaledDevice>, JournalError> {
+            Ok(Some(self.device.clone()))
+        }
+        fn commit_device(&mut self, _: &JournaledDevice) -> Result<(), JournalError> {
+            unreachable!()
+        }
+        fn pending_setup(&self) -> Result<Option<PendingSetupRecord>, JournalError> {
+            Ok(None)
+        }
+        fn commit_pending_setup(&mut self, _: &PendingSetupRecord) -> Result<(), JournalError> {
+            unreachable!()
+        }
+        fn clear_pending_setup(&mut self) -> Result<(), JournalError> {
+            unreachable!()
+        }
+        fn staged_admission(&self) -> Result<Option<StagedAdmission>, JournalError> {
+            Ok(self.staged.clone())
+        }
+        fn insert_staged_admission(&mut self, _: &StagedAdmission) -> Result<(), JournalError> {
+            unreachable!()
+        }
+        fn clear_staged_admission(&mut self, _: &StagedAdmission) -> Result<(), JournalError> {
+            self.staged = None;
+            Ok(())
+        }
+    }
+    struct NoStore;
+    impl DeviceKeyStore for NoStore {
+        async fn create(&mut self, _: ControlKeyPolicy) -> Result<StoredDevice, KeyStoreError> {
+            unreachable!()
+        }
+        async fn load(&mut self, _: KeyHandle) -> Result<StoredDevice, KeyStoreError> {
+            unreachable!()
+        }
+        async fn sign_control(
+            &mut self,
+            _: KeyHandle,
+            _: Vec<u8>,
+        ) -> Result<[u8; 64], KeyStoreError> {
+            unreachable!()
+        }
+        async fn sign_content(
+            &mut self,
+            _: KeyHandle,
+            _: Vec<u8>,
+        ) -> Result<[u8; 64], KeyStoreError> {
+            unreachable!()
+        }
+        async fn decapsulate(
+            &mut self,
+            _: KeyHandle,
+            _: [u8; 1120],
+        ) -> Result<Secret<32>, KeyStoreError> {
+            unreachable!()
+        }
+    }
+    struct NoProtector;
+    impl PendingSetupProtector for NoProtector {
+        fn seal(&mut self, _: &[u8]) -> Result<Vec<u8>, ProtectorError> {
+            unreachable!()
+        }
+        fn open(&mut self, _: &[u8]) -> Result<crate::crypto::SecretBytes, ProtectorError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn reconcile_and_scanner_status_verify_only_the_successor() {
+        let signer = SigningKey::generate();
+        let first = crate::DevicePublicKeys::new(
+            SigningKey::generate().public(),
+            signer.public(),
+            KemKey::generate().public(),
+        )
+        .unwrap();
+        let draft = AccountEvent::genesis(
+            first.clone(),
+            RecoveryPublicKeys::new(SigningKey::generate().public(), KemKey::generate().public()),
+        );
+        let genesis = draft.finish(signer.sign(draft.signing_bytes())).unwrap();
+        let anchor = AccountId::of_genesis(&genesis).unwrap();
+        let account = VerifiedAccount::from_genesis(anchor, genesis.as_bytes()).unwrap();
+        let recipient = crate::DevicePublicKeys::new(
+            SigningKey::generate().public(),
+            SigningKey::generate().public(),
+            KemKey::generate().public(),
+        )
+        .unwrap();
+        let draft = account.add_device(first.id(), recipient).unwrap();
+        let add = draft.finish(signer.sign(draft.signing_bytes())).unwrap();
+        let staged = StagedAdmission {
+            position: 2,
+            previous: account.head().hash,
+            event: add.as_bytes().to_vec(),
+            delivery: vec![1],
+        };
+        let device = JournaledDevice {
+            handle: KeyHandle([3; 32]),
+            keys: first,
+            policy: ControlKeyPolicy::AppEnforcedOwnerConfirmation,
+            kind: DeviceKeyStoreKind::MacLoginKeychainV1,
+        };
+        let mut owner = AccountOwner::new(
+            Journal {
+                account: JournaledAccount {
+                    anchor,
+                    history: vec![genesis.as_bytes().to_vec()],
+                    head: account.head(),
+                    stopped: false,
+                },
+                device: device.clone(),
+                staged: Some(staged),
+            },
+            NoStore,
+            NoProtector,
+            AccountGeneration::new(),
+        );
+        owner.loaded = Some(Loaded {
+            account,
+            device: Some(stored(&device)),
+            stopped: false,
+        });
+        reset_signature_checks();
+        assert!(matches!(
+            owner.reconcile_staged_admission(Some(&[add.as_bytes()])),
+            Ok(AdmissionResolution::Admitted { .. })
+        ));
+        assert_eq!(
+            signature_checks(),
+            1,
+            "one new signature, no genesis replay"
+        );
+        reset_signature_checks();
+        assert_eq!(
+            owner.scanner_status(),
+            Ok(crate::pairing::ScannerStatus::Added)
+        );
+        assert_eq!(
+            signature_checks(),
+            0,
+            "status must use the verified projection"
+        );
     }
 }

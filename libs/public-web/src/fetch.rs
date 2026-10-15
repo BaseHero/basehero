@@ -70,13 +70,9 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(limits: Limits) -> Result<Self, FetchError> {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            roots.add(cert).map_err(|_| FetchError::TlsConfiguration)?;
-        }
         Ok(Self {
             lookup: std::sync::Arc::new(crate::resolve::SystemLookup),
-            tls: tls_config(roots)?,
+            tls: tls_config(bh_tls_roots::browser_roots())?,
             limits,
         })
     }

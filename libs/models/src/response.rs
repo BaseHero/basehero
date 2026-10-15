@@ -1,8 +1,9 @@
 //! Bounded decoding of decrypted chat-completion SSE bodies.
 //!
-//! This module does not authenticate a provider or its usage. Only pass plaintext
-//! here after the transport has authenticated and decrypted it. Tool calls are
-//! proposals, never authorization to execute a tool.
+//! This module does not authenticate a provider or its usage. Its text output is
+//! provisional until the owning route has authenticated the complete response;
+//! NEAR decrypts fields before its final exact-wire signature check. Tool calls
+//! are proposals, never authorization to execute a tool.
 
 use serde::Deserialize;
 use serde_json::Value;

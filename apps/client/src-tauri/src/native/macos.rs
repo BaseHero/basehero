@@ -26,12 +26,13 @@ const LOGIN_SERVICE: &str = "app.basehero.client.device-keys.login-v1"; // M1 on
 const ORDINARY: &str = "ordinary";
 const RECEIVER: &str = "receiver";
 const CONTROL: &str = "control";
+const CONTROL_PUBLIC: &str = "control-public";
 const VERSION: u8 = 1;
 const PENDING_SETUP_SERVICE: &str = "app.basehero.client.pending-setup.login-v1"; // M1 only
 const PENDING_SETUP_ACCOUNT: &str = "wrapping-key";
 const WRAPPING_KEY_LEN: usize = 32;
 
-/// Only the three roles under one fresh 256-bit namespace can form a device.
+/// All four roles under one fresh 256-bit namespace form a device.
 /// The caller must persist the returned handle *and* original verified account
 /// history; this adapter cannot commit the OS keychain and SQLite atomically.
 pub(super) struct MacKeyStore;
@@ -142,13 +143,103 @@ fn add(
     }
     let bytes = SecretBytes::from_parts(&[&[VERSION, tag(policy)], seed.expose()])
         .map_err(|_| KeyStoreError::StorageFailure)?;
-    // The handle is freshly random and all three slots were probed empty. This
+    // The handle is freshly random and all four slots were probed empty. This
     // wrapper does an update on duplicate; never reuse a previous namespace.
     set_generic_password_options(bytes.expose(), options).map_err(status)
 }
 
+// Public metadata is in the same handle's keychain namespace but not behind
+// the control ACL. The account owner also matches it to signed device history.
+fn protected_control_public(handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+    let item =
+        SecretBytes::from_vec(generic_password(options(handle, CONTROL_PUBLIC)).map_err(status)?);
+    let bytes = item.expose();
+    if bytes.len() != 34
+        || bytes[0] != VERSION
+        || policy(bytes[1])? != ControlKeyPolicy::CurrentBiometricsOnly
+    {
+        return Err(KeyStoreError::WrongKey);
+    }
+    bytes[2..].try_into().map_err(|_| KeyStoreError::WrongKey)
+}
+fn add_protected_public(handle: &KeyHandle, public: &[u8; 32]) -> Result<(), KeyStoreError> {
+    let bytes = SecretBytes::from_parts(&[
+        &[VERSION, tag(ControlKeyPolicy::CurrentBiometricsOnly)],
+        public,
+    ])
+    .map_err(|_| KeyStoreError::StorageFailure)?;
+    set_generic_password_options(bytes.expose(), options(handle, CONTROL_PUBLIC)).map_err(status)
+}
+
 fn delete(handle: &KeyHandle, role: &str) -> Result<(), KeyStoreError> {
     delete_generic_password_options(options(handle, role)).map_err(status)
+}
+
+// The same load decision is executed with each route's actual Keychain I/O.
+// Unit tests inject only that I/O, never a second implementation of load.
+trait IdentityIo {
+    fn ordinary(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError>;
+    fn receiver(&mut self, handle: &KeyHandle) -> Result<[u8; 1216], KeyStoreError>;
+    fn control_public(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError>;
+    fn control(&mut self, handle: &KeyHandle) -> Result<SigningKey, KeyStoreError>;
+}
+fn loaded_keys(
+    io: &mut impl IdentityIo,
+    handle: &KeyHandle,
+) -> Result<DevicePublicKeys, KeyStoreError> {
+    let ordinary = io.ordinary(handle)?;
+    let receiver = io.receiver(handle)?;
+    let control_public = io.control_public(handle)?;
+    DevicePublicKeys::new(ordinary, control_public, receiver).map_err(|_| KeyStoreError::WrongKey)
+}
+fn sign_with_control(
+    io: &mut impl IdentityIo,
+    handle: &KeyHandle,
+    message: &[u8],
+) -> Result<[u8; 64], KeyStoreError> {
+    Ok(io.control(handle)?.sign(message))
+}
+struct ProtectedIdentityIo;
+impl IdentityIo for ProtectedIdentityIo {
+    fn ordinary(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+        let (policy, seed) = read(handle, ORDINARY)?;
+        if policy != ControlKeyPolicy::CurrentBiometricsOnly {
+            return Err(KeyStoreError::WrongKey);
+        }
+        Ok(SigningKey::from_seed(&seed).public())
+    }
+    fn receiver(&mut self, handle: &KeyHandle) -> Result<[u8; 1216], KeyStoreError> {
+        let (policy, seed) = read(handle, RECEIVER)?;
+        if policy != ControlKeyPolicy::CurrentBiometricsOnly {
+            return Err(KeyStoreError::WrongKey);
+        }
+        Ok(KemKey::from_seed(&seed).public())
+    }
+    fn control_public(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+        protected_control_public(handle)
+    }
+    fn control(&mut self, handle: &KeyHandle) -> Result<SigningKey, KeyStoreError> {
+        let (policy, seed) = read(handle, CONTROL)?;
+        if policy != ControlKeyPolicy::CurrentBiometricsOnly {
+            return Err(KeyStoreError::WrongKey);
+        }
+        Ok(SigningKey::from_seed(&seed))
+    }
+}
+struct LoginIdentityIo;
+impl IdentityIo for LoginIdentityIo {
+    fn ordinary(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+        Ok(SigningKey::from_seed(&login_read(handle, ORDINARY)?).public())
+    }
+    fn receiver(&mut self, handle: &KeyHandle) -> Result<[u8; 1216], KeyStoreError> {
+        Ok(KemKey::from_seed(&login_read(handle, RECEIVER)?).public())
+    }
+    fn control_public(&mut self, handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+        login_control_public(handle)
+    }
+    fn control(&mut self, handle: &KeyHandle) -> Result<SigningKey, KeyStoreError> {
+        Ok(SigningKey::from_seed(&login_read(handle, CONTROL)?))
+    }
 }
 
 impl DeviceKeyStore for MacKeyStore {
@@ -169,7 +260,7 @@ impl DeviceKeyStore for MacKeyStore {
         let handle = KeyHandle(crypto::random());
         // Reject an already occupied namespace, never intentionally overwrite an
         // admitted device. Any unexpected read error fails closed, not as empty.
-        for role in [ORDINARY, RECEIVER, CONTROL] {
+        for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
             match generic_password(options(&handle, role)) {
                 Err(error) if error.code() == -25300 => {} // errSecItemNotFound
                 Ok(bytes) => {
@@ -184,8 +275,14 @@ impl DeviceKeyStore for MacKeyStore {
             let _ = delete(&handle, ORDINARY); // inaccessible orphan on cleanup failure
             return Err(error);
         }
-        // Write protected control LAST; no half-created returned identity.
+        // A returned identity needs both control and metadata; failure rolls back.
         if let Err(error) = add(&handle, CONTROL, policy, &control.export_seed()) {
+            let _ = delete(&handle, RECEIVER);
+            let _ = delete(&handle, ORDINARY);
+            return Err(error);
+        }
+        if let Err(error) = add_protected_public(&handle, &control.public()) {
+            let _ = delete(&handle, CONTROL);
             let _ = delete(&handle, RECEIVER);
             let _ = delete(&handle, ORDINARY);
             return Err(error);
@@ -199,25 +296,11 @@ impl DeviceKeyStore for MacKeyStore {
     }
 
     async fn load(&mut self, handle: KeyHandle) -> Result<StoredDevice, KeyStoreError> {
-        // Reading control enforces its item ACL, so load may prompt. Never cache a
-        // decrypted control seed across requests; account owner must offload
-        // interactive calls from the UI thread and recheck generation after await.
-        let (ordinary_policy, ordinary) = read(&handle, ORDINARY)?;
-        let (receiver_policy, receiver) = read(&handle, RECEIVER)?;
-        let (control_policy, control) = read(&handle, CONTROL)?;
-        if ordinary_policy != control_policy || receiver_policy != control_policy {
-            return Err(KeyStoreError::WrongKey);
-        }
-        let keys = DevicePublicKeys::new(
-            SigningKey::from_seed(&ordinary).public(),
-            SigningKey::from_seed(&control).public(),
-            KemKey::from_seed(&receiver).public(),
-        )
-        .map_err(|_| KeyStoreError::WrongKey)?;
+        let keys = loaded_keys(&mut ProtectedIdentityIo, &handle)?;
         Ok(StoredDevice {
             handle,
             keys,
-            policy: control_policy,
+            policy: ControlKeyPolicy::CurrentBiometricsOnly,
             kind: DeviceKeyStoreKind::MacDataProtectionKeychainV1,
         })
     }
@@ -238,8 +321,7 @@ impl DeviceKeyStore for MacKeyStore {
     ) -> Result<[u8; 64], KeyStoreError> {
         // The protected item retrieval itself enforces the biometric-set (or
         // qualified passcode-only) ACL. A prompt result alone is not authority.
-        let (_, seed) = read(&handle, CONTROL)?;
-        Ok(SigningKey::from_seed(&seed).sign(&message))
+        sign_with_control(&mut ProtectedIdentityIo, &handle, &message)
     }
 
     async fn decapsulate(
@@ -298,6 +380,28 @@ fn login_add(handle: &KeyHandle, role: &str, seed: &Secret<32>) -> Result<(), Ke
     // and preflight avoid the wrapper's duplicate-item update behavior.
     set_generic_password_options(bytes.expose(), login_options(handle, role)).map_err(status)
 }
+fn login_control_public(handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+    let item = SecretBytes::from_vec(
+        generic_password(login_options(handle, CONTROL_PUBLIC)).map_err(status)?,
+    );
+    let bytes = item.expose();
+    if bytes.len() != 34
+        || bytes[0] != VERSION
+        || policy(bytes[1])? != ControlKeyPolicy::AppEnforcedOwnerConfirmation
+    {
+        return Err(KeyStoreError::WrongKey);
+    }
+    bytes[2..].try_into().map_err(|_| KeyStoreError::WrongKey)
+}
+fn login_add_public(handle: &KeyHandle, public: &[u8; 32]) -> Result<(), KeyStoreError> {
+    let bytes = SecretBytes::from_parts(&[
+        &[VERSION, tag(ControlKeyPolicy::AppEnforcedOwnerConfirmation)],
+        public,
+    ])
+    .map_err(|_| KeyStoreError::StorageFailure)?;
+    set_generic_password_options(bytes.expose(), login_options(handle, CONTROL_PUBLIC))
+        .map_err(status)
+}
 fn login_delete(handle: &KeyHandle, role: &str) {
     let _ = delete_generic_password_options(login_options(handle, role));
 }
@@ -313,7 +417,7 @@ impl DeviceKeyStore for MacLoginKeyStore {
         let keys = DevicePublicKeys::new(ordinary.public(), control.public(), receiver.public())
             .map_err(|_| KeyStoreError::WrongKey)?;
         let handle = KeyHandle(crypto::random());
-        for role in [ORDINARY, RECEIVER, CONTROL] {
+        for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
             match generic_password(login_options(&handle, role)) {
                 Err(error) if error.code() == -25300 => {} // errSecItemNotFound
                 Ok(bytes) => {
@@ -333,6 +437,12 @@ impl DeviceKeyStore for MacLoginKeyStore {
             login_delete(&handle, ORDINARY);
             return Err(error);
         }
+        if let Err(error) = login_add_public(&handle, &control.public()) {
+            login_delete(&handle, CONTROL);
+            login_delete(&handle, RECEIVER);
+            login_delete(&handle, ORDINARY);
+            return Err(error);
+        }
         Ok(StoredDevice {
             handle,
             keys,
@@ -342,18 +452,8 @@ impl DeviceKeyStore for MacLoginKeyStore {
     }
 
     async fn load(&mut self, handle: KeyHandle) -> Result<StoredDevice, KeyStoreError> {
-        // No LocalAuthentication prompt for ordinary content or receiver.
-        // Load compares all three derived public halves; it is not authority
-        // until the account owner compares them to original verified history.
-        let ordinary = login_read(&handle, ORDINARY)?;
-        let receiver = login_read(&handle, RECEIVER)?;
-        let control = login_read(&handle, CONTROL)?;
-        let keys = DevicePublicKeys::new(
-            SigningKey::from_seed(&ordinary).public(),
-            SigningKey::from_seed(&control).public(),
-            KemKey::from_seed(&receiver).public(),
-        )
-        .map_err(|_| KeyStoreError::WrongKey)?;
+        // The login route's control seed is app-gated at signing, not at load.
+        let keys = loaded_keys(&mut LoginIdentityIo, &handle)?;
         Ok(StoredDevice {
             handle,
             keys,
@@ -373,8 +473,7 @@ impl DeviceKeyStore for MacLoginKeyStore {
             GateError::AuthenticationCancelled => KeyStoreError::AuthenticationCancelled,
             GateError::Unavailable => KeyStoreError::Unavailable,
         })?;
-        let seed = login_read(&handle, CONTROL)?;
-        Ok(SigningKey::from_seed(&seed).sign(&message))
+        sign_with_control(&mut LoginIdentityIo, &handle, &message)
     }
     async fn sign_content(
         &mut self,
@@ -470,6 +569,162 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestIo {
+        ordinary: SigningKey,
+        receiver: KemKey,
+        control: SigningKey,
+        public: Result<[u8; 32], KeyStoreError>,
+        releases: usize,
+    }
+    impl TestIo {
+        fn new() -> Self {
+            let control = SigningKey::generate();
+            Self {
+                ordinary: SigningKey::generate(),
+                receiver: KemKey::generate(),
+                public: Ok(control.public()),
+                control,
+                releases: 0,
+            }
+        }
+    }
+    impl IdentityIo for TestIo {
+        fn ordinary(&mut self, _: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+            Ok(self.ordinary.public())
+        }
+        fn receiver(&mut self, _: &KeyHandle) -> Result<[u8; 1216], KeyStoreError> {
+            Ok(self.receiver.public())
+        }
+        fn control_public(&mut self, _: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
+            self.public
+        }
+        fn control(&mut self, _: &KeyHandle) -> Result<SigningKey, KeyStoreError> {
+            self.releases += 1;
+            Ok(SigningKey::from_seed(&self.control.export_seed()))
+        }
+    }
+    #[test]
+    fn both_keychain_routes_share_tested_load_decision() {
+        let handle = KeyHandle([9; 32]);
+        for route in [
+            DeviceKeyStoreKind::MacDataProtectionKeychainV1,
+            DeviceKeyStoreKind::MacLoginKeychainV1,
+        ] {
+            // Both production route adapters call loaded_keys and sign_with_control;
+            // only the Keychain reads/writes differ. The M1 approval precedes signing.
+            let mut io = TestIo::new();
+            for _ in 0..3 {
+                // load, ordinary delivery and ordinary receiving
+                assert_eq!(
+                    loaded_keys(&mut io, &handle).unwrap().control(),
+                    &io.control.public(),
+                    "{route:?}"
+                );
+            }
+            assert_eq!(io.releases, 0, "{route:?}");
+            let sig = sign_with_control(&mut io, &handle, b"control").unwrap();
+            assert!(crypto::verify(&io.control.public(), b"control", &sig).is_ok());
+            assert_eq!(io.releases, 1, "{route:?}");
+            // A missing record is a lost identity, not permission to read control.
+            let mut absent = TestIo::new();
+            for failure in [
+                KeyStoreError::Invalidated,
+                KeyStoreError::StorageFailure,
+                KeyStoreError::WrongKey,
+            ] {
+                absent.public = Err(failure);
+                assert!(
+                    matches!(loaded_keys(&mut absent, &handle), Err(error) if error == failure),
+                    "{route:?}"
+                );
+                assert_eq!(absent.releases, 0, "{route:?}");
+            }
+        }
+    }
+    #[test]
+    fn mac_load_entries_do_not_release_control_outside_the_tested_decision() {
+        // This checks the real route entries, not TestIo: both must delegate
+        // without reading the control seed before loaded_keys runs.
+        let source = include_str!("macos.rs");
+        for (store, next_method, forbidden_read, delegate) in [
+            (
+                "MacKeyStore",
+                "async fn sign_content(",
+                "read(&handle, CONTROL)",
+                "loaded_keys(&mut ProtectedIdentityIo, &handle)?",
+            ),
+            (
+                "MacLoginKeyStore",
+                "async fn sign_control(",
+                "login_read(&handle, CONTROL)",
+                "loaded_keys(&mut LoginIdentityIo, &handle)?",
+            ),
+        ] {
+            let entry = source
+                .split_once(&format!("impl DeviceKeyStore for {store} {{"))
+                .unwrap()
+                .1
+                .split_once("async fn load(&mut self, handle: KeyHandle)")
+                .unwrap()
+                .1
+                .split_once(next_method)
+                .unwrap()
+                .0;
+            assert!(
+                entry.contains(delegate),
+                "{store} must use the tested load decision"
+            );
+            assert!(
+                !entry.contains(forbidden_read),
+                "{store} must not read control outside the tested load decision"
+            );
+        }
+    }
+    #[test]
+    fn both_creation_routes_require_metadata_and_clean_on_failure() {
+        // Keep the native keychain calls under each create branch in the tested
+        // sequence: a failed metadata write must not return a usable handle.
+        let source = include_str!("macos.rs");
+        for (store, add_public, cleanup) in [
+            (
+                "MacKeyStore",
+                "add_protected_public(&handle, &control.public())",
+                "delete(&handle, CONTROL)",
+            ),
+            (
+                "MacLoginKeyStore",
+                "login_add_public(&handle, &control.public())",
+                "login_delete(&handle, CONTROL)",
+            ),
+        ] {
+            let creation = source
+                .split_once(&format!("impl DeviceKeyStore for {store} {{"))
+                .unwrap()
+                .1
+                .split_once("async fn load(&mut self, handle: KeyHandle)")
+                .unwrap()
+                .0;
+            let metadata = creation.find(add_public).unwrap();
+            let after_metadata = &creation[metadata..];
+            let rollback = after_metadata.find(cleanup).unwrap();
+            let returned = after_metadata.find("Ok(StoredDevice {").unwrap();
+            assert!(
+                rollback < returned,
+                "{store} must roll back before returning"
+            );
+            assert!(after_metadata[..returned].contains("return Err(error)"));
+            for role in ["RECEIVER", "ORDINARY"] {
+                assert!(after_metadata[..returned].contains(&format!(
+                    "{cleanup_prefix}(&handle, {role})",
+                    cleanup_prefix = if store == "MacKeyStore" {
+                        "delete"
+                    } else {
+                        "login_delete"
+                    }
+                )));
+            }
+        }
+    }
     #[test]
     fn os_statuses_do_not_confuse_failed_auth_with_key_loss() {
         assert_eq!(status_code(-128), KeyStoreError::AuthenticationCancelled);

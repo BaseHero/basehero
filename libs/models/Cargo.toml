@@ -9,11 +9,12 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+jsonschema = { workspace = true, optional = true }
 tinfoil = { workspace = true, optional = true }
 tinfoil-ehbp = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
+bh-tls-roots = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread"] }
 futures-util = { workspace = true, optional = true }
 # Directly named only in the feature-gated, independent enclave-side tests;
@@ -38,7 +39,7 @@ base64 = { workspace = true, optional = true }
 
 [features]
 tinfoil-route = [
-  "dep:tinfoil", "dep:tinfoil-ehbp", "dep:reqwest", "dep:rustls", "dep:rustls-native-certs",
+  "dep:tinfoil", "dep:tinfoil-ehbp", "dep:reqwest", "dep:rustls", "dep:bh-tls-roots",
   "dep:tokio", "dep:futures-util",
   "dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex",
 ]
@@ -46,6 +47,7 @@ near-route = [
   "dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex",
   "dep:hkdf", "dep:sha2", "dep:bh-crypto",
   "dep:bh-confidential-attestation", "dep:dcap-qvl", "dep:p384", "dep:base64",
+  "dep:jsonschema",
 ]
 
 [dev-dependencies]

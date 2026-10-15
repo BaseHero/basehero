@@ -18,6 +18,18 @@ function el(name, attributes = {}) {
 test('inventory matches actual bundled editor nodes and marks', () => {
   assert.deepEqual(Object.keys(schema.nodes).sort(), ['blockquote','bulletList','doc','hardBreak','heading','listItem','orderedList','paragraph','taskItem','taskList','text'].sort());
   assert.deepEqual(Object.keys(schema.marks).sort(), ['bold','code','italic','link','strike','underline'].sort());
+  for(const [name,mark] of Object.entries(schema.marks))
+    for(const [otherName,other] of Object.entries(schema.marks))
+      if(name!==otherName)assert.equal(mark.excludes(other),false,`${name} excludes ${otherName}`);
+});
+
+test('code and italic coexist in the shared fixture and project to an editable note', () => {
+  const doc=new Y.Doc();Y.applyUpdate(doc,readFileSync(new URL('./code-italic.bin',import.meta.url)));
+  const fragment=doc.getXmlFragment('default');
+  assert.equal(classify(fragment).supported,true);
+  const projected=initProseMirrorDoc(fragment,schema).doc;
+  assert.deepEqual(projected.firstChild.firstChild.marks.map(mark=>mark.type.name).sort(),['code','italic']);
+  doc.destroy();
 });
 
 test('reject unknown nodes, marks and attributes without mutating original bytes', () => {

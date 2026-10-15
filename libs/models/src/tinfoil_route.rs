@@ -208,19 +208,15 @@ fn bearer(credential: &str) -> Result<header::HeaderValue, RouteError> {
 
 // Gateway TLS is our connection (unlike SDK attestation and enclave EHBP).
 // Select aws-lc-rs explicitly: the SDK installs ring as the process default,
-// which lacks our required hybrid-first TLS key exchange. Keep normal roots,
+// which lacks our required hybrid-first TLS key exchange. Keep browser roots,
 // certificate/hostname checks and rustls safe protocol versions.
 fn gateway_tls_config() -> Result<rustls::ClientConfig, RouteError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        roots.add(cert).map_err(|_| RouteError::Transport)?;
-    }
     Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|_| RouteError::Transport)?
-    .with_root_certificates(roots)
+    .with_root_certificates(bh_tls_roots::browser_roots())
     .with_no_client_auth())
 }
 

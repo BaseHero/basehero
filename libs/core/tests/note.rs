@@ -101,6 +101,13 @@ fn shared_inventory_classifies_yrs_content_without_modifying_note() {
         .unwrap();
     let original = note.state();
     assert!(classify_note(&original).unwrap());
+    assert!(
+        classify_note(include_bytes!(
+            "../../../apps/client/editor/test/code-italic.bin"
+        ))
+        .unwrap(),
+        "shared code+italic fixture is editable on both sides"
+    );
     let rich = include_bytes!("../../../apps/client/editor/test/rich.bin");
     assert!(
         classify_note(rich).unwrap(),
@@ -151,6 +158,14 @@ fn shared_inventory_classifies_yrs_content_without_modifying_note() {
         txn.get_xml_fragment("default").unwrap().get_string(&txn)
     };
     assert!(xml.contains("futureWidget") && xml.contains("payload=\"keep\""));
+}
+
+#[test]
+fn primitive_after_valid_xml_block_is_unsupported() {
+    // Yjs allows a primitive XML child. yrs children() stops on that child;
+    // classification must inspect every array slot instead.
+    let bytes = include_bytes!("../../../apps/client/editor/test/primitive-after-valid.bin");
+    assert!(!classify_note(bytes).unwrap());
 }
 
 #[test]

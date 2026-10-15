@@ -113,10 +113,6 @@ impl SearchClient {
         let mut token = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| SearchError::Configuration)?;
         token.set_sensitive(true);
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            roots.add(cert).map_err(|_| SearchError::Configuration)?;
-        }
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .no_gzip()
@@ -129,7 +125,10 @@ impl SearchClient {
             .http1_only()
             .pool_max_idle_per_host(0)
             .connect_timeout(Duration::from_secs(5))
-            .tls_backend_preconfigured(tls_config(roots).map_err(|_| SearchError::Configuration)?);
+            .tls_backend_preconfigured(
+                tls_config(bh_tls_roots::browser_roots())
+                    .map_err(|_| SearchError::Configuration)?,
+            );
         if let Some(dns) = dns {
             builder = builder.dns_resolver(Arc::new(crate::resolve::GuardedResolver(dns)));
         }

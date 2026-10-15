@@ -17,6 +17,7 @@ case "${1:-portable}" in
     node scripts/affected.mjs --layers
     node --test scripts/affected.test.mjs scripts/webdriver-exclusion.test.mjs scripts/check-webdriver-markers.test.mjs
     node scripts/webdriver-exclusion.mjs
+    python3 -m unittest discover -s scripts -p test_mac_package.py
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
     # Security socket fixtures need test-owned addresses inside a Linux network namespace.
@@ -58,6 +59,11 @@ case "${1:-portable}" in
     nix develop --command cargo test --locked -p bh-device-keys
     apps/client/src-tauri/gen/android/gradlew -p apps/client/plugins/device-keys/android testDebugUnitTest assembleRelease --no-daemon
     ;;
+  android-device-keys-emulator)
+    # Opt-in Keystore/BiometricPrompt instrumentation, from nix develop .#androidEmulator.
+    python3 apps/client/plugins/device-keys/android/test-runner-safety.py
+    bash apps/client/plugins/device-keys/android/run-emulator.sh
+    ;;
   android-crypto)
     artifacts=$(mktemp)
     trap 'rm -f "$artifacts"' EXIT
@@ -95,7 +101,7 @@ case "${1:-portable}" in
     bash apps/client/tests/webdriver/run-android.sh
     ;;
   *)
-    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-device-keys|android-crypto|wasm|wasm-crypto|wasm-sync|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
+    echo "usage: bash scripts/check.sh [portable|ui|editor|desktop|android|android-device-keys|android-device-keys-emulator|android-crypto|wasm|wasm-crypto|wasm-sync|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
     exit 2
     ;;
 esac

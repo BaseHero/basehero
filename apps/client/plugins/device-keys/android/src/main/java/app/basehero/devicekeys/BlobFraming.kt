@@ -9,7 +9,7 @@ internal object BlobFraming {
     }
     fun ad(handle: String, role: String): ByteArray {
         require(handle.length == 64 && handle.all { it in '0'..'9' || it in 'a'..'f' })
-        require(role == "ordinary" || role == "receiver" || role == "control")
+        require(role == "ordinary" || role == "receiver" || role == "control" || role == "control-public")
         return "BaseHero device keys v1:$handle:$role".toByteArray(Charsets.US_ASCII)
     }
 }

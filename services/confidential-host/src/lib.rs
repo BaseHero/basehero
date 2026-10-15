@@ -5,6 +5,9 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod time;
+pub use time::{TimeError, TimeSampler};
+
 use bh_confidential_attestation::{MAX_INPUT_BYTES, report_data};
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};

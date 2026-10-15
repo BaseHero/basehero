@@ -167,7 +167,7 @@ impl Synthetic {
             app_compose: &self.owned.compose,
             advertised_nonce: self.expected.nonce,
             advertised_report_data: None,
-            ohttp_signing_key: self.expected.signer,
+            ohttp_signing_key: self.expected.pairs[0].0,
             ohttp_key_config: &self.config,
             ohttp_signature: &self.signature,
         }
@@ -179,16 +179,212 @@ impl Synthetic {
 }
 
 #[test]
+fn signed_policy_pair_drives_real_gateway_assembly_and_handoff() {
+    use crate::provider_policy::{self, Install, RouteEvidence, Trust};
+    let fixture = Synthetic::new();
+    let root = SigningKey::from_seed(&bh_crypto::Secret::from_slice(&[7; 32]).unwrap());
+    let trust = Trust {
+        root: root.public(),
+        key_id: *b"TESTKEY1",
+        provider: "near",
+        models: &["z-ai/glm-5.3-flash"],
+        app_build_date: 100,
+        max_lifetime_secs: 1000,
+    };
+    let mut payload = vec![1, 4];
+    payload.extend(b"near");
+    payload.extend(11u64.to_be_bytes());
+    payload.extend(90u64.to_be_bytes());
+    payload.extend(500u64.to_be_bytes());
+    payload.extend(1u16.to_be_bytes());
+    payload.push(1);
+    payload.extend(fixture.expected.pairs[0].0);
+    payload.extend(fixture.expected.pairs[0].1);
+    let mut bytes = b"BHPOL001TESTKEY1".to_vec();
+    bytes.extend((payload.len() as u32).to_be_bytes());
+    bytes.extend(&payload);
+    let mut signed = b"BaseHero provider-admission v1\0".to_vec();
+    signed.extend(&payload);
+    bytes.extend(root.sign(&signed));
+    let time = Time {
+        earliest: 110,
+        latest: 110,
+        max_uncertainty_secs: 0,
+    };
+    let state = match provider_policy::install(None, &bytes, &trust, Some(time)) {
+        Install::Installed {
+            state,
+            usable_now: true,
+        } => state,
+        _ => panic!("signed fixture rejected"),
+    };
+    let expected =
+        provider_policy::expected_gateway(state.snapshot(), fixture.expected.nonce, Some(time))
+            .unwrap();
+    let mut claims = fixture.claims.clone();
+    claims.earliest_expiration_date = 300;
+    let verified = assemble(&claims, &fixture.evidence(), &expected).unwrap();
+    assert_eq!(verified.valid_until(), 300);
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            Some(time)
+        ),
+        Ok(())
+    );
+    let mut foreign_trust = trust;
+    foreign_trust.provider = "tinfoil";
+    let mut foreign_payload = vec![1, 7];
+    foreign_payload.extend(b"tinfoil");
+    foreign_payload.extend(11u64.to_be_bytes());
+    foreign_payload.extend(90u64.to_be_bytes());
+    foreign_payload.extend(500u64.to_be_bytes());
+    foreign_payload.extend(0u16.to_be_bytes());
+    let mut foreign_bytes = b"BHPOL001TESTKEY1".to_vec();
+    foreign_bytes.extend((foreign_payload.len() as u32).to_be_bytes());
+    foreign_bytes.extend(&foreign_payload);
+    let mut foreign_signed = b"BaseHero provider-admission v1\0".to_vec();
+    foreign_signed.extend(&foreign_payload);
+    foreign_bytes.extend(root.sign(&foreign_signed));
+    let foreign = provider_policy::restore(&foreign_bytes, &foreign_trust).unwrap();
+    assert_eq!(
+        provider_policy::check_current(
+            foreign.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            Some(time)
+        ),
+        Err(provider_policy::Reject::Provider)
+    );
+    let at = |earliest| {
+        Some(Time {
+            earliest,
+            latest: earliest,
+            max_uncertainty_secs: 0,
+        })
+    };
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            at(299)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            at(300)
+        ),
+        Err(provider_policy::Reject::Expired)
+    );
+    let resign = |mut payload: Vec<u8>| {
+        payload[6..14].copy_from_slice(&12u64.to_be_bytes());
+        let mut bytes = b"BHPOL001TESTKEY1".to_vec();
+        bytes.extend((payload.len() as u32).to_be_bytes());
+        bytes.extend(&payload);
+        let mut signed = b"BaseHero provider-admission v1\0".to_vec();
+        signed.extend(&payload);
+        bytes.extend(root.sign(&signed));
+        bytes
+    };
+    let mut retired = payload.clone();
+    let pair_start = retired.len() - 64;
+    retired[pair_start..pair_start + 32].fill(0x44);
+    let retired = match provider_policy::install(Some(&state), &resign(retired), &trust, Some(time))
+    {
+        Install::Installed { state, .. } => state,
+        _ => panic!("retirement rejected"),
+    };
+    assert_eq!(
+        provider_policy::check_current(
+            retired.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            Some(time)
+        ),
+        Err(provider_policy::Reject::Denied)
+    );
+    let mut long_claims = fixture.claims.clone();
+    long_claims.earliest_expiration_date = 700;
+    let long_verified = assemble(&long_claims, &fixture.evidence(), &expected).unwrap();
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            RouteEvidence::Gateway(&long_verified),
+            at(500)
+        ),
+        Err(provider_policy::Reject::Expired)
+    );
+    let mut empty = payload.clone();
+    empty.truncate(6 + 8 + 8 + 8 + 2);
+    empty[30..32].copy_from_slice(&0u16.to_be_bytes());
+    let withdrawal =
+        match provider_policy::install(Some(&state), &resign(empty), &trust, Some(time)) {
+            Install::Installed {
+                state,
+                usable_now: false,
+            } => state,
+            _ => panic!("withdrawal rejected"),
+        };
+    assert_eq!(
+        provider_policy::check_current(
+            withdrawal.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            Some(time)
+        ),
+        Err(provider_policy::Reject::Denied)
+    );
+    // The crossed signer/compose never becomes a pair, even at dispatch.
+    let mut crossed_policy = payload.clone();
+    crossed_policy[30..32].copy_from_slice(&2u16.to_be_bytes());
+    let mut original = crossed_policy.split_off(32);
+    original[33..65].fill(0x55);
+    let mut alternate = vec![1u8];
+    alternate.extend([0x44; 32]);
+    alternate.extend(fixture.expected.pairs[0].1);
+    let mut pairs = [original, alternate];
+    pairs.sort();
+    for entry in pairs {
+        crossed_policy.extend(entry);
+    }
+    let crossed_state =
+        match provider_policy::install(Some(&state), &resign(crossed_policy), &trust, Some(time)) {
+            Install::Installed { state, .. } => state,
+            _ => panic!("crossed policy rejected"),
+        };
+    assert_eq!(
+        provider_policy::check_current(
+            crossed_state.snapshot(),
+            RouteEvidence::Gateway(&verified),
+            Some(time)
+        ),
+        Err(provider_policy::Reject::Denied)
+    );
+    let crossed = Expected::from_policy(
+        vec![
+            (fixture.expected.pairs[0].0, [0x55; 32]),
+            ([0x44; 32], fixture.expected.pairs[0].1),
+        ],
+        fixture.expected.nonce,
+    );
+    assert_eq!(
+        assemble(&fixture.claims, &fixture.evidence(), &crossed),
+        Err(Error::Configuration)
+    );
+}
+
+#[test]
 fn synthetic_gateway_evidence_verifies_and_binds_the_ohttp_signer() {
     let fixture = Synthetic::new();
     let verified = fixture.assemble().unwrap();
-    assert_eq!(verified.signer().public_key(), &fixture.expected.signer);
+    assert_eq!(verified.signer().public_key(), &fixture.expected.pairs[0].0);
     assert!(!verified.out_of_date());
-    assert_eq!(verified.compose_sha256(), &fixture.expected.compose_sha256);
+    assert_eq!(verified.compose_sha256(), &fixture.expected.pairs[0].1);
     let parsed = verify_key_config(
         &fixture.config,
         &fixture.signature,
-        &GatewaySigner::for_tests(fixture.expected.signer),
+        &GatewaySigner::for_tests(fixture.expected.pairs[0].0),
     )
     .unwrap();
     assert_eq!(verified.key_config(), &parsed);
@@ -244,7 +440,7 @@ fn report_data_nonce_and_advertised_bindings_fail_closed() {
     let other = Expected::for_tests(
         [0x77u8; 32],
         fixture.expected.nonce,
-        fixture.expected.compose_sha256,
+        fixture.expected.pairs[0].1,
     );
     assert_eq!(
         assemble(&fixture.claims, &fixture.evidence(), &other),
@@ -494,6 +690,6 @@ fn pinned_candidate_constants_match_the_reviewed_deployment() {
         ]
     );
     let pinned = Expected::pinned([1u8; 32]);
-    assert_eq!(pinned.signer, GATEWAY_SIGNING_IDENTITY);
-    assert_eq!(pinned.compose_sha256, GATEWAY_COMPOSE_SHA256);
+    assert_eq!(pinned.pairs[0].0, GATEWAY_SIGNING_IDENTITY);
+    assert_eq!(pinned.pairs[0].1, GATEWAY_COMPOSE_SHA256);
 }

@@ -123,6 +123,7 @@
                 pkg-config
                 cargo-tauri
                 nodejs_22
+                python3 # Mac packaging and its portable archive fixtures.
               ]
               ++ lib.optionals stdenv.hostPlatform.isLinux [
                 xvfb

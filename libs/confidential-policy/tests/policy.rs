@@ -298,6 +298,73 @@ fn configured_lifetime_is_required_and_extreme_intervals_do_not_overflow() {
 }
 
 #[test]
+fn prepared_candidate_is_not_live_until_published_and_cannot_cross_floors_or_roots() {
+    let mut g = gate();
+    push(&mut g, &policy(1)).unwrap();
+    let bytes = serde_json::to_vec(&policy(2)).unwrap();
+    let candidate = g.prepare_delivery(&bytes, &sign(&bytes)).unwrap();
+    assert_eq!(candidate.snapshot().payload(), bytes);
+    assert_eq!(check(&mut g), Ok(()));
+    push(&mut g, &policy(3)).unwrap();
+    assert_eq!(
+        g.publish_delivery(candidate),
+        Err(Error::GenerationConflict)
+    );
+    let candidate = g.prepare_delivery(&bytes, &sign(&bytes));
+    assert!(matches!(candidate, Err(Error::PolicyRollback)));
+    let bytes = serde_json::to_vec(&policy(4)).unwrap();
+    let candidate = g.prepare_delivery(&bytes, &sign(&bytes)).unwrap();
+    let other = SigningKey::from_seed(&Secret::from_slice(&[8; 32]).unwrap());
+    let mut foreign = PolicyGate::new(
+        other.public(),
+        Limits {
+            max_lifetime_secs: 100,
+            max_uncertainty_secs: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        foreign.publish_delivery(candidate),
+        Err(Error::GenerationConflict)
+    );
+}
+
+#[test]
+fn restored_snapshot_authenticates_but_starts_unavailable_and_keeps_floor() {
+    let mut g = gate();
+    let bytes = serde_json::to_vec(&policy(2)).unwrap();
+    g.push(&bytes, &sign(&bytes)).unwrap();
+    let snapshot = g.snapshot().unwrap();
+    let mut restored = PolicyGate::restore_unavailable(
+        signing().public(),
+        Limits {
+            max_lifetime_secs: 100,
+            max_uncertainty_secs: 5,
+        },
+        &snapshot,
+    )
+    .unwrap();
+    assert_eq!(check(&mut restored), Err(Error::PolicyUnavailable));
+    assert_eq!(push(&mut restored, &policy(1)), Err(Error::PolicyRollback));
+    assert_eq!(check(&mut restored), Err(Error::PolicyUnavailable));
+    push(&mut restored, &policy(2)).unwrap();
+    assert_eq!(check(&mut restored), Ok(()));
+    let mut tampered = snapshot.clone();
+    tampered.signature[0] ^= 1;
+    assert!(matches!(
+        PolicyGate::restore_unavailable(
+            signing().public(),
+            Limits {
+                max_lifetime_secs: 100,
+                max_uncertainty_secs: 5
+            },
+            &tampered
+        ),
+        Err(Error::Signature)
+    ));
+}
+
+#[test]
 fn policy_has_no_implicit_machine_or_role_permissions() {
     let mut g = gate();
     let mut p = policy(1);

@@ -2,7 +2,7 @@
 use bh_account::{
     AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount,
     crypto::{self, KemKey, Secret, SigningKey},
-    personal::{PersonalKey, open_for_receiver, prepare_publication},
+    personal::{self, PersonalKey, open_for_receiver, prepare_publication},
     platform::{
         ControlKeyPolicy, DeviceKeyStore, DeviceKeyStoreKind, KeyHandle, KeyStoreError,
         StoredDevice,
@@ -35,6 +35,7 @@ struct Fake {
     wrong_receiver: bool,
     sign_calls: usize,
     decap_calls: usize,
+    control_releases: usize,
 }
 impl Fake {
     fn new() -> Self {
@@ -52,6 +53,7 @@ impl Fake {
             wrong_receiver: false,
             sign_calls: 0,
             decap_calls: 0,
+            control_releases: 0,
         }
     }
     fn stored(&self) -> StoredDevice {
@@ -76,6 +78,7 @@ impl DeviceKeyStore for Fake {
         if handle != self.handle {
             return Err(KeyStoreError::Unavailable);
         }
+        // Public identity loading must not release the protected control seed.
         let mut stored = self.stored();
         if self.wrong_loaded_handle {
             stored.handle = KeyHandle([8; 32]);
@@ -104,6 +107,7 @@ impl DeviceKeyStore for Fake {
         message: Vec<u8>,
     ) -> Result<[u8; 64], KeyStoreError> {
         self.sign_calls += 1;
+        self.control_releases += 1;
         if handle != self.handle {
             return Err(KeyStoreError::Unavailable);
         }
@@ -204,6 +208,10 @@ fn async_key_boundary_refuses_wrong_handle_cancel_invalidation_and_wrong_signer(
     store.wrong_control = false;
     assert!(ready(request.sign_with(&device, &mut store)).is_ok());
     assert_eq!(store.sign_calls, 4);
+    // The successful control signature releases exactly once; load must not.
+    let before = store.control_releases;
+    assert!(ready(request.sign_with(&device, &mut store)).is_ok());
+    assert_eq!(store.control_releases - before, 1);
     let mut wrong = store.stored();
     wrong.handle = KeyHandle([8; 32]);
     assert!(matches!(
@@ -286,6 +294,7 @@ fn first_device_seal_requires_matching_native_receiver() {
     assert!(stopped.apply(&[0]).is_err());
     assert!(ready(open_for_receiver(&stopped, seal, &device, &mut store)).is_err());
     assert_eq!(store.decap_calls, 0, "sticky stop reached receiver");
+    store.control_releases = 0;
     assert_eq!(
         ready(open_for_receiver(&state, seal, &device, &mut store))
             .unwrap()
@@ -293,6 +302,44 @@ fn first_device_seal_requires_matching_native_receiver() {
         personal.public()
     );
     assert_eq!(store.decap_calls, 1);
+    assert_eq!(
+        store.control_releases, 0,
+        "ordinary receiving must not release control"
+    );
+
+    let mut recipient_store = Fake::new();
+    let recipient = recipient_store.stored();
+    let draft = state
+        .add_device(device.keys.id(), recipient.keys.clone())
+        .unwrap();
+    let admission = ready(draft.sign_with(&device, &mut store)).unwrap();
+    store.control_releases = 0;
+    let delivery = ready(personal::seal_for_device(
+        &state,
+        &personal,
+        &device,
+        &recipient.keys,
+        &admission,
+        &mut store,
+    ))
+    .unwrap();
+    assert_eq!(
+        store.control_releases, 0,
+        "ordinary delivery released control"
+    );
+    state.apply(admission.as_bytes()).unwrap();
+    let received = ready(personal::open_for_device(
+        &state,
+        &delivery,
+        &recipient,
+        &mut recipient_store,
+    ))
+    .unwrap();
+    assert_eq!(received.public(), personal.public());
+    assert_eq!(
+        recipient_store.control_releases, 0,
+        "ordinary delivery receive released control"
+    );
     store.wrong_receiver = true;
     assert!(
         ready(open_for_receiver(

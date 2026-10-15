@@ -37,14 +37,20 @@ impl Note {
         Self { doc: Doc::new() }
     }
 
-    /// Apply a Yjs v1 update. On any error, discard this working Note rather
-    /// than assuming yrs rolled back a partially applied transaction.
+    /// Apply a Yjs v1 update. Decode fails before a transaction opens; on
+    /// Apply errors, discard this working Note rather than assume rollback.
     pub fn apply_update(&mut self, bytes: &[u8]) -> Result<(), NoteError> {
         let update = Update::decode_v1(bytes).map_err(NoteError::Decode)?;
         self.doc
             .transact_mut()
             .apply_update(update)
             .map_err(NoteError::Apply)
+    }
+
+    /// Identity of this working yrs replica. Useful to verify an update was
+    /// applied in place; not an authentication token or a durable Note ID.
+    pub fn replica_id(&self) -> u64 {
+        self.doc.client_id().get()
     }
 
     pub fn state(&self) -> Vec<u8> {

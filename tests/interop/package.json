@@ -4,7 +4,7 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
-    "test": "node known.mjs",
+    "test": "node known.mjs && node checked-yrs.mjs",
     "proof:unknown": "node unknown-preservation.red.mjs"
   },
   "devDependencies": {

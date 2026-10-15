@@ -3,9 +3,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { browserMatrix, launchBrowser, openPage, startUiServer } from "./harness.mjs";
+import { tauriIpcStub } from "./tauri-ipc-stub.mjs";
 
 function senderHost() {
-  window.__bhIpc.handle("note_binding", () => Array(32).fill(3));
+  window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:crypto.randomUUID()}));
   window.__bhIpc.handle("note_open", () => ({ state: [0, 0], generation: 7, sequence: 5 }));
   window.__bhIpc.handle("note_commit", (args) => new Promise((resolve) => {
     (window.__bhPendingAcks ??= []).push({ args, resolve });
@@ -14,7 +15,7 @@ function senderHost() {
 }
 
 function receiverHost() {
-  window.__bhIpc.handle("note_binding", () => Array(32).fill(3));
+  window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:'42'}));
   window.__bhIpc.handle("note_open", () => new Promise((resolve) => {
     window.__bhFinishOpen = () => resolve({ state: [0, 0], generation: 7, sequence: 5 });
   }));
@@ -30,6 +31,202 @@ async function dispatch(page, generation, sequence, update) {
 
 for (const browserName of browserMatrix) {
   describe(`bound note bridge in ${browserName}`, () => {
+    test("synchronous native result reports failure and retries the same sequence", async () => {
+      const server = await startUiServer(); const browser = await launchBrowser(browserName);
+      try {
+        const page = await browser.newPage();
+        await page.addInitScript(tauriIpcStub);
+        await page.addInitScript(() => {
+          window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:'42'}));
+          window.__bhIpc.handle('note_open', () => ({state:[0,0],generation:7,sequence:5}));
+          window.__bhIpc.handle('note_close', () => null);
+        });
+        // Only the editor is fault-injected; the actual bundled bridge handles
+        // a synchronous throwing onUpdate and a successful same-sequence retry.
+        await page.route('**/note-editor.js', route => route.fulfill({contentType:'text/javascript',body:`
+          export async function createNoteEditor(root,host) {
+            let calls=0;
+            await host.open(() => { if (++calls === 1) throw Error('injected render failure'); });
+            window.__bhHandlerCalls=()=>calls;
+          }
+        `}));
+        await page.goto(`${server.origin}/`, {waitUntil:'load'});
+        await page.waitForFunction(() => typeof window.__bhNoteDelivery === 'function');
+        const result = await page.evaluate(() => {
+          const packet = {generation:7, sequence:6, update:[0,0], resync:true};
+          const failed = window.__bhNoteDelivery(packet);
+          const staleGeneration = window.__bhNoteDelivery({...packet, generation:8});
+          const valid = window.__bhNoteDelivery(packet);
+          const duplicate = window.__bhNoteDelivery(packet);
+          const handlerCalls = window.__bhHandlerCalls();
+          window.dispatchEvent(new Event('pagehide'));
+          const noListener = window.__bhNoteDelivery?.(packet) ?? 'stale';
+          return {failed, staleGeneration, valid, duplicate, handlerCalls, noListener};
+        });
+        assert.deepEqual(result, {failed:'failed', staleGeneration:'stale', valid:'accepted', duplicate:'stale', handlerCalls:2, noListener:'stale'});
+        await page.close();
+      } finally { await browser.close(); await server.close(); }
+    });
+    test("a buffered handler failure closes the view instead of leaving a stale editor", async () => {
+      const server=await startUiServer();const browser=await launchBrowser(browserName);
+      try {
+        const page=await browser.newPage();
+        await page.addInitScript(tauriIpcStub);
+        await page.addInitScript(() => {
+          window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
+          window.__bhIpc.handle('note_open',()=>new Promise(resolve=>{window.__bhResolve=()=>resolve({state:[0,0],generation:7,sequence:5});}));
+          window.__bhIpc.handle('note_close',()=>null);
+        });
+        await page.route('**/note-editor.js',route=>route.fulfill({contentType:'text/javascript',body:`
+          export async function createNoteEditor(root,host) {
+            await host.open(() => {throw Error('injected buffered render failure');});
+            root.textContent='editable';
+          }
+        `}));
+        await page.goto(`${server.origin}/`,{waitUntil:'load'});
+        await page.waitForFunction(()=>typeof window.__bhResolve==='function');
+        assert.equal(await page.evaluate(()=>window.__bhNoteDelivery({generation:7,sequence:6,update:[0,0],resync:true})),'buffered');
+        await page.evaluate(()=>window.__bhResolve());
+        await page.getByText('Note unavailable').waitFor();
+        assert.equal(await page.locator('main').getByText('editable').count(),0);
+        assert.equal(await page.evaluate(()=>window.__bhIpc.calls.filter(call=>call.command==='note_close').length),1);
+        await page.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("an old queued eval cannot deliver into a reloaded page", async () => {
+      const server=await startUiServer(); const browser=await launchBrowser(browserName);
+      try {
+        const page=await openPage(browser,server.origin,{extraInit:[senderHost]});
+        await page.locator('.ProseMirror').waitFor();
+        const old=await page.evaluate(() => window.__bhNotePage);
+        await page.reload();
+        await page.locator('.ProseMirror').waitFor();
+        const result=await page.evaluate(old => {
+          let dispatched=0;
+          const receive=window.__bhNoteDelivery;
+          window.__bhNoteDelivery=packet=>{dispatched++;return receive(packet);};
+          // Same expression as native: compare before constructing the payload.
+          const result=(()=>{if(window.__bhNotePage!==old)return 'stale';return window.__bhNoteDelivery?.({generation:7,sequence:6,update:[0,0],resync:true})??'stale'})();
+          return {result,dispatched,current:window.__bhNotePage};
+        },old);
+        assert.notEqual(result.current,old);
+        assert.deepEqual({result:result.result,dispatched:result.dispatched},{result:'stale',dispatched:0});
+        await page.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("retryable native open never falls back to empty editing or setup", async () => {
+      const server=await startUiServer();const browser=await launchBrowser(browserName);
+      try {
+        const page=await openPage(browser,server.origin,{extraInit:[() => {
+          window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
+          let calls=0;
+          window.__bhIpc.handle('note_open',()=>{
+            if (++calls<3) throw 'note changed; retry open';
+            return {state:[0,0],generation:9,sequence:0};
+          });
+          window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
+          window.__bhIpc.handle('note_close',()=>null);
+        }]});
+        await page.locator('.ProseMirror').waitFor();
+        assert.equal(await page.locator('header strong').textContent(),'NOTE');
+        assert.equal(await page.evaluate(()=>window.__bhIpc.calls.filter(call=>call.command==='note_open').length),3);
+        assert.equal(await page.locator('[role="status"]').textContent(),'Saved on this device');
+        await page.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("failed native open offers an explicit retry without an empty editor", async () => {
+      const server=await startUiServer();const browser=await launchBrowser(browserName);
+      try {
+        const page=await openPage(browser,server.origin,{extraInit:[() => {
+          window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
+          let calls=0;
+          window.__bhIpc.handle('note_open',()=>{
+            if (++calls===1) throw 'note unavailable';
+            return {state:[0,0],generation:9,sequence:0};
+          });
+          window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
+          window.__bhIpc.handle('note_close',()=>null);
+        }]});
+        await page.getByRole('button',{name:'Retry opening note'}).waitFor();
+        assert.equal(await page.locator('.ProseMirror').count(),0);
+        assert.equal(await page.locator('header strong').textContent(),'NOTE');
+        await page.getByRole('button',{name:'Retry opening note'}).click();
+        await page.locator('.ProseMirror').waitFor();
+        assert.equal(await page.evaluate(()=>window.__bhIpc.calls.filter(c=>c.command==='note_open').length),2);
+        await page.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("bounded pre-open events force fresh committed snapshot rather than partial replay", async () => {
+      const server=await startUiServer();const browser=await launchBrowser(browserName);
+      try {
+        const source=await openPage(browser,server.origin,{extraInit:[senderHost]});
+        await source.locator('.ProseMirror').waitFor();
+        await source.locator('.ProseMirror').click();await source.keyboard.insertText('committed elsewhere');
+        await source.waitForFunction(()=>window.__bhPendingAcks?.length===1);
+        const remote=await source.evaluate(()=>window.__bhPendingAcks[0].args.update);
+        const receiver=await openPage(browser,server.origin,{extraInit:[() => {
+          window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
+          let opens=0;
+          window.__bhIpc.handle('note_open',()=>{
+            if (++opens===1) return new Promise(resolve=>{window.__bhFirstOpen=()=>resolve({state:[0,0],generation:7,sequence:5});});
+            return {state:window.__bhCommittedState,generation:8,sequence:258};
+          });
+          window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
+          window.__bhIpc.handle('note_close',()=>null);
+        }]});
+        await receiver.waitForFunction(()=>typeof window.__bhFirstOpen==='function');
+        await receiver.evaluate(update=>{
+          window.__bhCommittedState=update;
+          for(let sequence=6;sequence<=262;sequence++) window.dispatchEvent(new CustomEvent('bh-note-update',{detail:{generation:7,sequence,update}}));
+          window.__bhFirstOpen();
+        },remote);
+        await receiver.locator('.ProseMirror').waitFor();
+        assert.match(await receiver.locator('.ProseMirror').textContent(),/committed elsewhere/);
+        assert.equal(await receiver.evaluate(()=>window.__bhIpc.calls.filter(c=>c.command==='note_open').length),2);
+        await receiver.close();await source.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("resync merges into an editing view without losing an unacked edit or retry identity", async () => {
+      const server = await startUiServer();
+      const browser = await launchBrowser(browserName);
+      try {
+        const source = await openPage(browser, server.origin, {extraInit:[senderHost]});
+        await source.locator('.ProseMirror').waitFor();
+        await source.locator('.ProseMirror').click();
+        await source.keyboard.insertText('remote');
+        await source.waitForFunction(() => window.__bhPendingAcks?.length === 1);
+        const remote = await source.evaluate(() => window.__bhPendingAcks[0].args.update);
+        const view = await openPage(browser, server.origin, {extraInit:[senderHost]});
+        await view.locator('.ProseMirror').waitFor();
+        await view.locator('.ProseMirror').click();
+        await view.keyboard.insertText('local');
+        await view.waitForFunction(() => window.__bhPendingAcks?.length === 1);
+        const before = await view.evaluate(() => window.__bhPendingAcks[0].args);
+        await view.evaluate((update) => window.dispatchEvent(new CustomEvent('bh-note-update',{
+          detail:{generation:7,sequence:6,resync:true,update}
+        })),remote);
+        await view.waitForFunction(() => document.querySelector('.ProseMirror')?.textContent.includes('remote'));
+        assert.match(await view.locator('.ProseMirror').textContent(),/local/);
+        assert.notEqual(await view.locator('[role="status"]').textContent(),'Saved on this device');
+        // A failed save keeps exactly the same request bytes. Another overflow
+        // merge does not take the destructive editor close/recreate path.
+        await view.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:'wrong-id'}));
+        await view.getByRole('button',{name:'Retry save'}).waitFor({state:'visible'});
+        await view.evaluate((update) => window.dispatchEvent(new CustomEvent('bh-note-update',{
+          detail:{generation:7,sequence:7,resync:true,update}
+        })),remote);
+        await view.getByRole('button',{name:'Retry save'}).click();
+        await view.waitForFunction(() => window.__bhPendingAcks.length === 2);
+        const retry = await view.evaluate(() => window.__bhPendingAcks[1].args);
+        assert.deepEqual(retry,before);
+        await view.evaluate(() => window.__bhPendingAcks[1].resolve({requestId:window.__bhPendingAcks[1].args.requestId}));
+        await view.waitForFunction(() => document.querySelector('[role="status"]').textContent === 'Saved on this device');
+        const text = await view.locator('.ProseMirror').textContent();
+        assert.match(text,/remote/);assert.match(text,/local/);
+        assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_commit').length),2);
+        await source.close();await view.close();
+      } finally {await browser.close();await server.close();}
+    });
     test("mounts only with a binding, buffers and fences updates, and saves only matching commits", async () => {
       const server = await startUiServer();
       const browser = await launchBrowser(browserName);
@@ -75,6 +272,7 @@ for (const browserName of browserMatrix) {
         const receiver = await openPage(browser, server.origin, { extraInit: [receiverHost] });
         await receiver.waitForFunction(() => typeof window.__bhFinishOpen === "function");
         // These arrive during note_open, before the snapshot and generation are known.
+        assert.equal(await receiver.evaluate(update => window.__bhNoteDelivery({generation:8,sequence:100,update}),later.update),'buffered');
         await dispatch(receiver, 8, 100, later.update);
         await dispatch(receiver, 7, 6, first.update);
         assert.equal(await receiver.locator(".ProseMirror").count(), 0);

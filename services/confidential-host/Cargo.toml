@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 bh-confidential-attestation = { path = "../../libs/confidential-attestation" }
+bh-crypto.workspace = true
+bh-qualified-time = { path = "../../libs/qualified-time" }
 hex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

@@ -253,6 +253,76 @@ fn public_candidate_pipeline_rejects_bad_second_candidate() {
 }
 
 #[test]
+fn returned_report_count_is_bounded_before_appraisal_and_every_last_candidate_checked() {
+    use std::cell::Cell;
+    let mut evidence = archived_claims();
+    let (report, hash) = report_fixture(&mut evidence);
+    let (jwt, jwks) = token(claims(), "synthetic-key-1");
+    let hashes = [hash];
+    let expected = expected(&hashes);
+    for count in [0, 1, 32, 33, 256] {
+        let raw = serde_json::to_vec(
+            &serde_json::json!({"model_attestations": vec![report.clone(); count]}),
+        )
+        .unwrap();
+        if (1..=32).contains(&count) && raw.len() <= MAX_INPUT_BYTES {
+            assert_eq!(preflight_reports(META, &raw), Ok(count));
+        } else {
+            assert!(matches!(
+                preflight_reports(META, &raw),
+                Err(Error::Evidence | Error::TooLarge)
+            ));
+        }
+        let collateral = vec![COLLATERAL; count];
+        let nras = (0..count).map(|_| nras(&jwt, &jwks)).collect::<Vec<_>>();
+        let appraisals = Cell::new(0);
+        let result = verify_with(
+            META,
+            &raw,
+            &collateral,
+            &nras,
+            &expected,
+            Some(time()),
+            |_, _| {
+                appraisals.set(appraisals.get() + 1);
+                Ok(evidence.clone())
+            },
+        );
+        if (1..=32).contains(&count) && raw.len() <= MAX_INPUT_BYTES {
+            assert_eq!(result.unwrap().len(), count);
+            assert_eq!(appraisals.get(), count);
+        } else {
+            assert!(matches!(result, Err(Error::Evidence | Error::TooLarge)));
+            assert_eq!(appraisals.get(), 0);
+        }
+    }
+    let mut bad = report.clone();
+    bad["signing_public_key"] = serde_json::json!(hex(&[0x44; 32]));
+    let mut reports = vec![report; 32];
+    reports[31] = bad;
+    let raw = serde_json::to_vec(&serde_json::json!({"model_attestations": reports})).unwrap();
+    let collateral = vec![COLLATERAL; 32];
+    let nras = (0..32).map(|_| nras(&jwt, &jwks)).collect::<Vec<_>>();
+    let appraisals = Cell::new(0);
+    assert_eq!(
+        verify_with(
+            META,
+            &raw,
+            &collateral,
+            &nras,
+            &expected,
+            Some(time()),
+            |_, _| {
+                appraisals.set(appraisals.get() + 1);
+                Ok(evidence.clone())
+            }
+        ),
+        Err(Error::Key)
+    );
+    assert_eq!(appraisals.get(), 32);
+}
+
+#[test]
 fn public_verifier_rejects_tampered_quote_before_key_construction() {
     let mut evidence = archived_claims();
     let (mut report, hash) = report_fixture(&mut evidence);
@@ -289,6 +359,191 @@ fn public_verifier_rejects_tampered_quote_before_key_construction() {
             Some(time())
         ),
         Err(Error::Quote)
+    );
+}
+
+#[test]
+fn signed_policy_model_hash_drives_real_assembly() {
+    use crate::provider_policy::{self, Install, Trust};
+    let mut evidence = archived_claims();
+    let (report, hash) = report_fixture(&mut evidence);
+    let key = bh_crypto::SigningKey::from_seed(&bh_crypto::Secret::from_slice(&[7; 32]).unwrap());
+    let trust = Trust {
+        root: key.public(),
+        key_id: *b"TESTKEY1",
+        provider: "near",
+        models: &[MODEL],
+        app_build_date: 1_751_328_000,
+        max_lifetime_secs: 10_000,
+    };
+    let mut payload = vec![1, 4];
+    payload.extend(b"near");
+    payload.extend(11u64.to_be_bytes());
+    payload.extend(1_751_327_999u64.to_be_bytes());
+    payload.extend(1_751_337_000u64.to_be_bytes());
+    payload.extend(1u16.to_be_bytes());
+    payload.push(2);
+    payload.push(MODEL.len() as u8);
+    payload.extend(MODEL.as_bytes());
+    payload.extend(hash);
+    let mut bytes = b"BHPOL001TESTKEY1".to_vec();
+    bytes.extend((payload.len() as u32).to_be_bytes());
+    bytes.extend(&payload);
+    let mut signed = b"BaseHero provider-admission v1\0".to_vec();
+    signed.extend(&payload);
+    bytes.extend(key.sign(&signed));
+    let policy_time = Time {
+        earliest: time().earliest,
+        latest: time().earliest,
+        max_uncertainty_secs: 0,
+    };
+    let state = match provider_policy::install(None, &bytes, &trust, Some(policy_time)) {
+        Install::Installed {
+            state,
+            usable_now: true,
+        } => state,
+        _ => panic!("signed fixture rejected"),
+    };
+    let expected =
+        provider_policy::expected_model(state.snapshot(), MODEL, NONCE, Some(policy_time)).unwrap();
+    let (jwt, jwks) = token(claims(), "synthetic-key-1");
+    evidence.earliest_expiration_date = 1_751_328_500;
+    let result = assemble(
+        &model(&report),
+        &evidence,
+        &nras(&jwt, &jwks),
+        &expected,
+        time(),
+    )
+    .unwrap();
+    assert_eq!(result.compose_sha256(), &hash);
+    assert_eq!(result.model(), MODEL);
+    assert_eq!(result.valid_until(), 1_751_328_500);
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            provider_policy::RouteEvidence::Model(&result),
+            Some(policy_time)
+        ),
+        Ok(())
+    );
+    let at = |earliest| {
+        Some(Time {
+            earliest,
+            latest: earliest,
+            max_uncertainty_secs: 0,
+        })
+    };
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            provider_policy::RouteEvidence::Model(&result),
+            at(1_751_328_499)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            provider_policy::RouteEvidence::Model(&result),
+            at(1_751_328_500)
+        ),
+        Err(provider_policy::Reject::Expired)
+    );
+    let mut long_claims = evidence.clone();
+    long_claims.earliest_expiration_date = 1_751_339_000;
+    let mut long_jwt_claims = claims();
+    long_jwt_claims["exp"] = serde_json::json!(1_751_338_000u64);
+    let (long_jwt, long_jwks) = token(long_jwt_claims, "synthetic-key-1");
+    let long_key = assemble(
+        &model(&report),
+        &long_claims,
+        &nras(&long_jwt, &long_jwks),
+        &expected,
+        time(),
+    )
+    .unwrap();
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            provider_policy::RouteEvidence::Model(&long_key),
+            at(1_751_337_000)
+        ),
+        Err(provider_policy::Reject::Expired)
+    );
+    let make = |version: u64, entries: &[u8], count: u16| {
+        let mut p = payload[..32].to_vec();
+        p[6..14].copy_from_slice(&version.to_be_bytes());
+        p[30..32].copy_from_slice(&count.to_be_bytes());
+        p.extend(entries);
+        let mut b = b"BHPOL001TESTKEY1".to_vec();
+        b.extend((p.len() as u32).to_be_bytes());
+        b.extend(&p);
+        let mut signed = b"BaseHero provider-admission v1\0".to_vec();
+        signed.extend(&p);
+        b.extend(key.sign(&signed));
+        b
+    };
+    let other_hash = [0x44; 32];
+    let mut other_model = payload[32..].to_vec();
+    let hash_start = other_model.len() - 32;
+    other_model[hash_start..].copy_from_slice(&other_hash);
+    let retired = match provider_policy::install(
+        Some(&state),
+        &make(12, &other_model, 1),
+        &trust,
+        Some(policy_time),
+    ) {
+        Install::Installed { state, .. } => state,
+        _ => panic!("retirement rejected"),
+    };
+    assert_eq!(
+        provider_policy::check_current(
+            retired.snapshot(),
+            provider_policy::RouteEvidence::Model(&result),
+            Some(policy_time)
+        ),
+        Err(provider_policy::Reject::Denied)
+    );
+    let withdrawal = match provider_policy::install(
+        Some(&state),
+        &make(12, &[], 0),
+        &trust,
+        Some(policy_time),
+    ) {
+        Install::Installed {
+            state,
+            usable_now: false,
+        } => state,
+        _ => panic!("withdrawal rejected"),
+    };
+    assert_eq!(
+        provider_policy::check_current(
+            withdrawal.snapshot(),
+            provider_policy::RouteEvidence::Model(&result),
+            Some(policy_time)
+        ),
+        Err(provider_policy::Reject::Denied)
+    );
+    let mut early = claims();
+    early["exp"] = serde_json::json!(1_751_328_250u64);
+    let (early_jwt, early_jwks) = token(early, "synthetic-key-1");
+    let short = assemble(
+        &model(&report),
+        &evidence,
+        &nras(&early_jwt, &early_jwks),
+        &expected,
+        time(),
+    )
+    .unwrap();
+    assert_eq!(short.valid_until(), 1_751_328_250);
+    assert_eq!(
+        provider_policy::check_current(
+            state.snapshot(),
+            provider_policy::RouteEvidence::Model(&short),
+            at(1_751_328_250)
+        ),
+        Err(provider_policy::Reject::Expired)
     );
 }
 
@@ -403,7 +658,10 @@ fn nras_signature_issuer_nonce_freshness_and_verdict_are_required() {
     let hashes = [[0; 32]];
     let expected = expected(&hashes);
     let (jwt, jwks) = token(claims(), "synthetic-key-1");
-    assert_eq!(verify_nras(&nras(&jwt, &jwks), &expected, time()), Ok(()));
+    assert_eq!(
+        verify_nras(&nras(&jwt, &jwks), &expected, time()),
+        Ok(1_751_329_000)
+    );
     for missing in [
         "exp",
         "nbf",

@@ -6,6 +6,14 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::{DeviceDatabase, StoreError};
 
+/// The constant-size signed-history preflight; full account verification
+/// belongs to the independent admission source.
+pub struct AccountHistoryEdges {
+    pub count: u64,
+    pub first: Vec<u8>,
+    pub last: Vec<u8>,
+}
+
 /// Durable verified-account summary; never a head without stored signed bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountStateRecord {
@@ -34,6 +42,49 @@ pub struct PendingSetupRow {
     pub stage: u8,
     pub kit_saved: bool,
     pub blob: Vec<u8>,
+}
+
+/// Opaque exact signed add plus encrypted signed delivery. Single unresolved row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedAdmissionRow {
+    pub position: u64,
+    pub previous: [u8; 32],
+    pub event: Vec<u8>,
+    pub delivery: Vec<u8>,
+}
+
+fn read_staged(
+    connection: &rusqlite::Connection,
+) -> Result<Option<StagedAdmissionRow>, StoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT position,previous,event,delivery FROM account_staged_admission WHERE id=1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((position, previous, event, delivery)) = raw else {
+        return Ok(None);
+    };
+    if position <= 1 || event.is_empty() || delivery.is_empty() {
+        return Err(StoreError::CorruptStagedAdmission);
+    }
+    let previous = previous
+        .try_into()
+        .map_err(|_| StoreError::CorruptStagedAdmission)?;
+    Ok(Some(StagedAdmissionRow {
+        position: u64::try_from(position).map_err(|_| StoreError::CorruptStagedAdmission)?,
+        previous,
+        event,
+        delivery,
+    }))
 }
 
 fn fixed<const N: usize>(
@@ -66,6 +117,32 @@ impl DeviceDatabase {
             .optional()?)
     }
 
+    /// O(1) anchor/head continuity preflight for a caller holding independently
+    /// verified account state. This is not a substitute for verification of
+    /// account controls on admission or changes.
+    pub fn account_history_edges(&self) -> Result<Option<AccountHistoryEdges>, StoreError> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM account_events", [], |r| r.get(0))?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let first = self.connection.query_row(
+            "SELECT bytes FROM account_events ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let last = self.connection.query_row(
+            "SELECT bytes FROM account_events ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(Some(AccountHistoryEdges {
+            count: count as u64,
+            first,
+            last,
+        }))
+    }
     /// Original signed events in insertion order.
     pub fn account_history(&self) -> Result<Vec<Vec<u8>>, StoreError> {
         let mut statement = self
@@ -200,6 +277,51 @@ impl DeviceDatabase {
     pub fn clear_pending_setup(&mut self) -> Result<(), StoreError> {
         self.connection
             .execute("DELETE FROM account_pending_setup WHERE id=1", [])?;
+        Ok(())
+    }
+
+    pub fn staged_admission(&self) -> Result<Option<StagedAdmissionRow>, StoreError> {
+        read_staged(&self.connection)
+    }
+
+    /// Reserve the one staged row under an IMMEDIATE write lock; never overwrite
+    /// bytes that may already have reached the account home.
+    pub fn insert_staged_admission(&mut self, row: &StagedAdmissionRow) -> Result<(), StoreError> {
+        let position =
+            i64::try_from(row.position).map_err(|_| StoreError::CorruptStagedAdmission)?;
+        if position <= 1 || row.event.is_empty() || row.delivery.is_empty() {
+            return Err(StoreError::CorruptStagedAdmission);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_staged(&tx)?.is_some() {
+            return Err(StoreError::StagedAdmissionExists);
+        }
+        tx.execute("INSERT INTO account_staged_admission(id,position,previous,event,delivery) VALUES (1,?1,?2,?3,?4)",
+            params![position, row.previous.as_slice(), row.event.as_slice(), row.delivery.as_slice()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A stale completion must not erase a newer staged admission. Missing is
+    /// idempotent (including a restart after an already completed clear).
+    pub fn clear_staged_admission(
+        &mut self,
+        expected: &StagedAdmissionRow,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match read_staged(&tx)? {
+            None => return Ok(()),
+            Some(current) if current != *expected => {
+                return Err(StoreError::StagedAdmissionChanged);
+            }
+            Some(_) => {}
+        }
+        tx.execute("DELETE FROM account_staged_admission WHERE id=1", [])?;
+        tx.commit()?;
         Ok(())
     }
 }
