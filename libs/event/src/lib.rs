@@ -7,4 +7,6 @@ pub use codec::{
     ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, Error, GENESIS, NOTE, Payload,
     key_id, seal,
 };
-pub use history::{ConsumeError, History, NoteTarget, Outcome, PreparedEvent};
+pub use history::{
+    AppliedEvent, AppliedKind, ConsumeError, History, NoteTarget, Outcome, PreparedEvent,
+};

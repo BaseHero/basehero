@@ -1037,14 +1037,16 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
         };
         let wrong_before = wrong.state();
         assert_eq!(
-            f.history.consume(
-                prepared,
-                Some(NoteTarget {
-                    id: [9; 32],
-                    note: wrong
-                })
-            ),
-            Err(bh_event::ConsumeError::WrongTarget)
+            f.history
+                .consume(
+                    prepared,
+                    Some(NoteTarget {
+                        id: [9; 32],
+                        note: wrong
+                    })
+                )
+                .err(),
+            Some(bh_event::ConsumeError::WrongTarget)
         );
         assert_eq!(wrong.state(), wrong_before);
         assert!(!f.history.is_stopped());
@@ -1065,7 +1067,9 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
             &mut second
         };
         assert_eq!(
-            f.history.consume(prepared, Some(NoteTarget { id, note })),
+            f.history
+                .consume(prepared, Some(NoteTarget { id, note }))
+                .map(|v| v.outcome()),
             Ok(Outcome::Accepted)
         );
         assert_eq!(note.state(), authored.state());
@@ -1164,36 +1168,42 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
     let mut candidate = f.history.clone();
     let mut clone_note = Note::new();
     assert_eq!(
-        candidate.consume(
-            clone_prepared,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut clone_note
-            })
-        ),
+        candidate
+            .consume(
+                clone_prepared,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut clone_note
+                })
+            )
+            .map(|v| v.outcome()),
         Ok(Outcome::Accepted)
     );
     assert_eq!(f.history.head(), head);
     assert_eq!(
-        f.history.consume(
-            fresh,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut f.note
-            })
-        ),
+        f.history
+            .consume(
+                fresh,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .map(|v| v.outcome()),
         Ok(Outcome::Accepted)
     );
     let content = f.note.state();
     assert_eq!(
-        f.history.consume(
-            stale,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut f.note
-            })
-        ),
-        Err(bh_event::ConsumeError::StaleState)
+        f.history
+            .consume(
+                stale,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::StaleState)
     );
     assert_eq!(f.note.state(), content);
     assert_ne!(f.history.head(), head);
@@ -1224,25 +1234,29 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
         )
         .unwrap();
     assert_eq!(
-        f.history.consume(
-            accepted,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut f.note
-            })
-        ),
+        f.history
+            .consume(
+                accepted,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .map(|v| v.outcome()),
         Ok(Outcome::Accepted)
     );
     let head_after = f.history.head();
     assert_eq!(
-        f.history.consume(
-            pending,
-            Some(NoteTarget {
-                id: [8; 32],
-                note: &mut Note::new()
-            })
-        ),
-        Err(bh_event::ConsumeError::StaleState)
+        f.history
+            .consume(
+                pending,
+                Some(NoteTarget {
+                    id: [8; 32],
+                    note: &mut Note::new()
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::StaleState)
     );
     assert_eq!(f.history.head(), head_after);
     let add = f
@@ -1281,14 +1295,16 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
         .unwrap();
     assert_eq!(fresh.note_id(), None);
     assert_eq!(
-        f.history.consume(
-            fresh,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut f.note
-            })
-        ),
-        Err(bh_event::ConsumeError::WrongTarget)
+        f.history
+            .consume(
+                fresh,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::WrongTarget)
     );
     let fresh = f
         .history
@@ -1300,11 +1316,14 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
             None,
         )
         .unwrap();
-    assert_eq!(f.history.consume(fresh, None), Ok(Outcome::Accepted));
+    assert_eq!(
+        f.history.consume(fresh, None).map(|v| v.outcome()),
+        Ok(Outcome::Accepted)
+    );
     assert_eq!(f.history.account_head(), add.head());
     assert_eq!(
-        f.history.consume(stale, None),
-        Err(bh_event::ConsumeError::StaleState)
+        f.history.consume(stale, None).err(),
+        Some(bh_event::ConsumeError::StaleState)
     );
     assert_eq!(f.note.state(), content);
 }
@@ -1342,8 +1361,8 @@ fn same_head_trust_context_refuses_prepared_genesis() {
         assert_eq!(prepared.note_id(), None);
         assert_eq!(source.head(), Head::EMPTY);
         assert_eq!(
-            destination.consume(prepared, None),
-            Err(bh_event::ConsumeError::StaleState)
+            destination.consume(prepared, None).err(),
+            Some(bh_event::ConsumeError::StaleState)
         );
         assert_eq!(
             (
@@ -1406,14 +1425,16 @@ fn same_head_integrity_stop_refuses_prepared_note_without_losing_content() {
         before
     );
     assert_eq!(
-        f.history.consume(
-            prepared,
-            Some(NoteTarget {
-                id: [7; 32],
-                note: &mut f.note
-            })
-        ),
-        Err(bh_event::ConsumeError::StaleState)
+        f.history
+            .consume(
+                prepared,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::StaleState)
     );
     assert_eq!(
         (
@@ -1438,4 +1459,308 @@ fn fresh_seals_are_random_and_descriptor_encoding_is_canonical() {
     assert_ne!(one.descriptor.encode(), two.descriptor.encode());
     let bytes = one.descriptor.encode();
     assert_eq!(OpaqueEvent::decode(&bytes).unwrap().encode(), bytes);
+}
+
+#[test]
+fn applied_result_binds_ordered_original_body_and_typed_content() {
+    use bh_event::AppliedKind;
+    use bh_sync::referenced_body;
+    let mut f = Fixture::new();
+    let (data, edited) = note_delta("bound note");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let applied = f
+        .history
+        .consume(
+            prepared,
+            Some(NoteTarget {
+                id: [7; 32],
+                note: &mut f.note,
+            }),
+        )
+        .unwrap();
+    assert_eq!(applied.commitment(), order);
+    assert_eq!(applied.commitment_bytes(), order.encode());
+    assert_eq!(applied.descriptor_bytes(), event.descriptor.encode());
+    assert_eq!(applied.body_bytes(), event.body);
+    assert_eq!(
+        applied.body_commitment(),
+        referenced_body(&event.descriptor).unwrap()
+    );
+    assert_eq!(
+        applied.body_commitment(),
+        bh_sync::BodyObject::new(event.body.clone())
+            .unwrap()
+            .commitment()
+    );
+    assert_eq!(applied.head(), f.history.head());
+    assert_eq!(applied.floor(), f.history.floor());
+    match applied.kind() {
+        AppliedKind::NoteAccepted { note_id, delta } => {
+            assert_eq!(*note_id, [7; 32]);
+            assert_eq!(delta.expose(), &data[32..]);
+        }
+        _ => panic!("expected accepted note"),
+    }
+    assert_eq!(f.note.state(), edited.state());
+    assert!(!format!("{applied:?}").contains("bound note"));
+
+    let mut bad = vec![7; 32];
+    bad.extend([0xff, 0xff, 0xff]);
+    let (event, order) = f.content(&f.first, NOTE, &bad);
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let rejected = f
+        .history
+        .consume(
+            prepared,
+            Some(NoteTarget {
+                id: [7; 32],
+                note: &mut f.note,
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(rejected.kind(), AppliedKind::NoteRejected { note_id } if *note_id == [7; 32])
+    );
+    assert_eq!(rejected.outcome(), Outcome::ContentRejected);
+    assert_eq!(rejected.head(), order.head());
+    assert_eq!(f.note.state(), edited.state());
+
+    let add = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let add = add
+        .finish(f.first.control.sign(add.signing_bytes()))
+        .unwrap();
+    let (event, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        add.as_bytes(),
+        &f.first.control,
+        None,
+    );
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            None,
+        )
+        .unwrap();
+    let control = f.history.consume(prepared, None).unwrap();
+    assert!(matches!(control.kind(), AppliedKind::Control));
+    assert_eq!(control.outcome(), Outcome::Accepted);
+    assert_eq!(control.head(), order.head());
+    assert_eq!(control.descriptor_bytes(), event.descriptor.encode());
+}
+
+#[test]
+fn replay_verifies_records_from_anchors_without_applying_notes() {
+    let mut f = Fixture::new();
+    let first_order = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
+    let mut records = vec![(
+        first_order,
+        f.genesis.descriptor.encode(),
+        f.genesis.body.clone(),
+    )];
+    let (data, _) = note_delta("first");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
+    records.push((order, event.descriptor.encode(), event.body));
+    let add = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let add = add
+        .finish(f.first.control.sign(add.signing_bytes()))
+        .unwrap();
+    let (event, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        add.as_bytes(),
+        &f.first.control,
+        None,
+    );
+    assert_eq!(f.apply(&event, &order, false), Outcome::Accepted);
+    records.push((order, event.descriptor.encode(), event.body));
+    f.account.apply(add.as_bytes()).unwrap();
+    let live = &f.history;
+    let mut replay = History::replay(
+        f.account.id(),
+        &f.account_genesis,
+        f.base,
+        1,
+        &f.metadata,
+        Some(&f.epoch),
+        records.clone(),
+    )
+    .unwrap();
+    assert_eq!(replay.head(), live.head());
+    assert_eq!(replay.floor(), live.floor());
+    assert_eq!(replay.account_head(), live.account_head());
+    assert_eq!(replay.metadata_id(), live.metadata_id());
+    assert_eq!(replay.epoch_id(), live.epoch_id());
+    let (data, _) = note_delta("next");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let mut note = Note::new();
+    // A preparation from the live history must consume on the replayed one:
+    // this compares the full private predecessor, not just public accessors.
+    let prepared = f
+        .history
+        .prepare(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    assert_eq!(
+        replay
+            .consume(
+                prepared,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut note
+                })
+            )
+            .unwrap()
+            .outcome(),
+        Outcome::Accepted
+    );
+    assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
+    assert_eq!(replay.head(), f.history.head());
+
+    let check = |records: Vec<(Commitment, Vec<u8>, Vec<u8>)>, base| {
+        History::replay(
+            f.account.id(),
+            &f.account_genesis,
+            base,
+            1,
+            &f.metadata,
+            Some(&f.epoch),
+            records,
+        )
+        .err()
+    };
+    let mut changed = records.clone();
+    changed[1].1[40] ^= 1;
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    let mut changed = records.clone();
+    changed[1].2[40] ^= 1;
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    let mut changed = records.clone();
+    changed[1].0 = records[2].0;
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    // This alternate order has a valid chain from the same predecessor but
+    // commits to another descriptor. Only the exact descriptor binding catches it.
+    let (alternate, _) = note_delta("another ciphertext");
+    let (other, _) = f.content(&f.first, NOTE, &alternate);
+    let mut changed = records.clone();
+    changed[1].0 = Commitment::order(f.base, records[0].0.head(), &other.descriptor).unwrap();
+    assert_eq!(
+        check(changed[..2].to_vec(), f.base),
+        Some(Outcome::IntegrityStop)
+    );
+    // A fresh, correctly signed next record with an already-used EventId is
+    // refused even though its outer commitment and predecessor are valid.
+    let mut repeated = f.binding(&f.first, CLASS_CONTENT);
+    repeated.seen = records[2].0.head();
+    repeated.event_id = OpaqueEvent::decode(&records[1].1).unwrap().id();
+    let (duplicate, _) = f.create(repeated, NOTE, &data, &f.first.signing, Some(&f.epoch));
+    let duplicate_order =
+        Commitment::order(f.base, records[2].0.head(), &duplicate.descriptor).unwrap();
+    let mut changed = records.clone();
+    changed.push((
+        duplicate_order,
+        duplicate.descriptor.encode(),
+        duplicate.body,
+    ));
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    assert_eq!(
+        check(records[1..].to_vec(), f.base),
+        Some(Outcome::IntegrityStop)
+    );
+    let mut changed = records.clone();
+    changed.swap(1, 2);
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    let mut changed = records.clone();
+    changed.push(records[2].clone());
+    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    assert_eq!(
+        check(records.clone(), BaseId([99; 32])),
+        Some(Outcome::IntegrityStop)
+    );
+    assert_eq!(
+        History::replay(
+            f.account.id(),
+            &f.account_genesis,
+            f.base,
+            2,
+            &f.metadata,
+            Some(&f.epoch),
+            records.clone()
+        )
+        .err(),
+        Some(Outcome::IntegrityStop)
+    );
+    let higher = History::replay(
+        f.account.id(),
+        &f.account_genesis,
+        f.base,
+        2,
+        &f.metadata,
+        Some(&f.epoch),
+        Vec::<(Commitment, Vec<u8>, Vec<u8>)>::new(),
+    )
+    .unwrap();
+    assert_eq!(higher.floor(), 2);
+
+    let mut stopped = History::replay(
+        f.account.id(),
+        &f.account_genesis,
+        f.base,
+        1,
+        &f.metadata,
+        Some(&f.epoch),
+        records,
+    )
+    .unwrap();
+    let before = stopped.head();
+    stopped.mark_stopped();
+    assert_eq!(stopped.head(), before);
+    assert!(stopped.is_stopped());
+    assert_eq!(
+        stopped
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch)
+            )
+            .err(),
+        Some(Outcome::IntegrityStop)
+    );
 }

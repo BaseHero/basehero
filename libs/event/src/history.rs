@@ -6,8 +6,8 @@ use bh_account::{
     AccountEvent, AccountId, Error as AccountError, Head as AccountHead, VerifiedAccount,
 };
 use bh_core::note::Note;
-use bh_crypto::{Secret, verify};
-use bh_sync::{BaseId, Commitment, Digest, Head, OpaqueEvent};
+use bh_crypto::{Secret, SecretBytes, verify};
+use bh_sync::{BaseId, Commitment, Digest, Head, OpaqueEvent, referenced_body};
 use std::collections::BTreeMap;
 
 /// These results establish only historical verification, never a currently
@@ -38,6 +38,10 @@ pub enum ConsumeError {
 // authenticated event. Note plaintext remains guarded in OpenPayload.
 pub struct PreparedEvent {
     before: Prestate,
+    ordered: Commitment,
+    descriptor: Vec<u8>,
+    body: Vec<u8>,
+    body_commitment: Digest,
     head: Head,
     digest: Digest,
     event_id: [u8; 32],
@@ -51,6 +55,72 @@ impl PreparedEvent {
             PreparedKind::Note { id, .. } => Some(*id),
             PreparedKind::Control { .. } => None,
         }
+    }
+}
+/// An authenticated, consumed event. Its private construction binds all bytes
+/// required by a store to the same verification and history transition. Neither
+/// this value nor its kind implements serialization or cloning.
+pub struct AppliedEvent {
+    ordered: Commitment,
+    ordered_bytes: Vec<u8>,
+    descriptor: Vec<u8>,
+    body: Vec<u8>,
+    body_commitment: Digest,
+    kind: AppliedKind,
+    head: Head,
+    floor: u16,
+}
+/// Only an accepted note exposes an applied delta. A rejected content event
+/// advances the common history but must not change the Note.
+pub enum AppliedKind {
+    NoteAccepted {
+        note_id: [u8; 32],
+        delta: SecretBytes,
+    },
+    NoteRejected {
+        note_id: [u8; 32],
+    },
+    Control,
+}
+impl std::fmt::Debug for AppliedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppliedEvent")
+            .field("head", &self.head)
+            .field("floor", &self.floor)
+            .field("kind", &self.outcome())
+            .finish_non_exhaustive()
+    }
+}
+impl AppliedEvent {
+    pub fn commitment(&self) -> Commitment {
+        self.ordered
+    }
+    pub fn commitment_bytes(&self) -> &[u8] {
+        &self.ordered_bytes
+    }
+    pub fn descriptor_bytes(&self) -> &[u8] {
+        &self.descriptor
+    }
+    pub fn body_bytes(&self) -> &[u8] {
+        &self.body
+    }
+    pub fn body_commitment(&self) -> Digest {
+        self.body_commitment
+    }
+    pub fn kind(&self) -> &AppliedKind {
+        &self.kind
+    }
+    pub fn outcome(&self) -> Outcome {
+        match self.kind {
+            AppliedKind::NoteRejected { .. } => Outcome::ContentRejected,
+            _ => Outcome::Accepted,
+        }
+    }
+    pub fn head(&self) -> Head {
+        self.head
+    }
+    pub fn floor(&self) -> u16 {
+        self.floor
     }
 }
 enum PreparedKind {
@@ -128,6 +198,53 @@ impl History {
     }
     pub fn floor(&self) -> u16 {
         self.floor
+    }
+    pub fn metadata_id(&self) -> Option<[u8; 32]> {
+        self.metadata_id
+    }
+    pub fn epoch_id(&self) -> Option<[u8; 32]> {
+        self.epoch_id
+    }
+    /// Restore a durable integrity stop after replaying the unchanged verified
+    /// prefix. This never accepts an unverified head or lifts an existing stop.
+    pub fn mark_stopped(&mut self) {
+        self.stopped = true;
+    }
+    /// Rebuild only the verified history, not Note projections, from independently
+    /// anchored introductions/roots and exact stored originals in log order.
+    /// Malformed framing or any verification failure refuses the entire replay.
+    pub fn replay<I, D, B>(
+        account_id: AccountId,
+        account_genesis: &[u8],
+        base: BaseId,
+        remembered_floor: u16,
+        metadata: &Secret<32>,
+        content: Option<&Secret<32>>,
+        records: I,
+    ) -> Result<Self, Outcome>
+    where
+        I: IntoIterator<Item = (Commitment, D, B)>,
+        D: AsRef<[u8]>,
+        B: AsRef<[u8]>,
+    {
+        let mut history = Self::new(account_id, account_genesis, base, remembered_floor)
+            .map_err(|_| Outcome::IntegrityStop)?;
+        for (ordered, descriptor, body) in records {
+            let descriptor =
+                OpaqueEvent::decode(descriptor.as_ref()).map_err(|_| Outcome::IntegrityStop)?;
+            let prepared = history.prepare(
+                &ordered,
+                &descriptor,
+                Some(body.as_ref()),
+                metadata,
+                content,
+            )?;
+            // Prepare has authenticated the same original and body as live
+            // consumption. No Yjs application or projection state is needed to
+            // advance the common chain, account controls or version floor.
+            history.advance(&prepared);
+        }
+        Ok(history)
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped
@@ -345,6 +462,10 @@ impl History {
                     .expect("length checked");
                 return Ok(PreparedEvent {
                     before: self.prestate(),
+                    ordered: *ordered,
+                    descriptor: event.encode(),
+                    body: body.to_vec(),
+                    body_commitment: referenced_body(event).expect("inspected descriptor"),
                     head: ordered.head(),
                     digest: ordered.event_digest(),
                     event_id: event.id().0,
@@ -359,6 +480,10 @@ impl History {
         }
         Ok(PreparedEvent {
             before: self.prestate(),
+            ordered: *ordered,
+            descriptor: event.encode(),
+            body: body.to_vec(),
+            body_commitment: referenced_body(event).expect("inspected descriptor"),
             head: ordered.head(),
             digest: ordered.event_digest(),
             event_id: event.id().0,
@@ -378,7 +503,7 @@ impl History {
         &mut self,
         prepared: PreparedEvent,
         target: Option<NoteTarget<'_>>,
-    ) -> Result<Outcome, ConsumeError> {
+    ) -> Result<AppliedEvent, ConsumeError> {
         if self.prestate() != prepared.before || self.stopped {
             return Err(ConsumeError::StaleState);
         }
@@ -390,28 +515,49 @@ impl History {
         {
             return Err(ConsumeError::WrongTarget);
         }
-        let (account, metadata_id, epoch_id, note, result) = match prepared.kind {
+        let kind = match &prepared.kind {
+            PreparedKind::Control { .. } => AppliedKind::Control,
+            PreparedKind::Note { id, payload } => {
+                let target = target.expect("target checked");
+                match apply_note(target.note, &payload.data()[32..]) {
+                    Ok(candidate) => {
+                        // Take direct ownership of the copied delta in its wiped
+                        // allocation; the decrypted padded payload remains guarded.
+                        let delta = SecretBytes::from_vec(payload.data()[32..].to_vec());
+                        *target.note = candidate;
+                        AppliedKind::NoteAccepted {
+                            note_id: *id,
+                            delta,
+                        }
+                    }
+                    Err(()) => AppliedKind::NoteRejected { note_id: *id },
+                }
+            }
+        };
+        self.advance(&prepared);
+        Ok(AppliedEvent {
+            ordered: prepared.ordered,
+            ordered_bytes: prepared.ordered.encode(),
+            descriptor: prepared.descriptor,
+            body: prepared.body,
+            body_commitment: prepared.body_commitment,
+            kind,
+            head: self.head(),
+            floor: self.floor,
+        })
+    }
+
+    // Replay calls this only after prepare; it advances the same common history
+    // as consume, without needing or changing any Note projection.
+    fn advance(&mut self, prepared: &PreparedEvent) {
+        let is_control = matches!(&prepared.kind, PreparedKind::Control { .. });
+        let (account, metadata_id, epoch_id) = match &prepared.kind {
             PreparedKind::Control {
                 account,
                 metadata_id,
                 epoch_id,
-            } => (*account, metadata_id, epoch_id, None, Outcome::Accepted),
-            PreparedKind::Note { payload, .. } => {
-                let target = target.expect("target checked");
-                let next = apply_note(target.note, &payload.data()[32..]);
-                let result = if next.is_ok() {
-                    Outcome::Accepted
-                } else {
-                    Outcome::ContentRejected
-                };
-                (
-                    self.account.clone(),
-                    self.metadata_id,
-                    self.epoch_id,
-                    next.ok().map(|candidate| (target.note, candidate)),
-                    result,
-                )
-            }
+            } => ((**account).clone(), *metadata_id, *epoch_id),
+            PreparedKind::Note { .. } => (self.account.clone(), self.metadata_id, self.epoch_id),
         };
         let previous = self.entries.last();
         self.entries.push(Seen {
@@ -428,10 +574,6 @@ impl History {
         self.metadata_id = metadata_id;
         self.epoch_id = epoch_id;
         self.floor = self.floor.max(prepared.version);
-        if let Some((target, candidate)) = note {
-            *target = candidate;
-        }
-        Ok(result)
     }
 
     /// Compatibility API for a caller with an externally known note ID. Unlike
@@ -455,7 +597,7 @@ impl History {
             None
         };
         match self.consume(prepared, target) {
-            Ok(outcome) => outcome,
+            Ok(applied) => applied.outcome(),
             Err(_) => {
                 self.stopped = true;
                 Outcome::IntegrityStop

@@ -42,26 +42,54 @@ advance history, account or content. The owned, non-serializable prepared event
 exposes only `note_id() -> Option<[u8; 32]>`: a supported note's authenticated
 ID, or `None` for a control; the decrypted delta remains guarded inside it.
 `History::consume(&mut self, prepared, Option<NoteTarget>) ->
-Result<Outcome, ConsumeError>` requires the Note selected by that ID or **no Note**
-for controls. It compares the exact relevant in-memory predecessor (base, common
-head/control, account head, metadata/content epoch IDs, version floor, counts and
-stopped status) before applying a delta on a disposable Note or publishing a
-validated account candidate. A stale or wrong local selection consumes the value
-but changes neither history nor Note and is not a remote integrity stop. An
-identical independently trusted clone of the predecessor may consume it; a
-changed state cannot. Preparation latches a stop on `IntegrityStop` without
-advancing the verified checkpoint; callers must persist that stop alongside the
-retained checkpoint. Unsupported/missing inputs pause, not skip.
+Result<AppliedEvent, ConsumeError>` requires the Note selected by that ID or
+**no Note** for controls. It compares the exact relevant in-memory predecessor
+(base, common head/control, account head, metadata/content epoch IDs, version
+floor, counts and stopped status) before applying a delta on a disposable Note
+or publishing a validated account candidate. Its non-forgeable owned result
+binds the exact ordered `Commitment` and its encoded bytes, original encoded
+descriptor, body bytes and body commitment, plus the resulting head and floor.
+`kind()` distinguishes `NoteAccepted { note_id, delta }` (a wiped-on-drop
+`SecretBytes` with `expose()`), `NoteRejected { note_id }` (no delta), and
+`Control` (no Note). `outcome()` preserves the accepted/rejected classification.
+Debug formatting never prints decrypted content. A stale or wrong local selection
+consumes the value but changes neither history nor Note and is not a remote
+integrity stop. An identical independently trusted clone of the predecessor may
+consume it; a changed state cannot. Preparation latches a stop on
+`IntegrityStop` without advancing the verified checkpoint. Persist a stop marker
+with the **unchanged prior verified head**, never the failing raw input. On open,
+`History::replay(account_id, account_genesis, base, remembered_floor, metadata,
+content, records)` reconstructs the verified history from independently anchored
+introductions and roots, re-verifying each `(Commitment, descriptor bytes, body
+bytes)` in order with prepare's checks, then advancing the chain and controls
+without applying Note updates. Supply only **persisted applied originals** to
+replay, never downloaded but unapplied ciphertext; after replay the adapter must
+compare `replay.head()` with its persisted verified cursor so a truncated store
+cannot silently become the new checkpoint. A gap, reorder, duplicate ID, bad
+original/body or wrong anchor refuses replay; a remembered version floor is never
+lowered. After replay, a stored stop marker calls `mark_stopped()`, which only
+restricts future consumption. Replay currently costs O(history) on each open and
+requires retained bodies and roots; no snapshot checkpoint is provided.
+Unsupported/missing inputs pause, not skip.
 `History::apply` remains an externally known-note compatibility wrapper around
 prepare/consume: a guessed wrong note ID retains its earlier integrity-stop
 behavior. No ID is readable in O; the verifier supplies routing only after opening
 B. Authenticated malformed Yjs rejects content while advancing the ordered event
 and retaining the prior Note. This cryptographic result is **not** an unlock or
 current-authority credential.
-A consuming store must persist history, body references, floor, rejection and
-content/checkpoint together and must not turn this in-memory result into an access
-credential. Retry by reusing the same `Encoded` bytes; sealing again is a new
-random package; serialization identity here is not a durable resend/outbox proof.
+The consuming store must persist the **applied result's exact originals and
+commitment**, updated Note (only for `NoteAccepted`), verified cursor, floor and
+outcome in **one transaction**, with a predecessor/generation compare at commit.
+For a hidden base this includes the current unlock-generation check: successful
+historical verification does not authorise a late plaintext write after relock.
+`consume` advances the in-memory History and Note **before** that transaction
+commits. If commit fails or the generation compare loses, discard both advanced
+values (replay or start from a pre-consume clone); never continue consuming from
+the uncommitted state. Do not accept a second raw-byte argument with a `verified`
+flag, or treat this in-memory result as an access credential. The store owns
+durable atomicity; this library does not implement a transaction. Retry by
+reusing the same `Encoded` bytes; sealing again is a new random package;
+serialization identity here is not a durable resend/outbox proof.
 The encoder resolves key availability before copying payload bytes. Its owned
 padded payload and binding scratch use `SecretBytes::from_parts`, which wipes those
 owned allocations on drop, including error paths. Borrowed input, intermediate
