@@ -11,10 +11,13 @@ bh-storage.workspace = true
 bh-core.workspace = true
 bh-account.workspace = true
 bh-crypto.workspace = true
+bh-event.workspace = true
+bh-sync.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

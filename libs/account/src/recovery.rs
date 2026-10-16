@@ -18,6 +18,24 @@ impl Password {
     }
 }
 
+#[cfg(test)]
+mod kit_format_tests {
+    use super::*;
+    #[test]
+    fn kit_code_has_34_readable_characters_and_checks_a_typo() {
+        let code = RecoveryCode::from_raw(&std::array::from_fn(|i| i as u8));
+        let printed = code.to_kit_text();
+        assert_eq!(printed.len(), 34);
+        assert_eq!(
+            RecoveryCode::from_kit_text(&printed).unwrap().expose(),
+            code.expose()
+        );
+        let mut altered = printed.into_bytes();
+        altered[0] = if altered[0] == b'A' { b'B' } else { b'A' };
+        assert!(RecoveryCode::from_kit_text(&String::from_utf8(altered).unwrap()).is_err());
+    }
+}
+
 pub struct RecoveryCode(Secret<16>);
 impl RecoveryCode {
     pub fn generate() -> Self {
@@ -29,6 +47,70 @@ impl RecoveryCode {
     /// Only a trusted kit exporter or explicitly gated checker may read these raw bytes.
     pub fn expose(&self) -> &[u8; 16] {
         self.0.expose()
+    }
+
+    /// 128 random bits as 26 base32 characters plus two checksum characters;
+    /// seven groups of four separated by dashes (34 printable characters).
+    pub fn to_kit_text(&self) -> String {
+        const LETTERS: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut symbols = [0u8; 28];
+        for (index, symbol) in symbols.iter_mut().enumerate().take(26) {
+            let bit = index * 5;
+            let source = bit / 8;
+            let shift = bit % 8;
+            let high = u16::from(self.expose()[source]) << 8;
+            let low = u16::from(*self.expose().get(source + 1).unwrap_or(&0));
+            *symbol = LETTERS[usize::from(((high | low) >> (11 - shift)) & 31)];
+        }
+        let digest = crate::crypto::hash(self.expose());
+        symbols[26] = LETTERS[usize::from(digest[0] >> 3)];
+        symbols[27] = LETTERS
+            [usize::from(((u16::from(digest[0]) << 2) | (u16::from(digest[1]) >> 6)) as u8 & 31)];
+        let mut text = String::with_capacity(34);
+        for (index, letter) in symbols.iter().enumerate() {
+            if index > 0 && index % 4 == 0 {
+                text.push('-');
+            }
+            text.push(char::from(*letter));
+        }
+        text
+    }
+
+    pub fn from_kit_text(text: &str) -> Result<Self, Error> {
+        if text.len() > 64 {
+            return Err(Error::Malformed);
+        }
+        let raw: Vec<u8> = text.bytes().filter(|b| *b != b'-' && *b != b' ').collect();
+        if raw.len() != 28 {
+            return Err(Error::Malformed);
+        }
+        let mut symbols = [0u8; 28];
+        for (index, letter) in raw.iter().enumerate() {
+            let upper = letter.to_ascii_uppercase();
+            symbols[index] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+                .iter()
+                .position(|candidate| *candidate == upper)
+                .ok_or(Error::Malformed)? as u8;
+        }
+        if symbols[25] & 3 != 0 {
+            return Err(Error::Malformed);
+        }
+        let mut code = [0u8; 16];
+        for (index, symbol) in symbols[..26].iter().enumerate() {
+            for shift in 0..5 {
+                let bit = index * 5 + shift;
+                if bit < 128 && (symbol >> (4 - shift)) & 1 == 1 {
+                    code[bit / 8] |= 1 << (7 - bit % 8);
+                }
+            }
+        }
+        let digest = crate::crypto::hash(&code);
+        if symbols[26] != digest[0] >> 3
+            || symbols[27] != ((u16::from(digest[0]) << 2 | u16::from(digest[1]) >> 6) & 31) as u8
+        {
+            return Err(Error::InvalidCredentials);
+        }
+        Ok(Self::from_raw(&code))
     }
 }
 
@@ -82,7 +164,7 @@ fn key_id(public: &RecoveryPublicKeys) -> [u8; 32] {
     bytes.extend_from_slice(public.receiving());
     crypto::hash(&bytes)
 }
-fn commitment(bytes: &[u8]) -> Result<[u8; 32], Error> {
+pub(crate) fn commitment(bytes: &[u8]) -> Result<[u8; 32], Error> {
     let encoded = SecretBytes::from_parts(&[b"BH recovery record commit v1\0", bytes])
         .map_err(|_| Error::CryptoFailure)?;
     Ok(crypto::hash(encoded.expose()))

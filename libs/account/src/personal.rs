@@ -34,6 +34,11 @@ impl PersonalKey {
     pub fn public(&self) -> [u8; 1216] {
         self.0.public()
     }
+
+    /// Scoped receiver use without exporting its reconstructable seed.
+    pub fn decapsulate(&self, ciphertext: &[u8; 1120]) -> Result<Secret<32>, Error> {
+        crypto::decapsulate(&self.0, ciphertext).map_err(|_| Error::InvalidCredentials)
+    }
 }
 
 pub struct PreparedPublication {
@@ -67,7 +72,7 @@ fn id(public: &[u8; 1216]) -> [u8; 32] {
 fn recipient_hash(public: &[u8; 1216]) -> [u8; 32] {
     crypto::hash(&[b"BH personal recipient v1\0".as_slice(), public].concat())
 }
-fn commitment(seal: &[u8]) -> [u8; 32] {
+pub(crate) fn commitment(seal: &[u8]) -> [u8; 32] {
     crypto::hash(&[b"BH personal seal commit v1\0".as_slice(), seal].concat())
 }
 fn ad(
@@ -249,6 +254,19 @@ pub async fn open_for_receiver(
     device: &StoredDevice,
     store: &mut impl DeviceKeyStore,
 ) -> Result<PersonalKey, Error> {
+    open_initial_fenced(state, envelope, device, store, || true).await
+}
+
+pub(crate) async fn open_initial_fenced(
+    state: &VerifiedAccount,
+    envelope: &[u8],
+    device: &StoredDevice,
+    store: &mut impl DeviceKeyStore,
+    current: impl Fn() -> bool,
+) -> Result<PersonalKey, Error> {
+    if !current() {
+        return Err(Error::InvalidCredentials);
+    }
     let checked = checked(
         state,
         envelope,
@@ -262,10 +280,16 @@ pub async fn open_for_receiver(
         .load_matching(device)
         .await
         .map_err(|_| Error::InvalidCredentials)?;
+    if !current() {
+        return Err(Error::InvalidCredentials);
+    }
     let shared = store
         .decapsulate(device.handle.clone(), checked.ciphertext)
         .await
         .map_err(|_| Error::InvalidCredentials)?;
+    if !current() {
+        return Err(Error::InvalidCredentials);
+    }
     finish(state, envelope, SealPurpose::FirstDevice, &checked, &shared)
 }
 

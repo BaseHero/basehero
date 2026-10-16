@@ -167,7 +167,11 @@ impl DeviceKeyStore for FakeStore {
             return Err(KeyStoreError::Unavailable);
         }
         let ordinary = state.ordinary.as_ref().ok_or(KeyStoreError::Invalidated)?;
-        Ok(ordinary.sign(&message))
+        let signature = ordinary.sign(&message);
+        if state.advance_generation_on_sign {
+            self.generation.advance();
+        }
+        Ok(signature)
     }
 
     async fn decapsulate(

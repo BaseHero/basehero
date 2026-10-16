@@ -1,8 +1,9 @@
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 
 use bh_crypto::{Secret, SigningKey, sha256};
 use bh_release::{
-    Metadata, ReleaseError, SignedRelease, VerifyFor, check_available, verify_release,
+    Metadata, ReleaseError, SignedRelease, VerifyFor, check_available, download::StagedArtifact,
+    verify_release,
 };
 
 fn signing_key(seed: u8) -> SigningKey {
@@ -50,6 +51,28 @@ fn expected<'a>(key: &'a [u8; 32]) -> VerifyFor<'a> {
         channel: "stable",
         running_version: 11,
     }
+}
+
+#[test]
+fn a_held_file_is_staged_only_when_it_matches_the_signed_hash() {
+    let file = b"actual installer bytes";
+    let (key, release) = signed_release(file);
+    let available = check_available(&release, expected(&key)).unwrap();
+    // Left positioned at its end: staging hashes and then reads from the start.
+    let mut held = tempfile::tempfile().unwrap();
+    held.write_all(file).unwrap();
+    let mut staged = StagedArtifact::verify(held, &available).unwrap();
+    assert_eq!(staged.version(), 12);
+    let mut read = Vec::new();
+    staged.reader().read_to_end(&mut read).unwrap();
+    assert_eq!(read, file);
+
+    let mut altered = tempfile::tempfile().unwrap();
+    altered.write_all(b"actual installer bytez").unwrap();
+    assert!(matches!(
+        StagedArtifact::verify(altered, &available),
+        Err(ReleaseError::HashMismatch)
+    ));
 }
 
 #[test]

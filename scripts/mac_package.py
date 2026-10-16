@@ -2,10 +2,14 @@
 """Build a link-free, ad-hoc signed arm64 Tauri app from a source-only export.
 
 Run inside `git archive HEAD:basehero` unpacked outside the repository. No
-release signing key or production update endpoint is used by this tool.
+release signing key or production update endpoint is used by this tool; the
+app-signing certificate's SHA-1 is public and only compiled into the Keychain
+helper, which accepts an app signed with that certificate as its caller.
 """
 import argparse
 import gzip
+import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -20,6 +24,17 @@ NAME = "BaseHero-macos-aarch64.app.tar.gz"
 BUNDLE = "BaseHero.app"
 SYSTEM = ("/usr/lib/", "/System/Library/")
 SODIUM = "libsodium.26.dylib"
+HELPER = "bh-keychain-helper"
+# A fixed build identity makes this unsigned-byte pin independent of the
+# certificate root and bundle identifier supplied for each package. The
+# canonical helper is never shipped; the requested identity is built below.
+PIN_IDENTIFIER = "app.basehero.client"
+PIN_ROOT = "0" * 40
+EXPECTED_HELPER_SHA256 = "afd4a76923f88e02718649ce7b5f4fe8476cdc14d87a8a8b0dd693f79de2509e"
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
 
 
 def run(*args, cwd=None, env=None):
@@ -30,6 +45,53 @@ def release_number(text):
     if not re.fullmatch(r"[1-9][0-9]*", text, flags=re.ASCII) or int(text) > 2**64 - 1:
         raise ValueError("release number must be a canonical positive decimal u64")
     return int(text)
+
+
+def bundle_identifier(text):
+    if not re.fullmatch(r"[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+", text, flags=re.ASCII):
+        raise ValueError("bundle identifier must be a lowercase reverse-DNS name")
+    return text
+
+
+def certificate_root(text):
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9a-f]{40}", text, flags=re.ASCII):
+        raise ValueError("signing root must be the certificate's lowercase SHA-1")
+    return text
+
+
+def build_helper(identifier, root, triple):
+    """Build the Keychain helper alone, so its bytes depend only on its own
+    source, its locked dependencies, the pinned toolchain and these inputs.
+    App changes never reach it; neither do this checkout's or Cargo's paths."""
+    target_dir = ROOT / "target" / "keychain-helper"
+    cargo_home = os.environ.get("CARGO_HOME") or str(Path.home() / ".cargo")
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS") and not key.startswith("CARGO_PROFILE_")}
+    env.update({
+        "CARGO_TARGET_DIR": str(target_dir),
+        "CARGO_BUILD_TARGET": triple,
+        "BH_APP_IDENTIFIER": identifier,
+        "BH_KEYCHAIN_CALLER_ROOT": root,
+        # Unused dylibs stay unlinked, so no Nix store path reaches a load
+        # command. -S keeps the object-path debug map out of the link, so the
+        # linker's content-derived LC_UUID doesn't depend on the checkout path.
+        "RUSTFLAGS": f"--remap-path-prefix={ROOT}=/basehero --remap-path-prefix={cargo_home}=/cargo"
+                     " -Clink-arg=-Wl,-dead_strip_dylibs -Clink-arg=-Wl,-S",
+    })
+    run("cargo", "build", "--locked", "--profile", "keychain-helper", "-p", "bh-mac-keychain-helper",
+        "--bin", HELPER, "--target", triple, cwd=ROOT, env=env)
+    return target_dir / triple / "keychain-helper" / HELPER
+
+
+def verify_helper_pin(data):
+    actual = sha256(data)
+    if actual != EXPECTED_HELPER_SHA256:
+        raise ValueError(
+            f"Keychain helper unsigned SHA-256 changed: expected {EXPECTED_HELPER_SHA256}, got {actual}; "
+            "to update it deliberately, review helper source, locked deps, toolchain, "
+            "SDK and profile, then rebuild the canonical helper "
+            "(app.basehero.client, 40 zeroes as root) and update EXPECTED_HELPER_SHA256"
+        )
 
 
 def entries(app):
@@ -78,11 +140,11 @@ def macho_loads(path):
     return dependencies, rpaths
 
 
-def validate_bundle(app, version):
+def validate_bundle(app, version, identifier="app.basehero.client"):
     if app.name != BUNDLE or not app.is_dir() or app.is_symlink():
         raise ValueError("expected BaseHero.app directory")
     info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
-    if info.get("CFBundleIdentifier") != "app.basehero.client" or info.get("CFBundleVersion") != str(version):
+    if info.get("CFBundleIdentifier") != identifier or info.get("CFBundleVersion") != str(version):
         raise ValueError("bundle identifier or CFBundleVersion mismatch")
     executable = info.get("CFBundleExecutable")
     if not isinstance(executable, str) or Path(executable).name != executable or not (app / "Contents" / "MacOS" / executable).is_file():
@@ -152,7 +214,16 @@ def bundle_native_sodium(app):
                 run("install_name_tool", "-change", dep, "/usr/lib/libiconv.2.dylib", str(path))
 
 
-def build(version, output):
+def bundle_notices(app):
+    notices = app / "Contents" / "Resources" / "Licenses"
+    notices.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "apps" / "client" / "src-tauri" / "src" / "eff_large_wordlist-LICENSE.md",
+                 notices / "eff_large_wordlist-LICENSE.md")
+
+
+def build(version, output, identifier="app.basehero.client", signing_root=None):
+    bundle_identifier(identifier)
+    root = certificate_root(signing_root)
     if sys.platform != "darwin" or os.uname().machine != "arm64":
         raise ValueError("build requires an arm64 Mac")
     # A checkout can have its .git at ROOT (public repo) or above ROOT
@@ -183,14 +254,23 @@ def build(version, output):
     # CLI overlay enables only the app bundle; the committed config remains
     # inactive for ordinary development builds. Tauri version stays semver.
     # Tauri's trailing arguments pass --locked to its Cargo runner.
-    run("cargo", "tauri", "build", "--target", triple, "--bundles", "app", "--config", '{"bundle":{"active":true}}', "--", "--locked", cwd=ROOT / "apps" / "client" / "src-tauri", env=build_env)
+    overlay = json.dumps({"bundle": {"active": True}, "identifier": identifier})
+    run("cargo", "tauri", "build", "--target", triple, "--bundles", "app", "--config", overlay, "--", "--locked", cwd=ROOT / "apps" / "client" / "src-tauri", env=build_env)
+    # Build under a fixed identity first: certificate rotation and separate
+    # demo identifiers cannot change the pinned toolchain/source build input.
+    verify_helper_pin(build_helper(PIN_IDENTIFIER, PIN_ROOT, triple).read_bytes())
+    helper = app / "Contents" / "MacOS" / HELPER
+    shutil.copyfile(build_helper(identifier, root, triple), helper)
+    helper.chmod(0o755)
     materialize_links(app)
     info = app / "Contents" / "Info.plist"
     plist = plistlib.loads(info.read_bytes())
     plist["CFBundleVersion"] = str(version)
     info.write_bytes(plistlib.dumps(plist))
     bundle_native_sodium(app)
-    validate_bundle(app, version)
+    bundle_notices(app)
+    validate_bundle(app, version, identifier)
+    helper_bytes = helper.read_bytes()
     # Check the actual executable selected from this bundle's validated plist,
     # not a cached Cargo binary or a source feature declaration.
     run("node", str(ROOT / "scripts" / "check-webdriver-markers.mjs"),
@@ -200,23 +280,30 @@ def build(version, output):
     for path in entries(app):
         if path.is_file() and path.parent.name == "Frameworks" and inspect_macho(path):
             run("codesign", "--force", "--sign", "-", str(path))
+    # Hardened runtime: the helper ignores DYLD_* and refuses debuggers.
+    run("codesign", "--force", "--sign", "-", "--options", "runtime", "--identifier", f"{identifier}.keychain-helper", str(helper))
     run("codesign", "--force", "--sign", "-", str(app))
     run("codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app))
-    validate_bundle(app, version)
+    validate_bundle(app, version, identifier)
     archive_bundle(app, output / NAME)
-    print(f"{app}\n{output / NAME}")
+    # A changed helper makes macOS ask once per Keychain item after the update.
+    print(f"{app}\n{output / NAME}\nkeychain helper sha256 (before signing) {sha256(helper_bytes)}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("release_number", help="canonical positive decimal signed-release u64")
     parser.add_argument("output", type=Path, help="output directory outside the exported source")
+    parser.add_argument("--identifier", default="app.basehero.client", type=bundle_identifier,
+                        help="bundle identity; a separate identity keeps separate app data and keys")
+    parser.add_argument("--signing-root", required=True, type=certificate_root,
+                        help="lowercase SHA-1 of the app-signing certificate the Keychain helper trusts")
     args = parser.parse_args()
     number = release_number(args.release_number)
     output = args.output.resolve()
     if output.is_relative_to(ROOT):
         parser.error("output must be outside the source export")
-    build(number, output)
+    build(number, output, args.identifier, args.signing_root)
 
 
 if __name__ == "__main__":

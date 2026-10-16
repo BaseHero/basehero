@@ -4,7 +4,7 @@
 //
 //   node spec.mjs [screenshot.png]
 //
-// It asserts the real setup-screen DOM text and a valid non-empty PNG, and ends
+// It asserts the real first-run welcome screen DOM text and a valid non-empty PNG, and ends
 // the session. It is not a browser stub: the client must already be running.
 import { writeFileSync } from "node:fs";
 import { remote } from "webdriverio";
@@ -51,13 +51,14 @@ try {
       heading: q("h1"),
       paragraph: q("main p:not(.label)"),
       footer: q("footer"),
-      interactive: document.querySelectorAll("button, input, textarea, select, a, [contenteditable]").length,
+      actions: [...document.querySelectorAll("main button")]
+        .filter((node) => !node.hidden && node.offsetParent !== null)
+        .map((node) => node.textContent.trim()),
     };
   });
   mark("execute/sync read shell");
 
-  // The setup shell has no interactive control; exercise the click endpoint on
-  // a static element and prove nothing navigated.
+  // Exercise the click endpoint on a static element and prove nothing navigated.
   await h1.click();
   mark("click h1");
   const urlAfterClick = await browser.getUrl();
@@ -83,18 +84,19 @@ try {
   const height = isPng ? png.readUInt32BE(20) : 0;
 
   const expected = {
-    heading: "Your workspace starts here.",
-    label: "CLIENT FOUNDATION",
-    paragraph: "This build contains the app shell. Account setup and note editing are not available yet.",
-    footer: "NO ACCOUNT OPEN · NOT CONNECTED",
+    heading: "A place for your thoughts.",
+    label: "WELCOME",
+    paragraph: "Keep notes in your own space. You do not need an email to create an account.",
+    footer: "Cloud sync not connected",
   };
   for (const [key, want] of Object.entries(expected)) {
     if (shell[key] !== want) failures.push(`${key}: got ${JSON.stringify(shell[key])}, want ${JSON.stringify(want)}`);
   }
   if (heading !== expected.heading) failures.push("h1.getText(): got " + JSON.stringify(heading));
   if (!title.includes("BaseHero")) failures.push("title: got " + JSON.stringify(title));
-  if (!pageSource.includes("Account setup and note editing are not available yet.")) failures.push("page source lacks the setup sentence");
-  if (shell.interactive !== 0) failures.push(`shell has ${shell.interactive} interactive elements, expected none`);
+  if (!pageSource.includes("You do not need an email to create an account.")) failures.push("page source lacks the welcome sentence");
+  const actions = JSON.stringify(shell.actions);
+  if (actions !== JSON.stringify(["Create my account", "I already have an account"])) failures.push("welcome actions: got " + actions);
   if (!isPng) failures.push("screenshot is not a PNG");
   if (png.length === 0) failures.push("screenshot is empty");
   if (arithmetic !== 42) failures.push("execute/sync arithmetic: got " + JSON.stringify(arithmetic));
@@ -123,4 +125,4 @@ if (failures.length > 0) {
   for (const failure of failures) console.error("- " + failure);
   process.exit(1);
 }
-console.log("PASS: real setup-shell DOM, click, execute/sync, valid non-empty PNG, session ended");
+console.log("PASS: real welcome-screen DOM, click, execute/sync, valid non-empty PNG, session ended");

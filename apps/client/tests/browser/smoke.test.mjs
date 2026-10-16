@@ -3,9 +3,8 @@
 // device. Chromium approximates an Android WebView and WebKit the macOS
 // WKWebView; neither is real-device acceptance.
 //
-// Today the shell is a static setup screen. Navigation, editing, drafts and
-// their error states need the real app UI; those cases belong here once it
-// exists, and the setup-screen cases below are replaced rather than kept.
+// These cases cover the safe native-unavailable fallback and bundled assets.
+// The signup and notes-workspace suites exercise account and note journeys.
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 import { browserMatrix, launchBrowser, openPage, shellCsp, startUiServer } from "./harness.mjs";
@@ -28,11 +27,11 @@ for (const browserName of browserMatrix) {
     test("serves the real setup screen with the pre-app shell globals", async () => {
       const page = await openPage(browser, server.origin);
       assert.equal(await page.title(), "BaseHero");
-      assert.equal(await page.locator("header span").textContent(), "BASEHERO");
+      assert.equal(await page.locator("header .crumb").textContent(), "BaseHero");
       assert.equal(await page.locator("header strong").textContent(), "SETUP");
-      assert.equal(await page.locator(".label").textContent(), "CLIENT FOUNDATION");
-      assert.equal(await page.locator("h1").textContent(), "Your workspace starts here.");
-      assert.match(await page.locator("main p").last().textContent(), /not available yet/);
+      assert.equal(await page.locator(".label").textContent(), "BASEHERO");
+      assert.equal(await page.locator("h1").textContent(), "Open your notes in BaseHero.");
+      assert.match(await page.locator("main p").last().textContent(), /Start the BaseHero app/);
       assert.match(await page.locator("footer").textContent(), /NO ACCOUNT OPEN/);
       // The stub stands in for the Tauri shell, installed before app code.
       assert.equal(await page.evaluate(() => typeof window.__TAURI_INTERNALS__?.invoke), "function");
@@ -80,7 +79,7 @@ for (const browserName of browserMatrix) {
         assert.ok(metrics.scrollWidth <= metrics.innerWidth + 1, `${viewport.name}: no horizontal scroll, got ${metrics.scrollWidth} > ${metrics.innerWidth}`);
         assert.ok(metrics.mainLeft >= 0, `${viewport.name}: content starts on screen`);
         assert.ok(metrics.mainWidth <= metrics.innerWidth + 1, `${viewport.name}: main fits, got ${metrics.mainWidth}`);
-        assert.ok(metrics.headerHeight >= 56, `${viewport.name}: header keeps its bar height`);
+        assert.ok(metrics.headerHeight >= 38 && metrics.headerHeight <= 40, `${viewport.name}: header keeps its slim bar height, got ${metrics.headerHeight}`);
         assert.ok(metrics.footerVisible, `${viewport.name}: footer is within the viewport`);
         if (viewport.name === "desktop") assert.ok(metrics.mainWidth <= 801, `desktop: main is capped, got ${metrics.mainWidth}`);
         await page.close();

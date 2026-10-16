@@ -15,8 +15,8 @@ use crate::history::{
     AccountId, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, VerifiedAccount,
 };
 use crate::journal::{
-    AccountJournal, JournalError, JournaledDevice, PENDING_SETUP_VERSION, PendingSetupProtector,
-    PendingSetupRecord, ProtectorError, SetupStage, StagedAdmission,
+    AccountJournal, HistoryCursor, JournalError, JournaledDevice, PENDING_SETUP_VERSION,
+    PendingSetupProtector, PendingSetupRecord, ProtectorError, SetupStage, StagedAdmission,
 };
 use crate::platform::{DeviceKeyStore, KeyStoreError, StoredDevice};
 use crate::recovery::{Password, RecoveryCode, RecoveryKeys, prepare_record};
@@ -133,6 +133,7 @@ pub enum OwnerError {
     /// A capability was minted for a superseded generation, account or device.
     Stale,
     Device(KeyStoreError),
+    Protector(ProtectorError),
     Invalid(Error),
     /// No staged admission exists for reconciliation.
     NoStagedAdmission,
@@ -170,8 +171,9 @@ impl From<ProtectorError> for SetupError {
     }
 }
 
-/// Encrypted setup objects for the home. The journal and base records never
-/// carry them.
+/// Protected-home ciphertext objects. Never serialize these as public account
+/// history or WebView output; they contain no opened keys or recovery code.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingHomeObjects {
     pub record: Vec<u8>,
     pub device_seal: Vec<u8>,
@@ -187,6 +189,14 @@ pub enum AdmissionResolution {
     Checking { event: Vec<u8> },
     Admitted { delivery: Vec<u8> },
     NotAdded,
+}
+
+/// Public signed initial account prefix, separate from protected-home objects.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InitialAccountPrefix {
+    pub anchor: AccountId,
+    pub head: Head,
+    pub events: Vec<Vec<u8>>,
 }
 
 pub struct SetupStatus {
@@ -235,25 +245,93 @@ where
     /// offline authority. A stop, removal, missing key or corrupt history never
     /// regenerates identity or clears the remembered head.
     pub async fn activate(&mut self) -> Result<AccountLoad, OwnerError> {
-        let Some(record) = self.journal.load()? else {
+        // A durable no-code stage may precede the journal commit. Retire the
+        // code-bearing key again after a crash, before minting authority.
+        if let Some(pending) = self.journal.pending_setup()?
+            && pending.kit_saved
+        {
+            self.protector
+                .retire_kit_key(&pending.blob)
+                .map_err(OwnerError::Protector)?;
+        }
+        if !self.journal.has_account()? {
             self.loaded = None;
             return Ok(AccountLoad::Uninitialized);
-        };
-        let history: Vec<&[u8]> = record.history.iter().map(Vec::as_slice).collect();
-        let account = match VerifiedAccount::replay(record.anchor, &history, record.head) {
-            Ok(account) => account,
-            Err(_) => {
+        }
+        let generation = self.generation.current();
+        let checked = match self.journal.load_projection() {
+            Ok(p) => p,
+            Err(JournalError::Corrupt) => {
                 self.loaded = None;
                 self.fence()?;
                 return Ok(AccountLoad::AdmissionRequired(
                     AdmissionReason::CorruptHistory,
                 ));
             }
+            Err(e) => return Err(e.into()),
+        };
+        let (account, stopped) = if let Some(mut checked) = checked {
+            loop {
+                if self.generation.current() != generation {
+                    return Err(OwnerError::Stale);
+                }
+                if checked.account.head() == checked.target {
+                    break;
+                }
+                let cursor = HistoryCursor {
+                    anchor: checked.account.id(),
+                    cut: checked.target,
+                    next_position: checked.account.head().position + 1,
+                };
+                let page = self
+                    .journal
+                    .history_prefix(Some(cursor), 256)?
+                    .ok_or(JournalError::Corrupt)?;
+                let refs: Vec<_> = page.events.iter().map(Vec::as_slice).collect();
+                let candidate = match checked.account.applied_batch(&refs) {
+                    Ok(candidate) => candidate,
+                    Err(Error::Unavailable) => return Err(OwnerError::Invalid(Error::Unavailable)),
+                    Err(_) => {
+                        self.loaded = None;
+                        self.fence()?;
+                        return Ok(AccountLoad::AdmissionRequired(
+                            AdmissionReason::CorruptHistory,
+                        ));
+                    }
+                };
+                if self.generation.current() != generation {
+                    return Err(OwnerError::Stale);
+                }
+                self.journal.advance_projection(&candidate)?;
+                std::thread::yield_now();
+                checked = self
+                    .journal
+                    .load_projection()?
+                    .ok_or(JournalError::Corrupt)?;
+            }
+            (checked.account, checked.stopped)
+        } else {
+            let Some(record) = self.journal.load()? else {
+                self.loaded = None;
+                return Ok(AccountLoad::Uninitialized);
+            };
+            let history: Vec<&[u8]> = record.history.iter().map(Vec::as_slice).collect();
+            let account = match VerifiedAccount::replay(record.anchor, &history, record.head) {
+                Ok(account) => account,
+                Err(_) => {
+                    self.loaded = None;
+                    self.fence()?;
+                    return Ok(AccountLoad::AdmissionRequired(
+                        AdmissionReason::CorruptHistory,
+                    ));
+                }
+            };
+            (account, record.stopped)
         };
 
         // A persisted stop stays stopped and keeps the last verified state. It is
         // checked before any device or native work.
-        if record.stopped {
+        if stopped {
             self.loaded = Some(Loaded {
                 account,
                 device: None,
@@ -273,7 +351,9 @@ where
 
         // The native load may prompt. A lock, stop or invalidation that advances
         // the shared generation while it is in flight must not mint authority.
-        let generation = self.generation.current();
+        if self.generation.current() != generation {
+            return Err(OwnerError::Stale);
+        }
         match self.store.load_matching(&expected).await {
             Ok(()) => {}
             Err(error) => {
@@ -366,36 +446,50 @@ where
             )
         };
         let last_head = self.loaded.as_ref().expect("checked").account.head();
-        // apply_batch makes the one transactional copy and advances this owner
-        // before the journal commit. A failed/uncertain commit must stop this
-        // owner until activation rebuilds from durable signed bytes.
-        let result = self
+        // No successor means no projection copy, no SQLite write and no fence.
+        if events.is_empty() {
+            return Ok(last_head);
+        }
+        let candidate = self
             .loaded
-            .as_mut()
+            .as_ref()
             .expect("checked")
             .account
-            .apply_batch(events);
-        match result {
-            Ok(()) => {
-                let loaded = self.loaded.as_ref().expect("checked");
-                let head = loaded.account.head();
+            .clone()
+            .applied_batch(events);
+        match candidate {
+            Ok(candidate) => {
+                let head = candidate.head();
                 let removed = device_id
-                    .map(|id| loaded.account.active_device(id).is_err())
+                    .map(|id| candidate.active_device(id).is_err())
                     .unwrap_or(false);
-                if let Err(error) =
-                    self.journal
-                        .commit_verified_fenced(anchor, events, head, false, |success| {
-                            if !success || removed {
-                                self.generation.advance();
-                            }
-                        })
-                {
-                    // An uncertain durable result cannot leave a usable owner.
+                if let Err(error) = self.journal.commit_projected_fenced(
+                    anchor,
+                    events,
+                    head,
+                    false,
+                    Some(&candidate),
+                    |success| {
+                        if !success || removed {
+                            self.generation.advance();
+                        }
+                    },
+                ) {
                     self.loaded.as_mut().expect("checked").stopped = true;
                     return Err(error.into());
                 }
+                match self.journal.rebase_projection(candidate) {
+                    Ok(account) => self.loaded.as_mut().expect("checked").account = account,
+                    Err(error) => {
+                        // Commit succeeded but this owner cannot publish an indexed
+                        // view. Reload before use; never publish a partial overlay.
+                        self.loaded = None;
+                        return Err(error.into());
+                    }
+                }
                 Ok(head)
             }
+            Err(Error::Unavailable) => Err(OwnerError::Invalid(Error::Unavailable)),
             Err(error) => {
                 // Stop the session before the durable write: a storage failure
                 // must not leave this owner active with usable capabilities.
@@ -403,12 +497,18 @@ where
                     loaded.stopped = true;
                 }
                 self.journal
-                    .commit_verified_fenced(anchor, &[], last_head, true, |_| {
+                    .commit_projected_fenced(anchor, &[], last_head, true, None, |_| {
                         self.generation.advance();
                     })?;
                 Err(OwnerError::Invalid(error))
             }
         }
+    }
+
+    /// Borrow only checked native identity, never exposing it to the WebView.
+    pub fn verified(&self, capability: &AccountCapability) -> Result<&VerifiedAccount, OwnerError> {
+        self.check(capability)?;
+        Ok(&self.loaded.as_ref().expect("checked").account)
     }
 
     /// Build a device admission request against the verified, active owner.
@@ -533,7 +633,10 @@ where
                 event: staged.event,
             });
         }
-        let outcome = if verified.verified_event_at(staged.position, &staged.event) {
+        let outcome = if verified
+            .verified_event_at(staged.position, &staged.event)
+            .map_err(OwnerError::Invalid)?
+        {
             AdmissionResolution::Admitted {
                 delivery: staged.delivery.clone(),
             }
@@ -603,6 +706,141 @@ where
         Ok(event)
     }
 
+    /// Ordinary native device signing, not control approval. No database guard
+    /// is held during either native operation; late results are discarded.
+    pub async fn sign_content(
+        &mut self,
+        capability: &AccountCapability,
+        message: &[u8],
+    ) -> Result<[u8; 64], OwnerError> {
+        self.check(capability)?;
+        let device = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.device.clone())
+            .ok_or(OwnerError::NotActive)?;
+        let loaded = self.store.load_matching(&device).await;
+        self.check(capability)?;
+        loaded.map_err(OwnerError::Device)?;
+        let signature = self
+            .store
+            .sign_content(device.handle, message.to_vec())
+            .await;
+        self.check(capability)?;
+        let signature = signature.map_err(OwnerError::Device)?;
+        crate::crypto::verify(device.keys.signing(), message, &signature)
+            .map_err(|_| OwnerError::Invalid(Error::BadSignature))?;
+        Ok(signature)
+    }
+
+    /// Read exactly the remembered signup cut, never the current history length.
+    /// Public signed originals only; additional controls use a captured journal
+    /// cursor, not this bounded initial-prefix interface.
+    pub fn initial_prefix(
+        &self,
+        capability: &AccountCapability,
+    ) -> Result<InitialAccountPrefix, OwnerError> {
+        self.check(capability)?;
+        let retained = self
+            .journal
+            .initial_bootstrap()?
+            .ok_or(JournalError::Corrupt)?;
+        let prefix = self.read_initial_prefix(&retained)?;
+        self.check(capability)?;
+        Ok(prefix)
+    }
+
+    fn read_initial_prefix(
+        &self,
+        retained: &crate::journal::InitialBootstrapRecord,
+    ) -> Result<InitialAccountPrefix, OwnerError> {
+        if retained.head.position != 3
+            || self
+                .loaded
+                .as_ref()
+                .is_none_or(|l| l.account.id() != retained.anchor)
+        {
+            return Err(OwnerError::Journal(JournalError::Corrupt));
+        }
+        let page = self
+            .journal
+            .history_prefix(
+                Some(crate::journal::HistoryCursor {
+                    anchor: retained.anchor,
+                    cut: retained.head,
+                    next_position: 1,
+                }),
+                3,
+            )?
+            .ok_or(JournalError::Corrupt)?;
+        if page.events.len() != 3
+            || page.next.is_some()
+            || page.cut != retained.head
+            || page.anchor != retained.anchor
+            || page.first_position != 1
+        {
+            return Err(OwnerError::Journal(JournalError::Corrupt));
+        }
+        let prefix = InitialAccountPrefix {
+            anchor: page.anchor,
+            head: page.cut,
+            events: page.events,
+        };
+        verify_initial_prefix(&prefix).map_err(OwnerError::Invalid)?;
+        Ok(prefix)
+    }
+
+    /// Native-only authenticated bootstrap. Public signed history and private
+    /// encrypted objects remain distinct owned types; neither contains roots.
+    pub fn initial_bootstrap(
+        &self,
+        capability: &AccountCapability,
+    ) -> Result<(InitialAccountPrefix, PendingHomeObjects), OwnerError> {
+        self.check(capability)?;
+        let retained = self
+            .journal
+            .initial_bootstrap()?
+            .ok_or(JournalError::Corrupt)?;
+        let prefix = self.read_initial_prefix(&retained)?;
+        let account = verify_initial_prefix(&prefix).map_err(OwnerError::Invalid)?;
+        authenticate_initial_objects(&account, &retained).map_err(OwnerError::Invalid)?;
+        self.check(capability)?;
+        Ok((
+            prefix,
+            PendingHomeObjects {
+                record: retained.recovery_record,
+                device_seal: retained.device_seal,
+                recovery_seal: retained.recovery_seal,
+            },
+        ))
+    }
+
+    /// Initial-device opening only. Pairing has a distinct authenticated delivery
+    /// and opener; missing initial material never falls back or regenerates.
+    pub async fn open_personal(
+        &mut self,
+        capability: &AccountCapability,
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        let (prefix, objects) = self.initial_bootstrap(capability)?;
+        let historical = verify_initial_prefix(&prefix).map_err(OwnerError::Invalid)?;
+        let device = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.device.clone())
+            .ok_or(OwnerError::NotActive)?;
+        self.check(capability)?;
+        let result = personal::open_initial_fenced(
+            &historical,
+            &objects.device_seal,
+            &device,
+            &mut self.store,
+            || capability.is_current(),
+        )
+        .await;
+        self.check(capability)?;
+        result.map_err(OwnerError::Invalid)
+    }
+
     fn check(&self, capability: &AccountCapability) -> Result<(), OwnerError> {
         let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
         if loaded.stopped {
@@ -635,7 +873,7 @@ where
         // Never start a second setup over an existing account: it would sign a
         // new genesis and overwrite the working device identity. A crash before
         // `commit_pending_setup` can still leave only an unreferenced device row.
-        if self.journal.load()?.is_some() || self.journal.pending_setup()?.is_some() {
+        if self.journal.has_account()? || self.journal.pending_setup()?.is_some() {
             return Err(SetupError::AlreadyStarted);
         }
         // Create the native identity first: SQLite and the OS key store cannot be
@@ -736,6 +974,9 @@ where
             .journal
             .pending_setup()?
             .ok_or(SetupError::NotStarted)?;
+        if record.kit_saved {
+            return Err(SetupError::NotStarted);
+        }
         let material = self.open_material(&record)?;
         Ok(RecoveryCode::from_raw(material.code.expose()))
     }
@@ -773,8 +1014,8 @@ where
     /// Reconcile a home-ordered response against the exact signed bytes we hold.
     ///
     /// Call this only after the home acknowledged the ordered events **and** the
-    /// three private objects from `pending_home_objects`; a later kit
-    /// confirmation deletes the local copies of those objects. Only an exact head
+    /// three private objects from `pending_home_objects`; immutable encrypted
+    /// originals survive deletion of the disposable pending blob. Only an exact head
     /// match commits verified history, and bytes already stored are not appended
     /// again, so a retry is idempotent.
     pub fn confirm_home_ordered(&mut self, reported: Head) -> Result<(), SetupError> {
@@ -786,27 +1027,32 @@ where
         if head != reported {
             return Err(SetupError::HomeMismatch);
         }
-        if !self.home_ordered(&material)? {
-            let mut events: Vec<&[u8]> = Vec::with_capacity(1 + material.controls.len());
-            events.push(&material.genesis);
-            events.extend(material.controls.iter().map(Vec::as_slice));
-            self.journal
-                .commit_verified(material.anchor, &events, head, false)?;
+        if !self.local_history_committed(&material)? {
+            self.commit_local_history(&material, head)?;
         }
         if record.kit_saved {
-            self.journal.clear_pending_setup()?;
+            self.protector.retire_kit_key(&record.blob)?;
+            self.retain_initial(&material, true)?;
+        } else if record.stage != SetupStage::HomeOrdered {
+            let mut ordered = record;
+            ordered.stage = SetupStage::HomeOrdered;
+            self.journal.commit_pending_setup(&ordered)?;
         }
         Ok(())
     }
 
     /// True when the journal already holds the staged anchor and first events.
-    fn home_ordered(&self, material: &PendingMaterial) -> Result<bool, SetupError> {
-        let Some(account) = self.journal.load()? else {
+    /// This proves only a local commit, never home ordering or private delivery.
+    fn local_history_committed(&self, material: &PendingMaterial) -> Result<bool, SetupError> {
+        let Some(account) = self
+            .journal
+            .history_prefix(None, 1 + material.controls.len())?
+        else {
             return Ok(false);
         };
         if account.anchor != material.anchor
-            || account.history.len() < 1 + material.controls.len()
-            || account.history[0] != material.genesis
+            || account.events.len() < 1 + material.controls.len()
+            || account.events[0] != material.genesis
         {
             return Ok(false);
         }
@@ -814,23 +1060,84 @@ where
             .controls
             .iter()
             .enumerate()
-            .all(|(index, control)| account.history[index + 1] == *control))
+            .all(|(index, control)| account.events[index + 1] == *control))
     }
 
     /// Explicit saved-kit confirmation. An opened destination is not success.
-    /// The person's answer is kept even before the home orders the staged bytes;
-    /// once both hold, the pending code and recovery material are deleted.
+    /// Commit the verified prefix locally even if the home is not available.
+    /// Keep the signed events and encrypted private delivery objects pending,
+    /// but replace the recoverable code in the protected blob with zeroes.
     pub fn confirm_kit_saved(&mut self) -> Result<(), SetupError> {
         let Some(mut record) = self.journal.pending_setup()? else {
             return Err(SetupError::NotStarted);
         };
-        let material = self.open_material(&record)?;
-        if self.home_ordered(&material)? {
-            self.journal.clear_pending_setup()?;
-        } else {
+        let mut material = self.open_material(&record)?;
+        let head = expected_head(&material)?;
+        if !record.kit_saved {
+            material.code = RecoveryCode::from_raw(&[0; 16]);
+            record.blob = self
+                .protector
+                .reseal_without_code(&record.blob, material.encode().expose())?;
             record.kit_saved = true;
+            // Crash-safe: the no-code blob is durable before the local commit.
+            // A retry completes the commit without regenerating an account.
             self.journal.commit_pending_setup(&record)?;
         }
+        self.protector.retire_kit_key(&record.blob)?;
+        if !self.local_history_committed(&material)? {
+            self.commit_local_history(&material, head)?;
+        }
+        self.retain_initial(&material, record.stage == SetupStage::HomeOrdered)?;
+        Ok(())
+    }
+
+    fn retain_initial(
+        &mut self,
+        material: &PendingMaterial,
+        clear_pending: bool,
+    ) -> Result<(), SetupError> {
+        let head = expected_head(material)?;
+        if head.position != 3 {
+            return Err(SetupError::Corrupt);
+        }
+        let prefix = InitialAccountPrefix {
+            anchor: material.anchor,
+            head,
+            events: std::iter::once(material.genesis.clone())
+                .chain(material.controls.clone())
+                .collect(),
+        };
+        let account = verify_initial_prefix(&prefix).map_err(SetupError::Protocol)?;
+        let row = crate::journal::InitialBootstrapRecord {
+            anchor: material.anchor,
+            head,
+            recovery_record: material.record.clone(),
+            device_seal: material.device_seal.clone(),
+            recovery_seal: material.recovery_seal.clone(),
+        };
+        authenticate_initial_objects(&account, &row).map_err(SetupError::Protocol)?;
+        self.journal.retain_initial_bootstrap(&row, clear_pending)?;
+        Ok(())
+    }
+
+    fn commit_local_history(
+        &mut self,
+        material: &PendingMaterial,
+        head: Head,
+    ) -> Result<(), SetupError> {
+        let mut events: Vec<&[u8]> = Vec::with_capacity(1 + material.controls.len());
+        events.push(&material.genesis);
+        events.extend(material.controls.iter().map(Vec::as_slice));
+        let account = VerifiedAccount::replay(material.anchor, &events, head)
+            .map_err(SetupError::Protocol)?;
+        self.journal.commit_projected_fenced(
+            material.anchor,
+            &events,
+            head,
+            false,
+            Some(&account),
+            |_| {},
+        )?;
         Ok(())
     }
 
@@ -870,6 +1177,36 @@ fn status_from_material(
         head: expected_head(material)?,
         submission,
     })
+}
+
+fn verify_initial_prefix(prefix: &InitialAccountPrefix) -> Result<VerifiedAccount, Error> {
+    if prefix.head.position != 3 || prefix.events.len() != 3 {
+        return Err(Error::InvalidSetup);
+    }
+    VerifiedAccount::replay(
+        prefix.anchor,
+        &prefix.events.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        prefix.head,
+    )
+}
+
+fn authenticate_initial_objects(
+    account: &VerifiedAccount,
+    row: &crate::journal::InitialBootstrapRecord,
+) -> Result<(), Error> {
+    let (record_digest, personal) = account.initial_materials()?;
+    if row.anchor != account.id()
+        || row.head != account.head()
+        || row.recovery_record.len() != 242
+        || row.device_seal.len() != 1299
+        || row.recovery_seal.len() != 1299
+        || crate::recovery::commitment(&row.recovery_record)? != *record_digest
+        || personal::commitment(&row.device_seal) != *personal.device_digest()
+        || personal::commitment(&row.recovery_seal) != *personal.recovery_digest()
+    {
+        return Err(Error::InvalidCredentials);
+    }
+    Ok(())
 }
 
 fn expected_head(material: &PendingMaterial) -> Result<Head, SetupError> {
@@ -1065,6 +1402,12 @@ mod cost_tests {
             unreachable!()
         }
         fn open(&mut self, _: &[u8]) -> Result<crate::crypto::SecretBytes, ProtectorError> {
+            unreachable!()
+        }
+        fn reseal_without_code(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, ProtectorError> {
+            unreachable!()
+        }
+        fn retire_kit_key(&mut self, _: &[u8]) -> Result<(), ProtectorError> {
             unreachable!()
         }
     }

@@ -7,8 +7,9 @@
 //
 // Tests use synthetic files for both directions; real release artifacts are
 // checked without the feature, and `--expect present` is the positive control.
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 export const MARKERS = [
   "tauri-plugin-webdriver",
@@ -49,7 +50,7 @@ export function check(path, expectation) {
   return [];
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const [path, flag, expectation] = process.argv.slice(2);
   if (!path || flag !== "--expect" || !["absent", "present"].includes(expectation)) {
     console.error("usage: node scripts/check-webdriver-markers.mjs <artifact> --expect absent|present");

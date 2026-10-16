@@ -72,6 +72,20 @@ impl StagedArtifact {
     pub(crate) fn test_verified(file: std::fs::File, version: u64) -> Self {
         Self { file, version }
     }
+    /// Hash this privately held file against signed metadata and keep that
+    /// same handle, positioned at its start. Blocking: call on a worker thread.
+    pub fn verify(
+        mut file: std::fs::File,
+        release: &AvailableRelease,
+    ) -> Result<Self, ReleaseError> {
+        file.seek(SeekFrom::Start(0)).map_err(ReleaseError::Read)?;
+        let verified = release.verify_staged(&mut file)?;
+        file.seek(SeekFrom::Start(0)).map_err(ReleaseError::Read)?;
+        Ok(Self {
+            file,
+            version: verified.version(),
+        })
+    }
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -241,14 +255,7 @@ impl Transport {
         // worker sees the raw handle, and it hashes/repositions that same inode.
         let file = file.into_std().await;
         tokio::task::spawn_blocking(move || -> Result<StagedArtifact, DownloadError> {
-            let mut file = file;
-            file.seek(SeekFrom::Start(0))?;
-            let verified = found.available.verify_staged(&mut file)?;
-            file.seek(SeekFrom::Start(0))?;
-            Ok(StagedArtifact {
-                file,
-                version: verified.version(),
-            })
+            Ok(StagedArtifact::verify(file, &found.available)?)
         })
         .await
         .map_err(staging_worker_error)?

@@ -533,6 +533,7 @@ impl History {
                 let mut account = Arc::clone(&self.account);
                 match Arc::make_mut(&mut account).apply(parsed.as_bytes()) {
                     Ok(()) => next_account = Some(account),
+                    Err(AccountError::Unavailable) => return Err(Outcome::UnavailablePause),
                     Err(AccountError::UnsupportedVersion | AccountError::UnsupportedControl) => {
                         return Err(Outcome::UnsupportedPause);
                     }

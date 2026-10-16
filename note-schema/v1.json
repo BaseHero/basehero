@@ -1,6 +1,7 @@
 {
   "version": 1,
   "fragment": "default",
+  "editingPositions": 1000000,
   "nodes": {
     "paragraph": {},
     "heading": { "level": { "enum": [1, 2, 3] } },

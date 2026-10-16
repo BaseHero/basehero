@@ -97,7 +97,7 @@ test('failed attempted bytes and ID remain exact while unsent edits merge into o
     assert.deepEqual(queued[0].bytes,first.bytes);
     assert.equal(queued[1].id,undefined,'do not allocate a request ID before submission');
     await page.evaluate(()=>queueHarness.reject());
-    await page.waitForFunction(()=>queueHarness.state().pending>0 && document.querySelector('[data-status]').textContent.includes('Retry'));
+    await page.waitForFunction(()=>queueHarness.state().pending>0 && document.querySelector('[data-status]').textContent==='Not saved');
     const failed=await page.evaluate(()=>window.__queuePending()[0]);
     assert.equal(failed.id,first.id);assert.deepEqual(failed.bytes,first.bytes,'failure cannot mutate attempted bytes');
     await page.evaluate(()=>queueHarness.retry());

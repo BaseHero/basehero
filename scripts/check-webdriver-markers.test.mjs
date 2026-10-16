@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 import { MARKERS, check, markersIn } from "./check-webdriver-markers.mjs";
 
@@ -29,6 +31,15 @@ test("a release artifact without the feature passes, and one with it is rejected
   const failures = check(dirty, "absent");
   assert.equal(failures.length, 1);
   assert.match(failures[0], /tauri_plugin_webdriver/);
+});
+
+test("the CLI rejects a dirty artifact when its script is reached through a directory alias", () => {
+  const alias = join(dir, "script-alias");
+  symlinkSync(dirname(fileURLToPath(import.meta.url)), alias, "dir");
+  const dirty = artifact("dirty-via-alias.bin", ["tauri_plugin_webdriver"]);
+  const result = spawnSync(process.execPath, [join(alias, "check-webdriver-markers.mjs"), dirty, "--expect", "absent"], { encoding: "utf8" });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /webdriver markers FAIL/);
 });
 
 test("the positive control requires every marker", () => {

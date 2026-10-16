@@ -9,7 +9,7 @@ window.measure={
     canonical=new Y.Doc();Y.applyUpdate(canonical,new Uint8Array(state));
     listeners=[];views=[];commits=[];
     for(let i=0;i<2;i++)views.push(await createNoteEditor(document.querySelector(`#root${i}`),{
-      open:async callback=>{listeners.push(callback);return {state:Y.encodeStateAsUpdate(canonical),unsubscribe:()=>{}};},
+      open:async callback=>{listeners.push(callback);return {clientId:2002468231004600,state:Y.encodeStateAsUpdate(canonical),unsubscribe:()=>{}};},
       commit:async(update,id)=>{
         const bytes=new Uint8Array(update);commits.push([...bytes]);
         deliver(bytes); // The host fans out locally committed updates to every view.

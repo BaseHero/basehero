@@ -8,7 +8,7 @@ window.fallbackHarness={
   async open(){
     live=new Y.Doc();live.getXmlFragment('default').insert(0,[paragraph('start')]);
     view=await createNoteEditor(document.querySelector('#root'),{
-      open:async listener=>{receive=listener;return {state:Y.encodeStateAsUpdate(live),unsubscribe:()=>{}};},
+      open:async listener=>{receive=listener;return {clientId:2002468231004600,state:Y.encodeStateAsUpdate(live),unsubscribe:()=>{}};},
       commit:(bytes,id)=>new Promise(resolve=>jobs.push({bytes,id,resolve})),
     });
     return {mode:view.state().mode,fullChecks:window.__fullChecks};

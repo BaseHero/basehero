@@ -18,6 +18,7 @@ case "${1:-portable}" in
     node --test scripts/affected.test.mjs scripts/webdriver-exclusion.test.mjs scripts/check-webdriver-markers.test.mjs
     node scripts/webdriver-exclusion.mjs
     python3 -m unittest discover -s scripts -p test_mac_package.py
+    python3 -m unittest discover -s scripts -p test_mac_sign.py
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
     # Security socket fixtures need test-owned addresses inside a Linux network namespace.
@@ -34,6 +35,7 @@ case "${1:-portable}" in
     ;;
   editor)
     npm ci --prefix apps/client/editor --ignore-scripts --no-audit --no-fund
+    node apps/client/editor/scripts/patch-yjs.mjs
     node apps/client/editor/test/rich.mjs
     node apps/client/editor/test/unsupported.mjs
     node apps/client/editor/test/notices.mjs
@@ -47,6 +49,7 @@ case "${1:-portable}" in
     ;;
   desktop)
     cargo clippy --locked -p bh-client --all-targets -- -D warnings
+    cargo test --locked -p bh-client --lib
     cargo build --locked -p bh-client
     ;;
   android)

@@ -21,7 +21,9 @@ bh-device = { path = "libs/device" }
 bh-device-keys = { path = "apps/client/plugins/device-keys" }
 bh-crypto = { path = "libs/crypto" }
 bh-event = { path = "libs/event" }
+bh-mac-keychain-helper = { path = "libs/mac-keychain-helper" }
 bh-mac-local-auth = { path = "libs/mac-local-auth" }
+bh-mac-lifecycle = { path = "libs/mac-lifecycle" }
 bh-confidential-policy = { path = "libs/confidential-policy" }
 bh-confidential-attestation = { path = "libs/confidential-attestation" }
 bh-confidential-channel = { path = "libs/confidential-channel" }
@@ -50,10 +52,14 @@ lol_html = "=2.9.0"
 # Minimal macOS LAContext binding; objc2-foundation/block2 are already locked.
 objc2 = "=0.6.5"
 objc2-foundation = "=0.3.2"
+# Already locked through Tao and muda; the app's Quit hook and save sheet.
+objc2-app-kit = { version = "=0.3.2", default-features = false }
+raw-window-handle = "=0.6.2"
 objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAPublicDefines", "block2"] }
 pkg-config = "=0.3.32"
 pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rfd = { version = "=0.17.2", default-features = false }
 # Already in the lockfile; Apple's SecItem data-protection and SecAccessControl wrappers.
 security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_15"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
@@ -77,6 +83,7 @@ tinfoil-ehbp = { git = "https://github.com/tinfoilsh/encrypted-http-body-protoco
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 url = "=2.5.8"
+zxcvbn = { version = "=3.1.1", default-features = false }
 futures-util = "=0.3.34"
 # Independent enclave-side encryption in offline model transport tests.
 hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
@@ -113,3 +120,20 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The Keychain helper's bytes must stay the same across app releases; macOS
+# asks again for every item when they change. Set every knob here so a
+# release-profile tweak for the app never reaches it.
+[profile.keychain-helper]
+inherits = "release"
+opt-level = 3
+debug = false
+split-debuginfo = "off"
+strip = true
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false

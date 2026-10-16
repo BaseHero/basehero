@@ -10,6 +10,28 @@ fn inventory() -> Value {
         .expect("checked static note schema")
 }
 
+/// Inventory nodes without a children rule are ProseMirror leaves (one
+/// position, such as a hard break); every other element has open and close.
+pub(crate) fn is_leaf(tag: &str) -> bool {
+    static LEAVES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LEAVES
+        .get_or_init(|| {
+            let spec = inventory();
+            spec["nodes"]
+                .as_object()
+                .map(|nodes| {
+                    nodes
+                        .keys()
+                        .filter(|name| spec["children"].get(name.as_str()).is_none())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|leaf| leaf == tag)
+}
+
 fn value_matches(rule: &Value, value: &Value) -> bool {
     if let Some(choices) = rule.get("enum").and_then(Value::as_array) {
         return choices.contains(value);

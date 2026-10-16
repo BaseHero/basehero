@@ -8,15 +8,20 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bh_account::VerifiedAccount;
 use bh_device::{ContainerId, Owner, OwnerError, coordinator::AuthoritySource};
-use bh_storage::{DeviceDatabase, NoteKey};
-use serde::Serialize;
+use bh_storage::{DeviceDatabase, MAX_NOTE_PAGE, NoteKey};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::lifecycle::{
+    self, CapturedView, Lifecycle, MAX_CURSOR_OFFSET, Poster, Reason, Refusal, Scope as DrainScope,
+    Target,
+};
 
 const MAX_STORAGE_TASKS: usize = 8;
 const MAX_CONTAINER_TASKS: usize = 2;
@@ -240,6 +245,8 @@ fn dispatch_surface(
     if !leases.current(label, token) {
         return (true, false);
     }
+    let page = leases.page(label);
+    let mut wake_after_drain = false;
     let mut submitted = false;
     let delivered = owner.drain_surface_once(label, &mut |item| {
         submitted = true;
@@ -252,7 +259,7 @@ fn dispatch_surface(
             resync: true,
         };
         if !owner.delivery_current(&retry) || !leases.current(label, token) {
-            leases.finish(label, token);
+            wake_after_drain = leases.finish(label, token) && owner.has_queued_delivery(label);
             return;
         }
         let callback_owner = Arc::clone(owner);
@@ -267,11 +274,15 @@ fn dispatch_surface(
                     return;
                 }
                 let consumed = matches!(value.trim(), "\"accepted\"" | "\"buffered\"");
-                if !consumed {
+                let obsolete = callback_leases.page(&callback_label) != page
+                    || !callback_owner.delivery_current(&callback_retry);
+                if !consumed && !obsolete {
                     callback_owner.retry_delivery(&callback_retry);
                 }
                 if callback_leases.finish(&callback_label, token)
-                    && consumed
+                    && (consumed
+                        || callback_leases.page(&callback_label) != page
+                        || !callback_owner.delivery_current(&callback_retry))
                     && callback_owner.has_queued_delivery(&callback_label)
                 {
                     next();
@@ -279,10 +290,18 @@ fn dispatch_surface(
             }),
         );
         if !accepted && leases.current(label, token) {
-            owner.retry_delivery(&retry);
-            leases.finish(label, token);
+            let obsolete = leases.page(label) != page || !owner.delivery_current(&retry);
+            if !obsolete {
+                owner.retry_delivery(&retry);
+            }
+            wake_after_drain = leases.finish(label, token)
+                && (leases.page(label) != page || !owner.delivery_current(&retry))
+                && owner.has_queued_delivery(label);
         }
     });
+    if wake_after_drain {
+        on_next();
+    }
     (delivered, submitted)
 }
 
@@ -375,8 +394,12 @@ impl DeliveryDispatcher {
                                 let script = format!("(()=>{{if(window.__bhNotePage!==\"{page}\")return 'stale';return window.__bhNoteDelivery?.({json})??'stale'}})()");
                                 if !post_if_current(&owner, &leases, &label, token, page, &retry,
                                     || pinned.eval_with_callback(script, callback).is_ok()) {
-                                    owner.retry_delivery(&retry);
-                                    if leases.finish(&label, token) && owner.has_queued_delivery(&label) {
+                                    if leases.page(&label) == Some(page) && owner.delivery_current(&retry) {
+                                        owner.retry_delivery(&retry);
+                                    }
+                                    if leases.finish(&label, token)
+                                        && (leases.page(&label) != Some(page) || !owner.delivery_current(&retry))
+                                        && owner.has_queued_delivery(&label) {
                                         wake_delivery(&again, &leases, &stopping, app, label);
                                     }
                                 }
@@ -482,10 +505,24 @@ pub struct NoteHost {
     admissions: Arc<Admission>,
     delivery: Arc<DeliveryDispatcher>,
     peers: Mutex<PeerCursors>,
+    // A new window's note, chosen natively before its page exists. Its first
+    // note_binding rechecks authority through show_note; never a page value.
+    intents: Mutex<HashMap<String, (ContainerId, [u8; 32])>>,
+    // Close/Quit/update drains and their bounded lifecycle evaluations.
+    lifecycle: Arc<Lifecycle>,
+    // Restored selection/reading position for a window's first binding of
+    // that note: presentation only, never authority.
+    hints: Mutex<HashMap<String, ([u8; 32], CapturedView)>>,
+    #[cfg(desktop)]
+    next_window: AtomicU64,
 }
 impl Default for NoteHost {
     fn default() -> Self {
-        let owner = Arc::new(Owner::default());
+        Self::with_owner(Arc::new(Owner::default()))
+    }
+}
+impl NoteHost {
+    pub fn with_owner(owner: Arc<Owner>) -> Self {
         let delivery = Arc::new(DeliveryDispatcher::new(Arc::clone(&owner)));
         Self {
             owner,
@@ -493,7 +530,135 @@ impl Default for NoteHost {
             admissions: Arc::new(Admission::default()),
             delivery,
             peers: Mutex::new(PeerCursors::default()),
+            intents: Mutex::new(HashMap::new()),
+            lifecycle: Arc::new(Lifecycle::default()),
+            hints: Mutex::new(HashMap::new()),
+            #[cfg(desktop)]
+            next_window: AtomicU64::new(0),
         }
+    }
+    /// A restored window shows `note` at this selection and reading position.
+    pub(crate) fn remember_hint(&self, label: &str, note: [u8; 32], view: CapturedView) {
+        self.hints
+            .lock()
+            .expect("view hint lock")
+            .insert(label.to_owned(), (note, view));
+    }
+    fn take_hint(&self, label: &str, note: [u8; 32]) -> Option<CapturedView> {
+        let hint = self.hints.lock().expect("view hint lock").remove(label)?;
+        (hint.0 == note).then_some(hint.1)
+    }
+    pub(crate) fn owner(&self) -> &Arc<Owner> {
+        &self.owner
+    }
+    #[cfg(any(desktop, test))]
+    pub(crate) fn remember_window(&self, label: &str, id: ContainerId, note: [u8; 32]) {
+        self.intents
+            .lock()
+            .expect("window intent lock")
+            .insert(label.to_owned(), (id, note));
+    }
+    pub(crate) fn forget_window_intent(&self, label: &str) {
+        self.intents
+            .lock()
+            .expect("window intent lock")
+            .remove(label);
+    }
+    /// Bind an unbound new window to its natively chosen note, once. While a
+    /// close, Quit or update holds the window, the intent stays for a later
+    /// binding (`Err`), which rechecks it like the first.
+    pub(crate) fn bind_window_intent(&self, label: &str) -> Result<bool, ()> {
+        if self.owner.bound_note(label).is_some() {
+            return Ok(false);
+        }
+        let intent = self
+            .intents
+            .lock()
+            .expect("window intent lock")
+            .remove(label);
+        let Some((id, note)) = intent else {
+            return Ok(false);
+        };
+        match self.owner.show_note(label, id, note) {
+            Ok(()) => Ok(true),
+            Err(OwnerError::Busy) => {
+                self.intents
+                    .lock()
+                    .expect("window intent lock")
+                    .entry(label.to_owned())
+                    .or_insert((id, note));
+                Err(())
+            }
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct NoteRow {
+    pub note: Vec<u8>,
+    pub title: String,
+    pub touched: i64,
+}
+/// Keyset cursor from a previous page's last row; not authority.
+#[derive(Deserialize)]
+pub(crate) struct After {
+    pub touched: i64,
+    pub note: Vec<u8>,
+}
+fn note_id(note: Vec<u8>) -> Result<[u8; 32], &'static str> {
+    note.try_into().map_err(|_| "note unavailable")
+}
+fn bound_container(owner: &Owner, window: &str) -> Result<ContainerId, &'static str> {
+    owner.bound_container(window).ok_or("note unavailable")
+}
+/// The calling window's own container; the page names no account or base.
+pub(crate) fn list_bound(
+    owner: &Owner,
+    window: &str,
+    after: Option<After>,
+) -> Result<Vec<NoteRow>, &'static str> {
+    let id = bound_container(owner, window)?;
+    let after = match after {
+        Some(After { touched, note }) => Some((touched, note_id(note)?)),
+        None => None,
+    };
+    let rows = owner
+        .list_notes(id, after, MAX_NOTE_PAGE)
+        .map_err(|_| "note unavailable")?;
+    Ok(rows
+        .into_iter()
+        .map(|entry| NoteRow {
+            note: entry.note.to_vec(),
+            title: entry.title,
+            touched: entry.touched,
+        })
+        .collect())
+}
+pub(crate) fn create_bound(owner: &Owner, window: &str) -> Result<Vec<u8>, &'static str> {
+    let id = bound_container(owner, window)?;
+    owner
+        .create_note(id)
+        .map(|note| note.to_vec())
+        .map_err(|_| "note unavailable")
+}
+pub(crate) fn show_bound(owner: &Owner, window: &str, note: Vec<u8>) -> Result<(), &'static str> {
+    let id = bound_container(owner, window)?;
+    owner
+        .show_note(window, id, note_id(note)?)
+        .map_err(|_| "note unavailable")
+}
+/// A new window may open only a note in the caller's authorized own base.
+pub(crate) fn new_window_note(
+    owner: &Owner,
+    window: &str,
+    note: Vec<u8>,
+) -> Result<(ContainerId, [u8; 32]), &'static str> {
+    let id = bound_container(owner, window)?;
+    let note = note_id(note)?;
+    match owner.has_note(id, note) {
+        Ok(true) => Ok((id, note)),
+        _ => Err("note unavailable"),
     }
 }
 impl NoteHost {
@@ -520,6 +685,9 @@ impl NoteHost {
         self.owner
             .bind(window.label(), id)
             .map_err(|_| "container unavailable")
+    }
+    pub fn has_binding(&self, window: &str) -> bool {
+        self.owner.bound_note(window).is_some()
     }
     fn clear_peer(&self, app: &AppHandle, window: &str) {
         let (id, targets) = {
@@ -568,6 +736,9 @@ impl NoteHost {
     fn invalidate(&self, app: &AppHandle, window: &str) {
         self.clear_peer(app, window);
         self.delivery.cancel(window);
+        // The old page's lifecycle eval and any drain waiting on it are void.
+        self.lifecycle.leases.cancel(window);
+        self.lifecycle.drains.page_gone(window);
         self.owner.invalidate(window);
     }
 }
@@ -584,6 +755,8 @@ struct Opened {
     state: Vec<u8>,
     generation: u64,
     sequence: u64,
+    client_id: u64,
+    writer_token: Vec<u8>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -602,25 +775,39 @@ struct Incoming {
 /// Call once per document. A second binding call rotates the page token and
 /// silently ends delivery to that document until it reloads.
 #[tauri::command]
-fn note_binding(window: WebviewWindow, host: tauri::State<'_, NoteHost>) -> Option<Binding> {
+fn note_binding(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+) -> Result<Option<Binding>, &'static str> {
     host.clear_peer(window.app_handle(), window.label());
-    host.owner.bound_note(window.label()).map(|note| Binding {
+    // A held new window keeps its note; the page offers to try again.
+    host.bind_window_intent(window.label())
+        .map_err(|()| "note busy")?;
+    Ok(host.owner.bound_note(window.label()).map(|note| Binding {
         note: note.to_vec(),
         surface: host.delivery.leases.bind_page(window.label()).to_string(),
-    })
+        view: host.take_hint(window.label(), note),
+    }))
 }
 #[derive(Serialize)]
 struct Binding {
     note: Vec<u8>,
     surface: String,
+    // Restart presentation for this note's first binding in a restored window.
+    view: Option<CapturedView>,
 }
 #[tauri::command]
 async fn note_open(
     window: WebviewWindow,
     host: tauri::State<'_, NoteHost>,
     note: Vec<u8>,
+    retire_writer: Option<Vec<u8>>,
 ) -> Result<Opened, &'static str> {
     let note: [u8; 32] = note.try_into().map_err(|_| "note unavailable")?;
+    // Capacity rollover only: the page's current writer token, never a slot.
+    let retire: Option<[u8; 32]> = retire_writer
+        .map(|t| t.try_into().map_err(|_| "invalid writer token"))
+        .transpose()?;
     let label = window.label().to_owned();
     let owner = Arc::clone(&host.owner);
     let (id, _) = owner
@@ -630,7 +817,10 @@ async fn note_open(
     let open_label = label.clone();
     let opened = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        owner.open(&open_label, note)
+        match retire {
+            Some(token) => owner.open_leased_retiring(&open_label, note, token),
+            None => owner.open_leased(&open_label, note),
+        }
     })
     .await
     .map_err(|_| "note unavailable")?;
@@ -643,6 +833,8 @@ async fn note_open(
         state: opened.state,
         generation: opened.generation,
         sequence: opened.sequence,
+        client_id: opened.writer.ok_or("writer unavailable")?.client_id,
+        writer_token: opened.writer.ok_or("writer unavailable")?.token.to_vec(),
     })
 }
 #[tauri::command]
@@ -651,21 +843,27 @@ async fn note_commit(
     host: tauri::State<'_, NoteHost>,
     generation: u64,
     request_id: String,
+    writer_token: Vec<u8>,
     update: Vec<u8>,
 ) -> Result<Acknowledged, &'static str> {
     let request: [u8; 16] = decode_request(&request_id).ok_or("invalid request")?;
+    let writer_token: [u8; 32] = writer_token
+        .try_into()
+        .map_err(|_| "invalid writer token")?;
     let label = window.label().to_owned();
     let (id, _) = host
         .owner
         .bound_work_key(&label, generation)
         .ok_or("note unavailable")?;
+    // Local writing, unlike a peer's delivery, keeps an update waiting.
+    host.lifecycle.typed();
     let task_permit = host.admissions.enter(id, Arc::clone(&host.tasks)).await;
     let owner = Arc::clone(&host.owner);
     let delivery = Arc::clone(&host.delivery);
     let app = window.app_handle().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _task_permit = task_permit;
-        let committed = owner.commit_queued(&label, generation, request, &update);
+        let committed = owner.commit_leased(&label, generation, writer_token, request, &update);
         if let Ok((_, targets)) = &committed {
             for target in targets {
                 delivery.wake(app.clone(), target.clone());
@@ -738,6 +936,521 @@ fn note_close(window: WebviewWindow, host: tauri::State<'_, NoteHost>, generatio
     }
     host.owner.close_generation(window.label(), generation);
 }
+/// The page drained under native drain `fence`: its accepted writing is saved
+/// and it holds new input. Tauri supplies the calling WebView; only that
+/// window's current page token counts, and the owner then refuses its writes.
+/// False tells the page to resume its own editing.
+#[tauri::command]
+async fn note_drained(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    surface: String,
+    fence: String,
+    view: Option<CapturedView>,
+) -> Result<bool, ()> {
+    let label = window.label().to_owned();
+    let page = host.delivery.leases.page(&label);
+    Ok(lifecycle::accept_drained(
+        &host.owner,
+        &host.lifecycle,
+        &label,
+        page,
+        lifecycle::Drained {
+            surface: &surface,
+            fence: &fence,
+            view,
+            frame: frame(&window),
+        },
+    )
+    .await)
+}
+/// The page could not save its writing in time (or at all).
+#[tauri::command]
+fn note_drain_failed(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    surface: String,
+    fence: String,
+) -> bool {
+    let page = host.delivery.leases.page(window.label());
+    lifecycle::drain_failed(&host.lifecycle, window.label(), page, &surface, &fence)
+}
+/// Outer position and inner size in logical points, as restore applies them.
+fn frame(window: &WebviewWindow) -> Option<[f64; 4]> {
+    let scale = window.scale_factor().ok()?;
+    let position = window.outer_position().ok()?.to_logical::<f64>(scale);
+    let size = window.inner_size().ok()?.to_logical::<f64>(scale);
+    Some([position.x, position.y, size.width, size.height])
+}
+
+/// Upper bound for one close, Quit or update drain; normally milliseconds.
+const DRAIN_LIMIT: Duration = Duration::from_secs(10);
+/// An update waits until no window has typed for this long.
+const UPDATE_TYPING_IDLE: Duration = Duration::from_secs(2);
+
+/// Posts a lifecycle script to the pinned WebView of a window, on its UI
+/// thread and only while `page` is still its note page; that check is
+/// ordered with page-load callbacks on the same thread.
+struct WebviewPoster {
+    app: AppHandle,
+    pages: Arc<DeliveryLeases>,
+}
+type EvalDone = Mutex<Option<Box<dyn FnOnce(String) + Send>>>;
+fn finish_eval(done: &EvalDone, value: String) {
+    if let Some(done) = done.lock().expect("eval callback lock").take() {
+        done(value);
+    }
+}
+impl Poster for WebviewPoster {
+    fn post(
+        &self,
+        label: &str,
+        page: u64,
+        script: String,
+        done: Box<dyn FnOnce(String) + Send>,
+    ) -> bool {
+        let Some(window) = self.app.get_webview_window(label) else {
+            return false;
+        };
+        let pages = Arc::clone(&self.pages);
+        let label = label.to_owned();
+        let pinned = window.clone();
+        let done: Arc<EvalDone> = Arc::new(Mutex::new(Some(done)));
+        window
+            .run_on_main_thread(move || {
+                if pages.page(&label) != Some(page) {
+                    finish_eval(&done, "\"stale\"".into());
+                    return;
+                }
+                let callback = Arc::clone(&done);
+                if pinned
+                    .eval_with_callback(script, move |value| finish_eval(&callback, value))
+                    .is_err()
+                {
+                    finish_eval(&done, "\"stale\"".into());
+                }
+            })
+            .is_ok()
+    }
+}
+
+/// Exit and relaunch readiness for a verified update: every window drained
+/// through a real local commit, and restart records written for every
+/// account. Held until exit; dropping it resumes editing and removes the
+/// records it wrote. Never sent to a page.
+pub struct RestartReady {
+    held: lifecycle::Held,
+}
+impl RestartReady {
+    /// Start the verified replacement, then exit keeping every window held
+    /// and the records in place. If `relaunch` fails, this guard drops.
+    ///
+    /// Containers hold an exclusive lock until this process exits, so
+    /// `relaunch` must only arrange for the new app to start after this PID
+    /// has gone (the Mac updater's waiter polls it); starting it directly
+    /// would find every account busy. `app.exit` stops the run loop without
+    /// `terminate:`, so it does not re-enter the Quit hook.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn exit(
+        self,
+        app: &AppHandle,
+        relaunch: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        relaunch()?;
+        self.held.keep();
+        app.exit(0);
+        Ok(())
+    }
+}
+
+impl NoteHost {
+    fn poster(&self, app: &AppHandle) -> Arc<dyn Poster> {
+        Arc::new(WebviewPoster {
+            app: app.clone(),
+            pages: Arc::clone(&self.delivery.leases),
+        })
+    }
+    fn targets(&self, app: &AppHandle) -> Vec<Target> {
+        app.webview_windows()
+            .into_keys()
+            .map(|label| Target {
+                page: self.delivery.leases.page(&label),
+                label,
+            })
+            .collect()
+    }
+    /// Update readiness: wait for two seconds without local typing,
+    /// then drain every window (at most ten seconds, within `deadline`) and
+    /// write restart records. A failed save, missing reply or record write
+    /// refuses; there is no discard path. Editing resumes on refusal.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn prepare_restart(
+        &self,
+        app: &AppHandle,
+        deadline: Instant,
+    ) -> Result<RestartReady, Refusal> {
+        lifecycle::typing_idle(&self.lifecycle, UPDATE_TYPING_IDLE, deadline).await?;
+        let mut held = lifecycle::drain(
+            &self.owner,
+            &self.lifecycle,
+            &self.poster(app),
+            DrainScope::All,
+            self.targets(app),
+            Reason::Update,
+            deadline.min(Instant::now() + DRAIN_LIMIT),
+        )
+        .await
+        .map_err(|failure| failure.refusal)?;
+        lifecycle::write_records(&self.owner, &mut held).await?;
+        Ok(RestartReady { held })
+    }
+    /// Ordinary Quit: drain every window, record them for the next launch,
+    /// and exit. A window that cannot save asks first, Keep open by default.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    async fn quit(&self, app: &AppHandle) -> bool {
+        let drained = lifecycle::drain(
+            &self.owner,
+            &self.lifecycle,
+            &self.poster(app),
+            DrainScope::All,
+            self.targets(app),
+            Reason::Quit,
+            Instant::now() + DRAIN_LIMIT,
+        )
+        .await;
+        match drained {
+            Ok(mut held) => {
+                // Writing is saved; a failed record only means these windows
+                // do not reopen next launch.
+                if lifecycle::write_records(&self.owner, &mut held)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("BaseHero: windows will not reopen; their records were not saved");
+                }
+                held.keep();
+                true
+            }
+            Err(failure) if failure.refusal == Refusal::Busy => false,
+            // The approved sheet on each window that could not save, in turn.
+            Err(failure) => {
+                lifecycle::confirm_each(failure, |label| async move {
+                    let Some(window) = app.get_webview_window(&label) else {
+                        return false;
+                    };
+                    let _ = window.set_focus();
+                    confirm_discard(&window).await
+                })
+                .await
+            }
+        }
+    }
+}
+
+/// Close one window after its writing is saved; a failed save asks first.
+#[cfg(desktop)]
+async fn close_window(app: AppHandle, window: WebviewWindow) {
+    let host = app.state::<NoteHost>();
+    let label = window.label().to_owned();
+    let targets = vec![Target {
+        page: host.delivery.leases.page(&label),
+        label: label.clone(),
+    }];
+    let drained = lifecycle::drain(
+        &host.owner,
+        &host.lifecycle,
+        &host.poster(&app),
+        DrainScope::Window(label),
+        targets,
+        Reason::Close,
+        Instant::now() + DRAIN_LIMIT,
+    )
+    .await;
+    match drained {
+        // destroy, not close: close would ask CloseRequested again.
+        Ok(held) => {
+            let _ = window.destroy();
+            drop(held);
+        }
+        // A drain of this window (or Quit) is already deciding.
+        Err(failure) if failure.refusal == Refusal::Busy => {}
+        Err(failure) => {
+            if confirm_discard(&window).await {
+                let _ = window.destroy();
+            }
+            drop(failure);
+        }
+    }
+}
+
+/// Native sheet: Keep open is the default; true only for Close without saving.
+#[cfg(target_os = "macos")]
+async fn confirm_discard(window: &WebviewWindow) -> bool {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let pinned = window.clone();
+    let shown = window.run_on_main_thread(move || {
+        bh_mac_lifecycle::ask_discard(&pinned, move |discard| {
+            let _ = sender.send(discard);
+        });
+    });
+    shown.is_ok() && receiver.await.unwrap_or(false)
+}
+#[cfg(not(target_os = "macos"))]
+#[cfg_attr(mobile, allow(dead_code))]
+async fn confirm_discard(_window: &WebviewWindow) -> bool {
+    false
+}
+
+/// Bring ordinary Quit (menu, Dock, logout, AppleScript) to the same drain.
+#[cfg(target_os = "macos")]
+fn intercept_quit(app: &AppHandle) -> Result<(), bh_mac_lifecycle::InstallError> {
+    let handle = app.clone();
+    bh_mac_lifecycle::intercept_terminate(move |reply| {
+        let app = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            // A panicking drain must cancel Quit rather than leave AppKit
+            // waiting forever for the dropped reply.
+            let draining = app.clone();
+            let quit = tauri::async_runtime::spawn(async move {
+                draining.state::<NoteHost>().quit(&draining).await
+            })
+            .await
+            .unwrap_or(false);
+            let _ = app.run_on_main_thread(move || {
+                let _ = reply.reply(quit);
+            });
+        });
+    })
+}
+
+/// Run a short catalogue operation off the main thread behind this container's
+/// admission, so a busy account cannot occupy every blocking thread.
+async fn admitted<R: Send + 'static>(
+    host: &NoteHost,
+    window: &WebviewWindow,
+    work: impl FnOnce(&Owner, &str) -> Result<R, &'static str> + Send + 'static,
+) -> Result<R, &'static str> {
+    let label = window.label().to_owned();
+    let id = bound_container(&host.owner, &label)?;
+    let permit = host.admissions.enter(id, Arc::clone(&host.tasks)).await;
+    let owner = Arc::clone(&host.owner);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        work(&owner, &label)
+    })
+    .await
+    .map_err(|_| "note unavailable")?
+}
+/// The first page of this window's own-base notes, most recent first.
+#[tauri::command]
+async fn note_list(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    after: Option<After>,
+) -> Result<Vec<NoteRow>, &'static str> {
+    admitted(&host, &window, move |owner, label| {
+        list_bound(owner, label, after)
+    })
+    .await
+}
+#[tauri::command]
+async fn note_create(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+) -> Result<Vec<u8>, &'static str> {
+    admitted(&host, &window, create_bound).await
+}
+/// Route this window to another note of its own base. The page then calls
+/// note_binding and note_open for the new load; the old generation is refused.
+#[tauri::command]
+async fn note_show(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    note: Vec<u8>,
+) -> Result<(), &'static str> {
+    host.clear_peer(window.app_handle(), window.label());
+    admitted(&host, &window, move |owner, label| {
+        show_bound(owner, label, note)
+    })
+    .await
+}
+/// Open the caller's note in another window that shares the same core note.
+#[tauri::command]
+async fn note_new_window(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    note: Vec<u8>,
+) -> Result<(), &'static str> {
+    let caller = window.label().to_owned();
+    let owner = Arc::clone(&host.owner);
+    let (id, note) =
+        tauri::async_runtime::spawn_blocking(move || new_window_note(&owner, &caller, note))
+            .await
+            .map_err(|_| "note unavailable")??;
+    open_window(&host, window.app_handle(), id, note)
+}
+fn open_window(
+    host: &NoteHost,
+    app: &AppHandle,
+    id: ContainerId,
+    note: [u8; 32],
+) -> Result<(), &'static str> {
+    open_window_at(host, app, id, note, None)
+}
+/// Where the Mac window buttons sit in the page's location bar; the main
+/// window's `trafficLightPosition` in tauri.conf.json is the same.
+#[cfg(desktop)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const TRAFFIC_LIGHTS: [f64; 2] = [14.0, 19.0];
+#[cfg(desktop)]
+fn open_window_at(
+    host: &NoteHost,
+    app: &AppHandle,
+    id: ContainerId,
+    note: [u8; 32],
+    restore: Option<(Option<[f64; 4]>, CapturedView)>,
+) -> Result<(), &'static str> {
+    let index = host
+        .next_window
+        .fetch_add(1, Ordering::Relaxed)
+        .checked_add(1)
+        .ok_or("window unavailable")?;
+    let label = format!("note-{index}");
+    // Record the intent before the page can ask for its binding.
+    host.remember_window(&label, id, note);
+    let builder =
+        tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
+            .title("BaseHero")
+            .inner_size(1000.0, 760.0)
+            .min_inner_size(320.0, 400.0);
+    // The page's location bar is the title bar, as for the main window.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(
+            TRAFFIC_LIGHTS[0],
+            TRAFFIC_LIGHTS[1],
+        ));
+    let mut builder = builder;
+    if let Some((frame, view)) = restore {
+        host.remember_hint(&label, note, view);
+        if let Some([x, y, width, height]) = frame {
+            builder = builder.inner_size(width, height);
+            if on_screen([x, y, width, height], &screens(app.available_monitors())) {
+                builder = builder.position(x, y);
+            }
+        }
+    }
+    if builder.build().is_err() {
+        host.forget_window_intent(&label);
+        host.hints.lock().expect("view hint lock").remove(&label);
+        return Err("window unavailable");
+    }
+    Ok(())
+}
+#[cfg(mobile)]
+fn open_window_at(
+    _host: &NoteHost,
+    _app: &AppHandle,
+    _id: ContainerId,
+    _note: [u8; 32],
+    _restore: Option<(Option<[f64; 4]>, CapturedView)>,
+) -> Result<(), &'static str> {
+    Err("window unavailable")
+}
+
+/// One window to reopen after Quit or update. Presentation only: its note is
+/// shown again through the full native authority check, in a new load.
+pub(crate) struct Restore {
+    pub note: [u8; 32],
+    pub view: CapturedView,
+    pub frame: Option<[f64; 4]>,
+}
+const MAX_RESTORED_WINDOWS: usize = 32;
+/// Records already passed native authority; bound and clamp what they hint.
+pub(crate) fn plan_restore(records: Vec<bh_storage::ViewRecord>) -> Vec<Restore> {
+    records
+        .into_iter()
+        .take(MAX_RESTORED_WINDOWS)
+        .map(|record| Restore {
+            note: record.key.note,
+            view: CapturedView {
+                version: 1,
+                anchor: record.anchor,
+                head: record.head,
+                cursor_offset: if record.cursor_offset.is_finite() {
+                    record
+                        .cursor_offset
+                        .clamp(-MAX_CURSOR_OFFSET, MAX_CURSOR_OFFSET)
+                } else {
+                    0.0
+                },
+            },
+            frame: restore_frame(record.frame),
+        })
+        .collect()
+}
+/// A logical [x, y, width, height]: finite, with a usable size.
+pub(crate) fn restore_frame(frame: [f64; 4]) -> Option<[f64; 4]> {
+    let [x, y, width, height] = frame;
+    frame.iter().all(|value| value.is_finite()).then_some([
+        x,
+        y,
+        width.clamp(320.0, 8000.0),
+        height.clamp(400.0, 8000.0),
+    ])
+}
+/// The window's title bar would sit on one of these logical screens.
+#[cfg_attr(mobile, allow(dead_code))]
+pub(crate) fn on_screen(frame: [f64; 4], screens: &[[f64; 4]]) -> bool {
+    let (x, y) = (frame[0] + 40.0, frame[1] + 10.0);
+    screens
+        .iter()
+        .any(|[sx, sy, sw, sh]| x >= *sx && x < sx + sw && y >= *sy && y < sy + sh)
+}
+#[cfg(desktop)]
+fn screens(monitors: tauri::Result<Vec<tauri::Monitor>>) -> Vec<[f64; 4]> {
+    monitors
+        .unwrap_or_default()
+        .iter()
+        .map(|monitor| {
+            let scale = monitor.scale_factor();
+            let position = monitor.position().to_logical::<f64>(scale);
+            let size = monitor.size().to_logical::<f64>(scale);
+            [position.x, position.y, size.width, size.height]
+        })
+        .collect()
+}
+/// Put back the main window's restored note view and frame, and open one
+/// window per other record through the ordinary native intent path.
+pub(crate) fn restore_windows(
+    host: &NoteHost,
+    window: &WebviewWindow,
+    id: ContainerId,
+    main: Option<Restore>,
+    others: Vec<Restore>,
+) {
+    if let Some(main) = main {
+        host.remember_hint(window.label(), main.note, main.view);
+        #[cfg(desktop)]
+        if let Some([x, y, width, height]) = main.frame {
+            let _ = window.set_size(tauri::LogicalSize::new(width, height));
+            if on_screen([x, y, width, height], &screens(window.available_monitors())) {
+                let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+            }
+        }
+    }
+    for other in others {
+        let _ = open_window_at(
+            host,
+            window.app_handle(),
+            id,
+            other.note,
+            Some((other.frame, other.view)),
+        );
+    }
+}
 fn decode_request(hex: &str) -> Option<[u8; 16]> {
     if hex.len() != 32 {
         return None;
@@ -750,14 +1463,36 @@ fn decode_request(hex: &str) -> Option<[u8; 16]> {
 }
 
 pub fn builder() -> tauri::Builder<tauri::Wry> {
-    tauri::Builder::default()
-        .manage(NoteHost::default())
+    let owner = Arc::new(Owner::default());
+    let builder = tauri::Builder::default()
+        .manage(NoteHost::with_owner(Arc::clone(&owner)))
+        .manage(crate::account_host::AccountHost::with_owner(owner).into_state())
         .invoke_handler(tauri::generate_handler![
             note_binding,
             note_open,
             note_commit,
             note_selection,
-            note_close
+            note_close,
+            note_list,
+            note_create,
+            note_show,
+            note_new_window,
+            note_drained,
+            note_drain_failed,
+            crate::account_host::account_screen,
+            crate::account_host::account_retry,
+            crate::account_host::account_suggest_password,
+            crate::account_host::account_create,
+            crate::account_host::account_confirm_kit,
+            crate::account_host::account_return,
+            crate::account_host::account_print_kit,
+            crate::account_host::account_email_kit,
+            crate::account_host::account_save_kit_file,
+            crate::account_host::account_open_note,
+            crate::mac_update::commands::update_status,
+            crate::mac_update::commands::update_not_now,
+            crate::mac_update::commands::update_install,
+            crate::window_layout::window_sidebar,
         ])
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
@@ -767,19 +1502,63 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     .invalidate(webview.app_handle(), webview.label());
             }
         })
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                window
-                    .app_handle()
-                    .state::<NoteHost>()
-                    .invalidate(window.app_handle(), window.label());
+        .on_window_event(|window, event| match event {
+            #[cfg(desktop)]
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                if let Some(target) = app.get_webview_window(window.label()) {
+                    tauri::async_runtime::spawn(close_window(app, target));
+                }
             }
+            tauri::WindowEvent::Destroyed => {
+                let host = window.app_handle().state::<NoteHost>();
+                host.forget_window_intent(window.label());
+                host.invalidate(window.app_handle(), window.label());
+            }
+            _ => {}
         })
+        .setup(|app| {
+            // Never run where ordinary Quit would skip saving.
+            #[cfg(target_os = "macos")]
+            {
+                intercept_quit(app.handle())
+                    .map_err(|error| format!("Quit cannot wait for saving ({error:?})"))?;
+                crate::mac_update::install(app);
+            }
+            let _ = app;
+            Ok(())
+        });
+    // A crashed page's writing is gone; its drain fails at once.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .on_web_content_process_terminate(|webview| {
+            let app = webview.app_handle();
+            app.state::<NoteHost>().invalidate(app, webview.label());
+        })
+        .menu(crate::window_layout::menu)
+        .on_menu_event(crate::window_layout::menu_event);
+    builder
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(desktop)]
+    #[test]
+    fn note_windows_put_the_mac_buttons_where_the_main_window_does() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let main = &config["app"]["windows"][0];
+        assert_eq!(main["titleBarStyle"], "Overlay");
+        assert_eq!(main["hiddenTitle"], true);
+        let at = &main["trafficLightPosition"];
+        assert_eq!(
+            [at["x"].as_f64().unwrap(), at["y"].as_f64().unwrap()],
+            TRAFFIC_LIGHTS
+        );
+    }
     use bh_account::{
         AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount,
         crypto::{KemKey, SigningKey},
@@ -861,13 +1640,20 @@ mod tests {
         assert!(peers.remove("right").is_empty());
     }
 
-    struct Issuer(HashMap<String, Scope>);
+    type ScopeRoutes = Arc<Mutex<HashMap<String, Scope>>>;
+    struct Issuer(ScopeRoutes);
     impl AuthoritySource for Issuer {
         fn bound_scope(&self, window: &str) -> Option<Scope> {
-            self.0.get(window).copied()
+            self.0.lock().unwrap().get(window).copied()
         }
     }
-    fn delivery_fixture() -> (Arc<Owner>, ContainerId, u64, std::path::PathBuf) {
+    fn delivery_fixture_with_scopes() -> (
+        Arc<Owner>,
+        ContainerId,
+        u64,
+        std::path::PathBuf,
+        ScopeRoutes,
+    ) {
         let dir = std::env::temp_dir().join(format!(
             "bh-native-{}-{:?}",
             std::process::id(),
@@ -911,24 +1697,134 @@ mod tests {
                 note: [4; 32],
             },
         };
+        let scopes = Arc::new(Mutex::new(HashMap::from([
+            ("writer".into(), scope),
+            ("reader".into(), scope),
+        ])));
         let owner = Arc::new(Owner::default());
         let id = owner
-            .register(
-                db,
-                Some(&proof),
-                Box::new(Issuer(HashMap::from([
-                    ("writer".into(), scope),
-                    ("reader".into(), scope),
-                ]))),
-            )
+            .register(db, Some(&proof), Box::new(Issuer(Arc::clone(&scopes))))
             .unwrap();
         owner.bind("writer", id).unwrap();
         owner.bind("reader", id).unwrap();
         let writer = owner.open("writer", [4; 32]).unwrap();
         owner.open("reader", [4; 32]).unwrap();
-        (owner, id, writer.generation, dir)
+        (owner, id, writer.generation, dir, scopes)
+    }
+    fn delivery_fixture() -> (Arc<Owner>, ContainerId, u64, std::path::PathBuf) {
+        let (owner, id, generation, dir, _) = delivery_fixture_with_scopes();
+        (owner, id, generation, dir)
     }
     type Callback = Box<dyn Fn(String) + Send>;
+    #[test]
+    fn obsolete_eval_releases_old_lease_and_delivers_new_note_without_another_commit() {
+        let (owner, id, writer, _dir, scopes) = delivery_fixture_with_scopes();
+        let leases = Arc::new(DeliveryLeases::default());
+        leases.bind_page("reader");
+        owner
+            .commit_queued("writer", writer, [1; 16], &[0, 0])
+            .unwrap();
+        let old = leases.start("reader").unwrap();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let delivered_next = Arc::clone(&delivered);
+        let owner_next = Arc::clone(&owner);
+        let leases_next = Arc::clone(&leases);
+        let next: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let token = leases_next
+                .start("reader")
+                .expect("obsolete lease must be released");
+            let (ok, submitted) = dispatch_surface(
+                &owner_next,
+                &leases_next,
+                "reader",
+                token,
+                |item, callback| {
+                    delivered_next.lock().unwrap().push(item.generation);
+                    callback("\"accepted\"".into());
+                    true
+                },
+                Arc::new(|| {}),
+            );
+            assert!(ok && submitted);
+        });
+        let mut old_callback = None;
+        let (ok, submitted) = dispatch_surface(
+            &owner,
+            &leases,
+            "reader",
+            old,
+            |_, callback| {
+                old_callback = Some(callback);
+                true
+            },
+            Arc::clone(&next),
+        );
+        assert!(ok && submitted);
+        // Same WebView: note switch rotates its page, not the outstanding lease.
+        let new_note = [5; 32];
+        let old_scope = scopes.lock().unwrap()["reader"];
+        let new_scope = Scope {
+            key: NoteKey {
+                note: new_note,
+                ..old_scope.key
+            },
+            ..old_scope
+        };
+        {
+            let mut routes = scopes.lock().unwrap();
+            routes.insert("reader".into(), new_scope);
+            routes.insert("new-writer".into(), new_scope);
+        }
+        owner.bind("reader", id).unwrap();
+        let new_reader = owner.open("reader", new_note).unwrap().generation;
+        leases.bind_page("reader");
+        owner.bind("new-writer", id).unwrap();
+        let new_generation = owner.open("new-writer", new_note).unwrap().generation;
+        owner
+            .commit_queued("new-writer", new_generation, [2; 16], &[0, 0])
+            .unwrap();
+        assert!(
+            leases.start("reader").is_none(),
+            "new work waits behind old eval"
+        );
+        old_callback.unwrap()("\"stale\"".into());
+        assert_eq!(*delivered.lock().unwrap(), vec![new_reader]);
+        assert!(!owner.has_queued_delivery("reader"));
+    }
+    #[test]
+    fn obsolete_pre_post_failure_wakes_newly_queued_generation() {
+        let (owner, id, writer, _dir) = delivery_fixture();
+        let leases = Arc::new(DeliveryLeases::default());
+        leases.bind_page("reader");
+        owner
+            .commit_queued("writer", writer, [1; 16], &[0, 0])
+            .unwrap();
+        let old = leases.start("reader").unwrap();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&wakes);
+        let next: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        dispatch_surface(
+            &owner,
+            &leases,
+            "reader",
+            old,
+            |_, _| {
+                owner.bind("reader", id).unwrap();
+                owner.open("reader", [4; 32]).unwrap();
+                leases.bind_page("reader");
+                owner
+                    .commit_queued("writer", writer, [2; 16], &[0, 0])
+                    .unwrap();
+                false // The old scheduled post fails after navigation.
+            },
+            next,
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(owner.has_queued_delivery("reader"));
+        assert!(leases.start("reader").is_some());
+    }
     #[test]
     fn dispatcher_posts_one_eval_and_handles_lifecycle_completion_and_failure() {
         let (owner, id, writer, _dir) = delivery_fixture();
@@ -1024,6 +1920,11 @@ mod tests {
         leases.bind_page("reader");
         let replacement = leases.start("reader").unwrap();
         pending.pop().unwrap()("\"accepted\"".into());
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "replaced lease cannot wake"
+        );
         assert!(
             leases.current("reader", replacement),
             "late callback cannot release replacement"

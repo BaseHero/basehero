@@ -1,0 +1,56 @@
+{
+  "basehero-client-notes": {
+    "windows": [
+      "main",
+      "note-*"
+    ],
+    "commands": [
+      "note_binding",
+      "note_open",
+      "note_commit",
+      "note_selection",
+      "note_close",
+      "note_list",
+      "note_create",
+      "note_show",
+      "note_new_window",
+      "note_drained",
+      "note_drain_failed",
+      "update_status",
+      "update_not_now",
+      "update_install",
+      "window_sidebar"
+    ]
+  },
+  "basehero-client-setup": {
+    "windows": [
+      "main"
+    ],
+    "commands": [
+      "account_screen",
+      "account_retry",
+      "account_suggest_password",
+      "account_create",
+      "account_confirm_kit",
+      "account_return",
+      "account_print_kit",
+      "account_email_kit",
+      "account_save_kit_file",
+      "account_open_note"
+    ]
+  },
+  "basehero-client-window": {
+    "windows": [
+      "main",
+      "note-*"
+    ],
+    "platforms": [
+      "macOS"
+    ],
+    "commands": [],
+    "core": [
+      "core:window:allow-start-dragging",
+      "core:window:allow-internal-toggle-maximize"
+    ]
+  }
+}

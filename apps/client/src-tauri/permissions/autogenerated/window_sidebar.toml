@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-window-sidebar"
+description = "Enables the window_sidebar command without any pre-configured scope."
+commands.allow = ["window_sidebar"]
+
+[[permission]]
+identifier = "deny-window-sidebar"
+description = "Denies the window_sidebar command without any pre-configured scope."
+commands.deny = ["window_sidebar"]

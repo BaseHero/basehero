@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "basehero-client-window",
+  "description": "On a Mac the page's location bar is the title bar: it may move the window and zoom it on a double click, nothing else.",
+  "windows": [
+    "main",
+    "note-*"
+  ],
+  "platforms": [
+    "macOS"
+  ],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize"
+  ]
+}

@@ -6,7 +6,7 @@ window.readonlyHarness={
   async open(){
     this.writer=new Y.Doc();f(this.writer).insert(0,[p(),p(),new Y.XmlElement('future')]);
     const state=Y.encodeStateAsUpdate(this.writer);
-    this.view=await createNoteEditor(document.body,{open:async callback=>{this.receive=callback;return {state,unsubscribe(){}};},
+    this.view=await createNoteEditor(document.body,{open:async callback=>{this.receive=callback;return {clientId:2002468231004600,state,unsubscribe(){}};},
       commit:async()=>{throw Error('read-only must not save');}});
     this.stable=document.querySelectorAll('.note-content > div')[1];
     return this.view.state();
@@ -30,7 +30,7 @@ window.queueHarness={
   async open(){
     const initial=new Y.Doc();f(initial).insert(0,[p()]);
     const jobs=[];let view;
-    view=await createNoteEditor(document.body,{open:async callback=>{this.receive=callback;return {state:Y.encodeStateAsUpdate(initial),unsubscribe(){}};},
+    view=await createNoteEditor(document.body,{open:async callback=>{this.receive=callback;return {clientId:2002468231004600,state:Y.encodeStateAsUpdate(initial),unsubscribe(){}};},
       commit:(bytes,id)=>new Promise((resolve,reject)=>jobs.push({bytes:[...bytes],id,resolve,reject}))});
     this.jobs=jobs;this.view=view;this.initial=initial;
     return view.state();
@@ -47,14 +47,14 @@ window.queueHarness={
 window.historyFailureHarness=async()=>{
   const writer=new Y.Doc();f(writer).insert(0,[p()]);
   const root=document.createElement('div');document.body.append(root);
-  const view=await createNoteEditor(root,{open:async()=>({state:Y.encodeStateAsUpdate(writer),unsubscribe(){}}),
+  const view=await createNoteEditor(root,{open:async()=>({clientId:2002468231004600,state:Y.encodeStateAsUpdate(writer),unsubscribe(){}}),
     commit:async(_bytes,id)=>({requestId:id})});
   const original=Y.UndoManager.prototype.redo;
   Y.UndoManager.prototype.redo=()=>{throw new TypeError('redoItem');};
   let failed=false;
   const onError=event=>{failed=true;event.preventDefault();};
   window.addEventListener('error',onError);
-  root.querySelector('.note-controls button:nth-child(2)').click();
+  root.querySelector('.ProseMirror').dispatchEvent(new InputEvent('beforeinput',{inputType:'historyRedo',bubbles:true,cancelable:true}));
   window.removeEventListener('error',onError);
   Y.UndoManager.prototype.redo=original;
   const status={failed,mode:view.state().mode};
@@ -67,7 +67,7 @@ window.readFailureHarness=async phase=>{
   const original=Y.XmlFragment.prototype.toArray;
   try {
     if(phase==='open') Y.XmlFragment.prototype.toArray=()=>{throw Error('bad XML read');};
-    view=await createNoteEditor(root,{open:async cb=>{receive=cb;return {state:Y.encodeStateAsUpdate(writer),unsubscribe(){}};},
+    view=await createNoteEditor(root,{open:async cb=>{receive=cb;return {clientId:2002468231004600,state:Y.encodeStateAsUpdate(writer),unsubscribe(){}};},
       commit:async()=>{throw Error('unexpected commit');}});
     if(phase==='apply') {
       Y.XmlFragment.prototype.toArray=()=>{throw Error('bad XML read');};
@@ -82,7 +82,7 @@ window.nonTypeHarness=async(kind,location)=>{
   const initial=new Y.Doc(),writer=new Y.Doc();f(initial).insert(0,[p()]);
   const state=Y.encodeStateAsUpdate(initial);Y.applyUpdate(writer,state);
   let incoming,commits=0;window.__nonTypeBindingWrites=0;
-  const host={open:async callback=>{incoming=callback;return {state,unsubscribe(){}};},commit:async(_bytes,id)=>{commits++;return {requestId:id};}};
+  const host={open:async callback=>{incoming=callback;return {clientId:2002468231004600,state,unsubscribe(){}};},commit:async(_bytes,id)=>{commits++;return {requestId:id};}};
   const root=document.createElement('div');document.body.append(root);
   const view=await createNoteEditor(root,host);
   const before=Y.encodeStateVector(writer);

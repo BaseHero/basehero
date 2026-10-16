@@ -12,29 +12,27 @@ function capabilitiesIn(parsed) {
   return parsed.capabilities ?? [parsed];
 }
 
-test("shell bundles its assets and grants only the scoped native note commands", async () => {
+test("shell bundles its assets and grants no plugin or remote permissions, and core only to move its window", async () => {
   assert.equal(config.identifier, "app.basehero.client");
   assert.equal(config.build.frontendDist, "../ui");
   assert.equal(config.build.devUrl, undefined);
-  assert.deepEqual(config.app.security.capabilities, ["basehero-client-notes"]);
-  const build = await readFile(new URL("src-tauri/build.rs", root), "utf8");
-  for (const command of ["note_binding", "note_open", "note_commit", "note_close"]) {
-    assert(build.includes(`"${command}"`), `app command ${command} needs an ACL manifest`);
-  }
+  assert.deepEqual(config.app.security.capabilities, ["basehero-client-notes", "basehero-client-setup", "basehero-client-window"]);
 
-  // Explicit app-manifest commands require individual permissions. No plugin
-  // permissions (especially core:default), broad default or remote origins.
+  // command-acl.test.mjs checks the exact command union. Here: only app-command
+  // permissions, no plugin grants, no remote origins, and on a Mac only the two
+  // core window grants its location bar needs to move and zoom the window.
   const capabilitiesDir = new URL("src-tauri/capabilities/", root);
   const entries = await readdir(capabilitiesDir, { recursive: true });
   const capabilityFiles = entries.filter((name) => /\.(json|toml|json5)$/.test(name));
-  assert.deepEqual(capabilityFiles, ["shell.json"]);
+  assert.deepEqual(capabilityFiles.sort(), ["shell.json", "signup.json", "window.json"]);
   for (const name of capabilityFiles) {
     assert(name.endsWith(".json"), `capability ${name} must be JSON so the check can parse it`);
     const parsed = JSON.parse(await readFile(new URL(name, capabilitiesDir), "utf8"));
     for (const capability of capabilitiesIn(parsed)) {
-      assert.equal(capability.identifier, "basehero-client-notes");
-      assert.deepEqual(capability.windows, ["main", "note-*"]);
-      assert.deepEqual(capability.permissions, ["allow-note-binding", "allow-note-open", "allow-note-commit", "allow-note-close"]);
+      const prefixes = { "shell.json": ["allow-note-", "allow-update-", "allow-window-sidebar"], "signup.json": ["allow-account-"],
+        "window.json": ["core:window:allow-start-dragging", "core:window:allow-internal-toggle-maximize"] }[name];
+      if (name === "window.json") assert.deepEqual(capability.platforms, ["macOS"]);
+      for (const permission of capability.permissions) assert(prefixes.some((prefix) => permission.startsWith(prefix)), permission);
       assert.equal(capability.remote, undefined);
     }
   }
@@ -66,8 +64,7 @@ test("CSP refuses remote content, inline script and dynamic execution", () => {
   assert(!/https:|\*/.test(csp));
 });
 
-test("foundation screen never pretends that editing or an account is ready", () => {
-  assert(html.includes("Account setup and note editing are not available yet."));
+test("native-unavailable fallback grants no editing or account authority", () => {
   assert(!/<(?:input|textarea)|contenteditable/i.test(html));
   assert(!/localStorage|sessionStorage|indexedDB|fetch\s*\(|WebSocket/.test(js));
   assert(!/<script(?![^>]*\bsrc=)/i.test(html));

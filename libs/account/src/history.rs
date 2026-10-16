@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use indexed::{Indexed, KeyUse, Recent};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[cfg(test)]
 thread_local! {
@@ -15,7 +16,7 @@ const SIGNATURE_LEN: usize = 64;
 const DEVICE_LEN: usize = 32 + 32 + 1216;
 const RECOVERY_LEN: usize = 32 + 1216;
 const HEADER_LEN: usize = DOMAIN.len() + 2 + 2 + 8 + 32 + 32 + 32 + 1;
-const MAX_EVENT_LEN: usize = HEADER_LEN + DEVICE_LEN + RECOVERY_LEN + SIGNATURE_LEN;
+pub const MAX_EVENT_LEN: usize = HEADER_LEN + DEVICE_LEN + RECOVERY_LEN + SIGNATURE_LEN;
 
 /// An identity at the account home or within protected authority verification.
 /// This is not an ordinary base-service routing or tracking identifier.
@@ -51,6 +52,9 @@ pub enum Error {
     InvalidSetup,
     InvalidCredentials,
     CryptoFailure,
+    /// Local evidence is unavailable. Retry the same view after a transient read
+    /// failure; reload after an epoch reset or container closure. Never a stop.
+    Unavailable,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -343,13 +347,8 @@ impl AccountId {
 pub struct VerifiedAccount {
     id: AccountId,
     head: Head,
-    heads: BTreeMap<u64, [u8; 32]>,
-    // Retain past keys too: key reuse must not resurrect a removed identity.
-    devices: BTreeMap<DeviceId, DevicePublicKeys>,
-    // Exact public keys, including those of removed devices. Signing and
-    // control keys share a namespace so swapping their roles cannot reuse one.
-    used_signing: BTreeSet<[u8; 32]>,
-    used_receiving: BTreeSet<[u8; 1216]>,
+    recent: Recent,
+    indexed: Option<Indexed>,
     active: BTreeMap<DeviceId, DevicePublicKeys>,
     recovery: RecoveryPublicKeys,
     first: DeviceId,
@@ -384,11 +383,19 @@ impl VerifiedAccount {
         Ok(Self {
             id: anchor,
             head: event.head(),
-            heads: BTreeMap::from([(1, event.head().hash)]),
-            active: devices.clone(),
-            devices,
-            used_signing: BTreeSet::from([first.signing, first.control, recovery.signing]),
-            used_receiving: BTreeSet::from([first.receiving, recovery.receiving]),
+            recent: Recent {
+                heads: BTreeMap::from([(1, event.head().hash)]),
+                added: BTreeMap::from([(first.id(), (first.as_ref().clone(), 1))]),
+                removed: BTreeMap::new(),
+                used_signing: BTreeMap::from([
+                    (first.signing, 1),
+                    (first.control, 1),
+                    (recovery.signing, 1),
+                ]),
+                used_receiving: BTreeMap::from([(first.receiving, 1), (recovery.receiving, 1)]),
+            },
+            indexed: None,
+            active: devices,
             recovery: recovery.as_ref().clone(),
             first: first.id(),
             record_digest: None,
@@ -404,7 +411,7 @@ impl VerifiedAccount {
         for bytes in &history[1..] {
             state.apply_one(bytes)?;
         }
-        match state.heads.get(&remembered.position) {
+        match state.recent.heads.get(&remembered.position) {
             None => Err(Error::TruncatedHistory),
             Some(hash) if hash != &remembered.hash => Err(Error::Fork),
             Some(_) => Ok(state),
@@ -427,17 +434,28 @@ impl VerifiedAccount {
         self.running()?;
         self.active.get(&id).ok_or(Error::NotActive)
     }
-    /// Include removed identities so a scanner does not treat removal as a
-    /// fresh pending request for the same keys.
+    /// Compatibility hint, not an authoritative status API: unavailable evidence
+    /// conservatively counts as seen. Use `seen_device` to distinguish failure.
     pub fn has_seen_device(&self, id: DeviceId) -> bool {
-        self.devices.contains_key(&id)
+        self.seen_device(id).unwrap_or(true)
+    }
+    pub fn seen_device(&self, id: DeviceId) -> Result<bool, Error> {
+        if self.recent.added.contains_key(&id) {
+            return Ok(true);
+        }
+        self.indexed
+            .as_ref()
+            .map_or(Ok(false), |i| i.index.device_seen(i.cut, &id))
     }
     /// Compare an original signed event with this projection's verified chain.
     /// Useful for reconciling a staged event without replaying its entire prefix.
-    pub(crate) fn verified_event_at(&self, position: u64, bytes: &[u8]) -> bool {
-        self.heads
-            .get(&position)
-            .is_some_and(|head| *head == hash(bytes))
+    pub(crate) fn verified_event_at(&self, position: u64, bytes: &[u8]) -> Result<bool, Error> {
+        if let Some(head) = self.recent.heads.get(&position) {
+            return Ok(*head == hash(bytes));
+        }
+        self.indexed
+            .as_ref()
+            .map_or(Ok(false), |i| i.index.event_matches(i.cut, position, bytes))
     }
     pub fn active_devices(&self) -> Result<impl Iterator<Item = &DevicePublicKeys>, Error> {
         self.running()?;
@@ -450,6 +468,10 @@ impl VerifiedAccount {
     }
     /// The current verified publication (the initial one until rotation is
     /// implemented). Never infer it from a home-supplied object.
+    pub fn personal_public(&self) -> Result<&[u8; 1216], Error> {
+        Ok(self.personal_publication()?.public())
+    }
+
     pub(crate) fn personal_publication(&self) -> Result<&PersonalPublication, Error> {
         self.running()?;
         self.personal.as_ref().ok_or(Error::IncompleteMaterials)
@@ -504,7 +526,7 @@ impl VerifiedAccount {
         self.preparing_publication()?;
         if author != self.first
             || public == *self.recovery.receiving()
-            || self.used_receiving.contains(&public)
+            || self.key_used(KeyUse::Receiving(&public))?
         {
             return Err(Error::InvalidSetup);
         }
@@ -560,12 +582,12 @@ impl VerifiedAccount {
         }
     }
     fn check_new_device(&self, keys: &DevicePublicKeys) -> Result<(), Error> {
-        if self.devices.contains_key(&keys.id()) {
+        if self.seen_device(keys.id())? {
             return Err(Error::DuplicateDevice);
         }
-        if self.used_signing.contains(keys.signing())
-            || self.used_signing.contains(keys.control())
-            || self.used_receiving.contains(keys.receiving())
+        if self.key_used(KeyUse::Signing(keys.signing()))?
+            || self.key_used(KeyUse::Signing(keys.control()))?
+            || self.key_used(KeyUse::Receiving(keys.receiving()))?
         {
             return Err(Error::KeyReuse);
         }
@@ -574,8 +596,8 @@ impl VerifiedAccount {
     /// Apply one already ordered event to an owned candidate without copying its
     /// projection. For shared views use `Arc::unwrap_or_clone(view).applied(bytes)?`,
     /// which copies only when shared. It sets no stop: on error the candidate is
-    /// discarded, and the caller must record the stop itself and not continue
-    /// from a retained view.
+    /// discarded. Invalid events require the caller to record a stop; unavailable
+    /// local evidence permits retry from the unchanged accepted view.
     pub fn applied(mut self, bytes: &[u8]) -> Result<VerifiedAccount, Error> {
         self.running()?;
         self.apply_one(bytes)?;
@@ -593,7 +615,9 @@ impl VerifiedAccount {
         let mut candidate = self.clone();
         for bytes in events {
             if let Err(error) = candidate.apply_one(bytes) {
-                self.stopped = true;
+                if error != Error::Unavailable {
+                    self.stopped = true;
+                }
                 return Err(error);
             }
         }
@@ -621,14 +645,23 @@ impl VerifiedAccount {
             Control::Genesis { .. } => return Err(Error::UnsupportedControl),
             Control::AddDevice(keys) => {
                 self.check_new_device(keys)?;
-                self.used_signing.insert(*keys.signing());
-                self.used_signing.insert(*keys.control());
-                self.used_receiving.insert(*keys.receiving());
-                self.devices.insert(keys.id(), keys.as_ref().clone());
+                self.recent
+                    .used_signing
+                    .insert(*keys.signing(), event.position);
+                self.recent
+                    .used_signing
+                    .insert(*keys.control(), event.position);
+                self.recent
+                    .used_receiving
+                    .insert(*keys.receiving(), event.position);
+                self.recent
+                    .added
+                    .insert(keys.id(), (keys.as_ref().clone(), event.position));
                 self.active.insert(keys.id(), keys.as_ref().clone());
             }
             Control::RemoveSelf => {
                 self.active.remove(&event.author);
+                self.recent.removed.insert(event.author, event.position);
             }
             Control::RecoveryRecord(digest) => {
                 if event.position != 2 || event.author != self.first || self.record_digest.is_some()
@@ -643,7 +676,7 @@ impl VerifiedAccount {
                     || self.record_digest.is_none()
                     || self.personal.is_some()
                     || publication.public == *self.recovery.receiving()
-                    || self.used_receiving.contains(&publication.public)
+                    || self.key_used(KeyUse::Receiving(&publication.public))?
                 {
                     return Err(Error::InvalidSetup);
                 }
@@ -651,10 +684,12 @@ impl VerifiedAccount {
             }
         }
         self.head = event.head();
-        self.heads.insert(self.head.position, self.head.hash);
+        self.recent.heads.insert(self.head.position, self.head.hash);
         Ok(())
     }
 }
+
+pub(crate) mod indexed;
 
 #[cfg(test)]
 pub(crate) fn signature_checks() -> usize {
@@ -719,5 +754,8 @@ mod cost_tests {
         let scans = OVERLAP_CHECKS.with(|checks| checks.get());
         assert_eq!(account.head().position, 1001);
         assert_eq!(scans, 0, "historic device overlap scans: {scans}");
+        assert_eq!(account.recent.added.len(), 1001);
+        assert_eq!(account.recent.heads.len(), 1001);
+        assert!(account.summary().len() < 2700);
     }
 }

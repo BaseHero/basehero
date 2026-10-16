@@ -1,9 +1,10 @@
 //! Two short-lived read-only SQLite connections per file container. Rebuild a
 //! note in keyset pages without holding the writer or a long read snapshot.
-use crate::{NoteKey, StoreError};
+use crate::{NoteEntry, NoteKey, StoreError, catalogue};
 use bh_core::note::Note;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::{
+    fs::File,
     ops::Deref,
     path::PathBuf,
     sync::{
@@ -17,6 +18,9 @@ pub struct ReadPool {
     path: PathBuf,
     idle: Mutex<(Vec<Connection>, usize)>,
     available: Condvar,
+    // A borrowed read pool may outlive the writer; retain the lock until
+    // its connections are closed too.
+    _lock: Option<Arc<File>>,
     replayed_rows: AtomicUsize,
 }
 struct Lease<'a> {
@@ -53,13 +57,80 @@ pub struct LoadedNote {
     pub bytes: usize,
 }
 impl ReadPool {
-    pub(crate) fn new(path: PathBuf) -> Arc<Self> {
+    pub(crate) fn new(path: PathBuf, lock: Option<Arc<File>>) -> Arc<Self> {
         Arc::new(Self {
             path,
             idle: Mutex::new((Vec::new(), 0)),
             available: Condvar::new(),
+            _lock: lock,
             replayed_rows: AtomicUsize::new(0),
         })
+    }
+    /// One statement guards epoch/cut and the lookup, without the writer.
+    pub fn account_device_seen(
+        &self,
+        anchor: [u8; 32],
+        epoch: u64,
+        cut: u64,
+        device: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.account_evidence(anchor, epoch, cut, 0, device)
+    }
+    pub fn account_key_used(
+        &self,
+        anchor: [u8; 32],
+        epoch: u64,
+        cut: u64,
+        space: u8,
+        key: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.account_evidence(anchor, epoch, cut, space as u64 + 1, key)
+    }
+    fn account_evidence(
+        &self,
+        anchor: [u8; 32],
+        epoch: u64,
+        cut: u64,
+        kind: u64,
+        key: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let conn = self.lease()?;
+        let (guard, found): (bool,bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_projection WHERE id=1 AND anchor=?1 AND epoch=?2 AND through_position>=?3),
+            CASE WHEN ?4=0 THEN EXISTS(SELECT 1 FROM account_devices WHERE epoch=?2 AND device=?5 AND added<=?3)
+            ELSE EXISTS(SELECT 1 FROM account_key_use WHERE epoch=?2 AND space=?4-1 AND key=?5 AND added<=?3) END",
+            params![anchor.as_slice(),crate::account::sql(epoch)?,crate::account::sql(cut)?,crate::account::sql(kind)?,key.as_slice()], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        if !guard {
+            return Err(StoreError::AuthorityChanged);
+        }
+        Ok(found)
+    }
+    pub fn account_event_bytes(
+        &self,
+        anchor: [u8; 32],
+        epoch: u64,
+        cut: u64,
+        position: u64,
+        max_event: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.lease()?;
+        let (guard, bytes) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_projection WHERE id=1 AND anchor=?1 AND epoch=?2 AND through_position>=?3),
+            (SELECT bytes FROM account_events WHERE id=?4 AND id<=?3)",
+            params![anchor.as_slice(),crate::account::sql(epoch)?,crate::account::sql(cut)?,crate::account::sql(position)?], |r| {
+                let bytes = match r.get_ref(1)? {
+                    rusqlite::types::ValueRef::Null => None,
+                    _ => Some(crate::account::bounded_blob(r,1,max_event)?),
+                };
+                Ok((r.get::<_,bool>(0)?,bytes))
+            })?;
+        if !guard {
+            return Err(StoreError::AuthorityChanged);
+        }
+        if position <= cut && bytes.is_none() {
+            return Err(StoreError::CorruptAccount);
+        }
+        Ok(bytes)
     }
     fn lease(&self) -> Result<Lease<'_>, StoreError> {
         let mut idle = self.idle.lock().expect("read pool lock");
@@ -102,6 +173,16 @@ impl ReadPool {
     /// checkpoint counts as one apply; this counter counts SQLite tail rows.
     pub fn replayed_rows(&self) -> usize {
         self.replayed_rows.load(Ordering::Relaxed)
+    }
+    pub fn list_notes(
+        &self,
+        base: [u8; 32],
+        audience: [u8; 32],
+        after: Option<(i64, [u8; 32])>,
+        limit: usize,
+    ) -> Result<Vec<NoteEntry>, StoreError> {
+        let conn = self.lease()?;
+        catalogue::list(&conn, base, audience, after, limit)
     }
     pub fn note_state(&self, key: NoteKey) -> Result<ReadResult, StoreError> {
         self.note_state_with_progress(key, || {})

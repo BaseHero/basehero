@@ -7,7 +7,7 @@ use crate::crypto::{self, Secret};
 use crate::journal::{AccountJournal, JournalError, JournaledDevice, PendingSetupProtector};
 use crate::owner::{AccountCapability, AccountOwner, OwnerError};
 use crate::platform::{ControlKeyPolicy, DeviceKeyStore, KeyStoreError};
-use crate::{AccountId, DeviceId, DevicePublicKeys, Head, SigningRequest, VerifiedAccount};
+use crate::{AccountId, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, VerifiedAccount};
 
 const DOMAIN: &[u8; 8] = b"BHPAIR01";
 const PROOF_DOMAIN: &[u8] = b"BaseHero QR proof v1\0";
@@ -21,6 +21,7 @@ pub enum PairError {
     Malformed,
     UnsupportedVersion,
     History,
+    Unavailable,
     InvalidReply,
     CompetingReply,
     Ended,
@@ -96,7 +97,7 @@ pub async fn scanner_identity(
             .map_err(PairError::Device)?;
         return Ok(existing);
     }
-    if journal.load().map_err(PairError::Journal)?.is_some() {
+    if journal.has_account().map_err(PairError::Journal)? {
         return Err(PairError::WrongContext);
     }
     let device = store.create(policy).await.map_err(PairError::Device)?;
@@ -124,9 +125,23 @@ pub fn scanner_status(journal: &impl AccountJournal) -> Result<ScannerStatus, Pa
         .device()
         .map_err(PairError::Journal)?
         .ok_or(PairError::WrongContext)?;
-    let Some(record) = journal.load().map_err(PairError::Journal)? else {
+    if let Some(view) = journal.load_projection().map_err(PairError::Journal)? {
+        if view.stopped {
+            return Err(PairError::History);
+        }
+        if view.account.head() != view.target {
+            return Err(PairError::Unavailable);
+        }
+        return scanner_status_verified(&view.account, &device.keys);
+    }
+    if !journal.has_account().map_err(PairError::Journal)? {
         return Ok(ScannerStatus::Pending);
-    };
+    }
+    // Memory-only journals have no native index; verify original signed bytes.
+    let record = journal
+        .load()
+        .map_err(PairError::Journal)?
+        .ok_or(PairError::Unavailable)?;
     if record.stopped {
         return Err(PairError::History);
     }
@@ -146,16 +161,23 @@ pub(crate) fn scanner_status_verified(
     if state.is_stopped() {
         return Err(PairError::History);
     }
-    if !state.has_seen_device(keys.id()) {
+    if !state.seen_device(keys.id()).map_err(account_status_error)? {
         return Ok(ScannerStatus::Pending);
     }
     state
         .active_device(keys.id())
-        .map_err(|_| PairError::History)?;
-    if state.materials_ready().map_err(|_| PairError::History)? {
+        .map_err(account_status_error)?;
+    if state.materials_ready().map_err(account_status_error)? {
         Ok(ScannerStatus::ReadyForDelivery)
     } else {
         Ok(ScannerStatus::Added)
+    }
+}
+
+fn account_status_error(error: Error) -> PairError {
+    match error {
+        Error::Unavailable => PairError::Unavailable,
+        _ => PairError::History,
     }
 }
 

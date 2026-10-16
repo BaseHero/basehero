@@ -1,18 +1,69 @@
 /* Only a bound note host loads this stylesheet and the bundled editor module. */
-.note-controls { display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid var(--line); padding: 8px 0; }
-.note-controls[hidden] { display: none; }
-.note-controls button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 0; color: var(--text); font: 500 12px var(--mono); padding: 6px 10px; }
-.note-controls button:focus-visible { outline: 2px solid var(--yellow); }
-.note-content { min-height: 180px; padding: 12px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
-.note-content .ProseMirror { min-height: 180px; outline: none; }
-.note-content .ProseMirror:focus-visible { outline: 2px solid var(--yellow); outline-offset: 4px; }
+.note-bubble[hidden], .note-linkpop[hidden], .note-refusal[hidden], .note-large[hidden], .note-retry[hidden] { display: none; }
+/* The page: the writing gets the window. */
+.note-pane > section { max-width: 680px; margin: 0 auto; padding: 40px 48px 90px; }
+.note-content { overflow-wrap: anywhere; white-space: pre-wrap; }
+.note-content .ProseMirror { min-height: 60vh; outline: none; font-size: 16.5px; line-height: 1.66; }
+.note-content .ProseMirror:focus-visible { outline: none; }
+.note-content h1, .note-content h2, .note-content h3 { font-weight: 700; font-stretch: 80%; }
+.note-content h1 { font-size: 38px; line-height: 1.05; letter-spacing: -.005em; margin: 0 0 18px; }
+.note-content h2 { font-size: 22px; line-height: 1.2; margin: 28px 0 10px; }
+.note-content h3 { font-size: 18px; line-height: 1.3; margin: 22px 0 8px; }
+.note-content > .ProseMirror > :first-child { margin-top: 0; }
+.note-content p { margin: 0 0 12px; }
+.note-content ul, .note-content ol { padding-left: 22px; margin: 0 0 14px; }
+.note-content li { margin-bottom: 4px; }
+.note-content li > p, .note-content li > div > p { margin: 0; }
+.note-content li::marker { color: var(--text-3); }
+.note-content blockquote { margin: 0 0 14px; padding-left: 16px; border-left: 3px solid var(--line); color: var(--text-2); }
+.note-content code { font: 400 .88em/1 var(--mono); background: var(--panel-2); border: 1px solid var(--line); padding: 1px 5px; }
+.note-content a { color: inherit; text-decoration: underline; text-decoration-color: var(--blue); text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+.note-content ul[data-type="taskList"] { list-style: none; padding-left: 0; }
+.note-content ul[data-type="taskList"] > li { display: flex; align-items: baseline; gap: 12px; }
+.note-content ul[data-type="taskList"] > li > label { position: relative; flex: none; top: 3px; width: 16px; height: 16px; }
+.note-content ul[data-type="taskList"] > li > label > input { appearance: none; -webkit-appearance: none; display: block; width: 16px; height: 16px; margin: 0; border: 1.5px solid var(--text); border-radius: 0; background: none; cursor: pointer; }
+.note-content ul[data-type="taskList"] > li > label > input:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+.note-content ul[data-type="taskList"] > li[data-checked="true"] > label > input { background: var(--yellow); border-color: var(--yellow); }
+.note-content ul[data-type="taskList"] > li[data-checked="true"] > label::after { content: ""; position: absolute; left: 5px; top: 1px; width: 5px; height: 9px; border: solid var(--on-yellow); border-width: 0 2px 2px 0; transform: rotate(45deg); pointer-events: none; }
+.note-content ul[data-type="taskList"] > li > div { flex: 1; min-width: 0; }
+.note-content ul[data-type="taskList"] > li[data-checked="true"] > div { color: var(--text-2); text-decoration: line-through; text-decoration-color: var(--text-3); }
 /* A window's own selection remains locatable after that window loses focus. */
-.note-content .bh-own-selection { background: var(--yellow); color: #111; }
+.note-content .bh-own-selection { background: var(--select); }
 .note-content .bh-own-cursor { display: inline-block; height: 1em; border-left: 2px solid var(--yellow); margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
 /* Other open windows on this device only; never stored or synced. */
 .note-content .bh-peer-selection { background: #5aa9d366; }
 .note-content .bh-peer-cursor { display: inline-block; height: 1em; border-left: 2px solid #5aa9d3; margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
 .note-content .note-placeholder { display: inline-block; padding: 4px 8px; border: 1px solid var(--line); background: var(--panel-2); font: 500 12px var(--mono); }
-.note-content a { color: var(--text); text-decoration: underline; }
-.note-content ul[data-type="taskList"] { list-style: none; padding-left: 16px; }
-[data-status] { font: 500 12px var(--mono); color: var(--text-2); border-top: 1px solid var(--line); padding-top: 8px; }
+
+/* Notices inside the page: paused, refused, read-only. */
+.note-refusal, .note-large { margin: 0 0 24px; padding: 10px 14px; border: 1px solid var(--line-strong); background: var(--panel-2); font-size: 14px; line-height: 1.5; color: var(--text-2); }
+.note-refusal strong, .note-large strong { color: var(--text); font-weight: 600; }
+
+/* Formatting on a selection, and the link editor under it. */
+.note-bubble { position: fixed; z-index: 10; display: flex; align-items: center; height: 34px; padding: 0 3px; background: var(--bar); color: var(--on-bar-2); white-space: nowrap; }
+.note-bubble button { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 28px; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; }
+.note-bubble button:hover { color: var(--on-bar); }
+.note-bubble button[aria-pressed="true"] { color: var(--on-bar); background: var(--bar-2); box-shadow: inset 0 -2px 0 var(--yellow); }
+.note-bubble button:focus-visible { outline: 2px solid var(--yellow); outline-offset: -2px; }
+.note-bubble-rule { width: 1px; height: 18px; margin: 0 4px; background: var(--bar-line); }
+.note-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: square; stroke-linejoin: miter; }
+.note-glyph { display: inline-flex; width: 16px; justify-content: center; font: 600 15px/1 var(--sans); }
+.note-glyph.bold { font-weight: 700; }
+.note-glyph.italic { font-style: italic; font-weight: 500; }
+.note-glyph.heading { font-weight: 700; font-stretch: 80%; font-size: 16px; }
+.note-linkpop { position: fixed; z-index: 10; display: flex; align-items: center; gap: 6px; padding: 6px; background: var(--panel); border: 1px solid var(--line-strong); }
+.note-linkpop input { width: min(250px, 50vw); height: 28px; padding: 0 8px; border: 1px solid var(--line); border-radius: 0; background: var(--panel-2); color: var(--text); font: 400 13.5px/26px var(--sans); }
+.note-linkpop input:focus-visible { outline: 2px solid var(--yellow); outline-offset: -1px; }
+.note-linkpop input[aria-invalid="true"] { border-color: var(--line-strong); box-shadow: inset 0 -2px 0 var(--yellow); }
+.note-linkpop button { height: 28px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 0; background: none; color: var(--text); font: 600 13px/1 var(--sans); cursor: pointer; }
+.note-linkpop button.note-go { border-color: var(--yellow); background: var(--yellow); color: var(--on-yellow); }
+.note-linkpop button:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+
+/* The editor on its own, without the window's status line. */
+section > [data-status] { font: 500 12px var(--mono); color: var(--text-2); border-top: 1px solid var(--line); padding-top: 8px; }
+
+@media (max-width: 640px) {
+  .note-pane > section { padding: 26px 24px 70px; }
+  .note-content h1 { font-size: 30px; }
+  .note-content .ProseMirror { font-size: 16px; }
+}

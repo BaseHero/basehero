@@ -1,6 +1,6 @@
 # Real-app WebDriver tests
 
-These drive the real Tauri client (the setup shell) through `tauri-plugin-webdriver`
+These drive the real Tauri client (its first-run welcome screen) through `tauri-plugin-webdriver`
 over its loopback W3C endpoint, with one shared `spec.mjs` on every platform. They
 are opt-in and never part of the default or affected checks.
 
@@ -23,7 +23,7 @@ nix develop .#androidEmulator --command bash scripts/check.sh webdriver-android
 ```
 
 They are integration tests: a browser stub is not acceptance. Each writes
-`session-screenshot.png` (git-ignored) and fails on missing setup-screen text, a
+`session-screenshot.png` (git-ignored) and fails on missing welcome-screen text or actions, a
 changed URL after a click, an inline script that ran despite the CSP, or a
 screenshot that is not a valid non-empty PNG.
 
@@ -31,8 +31,8 @@ The plugin's unauthenticated endpoint has no Host or Origin check. Even on deskt
 loopback, a web page on the same machine can reach a running test build through
 DNS rebinding; only run feature builds for tests. The plugin also enables Tauri's
 default features in test builds (including `dynamic-acl`), unlike release, so ACL
-behaviour may differ. These tests do not exercise a privileged capability; the
-setup shell grants none.
+behaviour may differ. These tests call no native command; they only read the
+welcome screen and click a static heading.
 
 Android tests are emulator only; the driver never runs on physical devices. The
 runner intentionally refuses non-emulator devices before installing, deletes its

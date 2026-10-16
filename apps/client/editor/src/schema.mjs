@@ -9,11 +9,13 @@ import inventory from '../../../../note-schema/v1.json' with { type: 'json' };
 
 // The inventory is shared with bh-core. Do not silently add a StarterKit node:
 // every supported name, attribute and value must be checked before binding.
+// Inline code combines with other marks but excludes itself: y-tiptap stores
+// a non-self-excluding mark under a hashed `code--…` key the inventory lacks.
 export const extensions = [
   StarterKit.extend({
     addExtensions() {
       return this.parent().map(extension=>extension.name==='code'
-        ? extension.extend({excludes:''}) : extension);
+        ? extension.extend({excludes:'code'}) : extension);
     },
   }).configure({ undoRedo:false, trailingNode:false, codeBlock:false,
     horizontalRule:false, heading:{levels:inventory.nodes.heading.level.enum},
@@ -43,6 +45,27 @@ for (const [name,mark] of Object.entries(editorSchema.marks)) {
       throw new Error(`note schema mark exclusions diverged: ${name} excludes ${otherName}`);
   }
 }
+
+// Clock cost per ProseMirror position of one supported local edit (see
+// editBound in writer.mjs). y-tiptap writes one format key per mark type, or a
+// key hashed by attributes for a mark that does not exclude itself: bounded
+// only while such a mark has no attributes. An element writes its own item
+// and at most one item per attribute, over two positions (one for a leaf).
+const formatKeys=Object.values(editorSchema.marks).reduce((keys,mark)=>{
+  if (mark.excludes(mark)) return keys+1;
+  if (Object.keys(mark.attrs).length) throw new Error(`note schema mark has unbounded format keys: ${mark.name}`);
+  return keys+2;
+},0);
+export const positionCost=Math.max(2*formatKeys+2,...Object.values(editorSchema.nodes).map(node=>
+  Math.ceil((1+Object.keys(node.attrs).length)/(node.isLeaf?1:2))));
+
+// Local editing policy shared with the core's checked authoring: a note larger
+// than this many ProseMirror positions (UTF-16 units plus structure, about a
+// million characters) is kept and shown read-only. Never a reason to refuse,
+// truncate or stop saving content that is already accepted or received.
+export const editingPositions=inventory.editingPositions;
+export function withinEditingLimit(doc) {return doc.nodeSize<=editingPositions;}
+export const isLeafNode=name=>!!editorSchema.nodes[name]?.isLeaf;
 
 function valueMatches(rule, value) {
   if ('enum' in rule) return rule.enum.some(item => item === value);

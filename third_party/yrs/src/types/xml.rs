@@ -530,6 +530,41 @@ impl From<XmlElementPrelim> for In {
 pub struct XmlTextRef(BranchPtr);
 
 impl XmlTextRef {
+    /// Copies at most `chars` Unicode scalars of this text's literal visible
+    /// string: never formatting attributes, embeds or XML markup. Every linked
+    /// source item visited, including deleted and formatting items, charges
+    /// one unit of `items`; each copied scalar charges its UTF-8 length from
+    /// `bytes`. It stops after `chars` scalars without visiting the rest of
+    /// the text. An exhausted budget returns `Err(())`, never a shorter prefix.
+    pub fn plain_prefix<T: ReadTxn>(
+        &self,
+        _txn: &T,
+        items: &mut usize,
+        bytes: &mut usize,
+        chars: usize,
+    ) -> Result<String, ()> {
+        let mut next = self.0.start;
+        let mut result = String::new();
+        let mut count = 0;
+        while count < chars {
+            let Some(ptr) = next else { break };
+            *items = items.checked_sub(1).ok_or(())?;
+            let item: &Item = &ptr;
+            next = item.right;
+            if item.is_deleted() {
+                continue;
+            }
+            if let ItemContent::String(literal) = &item.content {
+                for ch in literal.as_str().chars().take(chars - count) {
+                    *bytes = bytes.checked_sub(ch.len_utf8()).ok_or(())?;
+                    result.push(ch);
+                    count += 1;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn get_string_fragment(
         head: Option<ItemPtr>,
         start: Option<&StickyIndex>,
@@ -1066,6 +1101,15 @@ pub trait XmlFragment: AsRef<Branch> {
         XmlNodes::new(iter, txn)
     }
 
+    /// Returns a lazy, budgeted cursor over this node's child source items,
+    /// borrowing `txn`. See [BoundedXmlChildren].
+    fn source_children<'a, T: ReadTxn>(&self, txn: &'a T) -> BoundedXmlChildren<'a, T> {
+        BoundedXmlChildren {
+            next: self.as_ref().start,
+            _txn: txn,
+        }
+    }
+
     /// Returns a number of elements stored in current array.
     fn len<T: ReadTxn>(&self, _txn: &T) -> u32 {
         self.as_ref().len()
@@ -1214,6 +1258,80 @@ where
 pub struct XmlNodes<'a, T> {
     iter: BlockIter,
     txn: &'a T,
+}
+
+/// Read-only cursor over an XML node's linked child source items, created by
+/// [XmlFragment::source_children]. Unlike [XmlFragment::children] and
+/// [XmlFragment::get], each [Self::next] call charges one unit of a caller-owned
+/// budget for *every* item it passes, including deleted items and non-XML
+/// values, so one budget can bound work across nested cursors. It never
+/// preloads or counts children.
+///
+/// ```
+/// use yrs::{Doc, Transact, WriteTxn, XmlElementPrelim, XmlFragment};
+/// let doc = Doc::new();
+/// let mut txn = doc.transact_mut();
+/// let root = txn.get_or_insert_xml_fragment("root");
+/// root.push_back(&mut txn, XmlElementPrelim::empty("p"));
+/// drop(txn);
+/// let txn = doc.transact();
+/// let mut cursor = root.source_children(&txn);
+/// let mut items = 1;
+/// assert!(cursor.next(&mut items).unwrap().is_some());
+/// assert!(cursor.next(&mut items).unwrap().is_none());
+/// ```
+///
+/// The cursor borrows the transaction it was created with, so it cannot be
+/// used after that transaction ends:
+///
+/// ```compile_fail
+/// use yrs::{Doc, Transact, XmlFragment};
+/// let doc = Doc::new();
+/// let root = doc.get_or_insert_xml_fragment("root");
+/// let mut cursor = {
+///     let txn = doc.transact();
+///     root.source_children(&txn)
+/// };
+/// let mut items = 1;
+/// let _ = cursor.next(&mut items);
+/// ```
+///
+/// nor across a mutation of the same transaction:
+///
+/// ```compile_fail
+/// use yrs::{Doc, Transact, WriteTxn, XmlElementPrelim, XmlFragment};
+/// let doc = Doc::new();
+/// let mut txn = doc.transact_mut();
+/// let root = txn.get_or_insert_xml_fragment("root");
+/// let mut cursor = root.source_children(&txn);
+/// root.push_back(&mut txn, XmlElementPrelim::empty("p"));
+/// let mut items = 1;
+/// let _ = cursor.next(&mut items);
+/// ```
+pub struct BoundedXmlChildren<'a, T: ReadTxn> {
+    next: Option<ItemPtr>,
+    _txn: &'a T,
+}
+
+impl<'a, T: ReadTxn> BoundedXmlChildren<'a, T> {
+    /// Returns the next live XML child, charging one unit of `items` per source
+    /// item passed. An exhausted budget returns `Err(())`, never `Ok(None)`.
+    pub fn next(&mut self, items: &mut usize) -> Result<Option<XmlOut>, ()> {
+        while let Some(ptr) = self.next {
+            *items = items.checked_sub(1).ok_or(())?;
+            let item: &Item = &ptr;
+            self.next = item.right;
+            if item.is_deleted() {
+                continue;
+            }
+            if let ItemContent::Type(inner) = &item.content {
+                if let Ok(node) = XmlOut::try_from(BranchPtr::from(inner)) {
+                    return Ok(Some(node));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl<'a, T: ReadTxn> XmlNodes<'a, T> {

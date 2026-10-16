@@ -7,7 +7,7 @@
 //! journal. This is deliberately not a generic key-value store.
 
 use crate::crypto::{Secret, SecretBytes};
-use crate::history::{AccountId, DevicePublicKeys, Head};
+use crate::history::{AccountId, DevicePublicKeys, Head, VerifiedAccount};
 
 /// Exact signed admission and signed recipient-encrypted delivery. The event's
 /// one-based position and predecessor are checked by the account layer, never
@@ -33,8 +33,10 @@ pub enum SetupStage {
     /// Local materials generated and signed; not submitted or ordered yet.
     Prepared,
     /// Submitted to the account home, result unknown. Reconcile the exact signed
-    /// bytes before treating it as ordered; never record it as a verified head.
+    /// bytes before treating it as home ordered.
     HomePending,
+    /// Home acknowledged the exact events and all three private objects.
+    HomeOrdered,
 }
 
 impl SetupStage {
@@ -42,6 +44,7 @@ impl SetupStage {
         match self {
             Self::Prepared => 0,
             Self::HomePending => 1,
+            Self::HomeOrdered => 2,
         }
     }
 
@@ -49,6 +52,7 @@ impl SetupStage {
         match code {
             0 => Some(Self::Prepared),
             1 => Some(Self::HomePending),
+            2 => Some(Self::HomeOrdered),
             _ => None,
         }
     }
@@ -83,6 +87,51 @@ pub struct JournaledAccount {
     pub stopped: bool,
 }
 
+/// Local owner-checked projection bound to its trusted anchor and exact head.
+/// Never supplied by an account home or a WebView.
+pub struct JournaledProjection {
+    pub account: VerifiedAccount,
+    pub stopped: bool,
+    /// Coherently captured current durable target; the view may be a rebuild cut.
+    pub target: Head,
+}
+
+/// A captured original-history prefix. Appends never change its final cut.
+/// This cursor is not authority; native callers must check their generation
+/// around a multi-page export.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub anchor: AccountId,
+    pub cut: Head,
+    pub next_position: u64,
+}
+impl std::fmt::Debug for HistoryCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryCursor")
+            .field("cut", &self.cut)
+            .field("next_position", &self.next_position)
+            .finish_non_exhaustive()
+    }
+}
+pub struct HistoryPage {
+    pub anchor: AccountId,
+    pub cut: Head,
+    pub first_position: u64,
+    pub events: Vec<Vec<u8>>,
+    pub next: Option<HistoryCursor>,
+}
+
+/// Exact protected-home objects and the original initial account cut. No code,
+/// recovery private key, or opened personal seed belongs here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InitialBootstrapRecord {
+    pub anchor: AccountId,
+    pub head: Head,
+    pub recovery_record: Vec<u8>,
+    pub device_seal: Vec<u8>,
+    pub recovery_seal: Vec<u8>,
+}
+
 /// Journal failures carry no identity, key or input bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalError {
@@ -101,6 +150,82 @@ pub enum JournalError {
 pub trait AccountJournal {
     /// Load the trusted anchor, original signed history, remembered head and stop.
     fn load(&self) -> Result<Option<JournaledAccount>, JournalError>;
+    /// Native journals return current authority or a resumable verified cut.
+    /// None permits full replay only for memory/remote journals.
+    fn load_projection(&self) -> Result<Option<JournaledProjection>, JournalError> {
+        Ok(None)
+    }
+    fn advance_projection(&mut self, _: &VerifiedAccount) -> Result<(), JournalError> {
+        Ok(())
+    }
+    /// Attach native evidence even after the first memory/genesis commit.
+    fn rebase_projection(&self, account: VerifiedAccount) -> Result<VerifiedAccount, JournalError> {
+        Ok(account)
+    }
+    fn has_account(&self) -> Result<bool, JournalError> {
+        Ok(self.load()?.is_some())
+    }
+    /// Limit 1..=256; every page is contiguous and ends at the captured cut,
+    /// never a moving current head. A gap, changed cut/account or oversized
+    /// original fails the whole page. None is only an absent account.
+    fn history_prefix(
+        &self,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<Option<HistoryPage>, JournalError> {
+        if !(1..=256).contains(&limit) {
+            return Err(JournalError::Corrupt);
+        }
+        let Some(record) = self.load()? else {
+            return if cursor.is_some() {
+                Err(JournalError::Corrupt)
+            } else {
+                Ok(None)
+            };
+        };
+        let c = cursor.unwrap_or(HistoryCursor {
+            anchor: record.anchor,
+            cut: record.head,
+            next_position: 1,
+        });
+        if c.anchor != record.anchor
+            || c.cut.position == 0
+            || c.cut.position > record.head.position
+            || (c.cut.position == record.head.position && c.cut.hash != record.head.hash)
+            || c.next_position == 0
+            || c.next_position > c.cut.position
+            || record
+                .history
+                .get((c.cut.position - 1) as usize)
+                .is_none_or(|bytes| crate::crypto::hash(bytes) != c.cut.hash)
+        {
+            return Err(JournalError::Corrupt);
+        }
+        let end = c
+            .cut
+            .position
+            .min(c.next_position.saturating_add(limit as u64 - 1));
+        let events = record
+            .history
+            .get((c.next_position - 1) as usize..end as usize)
+            .ok_or(JournalError::Corrupt)?;
+        if events
+            .iter()
+            .any(|e| e.len() > crate::history::MAX_EVENT_LEN)
+        {
+            return Err(JournalError::Corrupt);
+        }
+        Ok(Some(HistoryPage {
+            anchor: c.anchor,
+            cut: c.cut,
+            first_position: c.next_position,
+            events: events.to_vec(),
+            next: (end < c.cut.position).then_some(HistoryCursor {
+                next_position: end + 1,
+                ..c
+            }),
+        }))
+    }
 
     /// Append original signed bytes and set the resulting head and stop flag in
     /// one commit. An empty `events` slice only updates the stop flag; the head
@@ -135,8 +260,35 @@ pub trait AccountJournal {
         result
     }
 
+    /// Commit signed bytes and checked projection atomically, fencing under the writer guard.
+    fn commit_projected_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        head: Head,
+        stopped: bool,
+        projection: Option<&VerifiedAccount>,
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        let _ = projection;
+        self.commit_verified_fenced(anchor, events, head, stopped, fence)
+    }
+
     fn device(&self) -> Result<Option<JournaledDevice>, JournalError>;
     fn commit_device(&mut self, device: &JournaledDevice) -> Result<(), JournalError>;
+
+    /// Unsupported journals fail closed; they cannot silently lose the only
+    /// initial-device personal seal while deleting pending setup.
+    fn initial_bootstrap(&self) -> Result<Option<InitialBootstrapRecord>, JournalError> {
+        Err(JournalError::Storage)
+    }
+    fn retain_initial_bootstrap(
+        &mut self,
+        _record: &InitialBootstrapRecord,
+        _clear_pending: bool,
+    ) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
+    }
 
     fn pending_setup(&self) -> Result<Option<PendingSetupRecord>, JournalError>;
     fn commit_pending_setup(&mut self, setup: &PendingSetupRecord) -> Result<(), JournalError>;
@@ -155,8 +307,25 @@ pub trait AccountJournal {
 /// Native protection for the pending setup blob. A production adapter seals it
 /// with an OS-held key; no software fallback is offered here.
 pub trait PendingSetupProtector {
+    /// Create a fresh per-setup wrapping key for code-bearing material.
     fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ProtectorError>;
     fn open(&mut self, blob: &[u8]) -> Result<SecretBytes, ProtectorError>;
+    /// Seal a no-code replacement under a distinct key, retaining the old key
+    /// reference for crash-safe retirement after the replacement is durable.
+    fn reseal_without_code(
+        &mut self,
+        _old: &[u8],
+        _plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProtectorError> {
+        // Other platform adapters must explicitly implement safe retirement
+        // before first-device setup is enabled; never silently reuse a key.
+        Err(ProtectorError::Unavailable)
+    }
+    /// Idempotently retire the old code-bearing key; call on every restart of
+    /// a saved setup and before it may be cleared after home acknowledgement.
+    fn retire_kit_key(&mut self, _saved: &[u8]) -> Result<(), ProtectorError> {
+        Err(ProtectorError::Unavailable)
+    }
 }
 
 /// Protector failures carry no secret or handle.

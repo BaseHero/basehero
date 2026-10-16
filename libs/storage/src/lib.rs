@@ -9,6 +9,12 @@
 //! rebuildable indexes stay apart.
 
 pub mod account;
+mod catalogue;
+pub mod note_writers;
+pub mod own_base;
+pub use catalogue::{MAX_NOTE_PAGE, MAX_NOTE_TITLE, NoteEntry};
+mod view_records;
+pub use view_records::ViewRecord;
 mod local_reads;
 mod read_pool;
 pub use local_reads::{CheckpointJob, NoteSeed, PendingPage};
@@ -16,6 +22,8 @@ pub use read_pool::{LoadedNote, ReadPool, ReadResult};
 
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
+    io,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,12 +40,18 @@ pub enum OpenError {
     NewerData { found: u32, supported: u32 },
     #[error("local database could not be opened")]
     Database(#[from] rusqlite::Error),
+    #[error("container lock could not be opened: {0}")]
+    LockFile(#[from] io::Error),
+    #[error("container is owned by another process")]
+    Busy,
 }
 
 /// One owner for a device-local database. The connection is deliberately private:
 /// the UI receives domain operations, never arbitrary SQL or filesystem access.
 pub struct DeviceDatabase {
     connection: Connection,
+    // Dropped after the SQLite connection; never unlink the lock inode.
+    _lock: Option<Arc<File>>,
     readers: Option<Arc<ReadPool>>,
     notes: HashMap<NoteKey, CachedNote>,
     cache_bytes: usize,
@@ -79,6 +93,16 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid note update")]
     InvalidUpdate,
+    #[error("note is absent from the ordinary local catalogue")]
+    MissingNote,
+    #[error("note title exceeds the preview limit")]
+    InvalidNoteTitle,
+    #[error("note page exceeds the bounded limit or contains a corrupt id")]
+    InvalidNotePage,
+    #[error("local note touch counter exhausted")]
+    NoteCounterExhausted,
+    #[error("invalid window view record")]
+    InvalidViewRecord,
     #[error("note changed since working projection was loaded")]
     StaleNote,
     #[error("verified account anchor or availability changed")]
@@ -105,6 +129,10 @@ pub enum StoreError {
     StagedAdmissionChanged,
     #[error("staged account admission row is invalid")]
     CorruptStagedAdmission,
+    #[error("stored own-base record is inconsistent")]
+    CorruptOwnBase,
+    #[error("invalid or unavailable writer reservation")]
+    InvalidWriter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +147,9 @@ pub struct PendingNoteUpdate {
     pub update_id: i64,
     pub key: NoteKey,
     pub bytes: Vec<u8>,
+    /// Immutable joined proof preimage; None is explicitly legacy/fixture work.
+    /// Native packaging verifies derivation and encodes the shared declaration.
+    pub writer: Option<note_writers::WriterSlot>,
 }
 /// Seal `pending` with native authority only after releasing the owner/DB
 /// guards, then CAS-persist these exact bytes with publish_note_package.
@@ -144,11 +175,67 @@ pub struct StoredNotePackage {
 impl DeviceDatabase {
     /// Open without deleting or replacing existing data on any failure.
     ///
+    /// Container locking recognizes native `accounts/*.sqlite` paths only;
+    /// aliases (other case or hard links) are a known limit. Production paths
+    /// come from native container creation/enumeration, not untrusted input.
     /// Check compatibility before changing journal mode. Recheck while holding
     /// the migration write lock so concurrent openers cannot downgrade a version.
     /// Small schema changes and their version marker commit in one transaction.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
         let path = path.as_ref();
+        if path.extension().is_some_and(|ext| ext == "sqlite")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "accounts")
+        {
+            return Self::open_container(path);
+        }
+        Self::open_with_lock(path, None)
+    }
+
+    /// Native container entry point. Take the sibling advisory lock before
+    /// opening SQLite, and retain it for the lifetime of this shared database.
+    pub fn open_container(path: &Path) -> Result<Self, OpenError> {
+        let lock_path = path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        Self::lock_and_open(path, lock)
+    }
+
+    /// Claim a fresh random name by creating its lock inode exclusively,
+    /// then flock before allowing SQLite to create the database. `None` means
+    /// the caller should choose another random name.
+    pub fn create_container(path: &Path) -> Result<Option<Self>, OpenError> {
+        let lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path.with_extension("lock"))
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(OpenError::LockFile(error)),
+        };
+        // Do not overwrite an existing database whose lock inode was lost.
+        if path.exists() {
+            return Ok(None);
+        }
+        Self::lock_and_open(path, lock).map(Some)
+    }
+
+    fn lock_and_open(path: &Path, lock: File) -> Result<Self, OpenError> {
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(|_| OpenError::Busy)?;
+        Self::open_with_lock(path, Some(lock))
+    }
+
+    fn open_with_lock(path: &Path, lock: Option<File>) -> Result<Self, OpenError> {
+        let lock = lock.map(Arc::new);
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         ensure_supported(version(&connection)?)?;
@@ -157,9 +244,12 @@ impl DeviceDatabase {
         connection.pragma_update(None, "foreign_keys", true)?;
 
         initialize(&mut connection)?;
+        let readers = (path != Path::new(":memory:"))
+            .then(|| ReadPool::new(path.to_path_buf(), lock.clone()));
         Ok(Self {
             connection,
-            readers: (path != Path::new(":memory:")).then(|| ReadPool::new(path.to_path_buf())),
+            _lock: lock,
+            readers,
             notes: HashMap::new(),
             cache_bytes: 0,
             cache_budget: 32 * 1024 * 1024,
@@ -357,6 +447,51 @@ impl DeviceDatabase {
         request: [u8; 16],
         bytes: &[u8],
     ) -> Result<LocalCommit, StoreError> {
+        self.commit_working_update_inner(key, frontier, anchor, request, bytes, None, None)
+    }
+    /// Timed catalogue-aware variant for a future guarded owner. The title
+    /// must already have been derived outside session and writer guards.
+    pub fn commit_working_update_with_title_timed(
+        &mut self,
+        key: NoteKey,
+        frontier: i64,
+        anchor: [u8; 32],
+        request: [u8; 16],
+        bytes: &[u8],
+        title: &str,
+    ) -> Result<(LocalCommit, Duration), StoreError> {
+        let started = Instant::now();
+        let result =
+            self.commit_working_update_with_title(key, frontier, anchor, request, bytes, title)?;
+        Ok((result, started.elapsed()))
+    }
+    /// The caller derives the bounded preview from its working Note outside
+    /// the writer guard. This does not establish authority for the row/key.
+    pub fn commit_working_update_with_title(
+        &mut self,
+        key: NoteKey,
+        frontier: i64,
+        anchor: [u8; 32],
+        request: [u8; 16],
+        bytes: &[u8],
+        title: &str,
+    ) -> Result<LocalCommit, StoreError> {
+        if title.chars().count() > MAX_NOTE_TITLE {
+            return Err(StoreError::InvalidNoteTitle);
+        }
+        self.commit_working_update_inner(key, frontier, anchor, request, bytes, Some(title), None)
+    }
+    #[allow(clippy::too_many_arguments)] // One atomic delta/catalogue/proof write.
+    fn commit_working_update_inner(
+        &mut self,
+        key: NoteKey,
+        frontier: i64,
+        anchor: [u8; 32],
+        request: [u8; 16],
+        bytes: &[u8],
+        title: Option<&str>,
+        writer: Option<&note_writers::WriterSlot>,
+    ) -> Result<LocalCommit, StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -409,6 +544,13 @@ impl DeviceDatabase {
                 key.note.as_slice()
             ],
         )?;
+        if let Some(writer) = writer {
+            if writer.key != key || writer.account != anchor {
+                return Err(StoreError::InvalidWriter);
+            }
+            note_writers::link(&tx, id, writer)?;
+        }
+        catalogue::touch(&tx, key, title)?;
         tx.commit()?;
         Ok(LocalCommit {
             update_id: id,
@@ -474,6 +616,7 @@ impl DeviceDatabase {
                 key.note.as_slice()
             ],
         )?;
+        catalogue::touch(&tx, key, None)?;
         tx.commit()?;
         Ok(LocalCommit {
             update_id: id,
@@ -502,6 +645,7 @@ impl DeviceDatabase {
                     note: row.2.try_into().map_err(|_| StoreError::CorruptOutbox)?,
                 },
                 bytes: row.3,
+                writer: note_writers::pending_writer(&self.connection, update_id)?,
             },
         }))
     }
@@ -646,6 +790,7 @@ impl DeviceDatabase {
                     note: decode(3)?,
                 },
                 bytes: row.get(4)?,
+                writer: None,
             })
         })?;
         let mut result = Vec::new();
@@ -656,6 +801,8 @@ impl DeviceDatabase {
             if result.len() == 256 || bytes > 256 * 1024 {
                 return Err(StoreError::PageRequired);
             }
+            let mut row = row;
+            row.writer = note_writers::pending_writer(&self.connection, row.update_id)?;
             result.push(row);
         }
         Ok(result)
@@ -728,6 +875,9 @@ const MIGRATIONS: &[(u32, u32, Migration)] = &[
     (4, 5, migrate_v4_to_v5),
     (5, 6, migrate_v5_to_v6),
     (6, 7, migrate_v6_to_v7),
+    (7, 8, migrate_v7_to_v8),
+    (8, 9, migrate_v8_to_v9),
+    (9, 10, note_writers::migrate),
 ];
 
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
@@ -870,6 +1020,83 @@ fn migrate_v6_to_v7(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result
     // No production read uses this index. Keep the shipped v6 schema intact;
     // old databases remove it atomically when they next open.
     transaction.execute_batch("DROP INDEX note_updates_audience_id;")
+}
+
+fn migrate_v7_to_v8(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // Per-container, versioned local presentation only. Account verification
+    // and note authority never come from these rows.
+    transaction.execute_batch(
+        "CREATE TABLE view_records (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL,
+        base BLOB NOT NULL CHECK(length(base)=32),
+        audience BLOB NOT NULL CHECK(length(audience)=32),
+        note BLOB NOT NULL CHECK(length(note)=32),
+        anchor BLOB NOT NULL, head BLOB NOT NULL,
+        cursor_offset REAL NOT NULL,
+        x REAL NOT NULL, y REAL NOT NULL, width REAL NOT NULL, height REAL NOT NULL
+    );
+    CREATE TABLE note_counter (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        value INTEGER NOT NULL CHECK(value>=0)
+    );
+    INSERT INTO note_counter(id,value) VALUES (1,0);
+    CREATE TABLE notes (
+        base BLOB NOT NULL CHECK(length(base)=32),
+        audience BLOB NOT NULL CHECK(length(audience)=32),
+        note BLOB NOT NULL CHECK(length(note)=32),
+        touched INTEGER NOT NULL CHECK(touched>0),
+        title TEXT NOT NULL CHECK(length(title)<=80),
+        PRIMARY KEY(base,audience,note)
+    );
+    CREATE INDEX notes_recent ON notes(base,audience,touched DESC,note DESC);",
+    )
+}
+
+fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE account_projection (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            anchor BLOB NOT NULL CHECK(length(anchor)=32),
+            epoch INTEGER NOT NULL CHECK(epoch>0),
+            through_position INTEGER NOT NULL CHECK(through_position>=0),
+            through_hash BLOB NOT NULL CHECK(length(through_hash)=32),
+            summary BLOB NOT NULL
+        );
+        CREATE TABLE account_devices (
+            epoch INTEGER NOT NULL CHECK(epoch>0),
+            device BLOB NOT NULL CHECK(length(device)=32),
+            keys BLOB NOT NULL CHECK(length(keys)=1280),
+            added INTEGER NOT NULL CHECK(added>0),
+            removed INTEGER CHECK(removed IS NULL OR removed>added),
+            PRIMARY KEY(epoch,device)
+        ) WITHOUT ROWID;
+        CREATE INDEX account_devices_current ON account_devices(epoch,added) WHERE removed IS NULL;
+        CREATE TABLE account_key_use (
+            epoch INTEGER NOT NULL CHECK(epoch>0),
+            space INTEGER NOT NULL CHECK(space IN (0,1)),
+            key BLOB NOT NULL CHECK(length(key)=32),
+            added INTEGER NOT NULL CHECK(added>0),
+            PRIMARY KEY(epoch,space,key)
+        ) WITHOUT ROWID;
+        CREATE TABLE account_initial_bootstrap (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            anchor BLOB NOT NULL CHECK(length(anchor)=32),
+            head_position INTEGER NOT NULL CHECK(head_position=3),
+            head_hash BLOB NOT NULL CHECK(length(head_hash)=32),
+            recovery_record BLOB NOT NULL CHECK(length(recovery_record)=242),
+            device_seal BLOB NOT NULL CHECK(length(device_seal)=1299),
+            recovery_seal BLOB NOT NULL CHECK(length(recovery_seal)=1299)
+        );
+        CREATE TABLE own_base (
+            id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+            account BLOB NOT NULL UNIQUE CHECK(length(account)=32),
+            base BLOB NOT NULL CHECK(length(base)=32),
+            genesis_descriptor BLOB NOT NULL,
+            genesis_body BLOB NOT NULL,
+            initial_key_package BLOB NOT NULL
+        );",
+    )
 }
 
 #[cfg(test)]

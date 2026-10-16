@@ -12,6 +12,7 @@ use bh_account::{
         StoredDevice,
     },
 };
+use bh_mac_keychain_helper::{HelperError, Item, Request, process::HelperProcess};
 use bh_mac_local_auth::{GateError, approve_control};
 use security_framework::{
     access_control::{ProtectionMode, SecAccessControl},
@@ -21,16 +22,15 @@ use security_framework::{
     },
 };
 
-const SERVICE: &str = "app.basehero.client.device-keys.v1"; // M2 only
-const LOGIN_SERVICE: &str = "app.basehero.client.device-keys.login-v1"; // M1 only
+const SERVICE: &str = concat!(env!("BH_APP_IDENTIFIER"), ".device-keys.v1"); // M2 only
 const ORDINARY: &str = "ordinary";
 const RECEIVER: &str = "receiver";
 const CONTROL: &str = "control";
 const CONTROL_PUBLIC: &str = "control-public";
 const VERSION: u8 = 1;
-const PENDING_SETUP_SERVICE: &str = "app.basehero.client.pending-setup.login-v1"; // M1 only
-const PENDING_SETUP_ACCOUNT: &str = "wrapping-key";
 const WRAPPING_KEY_LEN: usize = 32;
+const PENDING_KIT: u8 = 1;
+const PENDING_HOME: u8 = 2;
 
 /// All four roles under one fresh 256-bit namespace form a device.
 /// The caller must persist the returned handle *and* original verified account
@@ -67,6 +67,30 @@ fn status_code(code: i32) -> KeyStoreError {
         -25300 => KeyStoreError::Invalidated,           // errSecItemNotFound
         -25293 | -25308 | -34018 => KeyStoreError::Unavailable, // failed auth, interaction, entitlement
         _ => KeyStoreError::StorageFailure,
+    }
+}
+
+// A refused login-keychain read is not proof that a key was lost. Surface it
+// as a failed unlock, then wait for the person's explicit Try again action.
+fn login_status_code(code: i32) -> KeyStoreError {
+    match code {
+        -25293 | -25308 => KeyStoreError::AuthenticationCancelled,
+        other => status_code(other),
+    }
+}
+
+#[cfg(test)]
+mod login_error_tests {
+    use super::*;
+    #[test]
+    fn refused_login_keychain_access_is_retryable_not_lost_identity() {
+        for code in [-128, -25293, -25308] {
+            assert_eq!(
+                login_status_code(code),
+                KeyStoreError::AuthenticationCancelled
+            );
+        }
+        assert_eq!(login_status_code(-25300), KeyStoreError::Invalidated);
     }
 }
 
@@ -345,20 +369,62 @@ impl DeviceKeyStore for MacKeyStore {
 /// obsolete pending operations and recheck the generation before consuming or
 /// dispatching a result. It carries `AppEnforcedOwnerConfirmation`, meaning the
 /// LA prompt below is a UI gate, NOT key-bound authentication. Code running as
-/// this Mac user can bypass it and use the software control seed. Legacy
-/// keychain ACLs may prompt again across unsigned/ad-hoc app updates.
-pub(super) struct MacLoginKeyStore;
+/// this Mac user can bypass it and use the software control seed. The legacy
+/// keychain asks again only when the Keychain helper's own bytes change.
+#[derive(Clone, Copy)]
+pub(crate) struct MacLoginKeyStore;
 
-fn login_options(handle: &KeyHandle, role: &str) -> PasswordOptions {
-    // No kSecUseDataProtectionKeychain and no synchronizable attribute: on a
-    // Mac in user context SecItem defaults to the file-based login keychain.
-    // Service differs from M2, so neither path reads the other's items.
-    PasswordOptions::new_generic_password(LOGIN_SERVICE, &name(handle, role))
+/// Every M1 login-keychain call goes through the Keychain helper beside the
+/// app executable. The helper creates the items, so their access list and
+/// partition name the helper, whose bytes stay the same across app updates.
+/// It stores them as before: generic passwords in the file-based login
+/// keychain, service `<identifier>.device-keys.login-v1` (or
+/// `.pending-setup.login-v2`), account `<hex handle>:<role>`.
+fn helper() -> &'static HelperProcess {
+    static HELPER: std::sync::LazyLock<HelperProcess> = std::sync::LazyLock::new(|| {
+        let program = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.join("bh-keychain-helper")))
+            .unwrap_or_default();
+        HelperProcess::new(program, Vec::new())
+    });
+    &HELPER
+}
+
+fn login_item(handle: &KeyHandle, role: &str) -> Item {
+    match role {
+        ORDINARY => Item::Ordinary(handle.0),
+        RECEIVER => Item::Receiver(handle.0),
+        CONTROL => Item::Control(handle.0),
+        CONTROL_PUBLIC => Item::ControlPublic(handle.0),
+        _ => unreachable!("not a device key role"),
+    }
+}
+
+// The OSStatus from the helper keeps today's meaning; a helper that is
+// missing, refuses us or breaks the protocol is a local failure, not key loss.
+fn helper_code(error: HelperError, map: fn(i32) -> KeyStoreError) -> KeyStoreError {
+    match error {
+        HelperError::Status(code) => map(code),
+        HelperError::Unavailable => KeyStoreError::StorageFailure,
+    }
+}
+
+fn helper_read(item: Item) -> Result<SecretBytes, HelperError> {
+    // Adopt the returned allocation at once; the helper's buffer is wiped on drop.
+    helper()
+        .call(&Request::Read(item))
+        .map(|value| SecretBytes::from_vec(value.to_vec()))
+}
+
+fn helper_add(item: Item, value: &[u8]) -> Result<(), HelperError> {
+    let value = bh_mac_keychain_helper::Zeroizing::new(value.to_vec());
+    helper().call(&Request::Add(item, value)).map(drop)
 }
 
 fn login_read(handle: &KeyHandle, role: &str) -> Result<Secret<32>, KeyStoreError> {
     let item =
-        SecretBytes::from_vec(generic_password(login_options(handle, role)).map_err(status)?);
+        helper_read(login_item(handle, role)).map_err(|e| helper_code(e, login_status_code))?;
     let bytes = item.expose();
     if bytes.len() != 34 || bytes[0] != VERSION {
         return Err(KeyStoreError::StorageFailure);
@@ -375,15 +441,14 @@ fn login_add(handle: &KeyHandle, role: &str, seed: &Secret<32>) -> Result<(), Ke
         seed.expose(),
     ])
     .map_err(|_| KeyStoreError::StorageFailure)?;
-    // macOS file-keychain default SecAccess trusts the creating app only for
-    // restricted reads; never grant access to every app. Fresh 256-bit handle
-    // and preflight avoid the wrapper's duplicate-item update behavior.
-    set_generic_password_options(bytes.expose(), login_options(handle, role)).map_err(status)
+    // macOS file-keychain default SecAccess trusts the creating code (the
+    // helper) only for restricted reads; never grant access to every app. The
+    // helper only adds, so an existing item is never replaced.
+    helper_add(login_item(handle, role), bytes.expose()).map_err(|e| helper_code(e, status_code))
 }
 fn login_control_public(handle: &KeyHandle) -> Result<[u8; 32], KeyStoreError> {
-    let item = SecretBytes::from_vec(
-        generic_password(login_options(handle, CONTROL_PUBLIC)).map_err(status)?,
-    );
+    let item = helper_read(login_item(handle, CONTROL_PUBLIC))
+        .map_err(|e| helper_code(e, login_status_code))?;
     let bytes = item.expose();
     if bytes.len() != 34
         || bytes[0] != VERSION
@@ -399,11 +464,11 @@ fn login_add_public(handle: &KeyHandle, public: &[u8; 32]) -> Result<(), KeyStor
         public,
     ])
     .map_err(|_| KeyStoreError::StorageFailure)?;
-    set_generic_password_options(bytes.expose(), login_options(handle, CONTROL_PUBLIC))
-        .map_err(status)
+    helper_add(login_item(handle, CONTROL_PUBLIC), bytes.expose())
+        .map_err(|e| helper_code(e, status_code))
 }
 fn login_delete(handle: &KeyHandle, role: &str) {
-    let _ = delete_generic_password_options(login_options(handle, role));
+    let _ = helper().call(&Request::Delete(login_item(handle, role)));
 }
 
 impl DeviceKeyStore for MacLoginKeyStore {
@@ -418,10 +483,10 @@ impl DeviceKeyStore for MacLoginKeyStore {
             .map_err(|_| KeyStoreError::WrongKey)?;
         let handle = KeyHandle(crypto::random());
         for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
-            match generic_password(login_options(&handle, role)) {
-                Err(error) if error.code() == -25300 => {} // errSecItemNotFound
+            match helper_read(login_item(&handle, role)) {
+                Err(HelperError::Status(-25300)) => {} // errSecItemNotFound
                 Ok(bytes) => {
-                    drop(SecretBytes::from_vec(bytes));
+                    drop(bytes);
                     return Err(KeyStoreError::Unavailable);
                 }
                 Err(_) => return Err(KeyStoreError::Unavailable),
@@ -507,53 +572,95 @@ impl DeviceKeyStore for MacLoginKeyStore {
 /// because silently generating a replacement would make the staged blob
 /// unopenable.
 ///
-/// The owner has no hook when the pending setup is cleared, so the single
-/// wrapping-key item is reused across later setups on this Mac; deleting it after
-/// setup completes is left to a later increment.
-pub(super) struct MacPendingSetupProtector;
+/// The code-bearing key belongs to one setup. The no-code home submission
+/// has a different key; an old WAL or backup ciphertext cannot be opened with
+/// the keys retained after a confirmed save.
+#[derive(Clone, Copy)]
+pub(crate) struct MacPendingSetupProtector;
 
-fn pending_setup_options() -> PasswordOptions {
-    // Ordinary file-based login keychain, like the M1 device keys: no
-    // kSecUseDataProtectionKeychain and no synchronizable attribute.
-    PasswordOptions::new_generic_password(PENDING_SETUP_SERVICE, PENDING_SETUP_ACCOUNT)
-}
-
-fn read_wrapping_key() -> Result<Option<Secret<32>>, ProtectorError> {
-    // Adopt the returned allocation immediately, including every error path.
-    let item = match generic_password(pending_setup_options()) {
-        Ok(bytes) => SecretBytes::from_vec(bytes),
-        Err(error) if error.code() == -25300 => return Ok(None), // errSecItemNotFound
-        Err(_) => return Err(ProtectorError::Failed),
-    };
-    let bytes = item.expose();
-    if bytes.len() != WRAPPING_KEY_LEN {
+fn read_wrapping_key(handle: &[u8; 32]) -> Result<Secret<32>, ProtectorError> {
+    // Fresh, independently named ordinary login-keychain item for each stage.
+    let item = helper_read(Item::Setup(*handle)).map_err(|error| match error {
+        HelperError::Status(-25300) => ProtectorError::Unavailable,
+        _ => ProtectorError::Failed,
+    })?;
+    if item.expose().len() != WRAPPING_KEY_LEN {
         return Err(ProtectorError::Failed);
     }
-    Secret::from_slice(bytes)
-        .map(Some)
-        .map_err(|_| ProtectorError::Failed)
+    Secret::from_slice(item.expose()).map_err(|_| ProtectorError::Failed)
 }
 
-fn create_wrapping_key() -> Result<Secret<32>, ProtectorError> {
+fn seal_with_fresh_key(
+    kind: u8,
+    old: Option<&[u8; 32]>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ProtectorError> {
+    let handle: [u8; 32] = crypto::random();
+    match helper_read(Item::Setup(handle)) {
+        Err(HelperError::Status(-25300)) => {}
+        _ => return Err(ProtectorError::Failed), // never overwrite an existing item
+    }
     let key = Secret::<32>::random();
+    let ciphertext = seal_pending_setup(&key, plaintext)?;
     let bytes = SecretBytes::from_parts(&[key.expose()]).map_err(|_| ProtectorError::Failed)?;
-    set_generic_password_options(bytes.expose(), pending_setup_options())
-        .map_err(|_| ProtectorError::Failed)?;
-    Ok(key)
+    helper_add(Item::Setup(handle), bytes.expose()).map_err(|_| ProtectorError::Failed)?;
+    let mut result = Vec::with_capacity(1 + 32 + old.map_or(0, |_| 32) + ciphertext.len());
+    result.push(kind);
+    result.extend_from_slice(&handle);
+    if let Some(old) = old {
+        result.extend_from_slice(old);
+    }
+    result.extend(ciphertext);
+    Ok(result)
 }
-
+fn pending_blob(blob: &[u8]) -> Result<(u8, [u8; 32], &[u8]), ProtectorError> {
+    if blob.len() < 1 + 32 + 24 + 16 {
+        return Err(ProtectorError::Failed);
+    }
+    let kind = blob[0];
+    let offset = match kind {
+        PENDING_KIT => 33,
+        PENDING_HOME => 65,
+        _ => return Err(ProtectorError::Failed),
+    };
+    let handle = blob[1..33].try_into().map_err(|_| ProtectorError::Failed)?;
+    let ciphertext = blob
+        .get(offset..)
+        .filter(|b| b.len() >= 24 + 16)
+        .ok_or(ProtectorError::Failed)?;
+    Ok((kind, handle, ciphertext))
+}
 impl PendingSetupProtector for MacPendingSetupProtector {
     fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ProtectorError> {
-        let wrapping = match read_wrapping_key()? {
-            Some(key) => key,
-            None => create_wrapping_key()?,
-        };
-        seal_pending_setup(&wrapping, plaintext)
+        seal_with_fresh_key(PENDING_KIT, None, plaintext)
     }
-
     fn open(&mut self, blob: &[u8]) -> Result<SecretBytes, ProtectorError> {
-        let wrapping = read_wrapping_key()?.ok_or(ProtectorError::Unavailable)?;
-        open_pending_setup(&wrapping, blob)
+        let (_, handle, ciphertext) = pending_blob(blob)?;
+        open_pending_setup(&read_wrapping_key(&handle)?, ciphertext)
+    }
+    fn reseal_without_code(
+        &mut self,
+        old: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProtectorError> {
+        let (kind, handle, _) = pending_blob(old)?;
+        if kind != PENDING_KIT {
+            return Err(ProtectorError::Failed);
+        }
+        seal_with_fresh_key(PENDING_HOME, Some(&handle), plaintext)
+    }
+    fn retire_kit_key(&mut self, saved: &[u8]) -> Result<(), ProtectorError> {
+        let (kind, _, _) = pending_blob(saved)?;
+        if kind != PENDING_HOME {
+            return Err(ProtectorError::Failed);
+        }
+        let old: [u8; 32] = saved[33..65]
+            .try_into()
+            .map_err(|_| ProtectorError::Failed)?;
+        match helper().call(&Request::Delete(Item::Setup(old))) {
+            Ok(_) | Err(HelperError::Status(-25300)) => Ok(()),
+            Err(_) => Err(ProtectorError::Failed),
+        }
     }
 }
 
@@ -561,14 +668,23 @@ impl PendingSetupProtector for MacPendingSetupProtector {
 const _: fn() = || {
     fn check<T: DeviceKeyStore>() {}
     check::<MacKeyStore>(); // retained M2 route, not selected
-    check::<MacLoginKeyStore>(); // M1 route, likewise not wired yet
+    check::<MacLoginKeyStore>(); // native M1 signup route
     fn check_protector<T: PendingSetupProtector>() {}
-    check_protector::<MacPendingSetupProtector>(); // M1, not constructed at startup
+    check_protector::<MacPendingSetupProtector>(); // native M1 signup route
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keychain_services_follow_the_app_identifier_and_keep_production_names() {
+        // The login-route names live in the helper, built for the same identifier.
+        let id = crate::APP_IDENTIFIER;
+        assert_eq!(SERVICE, format!("{id}.device-keys.v1"));
+        if id == "app.basehero.client" {
+            assert_eq!(SERVICE, "app.basehero.client.device-keys.v1");
+        }
+    }
     struct TestIo {
         ordinary: SigningKey,
         receiver: KemKey,
@@ -725,6 +841,49 @@ mod tests {
             }
         }
     }
+    /// Opt-in real macOS login-keychain check through a packaged helper beside
+    /// the test executable. A headless SSH context may not unlock the login
+    /// Keychain; never run automatically in CI.
+    #[test]
+    #[ignore = "requires interactive login Keychain; run explicitly on a logged-in Mac"]
+    fn real_login_keychain_separates_device_and_retired_kit_keys() {
+        struct Cleanup(KeyHandle);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
+                    login_delete(&self.0, role);
+                }
+            }
+        }
+        let mut store = MacLoginKeyStore;
+        let identity = tauri::async_runtime::block_on(
+            store.create(ControlKeyPolicy::AppEnforcedOwnerConfirmation),
+        )
+        .expect("create login Keychain device");
+        let _cleanup = Cleanup(identity.handle.clone());
+        let loaded = tauri::async_runtime::block_on(store.load(identity.handle.clone()))
+            .expect("load same device");
+        assert_eq!(identity.keys, loaded.keys);
+        let mut protector = MacPendingSetupProtector;
+        let kit = protector.seal(b"temporary test code").expect("kit stage");
+        let saved = protector
+            .reseal_without_code(&kit, b"home ciphertext only")
+            .expect("separate home key");
+        let (_, home_key, _) = pending_blob(&saved).unwrap();
+        protector
+            .retire_kit_key(&saved)
+            .expect("retire code-bearing key");
+        assert!(matches!(
+            protector.open(&kit),
+            Err(ProtectorError::Unavailable)
+        ));
+        assert_eq!(
+            protector.open(&saved).unwrap().expose(),
+            b"home ciphertext only"
+        );
+        let _ = helper().call(&Request::Delete(Item::Setup(home_key)));
+    }
+
     #[test]
     fn os_statuses_do_not_confuse_failed_auth_with_key_loss() {
         assert_eq!(status_code(-128), KeyStoreError::AuthenticationCancelled);

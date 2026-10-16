@@ -7,7 +7,7 @@ import { tauriIpcStub } from "./tauri-ipc-stub.mjs";
 
 function senderHost() {
   window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:crypto.randomUUID()}));
-  window.__bhIpc.handle("note_open", () => ({ state: [0, 0], generation: 7, sequence: 5 }));
+  window.__bhIpc.handle("note_open", () => ({clientId:window.__bhTestWriterId??2002468231004600,writerToken:Array(32).fill(9),state: [0, 0], generation: 7, sequence: 5 }));
   window.__bhIpc.handle("note_commit", (args) => new Promise((resolve) => {
     (window.__bhPendingAcks ??= []).push({ args, resolve });
   }));
@@ -17,7 +17,7 @@ function senderHost() {
 function receiverHost() {
   window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:'42'}));
   window.__bhIpc.handle("note_open", () => new Promise((resolve) => {
-    window.__bhFinishOpen = () => resolve({ state: [0, 0], generation: 7, sequence: 5 });
+    window.__bhFinishOpen = () => resolve({clientId:2002468231004601,writerToken:Array(32).fill(9),state: [0, 0], generation: 7, sequence: 5 });
   }));
   window.__bhIpc.handle("note_commit", (args) => ({ requestId: args.requestId }));
   window.__bhIpc.handle("note_close", () => null);
@@ -38,7 +38,7 @@ for (const browserName of browserMatrix) {
         await page.addInitScript(tauriIpcStub);
         await page.addInitScript(() => {
           window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:'42'}));
-          window.__bhIpc.handle('note_open', () => ({state:[0,0],generation:7,sequence:5}));
+          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5}));
           window.__bhIpc.handle('note_close', () => null);
         });
         // Only the editor is fault-injected; the actual bundled bridge handles
@@ -74,7 +74,7 @@ for (const browserName of browserMatrix) {
         await page.addInitScript(tauriIpcStub);
         await page.addInitScript(() => {
           window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
-          window.__bhIpc.handle('note_open',()=>new Promise(resolve=>{window.__bhResolve=()=>resolve({state:[0,0],generation:7,sequence:5});}));
+          window.__bhIpc.handle('note_open',()=>new Promise(resolve=>{window.__bhResolve=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5});}));
           window.__bhIpc.handle('note_close',()=>null);
         });
         await page.route('**/note-editor.js',route=>route.fulfill({contentType:'text/javascript',body:`
@@ -114,6 +114,45 @@ for (const browserName of browserMatrix) {
         await page.close();
       } finally {await browser.close();await server.close();}
     });
+    test("only a capacity rollover passes the current writer token to native open", async () => {
+      const server=await startUiServer();const browser=await launchBrowser(browserName);
+      try {
+        const page=await browser.newPage();
+        await page.addInitScript(tauriIpcStub);
+        await page.addInitScript(() => {
+          let opens=0;
+          window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
+          window.__bhIpc.handle('note_open',()=>{
+            opens++;
+            if (opens===3) throw 'note changed; retry open';
+            // Three successful native opens whose arrivals overflow the buffer.
+            if (opens>=5 && opens<=7) for (let i=1;i<=257;i++)
+              window.dispatchEvent(new CustomEvent('bh-note-update',{detail:{generation:opens,sequence:i,update:[0,0]}}));
+            return {clientId:opens,writerToken:Array(32).fill(opens),state:[0,0],generation:opens,sequence:0};
+          });
+          window.__bhIpc.handle('note_close',()=>null);
+        });
+        await page.route('**/note-editor.js',route=>route.fulfill({contentType:'text/javascript',body:`
+          export async function createNoteEditor(root,host) {
+            await host.open(()=>{});
+            await host.open(()=>{});
+            await host.open(()=>{},{retire:true});
+            await host.open(()=>{},{retire:true}).catch(()=>{});
+            await host.open(()=>{},{retire:true});
+            window.__bhOpened=true;
+            return {state:()=>({pending:0}),close(){}};
+          }
+        `}));
+        await page.goto(`${server.origin}/`,{waitUntil:'load'});
+        await page.waitForFunction(()=>window.__bhOpened===true);
+        const opens=await page.evaluate(()=>window.__bhIpc.calls.filter(c=>c.command==='note_open').map(c=>c.args));
+        // Ordinary opens never name a writer; the rollover names the current
+        // one, its bridge-level Changed retry keeps naming that same token, and
+        // a native open that succeeded before the page gave up is the current one.
+        assert.deepEqual(opens.map(args=>args.retireWriter?.[0]??null),[null,null,2,2,4,5,6,7]);
+        await page.close();
+      } finally {await browser.close();await server.close();}
+    });
     test("retryable native open never falls back to empty editing or setup", async () => {
       const server=await startUiServer();const browser=await launchBrowser(browserName);
       try {
@@ -122,15 +161,15 @@ for (const browserName of browserMatrix) {
           let calls=0;
           window.__bhIpc.handle('note_open',()=>{
             if (++calls<3) throw 'note changed; retry open';
-            return {state:[0,0],generation:9,sequence:0};
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:9,sequence:0};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
         }]});
         await page.locator('.ProseMirror').waitFor();
-        assert.equal(await page.locator('header strong').textContent(),'NOTE');
+        assert.equal(await page.locator('header .crumb').textContent(),'My base');
         assert.equal(await page.evaluate(()=>window.__bhIpc.calls.filter(call=>call.command==='note_open').length),3);
-        assert.equal(await page.locator('[role="status"]').textContent(),'Saved on this device');
+        assert.equal(await page.locator('[role="status"]').textContent(),'Saved on this Mac');
         await page.close();
       } finally {await browser.close();await server.close();}
     });
@@ -142,14 +181,14 @@ for (const browserName of browserMatrix) {
           let calls=0;
           window.__bhIpc.handle('note_open',()=>{
             if (++calls===1) throw 'note unavailable';
-            return {state:[0,0],generation:9,sequence:0};
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:9,sequence:0};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
         }]});
         await page.getByRole('button',{name:'Retry opening note'}).waitFor();
         assert.equal(await page.locator('.ProseMirror').count(),0);
-        assert.equal(await page.locator('header strong').textContent(),'NOTE');
+        assert.equal(await page.locator('header strong').textContent(),'Notes');
         await page.getByRole('button',{name:'Retry opening note'}).click();
         await page.locator('.ProseMirror').waitFor();
         assert.equal(await page.evaluate(()=>window.__bhIpc.calls.filter(c=>c.command==='note_open').length),2);
@@ -168,8 +207,8 @@ for (const browserName of browserMatrix) {
           window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
           let opens=0;
           window.__bhIpc.handle('note_open',()=>{
-            if (++opens===1) return new Promise(resolve=>{window.__bhFirstOpen=()=>resolve({state:[0,0],generation:7,sequence:5});});
-            return {state:window.__bhCommittedState,generation:8,sequence:258};
+            if (++opens===1) return new Promise(resolve=>{window.__bhFirstOpen=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5});});
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:window.__bhCommittedState,generation:8,sequence:258};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
@@ -196,7 +235,7 @@ for (const browserName of browserMatrix) {
         await source.keyboard.insertText('remote');
         await source.waitForFunction(() => window.__bhPendingAcks?.length === 1);
         const remote = await source.evaluate(() => window.__bhPendingAcks[0].args.update);
-        const view = await openPage(browser, server.origin, {extraInit:[senderHost]});
+        const view = await openPage(browser, server.origin, {extraInit:[senderHost,()=>{window.__bhTestWriterId=2002468231004601;}]});
         await view.locator('.ProseMirror').waitFor();
         await view.locator('.ProseMirror').click();
         await view.keyboard.insertText('local');
@@ -207,7 +246,7 @@ for (const browserName of browserMatrix) {
         })),remote);
         await view.waitForFunction(() => document.querySelector('.ProseMirror')?.textContent.includes('remote'));
         assert.match(await view.locator('.ProseMirror').textContent(),/local/);
-        assert.notEqual(await view.locator('[role="status"]').textContent(),'Saved on this device');
+        assert.equal(await view.locator('[role="status"]').textContent(),'Saved on this Mac');
         // A failed save keeps exactly the same request bytes. Another overflow
         // merge does not take the destructive editor close/recreate path.
         await view.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:'wrong-id'}));
@@ -220,7 +259,7 @@ for (const browserName of browserMatrix) {
         const retry = await view.evaluate(() => window.__bhPendingAcks[1].args);
         assert.deepEqual(retry,before);
         await view.evaluate(() => window.__bhPendingAcks[1].resolve({requestId:window.__bhPendingAcks[1].args.requestId}));
-        await view.waitForFunction(() => document.querySelector('[role="status"]').textContent === 'Saved on this device');
+        await view.waitForFunction(() => document.querySelector('[role="status"]').textContent === 'Saved on this Mac');
         const text = await view.locator('.ProseMirror').textContent();
         assert.match(text,/remote/);assert.match(text,/local/);
         assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_commit').length),2);
@@ -236,13 +275,13 @@ for (const browserName of browserMatrix) {
         });
         assert.equal(await unbound.locator("header strong").textContent(), "SETUP");
         assert.equal(await unbound.locator(".ProseMirror").count(), 0);
-        assert.deepEqual(await unbound.evaluate(() => window.__bhIpc.calls.map(c => c.command)), ["note_binding"]);
+        assert.deepEqual(await unbound.evaluate(() => window.__bhIpc.calls.map(c => c.command).filter(c => !c.startsWith("update_"))), ["note_binding", "account_screen"]);
         assert.equal(await unbound.evaluate(() => window.__bhStorageReads), 0);
         await unbound.close();
 
         const sender = await openPage(browser, server.origin, { extraInit: [senderHost] });
         await sender.locator(".ProseMirror").waitFor();
-        assert.equal(await sender.locator("header strong").textContent(), "NOTE");
+        assert.equal(await sender.locator("header .crumb").textContent(), "My base");
         assert.equal(await sender.locator(".note-content").count(), 1);
         assert.equal(await sender.evaluate(() => window.__bhStorageReads), 0);
         await sender.locator(".ProseMirror").click();
@@ -252,22 +291,22 @@ for (const browserName of browserMatrix) {
         assert.equal(first.generation, 7);
         assert.equal(typeof first.requestId, "string");
         assert.ok(first.update.length > 0);
-        assert.notEqual(await sender.locator('[role="status"]').textContent(), "Saved on this device");
+        assert.equal(await sender.locator('[role="status"]').textContent(), "Saved on this Mac");
         await sender.evaluate(() => window.__bhPendingAcks[0].resolve({ requestId: "wrong-id" }));
         await sender.getByRole("button", { name: "Retry save" }).waitFor({ state: "visible" });
-        assert.notEqual(await sender.locator('[role="status"]').textContent(), "Saved on this device");
+        assert.notEqual(await sender.locator('[role="status"]').textContent(), "Saved on this Mac");
         await sender.getByRole("button", { name: "Retry save" }).click();
         await sender.waitForFunction(() => window.__bhPendingAcks.length === 2);
         const retry = await sender.evaluate(() => window.__bhPendingAcks[1].args);
         assert.deepEqual(retry, first, "retry preserves the same request and update");
         await sender.evaluate(() => window.__bhPendingAcks[1].resolve({ requestId: window.__bhPendingAcks[1].args.requestId }));
-        await sender.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Saved on this device");
+        await sender.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Saved on this Mac");
         await sender.keyboard.insertText("!");
         await sender.waitForFunction(() => window.__bhPendingAcks.length === 3);
         const later = await sender.evaluate(() => window.__bhPendingAcks[2].args);
         assert.equal(later.generation, 7);
         await sender.evaluate(() => window.__bhPendingAcks[2].resolve({ requestId: window.__bhPendingAcks[2].args.requestId }));
-        await sender.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Saved on this device");
+        await sender.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Saved on this Mac");
 
         const receiver = await openPage(browser, server.origin, { extraInit: [receiverHost] });
         await receiver.waitForFunction(() => typeof window.__bhFinishOpen === "function");
@@ -292,7 +331,7 @@ for (const browserName of browserMatrix) {
         await receiver.keyboard.press("End");
         await receiver.keyboard.insertText(" world");
         await receiver.waitForFunction(() => document.querySelector(".ProseMirror").textContent === "hello! world");
-        await receiver.getByRole("button", { name: "Undo" }).click();
+        await receiver.locator(".ProseMirror").press("ControlOrMeta+z");
         await receiver.waitForFunction(() => document.querySelector(".ProseMirror").textContent === "hello!");
         assert.equal(await receiver.locator(".ProseMirror").textContent(), "hello!",
           "local Undo leaves incoming content intact");

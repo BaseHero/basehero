@@ -8,7 +8,9 @@
 //! `bh-storage::DeviceDatabase::open`, not to release metadata.
 
 pub mod download;
-#[cfg(any(target_os = "macos", test))]
+// Linux builds carry the same exchange so the app's update coordinator tests
+// run real bundle replacement on fixture directories; only macOS wires it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub mod mac_installer;
 
 use std::io::{self, Read};
@@ -100,7 +102,8 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+/// Decode a canonical lowercase hex value of exactly N bytes.
+pub fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     if !lower_hex(value, 2 * N) {
         return None;
     }

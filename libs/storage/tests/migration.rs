@@ -104,6 +104,93 @@ fn write_v6(path: &std::path::Path) {
 }
 
 #[test]
+fn v7_to_current_retains_pending_work_and_rejects_newer_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.sqlite");
+    write_v6(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX note_updates_audience_id; PRAGMA user_version=7;")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
+        params![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 16], b"unsent"],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO pending_note_work(update_id) VALUES (1)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO pending_scope(update_id,base,audience,note) VALUES (1,?1,?2,?3)",
+        params![[1u8; 32], [2u8; 32], [3u8; 32]],
+    )
+    .unwrap();
+    drop(conn);
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
+    assert_eq!(db.pending_note_updates().unwrap()[0].bytes, b"unsent");
+    assert!(
+        !db.pending_page([1; 32], [2; 32], Some([3; 32]), 0, 10, 4096)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let note = db.create_note([1; 32], [2; 32]).unwrap();
+    assert_eq!(
+        db.list_notes([1; 32], [2; 32], None, 50).unwrap()[0].note,
+        note
+    );
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", LOCAL_DATA_VERSION + 1)
+        .unwrap();
+    drop(conn);
+    assert!(matches!(
+        DeviceDatabase::open(&path),
+        Err(OpenError::NewerData {found,supported}) if found==LOCAL_DATA_VERSION+1 && supported==LOCAL_DATA_VERSION
+    ));
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(version(&conn), LOCAL_DATA_VERSION + 1);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pending_note_work", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn failed_v8_to_v9_rolls_back_projection_and_preserves_pending_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v8.sqlite");
+    drop(DeviceDatabase::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
+        params![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 16], b"unsent"],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO pending_note_work(update_id) VALUES (1)", [])
+        .unwrap();
+    conn.execute_batch("DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; PRAGMA user_version=8; CREATE TABLE own_base(bogus INTEGER);").unwrap();
+    drop(conn);
+    assert!(DeviceDatabase::open(&path).is_err());
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(version(&conn), 8);
+    assert!(!table_exists(&conn, "account_projection"));
+    assert!(!table_exists(&conn, "account_initial_bootstrap"));
+    assert_eq!(
+        conn.query_row("SELECT delta FROM note_updates WHERE id=1", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        b"unsent"
+    );
+    conn.execute_batch("DROP TABLE own_base;").unwrap();
+    drop(conn);
+    let db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
+    assert_eq!(db.pending_note_updates().unwrap()[0].bytes, b"unsent");
+}
+
+#[test]
 fn v6_to_v7_removes_only_unused_index_and_preserves_rows_and_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v6.sqlite");
@@ -129,7 +216,7 @@ fn v6_to_v7_removes_only_unused_index_and_preserves_rows_and_checkpoint() {
     assert_eq!(db.pending_note_updates().unwrap()[0].bytes, delta);
     drop(db);
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(version(&conn), 7);
+    assert_eq!(version(&conn), LOCAL_DATA_VERSION);
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name='note_updates_audience_id'",
@@ -413,7 +500,7 @@ fn v3_to_v4_preserves_pending_notes_and_account_journal() {
     // addition is note_outbox. Keep the actual note and account rows untouched.
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE pending_scope_backfill; DROP TABLE pending_scope; DROP TABLE note_checkpoints; DROP INDEX IF EXISTS note_updates_audience_id; DROP TABLE account_staged_admission; DROP TABLE note_outbox; PRAGMA user_version=3",
+        "DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE pending_scope_backfill; DROP TABLE pending_scope; DROP TABLE note_checkpoints; DROP INDEX IF EXISTS note_updates_audience_id; DROP TABLE account_staged_admission; DROP TABLE note_outbox; PRAGMA user_version=3",
     )
     .unwrap();
     drop(conn);
@@ -434,7 +521,7 @@ fn failed_v4_migration_rolls_back_marker_and_keeps_v3_rows() {
     drop(DeviceDatabase::open(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE note_outbox; PRAGMA user_version=3; CREATE TABLE note_outbox (bogus INTEGER)",
+        "DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE note_outbox; PRAGMA user_version=3; CREATE TABLE note_outbox (bogus INTEGER)",
     )
     .unwrap();
     drop(conn);

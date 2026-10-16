@@ -14,16 +14,19 @@
         "width": 1000,
         "height": 760,
         "minWidth": 320,
-        "minHeight": 400
+        "minHeight": 400,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 19 }
       }
     ],
     "security": {
-      "capabilities": ["basehero-client-notes"],
+      "capabilities": ["basehero-client-notes", "basehero-client-setup", "basehero-client-window"],
       "csp": "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'"
     }
   },
   "bundle": {
     "active": false,
-    "icon": ["../ui/icon.png"]
+    "icon": ["../ui/icon.png", "../ui/icon.icns"]
   }
 }

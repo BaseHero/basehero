@@ -1,7 +1,23 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "basehero-client-notes",
-  "description": "Only the bound note interface on the client window; no core or plugin permissions.",
+  "description": "Only the bound note interface, update status/install and the notes-list choice on the client windows; no core or plugin permissions.",
   "windows": ["main", "note-*"],
-  "permissions": ["allow-note-binding", "allow-note-open", "allow-note-commit", "allow-note-close"]
+  "permissions": [
+    "allow-note-binding",
+    "allow-note-open",
+    "allow-note-commit",
+    "allow-note-selection",
+    "allow-note-close",
+    "allow-note-list",
+    "allow-note-create",
+    "allow-note-show",
+    "allow-note-new-window",
+    "allow-note-drained",
+    "allow-note-drain-failed",
+    "allow-update-status",
+    "allow-update-not-now",
+    "allow-update-install",
+    "allow-window-sidebar"
+  ]
 }

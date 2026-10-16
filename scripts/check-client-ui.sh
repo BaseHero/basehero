@@ -18,6 +18,14 @@ if [ -z "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
 fi
 export PLAYWRIGHT_BROWSERS_PATH
 
+# Some browser tests build Yjs updates with the editor's own patched Yjs, so
+# its packages are installed and prepared first, even when this runs alone.
+(
+  cd apps/client/editor
+  npm ci --ignore-scripts --no-audit --no-fund
+  node scripts/patch-yjs.mjs
+)
+
 (
   cd apps/client/tests/browser
   npm ci --ignore-scripts --no-audit --no-fund
@@ -29,6 +37,5 @@ export PLAYWRIGHT_BROWSERS_PATH
 # rather than keeping a second copy.
 (
   cd apps/client/editor
-  npm ci --ignore-scripts --no-audit --no-fund
   npm run test:browser
 )

@@ -1,9 +1,92 @@
 * { box-sizing: border-box; }
-body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; background: var(--panel); color: var(--text); font: 16px/1.66 var(--sans); }
-header { display: flex; gap: 24px; align-items: center; min-height: 56px; padding-left: max(20px, env(safe-area-inset-left)); padding-top: env(safe-area-inset-top); background: var(--bar); color: var(--on-bar); font: 500 13px var(--mono); }
-header strong { align-self: stretch; display: grid; place-items: center; padding: 18px 24px; background: var(--yellow); color: var(--on-yellow); }
-main { flex: 1; width: min(100%, 800px); padding: 48px max(24px, env(safe-area-inset-left)); }
+html, body { height: 100%; }
+body { margin: 0; height: 100dvh; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr) auto; overflow: hidden; background: var(--panel); color: var(--text); font: 16px/1.66 var(--sans); -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; }
+::selection { background: var(--select); }
+.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: square; stroke-linejoin: miter; flex: none; }
+[hidden] { display: none !important; }
+header { grid-row: 1; } #update-banner { grid-row: 2; } main { grid-row: 3; } footer { grid-row: 4; }
+
+/* The location bar is the title bar: on a Mac the window's buttons sit at its left. */
+header.bar { display: flex; align-items: center; gap: 6px; min-width: 0; height: calc(38px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 8px 0 max(8px, env(safe-area-inset-left)); background: var(--bar); color: var(--on-bar); white-space: nowrap; user-select: none; -webkit-user-select: none; }
+[data-platform="mac"] header.bar { padding-left: 78px; }
+.ib { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 28px; flex: none; padding: 0; border: 0; background: none; color: var(--on-bar-2); cursor: pointer; }
+.ib:hover, .ib[aria-expanded="true"] { color: var(--on-bar); background: var(--bar-2); }
+.ib:focus-visible, #update-chip:focus-visible { outline: 2px solid var(--yellow); outline-offset: -2px; }
+.trail { display: flex; align-items: center; gap: 8px; min-width: 0; margin-left: 4px; font: 500 14.5px/1 var(--sans); font-stretch: 85%; color: var(--on-bar-2); }
+.trail .arrow { width: 14px; height: 14px; color: var(--yellow); stroke-width: 2; }
+.crumb { flex: none; }
+.here { min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 5px 8px; background: var(--yellow); color: var(--on-yellow); font-weight: 700; font-stretch: 80%; font-size: 15px; }
+.here:empty { display: none; }
+.trail:has(.here:empty) .arrow { display: none; }
+.spacer { flex: 1; }
+.bar-tools { display: flex; gap: 2px; flex: none; }
+#update-chip { display: none; align-items: center; gap: 7px; height: 26px; margin: 0 4px; padding: 0 9px; border: 1px solid var(--yellow); background: none; color: var(--on-bar); font: 600 13px/1 var(--sans); cursor: pointer; flex: none; }
+.sq { display: inline-block; width: 9px; height: 9px; flex: none; background: var(--yellow); }
+[data-update][data-sidebar="hidden"] #update-chip { display: inline-flex; }
+
+/* First run and other screens without a note. */
+main { min-height: 0; overflow: auto; width: min(100%, 800px); padding: 48px max(24px, env(safe-area-inset-left)); }
 h1 { font-size: clamp(34px, 5vw, 44px); font-stretch: 80%; line-height: 1.1; margin: 24px 0; }
-.label, footer { font: 500 12px/1.6 var(--mono); letter-spacing: .05em; }
-.label { color: var(--text-2); }
-footer { border-top: 1px solid var(--line); padding: 12px 20px max(12px, env(safe-area-inset-bottom)); background: var(--panel-2); }
+.label { font: 500 12px/1.6 var(--mono); letter-spacing: .05em; color: var(--text-2); }
+footer { min-height: 26px; padding: 4px 14px max(4px, env(safe-area-inset-bottom)); background: var(--panel-2); border-top: 1px solid var(--line); font: 500 12px/1.5 var(--mono); letter-spacing: .04em; text-transform: uppercase; color: var(--text-2); }
+
+/* The update before any note is open: a slim strip under the bar. */
+#update-banner { padding: 10px max(14px, env(safe-area-inset-left)); border-bottom: 1px solid var(--line); background: var(--panel-2); font: 400 13.5px/1.45 var(--sans); }
+#update-message { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 600; }
+#update-message::before { content: ""; width: 9px; height: 9px; flex: none; background: var(--yellow); }
+#update-progress { display: block; width: 100%; height: 4px; margin: 10px 0 2px; accent-color: var(--yellow); }
+#update-notes { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0 17px; color: var(--text-2); }
+#update-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin-top: 8px; }
+#update-banner button { border: 0; border-radius: 0; background: none; padding: 6px 0; color: var(--text-2); font: 500 13px/1 var(--sans); cursor: pointer; }
+#update-banner button:hover { color: var(--text); text-decoration: underline; }
+#update-banner button:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+#update-notes-toggle { flex-basis: 100%; text-align: left; padding-left: 17px !important; }
+#update-notes-toggle[aria-expanded="true"] { color: var(--text) !important; text-decoration: underline; }
+#update-install, #update-dismiss { order: -1; height: 26px; padding: 0 10px !important; background: var(--yellow) !important; color: var(--on-yellow) !important; font-weight: 600 !important; text-decoration: none !important; }
+#update-notes-toggle { order: -2; }
+#update-dismiss { margin-top: 8px; }
+
+/* A note open: bar, sidebar beside the full-height page, one status line. */
+main.note-workspace { width: 100%; padding: 0; overflow: hidden; display: grid; grid-template-columns: 232px minmax(0, 1fr); background: var(--grid); gap: 1px; position: relative; }
+[data-sidebar="hidden"] main.note-workspace { grid-template-columns: minmax(0, 1fr); }
+[data-sidebar="hidden"] .side, .scrim { display: none; }
+.side { display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+.side-head { margin: 0; padding: 16px 16px 8px; color: var(--text-3); text-transform: uppercase; }
+.note-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
+.note-list button { display: block; width: 100%; padding: 6px 10px; border: 0; background: none; color: var(--text); text-align: left; font: 400 14px/1.35 var(--sans); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.note-list button:hover { background: var(--panel-2); }
+.note-list button[aria-current] { background: var(--invert); color: var(--on-invert); font-weight: 600; box-shadow: inset 4px 0 0 var(--yellow); }
+.note-list button:focus-visible { outline: 2px solid var(--yellow); outline-offset: -2px; }
+.note-list .note-more { margin-top: 6px; color: var(--text-2); font-size: 13.5px; }
+.side #update-banner { margin: 0 8px 8px; padding: 12px; border: 1px solid var(--line); background: var(--panel); flex: none; max-height: 50%; overflow-y: auto; }
+.note-pane { min-width: 0; min-height: 0; overflow-y: auto; background: var(--panel); }
+.note-notice { max-width: 584px; margin: 20px auto 0; padding: 10px 14px; border: 1px solid var(--line-strong); background: var(--panel-2); font-size: 14px; line-height: 1.5; }
+.note-pane > [role="status"] { max-width: 584px; margin: 40px auto 12px; }
+.note-pane > button { display: block; margin: 0 auto; max-width: 584px; padding: 0 12px; height: 30px; border: 0; background: var(--yellow); color: var(--on-yellow); font: 600 13.5px var(--sans); cursor: pointer; }
+
+/* The status line: local state left, cloud right. */
+footer.status { display: flex; align-items: center; height: calc(26px + env(safe-area-inset-bottom)); min-height: 0; padding: 0 0 env(safe-area-inset-bottom); white-space: nowrap; }
+footer.status .local { display: flex; align-items: center; height: 100%; min-width: 0; }
+footer.status .cloud { display: flex; align-items: center; gap: 7px; margin-left: auto; padding: 0 14px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; }
+footer.status .cloud .i { width: 14px; height: 14px; }
+footer [data-status] { display: flex; align-items: center; gap: 7px; height: 100%; margin: 0; padding: 0 14px; }
+footer [data-status]::before { content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ok); }
+footer [data-status="busy"]::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-2); }
+footer [data-status="readonly"]::before { background: var(--text-3); }
+footer [data-status="failed"]::before { border-radius: 0; background: var(--yellow); }
+footer [data-status="failed"] { background: var(--invert); color: var(--on-invert); font-weight: 600; padding-right: 8px; }
+footer .note-retry { height: 20px; margin: 0 14px 0 0; padding: 0 8px; border: 0; background: var(--yellow); color: var(--on-yellow); font: 600 12.5px/1 var(--sans); letter-spacing: 0; text-transform: none; cursor: pointer; }
+footer [data-status="failed"] + .note-retry { margin-left: -2px; box-shadow: -6px 0 0 var(--invert); }
+
+/* A narrow window: the notes open over the page. */
+@media (max-width: 640px) {
+  main.note-workspace, [data-sidebar="hidden"] main.note-workspace { grid-template-columns: minmax(0, 1fr); }
+  .side { position: absolute; top: 0; bottom: 0; left: 0; z-index: 5; width: min(280px, 86%); border-right: 1px solid var(--line-strong); }
+  [data-sidebar="shown"] .scrim { display: block; position: absolute; inset: 0; z-index: 4; background: rgba(0, 0, 0, .25); }
+  .crumb, .crumb + .arrow { display: none; }
+  #update-chip { padding: 0 8px; }
+  #update-chip span + span { display: none; }
+  .trail { margin-left: 0; }
+  main:not(.note-workspace) { padding: 32px 20px; }
+}

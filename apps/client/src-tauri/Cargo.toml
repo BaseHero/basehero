@@ -18,6 +18,7 @@ webdriver = ["dep:tauri-plugin-webdriver"]
 
 [build-dependencies]
 tauri-build.workspace = true
+serde_json.workspace = true
 
 [dependencies]
 tauri.workspace = true
@@ -29,15 +30,33 @@ bh-confidential-attestation.workspace = true
 bh-account.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zxcvbn.workspace = true
 tokio.workspace = true
 tauri-plugin-webdriver = { workspace = true, optional = true }
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+bh-release.workspace = true
+bh-crypto.workspace = true
+flate2.workspace = true
+tar.workspace = true
+plist.workspace = true
+url.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 bh-device-keys.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+bh-mac-keychain-helper.workspace = true
 bh-mac-local-auth.workspace = true
+bh-release.workspace = true
+bh-crypto.workspace = true
+plist.workspace = true
+url.workspace = true
+bh-mac-lifecycle.workspace = true
 security-framework.workspace = true
+rfd.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
-//! Library-only Mac bundle installer. No app wiring, restart or data-directory access.
-//! Only accepts the verified, held inode from `download`, never an artifact path.
+//! Mac bundle installer. No restart or data-directory access: the app owns
+//! readiness, exit and relaunch. Only accepts the verified, held inode from
+//! `download`, never an artifact path.
 use crate::download::StagedArtifact;
 use std::io;
 use std::{
@@ -40,39 +41,83 @@ pub enum InstallError {
     Swap(io::Error),
 }
 
-/// Signed integer v maps to CFBundleVersion's canonical decimal representation
-/// (no leading zeroes). Info.plist only confirms identity; it grants no authority.
-/// This entry point is deliberately not exported on other platforms and has no
-/// app wiring until the native save barrier exists.
-#[cfg(target_os = "macos")]
-pub async fn install(
-    staged: StagedArtifact,
-    installed: &Path,
-    limits: ExtractLimits,
-) -> Result<(), InstallError> {
-    let installed = installed.to_path_buf();
-    tokio::task::spawn_blocking(move || install_blocking(staged, &installed, limits, || Ok(())))
-        .await
-        .map_err(|e| InstallError::Io(io::Error::other(e)))?
+/// Fully extracted, identity-checked app, still beside the unchanged installed app.
+/// Dropping this value discards the prepared update without touching the current app.
+pub struct PreparedInstall {
+    stage_dir: tempfile::TempDir,
+    installed: PathBuf,
 }
 
-// Linux unit tests exercise the same rename operations on fixture directories;
-// production platform-specific replacement is exposed only on macOS.
-#[cfg(all(test, not(target_os = "macos")))]
+/// Extract the verified artifact beside `installed` and check that it is the
+/// same app (`identifier`, the running app's own bundle identifier) at the
+/// signed version: integer v maps to CFBundleVersion's canonical decimal
+/// representation, with no leading zeroes. Info.plist only confirms identity;
+/// it grants no authority. Nothing is replaced until `PreparedInstall::commit`.
+pub async fn prepare(
+    staged: StagedArtifact,
+    installed: &Path,
+    identifier: &str,
+    limits: ExtractLimits,
+) -> Result<PreparedInstall, InstallError> {
+    let installed = installed.to_path_buf();
+    let identifier = identifier.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let stage_dir = prepare_blocking(staged, &installed, &identifier, limits)?;
+        Ok(PreparedInstall {
+            stage_dir,
+            installed,
+        })
+    })
+    .await
+    .map_err(|e| InstallError::Io(io::Error::other(e)))?
+}
+
+impl PreparedInstall {
+    /// Call the app's restart readiness immediately before the exchange. On
+    /// exchange failure the ready token is dropped, releasing the hold. The
+    /// returned token owns the successful exit and relaunch; the installer never
+    /// starts another process.
+    pub fn commit<R>(
+        self,
+        before_exchange: impl FnOnce() -> io::Result<R>,
+    ) -> Result<R, InstallError> {
+        let ready = before_exchange().map_err(InstallError::Swap)?;
+        exchange(&self.stage_dir, &self.installed)?;
+        Ok(ready)
+    }
+}
+
+// Tests use the same prepare + commit path as production.
+#[cfg(test)]
 async fn install(
     staged: StagedArtifact,
     installed: &Path,
     limits: ExtractLimits,
 ) -> Result<(), InstallError> {
-    install_blocking(staged, installed, limits, || Ok(()))
+    install_blocking(staged, installed, "app.basehero.client", limits, || Ok(()))
 }
 
-fn install_blocking(
+#[cfg(test)]
+fn install_blocking<R>(
+    staged: StagedArtifact,
+    installed: &Path,
+    identifier: &str,
+    limits: ExtractLimits,
+    before_exchange: impl FnOnce() -> io::Result<R>,
+) -> Result<R, InstallError> {
+    PreparedInstall {
+        stage_dir: prepare_blocking(staged, installed, identifier, limits)?,
+        installed: installed.to_path_buf(),
+    }
+    .commit(before_exchange)
+}
+
+fn prepare_blocking(
     mut staged: StagedArtifact,
     installed: &Path,
+    identifier: &str,
     limits: ExtractLimits,
-    before_exchange: impl FnOnce() -> io::Result<()>,
-) -> Result<(), InstallError> {
+) -> Result<tempfile::TempDir, InstallError> {
     if installed.file_name().is_none_or(|n| n != "BaseHero.app")
         || !fs::symlink_metadata(installed)?.file_type().is_dir()
     {
@@ -86,10 +131,14 @@ fn install_blocking(
         .tempdir_in(parent)?;
     let next = stage_dir.path().join("BaseHero.app");
     extract(staged.reader(), stage_dir.path(), limits)?;
-    check_identity(&next, staged.version())?;
+    check_identity(&next, identifier, staged.version())?;
+    Ok(stage_dir)
+}
+
+fn exchange(stage_dir: &tempfile::TempDir, installed: &Path) -> Result<(), InstallError> {
+    let next = stage_dir.path().join("BaseHero.app");
     // One same-volume exchange keeps the installed path present even if the process
     // dies. If the filesystem cannot exchange, leave the old app untouched.
-    before_exchange().map_err(InstallError::Swap)?;
     rustix::fs::renameat_with(
         rustix::fs::CWD,
         &next,
@@ -227,7 +276,11 @@ fn extract(reader: &mut dyn Read, stage: &Path, limits: ExtractLimits) -> Result
     }
 }
 
-fn check_identity(bundle: &Path, signed_version: u64) -> Result<(), InstallError> {
+fn check_identity(
+    bundle: &Path,
+    identifier: &str,
+    signed_version: u64,
+) -> Result<(), InstallError> {
     let info = bundle.join("Contents/Info.plist");
     let meta = fs::symlink_metadata(&info).map_err(|_| InstallError::Identity)?;
     if !meta.file_type().is_file() || meta.len() > 1024 * 1024 {
@@ -238,7 +291,7 @@ fn check_identity(bundle: &Path, signed_version: u64) -> Result<(), InstallError
     if dict
         .get("CFBundleIdentifier")
         .and_then(plist::Value::as_string)
-        != Some("app.basehero.client")
+        != Some(identifier)
     {
         return Err(InstallError::Identity);
     }
@@ -265,8 +318,8 @@ fn exchange_with_failure(
     installed: &Path,
     limits: ExtractLimits,
 ) -> Result<(), InstallError> {
-    install_blocking(staged, installed, limits, || {
-        Err(io::Error::other("injected"))
+    install_blocking(staged, installed, "app.basehero.client", limits, || {
+        Err::<(), _>(io::Error::other("injected"))
     })
 }
 
@@ -330,9 +383,9 @@ mod tests {
         f.seek(SeekFrom::Start(0)).unwrap();
         StagedArtifact::test_verified(f, 2)
     }
+    const ID: &str = "app.basehero.client";
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
-        // Includes Venus: fixture bundles stay inside this task's worktree,
-        // never /Applications or another user's installed app.
+        // Fixture bundles stay inside this crate's temporary directory, never /Applications or another user's installed app.
         let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let app = dir.path().join("BaseHero.app");
         fs::create_dir(&app).unwrap();
@@ -384,6 +437,7 @@ mod tests {
         install_blocking(
             StagedArtifact::test_verified(f, version),
             &app,
+            ID,
             ExtractLimits {
                 entries: 1000,
                 bytes: 200 * 1024 * 1024,
@@ -669,6 +723,75 @@ mod tests {
         assert_old(&link);
         assert_eq!(fs::read_link(&real).unwrap(), link);
     }
+    #[test]
+    fn preparation_precedes_hold_and_failed_exchange_drops_ready() {
+        struct Ready<'a>(&'a Cell<bool>);
+        impl Drop for Ready<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let (_dir, app) = fixture();
+        let held = Cell::new(false);
+        let released = Cell::new(false);
+        // A bad identity never reaches the readiness closure.
+        let result = install_blocking(stage(&valid("wrong.id", "2")), &app, ID, limits(), || {
+            held.set(true);
+            Ok(Ready(&released))
+        });
+        assert!(matches!(result, Err(InstallError::Identity)));
+        assert!(!held.get());
+        assert!(!released.get());
+        assert_old(&app);
+
+        let prepared = PreparedInstall {
+            stage_dir: prepare_blocking(stage(&valid(ID, "2")), &app, ID, limits()).unwrap(),
+            installed: app.clone(),
+        };
+        assert_old(&app);
+        // Make exchange fail after readiness; the production commit must drop
+        // the token without requiring a second test-only release callback.
+        let result = prepared.commit(|| {
+            held.set(true);
+            fs::remove_dir_all(&app)?;
+            Ok(Ready(&released))
+        });
+        assert!(matches!(result, Err(InstallError::Swap(_))));
+        assert!(held.get());
+        assert!(released.get());
+    }
+    #[test]
+    fn bundle_identity_is_the_running_apps_identifier() {
+        let demo = "app.basehero.client.updatedemo";
+        let (_dir, app) = fixture();
+        assert_eq!(
+            install_blocking(stage(&valid(demo, "2")), &app, ID, limits(), || Ok(())).unwrap_err(),
+            InstallError::Identity
+        );
+        assert_eq!(
+            install_blocking(stage(&valid(ID, "2")), &app, demo, limits(), || Ok(())).unwrap_err(),
+            InstallError::Identity
+        );
+        assert_old(&app);
+        install_blocking(stage(&valid(demo, "2")), &app, demo, limits(), || Ok(())).unwrap();
+        assert_eq!(
+            fs::read(app.join("Contents/MacOS/BaseHero")).unwrap(),
+            b"new"
+        );
+    }
+    #[test]
+    fn dropping_a_prepared_install_leaves_the_app_and_no_stage() {
+        let (dir, app) = fixture();
+        let prepared = PreparedInstall {
+            stage_dir: prepare_blocking(stage(&valid(ID, "2")), &app, ID, limits()).unwrap(),
+            installed: app.clone(),
+        };
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        drop(prepared);
+        assert_old(&app);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn failure_before_exchange_keeps_old_bundle() {
         let (_dir, app) = fixture();

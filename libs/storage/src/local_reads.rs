@@ -213,6 +213,7 @@ impl DeviceDatabase {
                         audience,
                         note,
                     },
+                    writer: crate::note_writers::pending_writer(&self.connection, id)?,
                     bytes: delta,
                 });
             }
@@ -265,6 +266,7 @@ impl DeviceDatabase {
                         audience,
                         note: row_note.try_into().map_err(|_| StoreError::InvalidUpdate)?,
                     },
+                    writer: crate::note_writers::pending_writer(&self.connection, id)?,
                     bytes: delta,
                 });
             }

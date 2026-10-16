@@ -23,6 +23,11 @@ pub struct AccountStateRecord {
     pub stopped: bool,
 }
 
+mod index;
+pub use index::*;
+mod bootstrap;
+pub use bootstrap::InitialBootstrapRecord;
+
 /// Recorded local device identity. Public halves only, never seeds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceIdentityRecord {
@@ -99,6 +104,28 @@ fn fixed<const N: usize>(
 }
 
 impl DeviceDatabase {
+    /// One writer-connection query: no durable account/setup/identity work may
+    /// be discarded when reusing an interrupted signup container.
+    pub fn account_container_empty(&self) -> Result<bool, StoreError> {
+        let empty: bool = self.connection.query_row(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM account_state UNION ALL
+                SELECT 1 FROM account_events UNION ALL
+                SELECT 1 FROM account_pending_setup UNION ALL
+                SELECT 1 FROM account_staged_admission UNION ALL
+                SELECT 1 FROM account_device UNION ALL
+                SELECT 1 FROM note_updates UNION ALL
+                SELECT 1 FROM note_outbox UNION ALL
+                SELECT 1 FROM note_checkpoints UNION ALL
+                SELECT 1 FROM notes UNION ALL
+                SELECT 1 FROM view_records
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(empty)
+    }
+
     pub fn account_state(&self) -> Result<Option<AccountStateRecord>, StoreError> {
         Ok(self
             .connection
@@ -121,11 +148,14 @@ impl DeviceDatabase {
     /// verified account state. This is not a substitute for verification of
     /// account controls on admission or changes.
     pub fn account_history_edges(&self) -> Result<Option<AccountHistoryEdges>, StoreError> {
-        let count: i64 =
+        // MAX on the rowid btree and two edge lookups do not scan a long log.
+        // Projection repair uses separate bounded, verified history pages.
+        let count: Option<i64> =
             self.connection
-                .query_row("SELECT COUNT(*) FROM account_events", [], |r| r.get(0))?;
-        if count == 0 {
-            return Ok(None);
+                .query_row("SELECT MAX(id) FROM account_events", [], |r| r.get(0))?;
+        let Some(count) = count else { return Ok(None) };
+        if count <= 0 {
+            return Err(StoreError::CorruptAccount);
         }
         let first = self.connection.query_row(
             "SELECT bytes FROM account_events ORDER BY id LIMIT 1",
@@ -165,25 +195,57 @@ impl DeviceDatabase {
         head_hash: [u8; 32],
         stopped: bool,
     ) -> Result<(), StoreError> {
+        self.commit_account_verified_projected(
+            anchor,
+            events,
+            head_position,
+            head_hash,
+            stopped,
+            None,
+        )
+    }
+
+    /// The original bytes, remembered head and locally verified projection are
+    /// one SQLite commit. Empty stop writes and legacy appends retain the prior
+    /// verified cut so a later activation can resume bounded reconstruction.
+    pub fn commit_account_verified_projected(
+        &mut self,
+        anchor: [u8; 32],
+        events: &[&[u8]],
+        head_position: u64,
+        head_hash: [u8; 32],
+        stopped: bool,
+        projection: Option<&AccountProjectionDelta>,
+    ) -> Result<(), StoreError> {
+        if projection.is_some() && events.is_empty() {
+            return Err(StoreError::CorruptAccount);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = transaction.query_row("SELECT COUNT(*) FROM account_events", [], |row| {
-            row.get::<_, i64>(0)
-        })? as u64;
-        let stored_anchor: Option<Vec<u8>> = transaction
-            .query_row("SELECT anchor FROM account_state WHERE id=1", [], |row| {
-                row.get(0)
-            })
+        let existing = transaction.query_row(
+            "SELECT COALESCE(MAX(id),0) FROM account_events",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let stored: Option<(Vec<u8>, i64)> = transaction
+            .query_row(
+                "SELECT anchor,head_position FROM account_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()?;
-        match stored_anchor {
-            Some(existing) if existing.as_slice() != anchor.as_slice() => {
+        match &stored {
+            Some((previous_anchor, position))
+                if previous_anchor.as_slice() != anchor.as_slice()
+                    || *position != existing as i64 =>
+            {
                 return Err(StoreError::CorruptAccount);
             }
             _ => {}
         }
         // A first commit must carry the genesis bytes; never a bare head 0.
-        if stored_anchor.is_none() && events.is_empty() {
+        if stored.is_none() && events.is_empty() {
             return Err(StoreError::HeadWithoutBytes);
         }
         if head_position != existing + events.len() as u64 {
@@ -201,6 +263,9 @@ impl DeviceDatabase {
                 i64::from(stopped as u8)
             ],
         )?;
+        if let Some(delta) = projection {
+            index::apply_delta(&transaction, anchor, delta)?;
+        }
         transaction.commit()?;
         Ok(())
     }

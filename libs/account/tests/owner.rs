@@ -12,6 +12,9 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+#[path = "support/indexed_journal.rs"]
+mod indexed_journal;
+
 #[path = "support/protector.rs"]
 mod protector;
 #[path = "support/store.rs"]
@@ -31,6 +34,711 @@ use rusqlite::{Connection, params};
 use store::FakeStore;
 
 type Owner = bh_account::owner::AccountOwner<DeviceJournal, FakeStore, PlainProtector>;
+
+#[test]
+fn retained_initial_bootstrap_opens_after_home_ack_and_later_controls() {
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    let originals = owner.pending_home_objects().unwrap();
+    owner.confirm_kit_saved().unwrap();
+    owner.confirm_home_ordered(setup.head).unwrap();
+    assert!(h.journal().pending_setup().unwrap().is_none());
+    drop(owner);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 2);
+    let (prefix, objects) = owner.initial_bootstrap(&cap).unwrap();
+    assert!(prefix.anchor == setup.anchor);
+    assert_eq!(prefix.head, setup.head);
+    assert_eq!(prefix.events, setup.submission);
+    assert!(objects == originals);
+    let personal = ready(owner.open_personal(&cap)).unwrap();
+    let (ct, shared) = bh_account::crypto::encapsulate(&personal.public()).unwrap();
+    assert_eq!(personal.decapsulate(&ct).unwrap().expose(), shared.expose());
+    let signature = ready(owner.sign_content(&cap, b"native content")).unwrap();
+    bh_account::crypto::verify(
+        owner
+            .verified(&cap)
+            .unwrap()
+            .active_device(cap.device_id())
+            .unwrap()
+            .signing(),
+        b"native content",
+        &signature,
+    )
+    .unwrap();
+}
+
+#[test]
+fn retained_bootstrap_survives_failed_pending_clear_and_refuses_private_tampering() {
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    owner.confirm_kit_saved().unwrap();
+    let cap = activate(&mut owner);
+    let before = owner.initial_bootstrap(&cap).unwrap();
+    h.raw().execute_batch("CREATE TRIGGER prevent_clear BEFORE DELETE ON account_pending_setup BEGIN SELECT RAISE(FAIL,'interrupted clear'); END;").unwrap();
+    assert!(owner.confirm_home_ordered(setup.head).is_err());
+    drop(owner);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    assert!(owner.initial_bootstrap(&cap).unwrap() == before);
+    h.raw().execute_batch("DROP TRIGGER prevent_clear").unwrap();
+    owner.confirm_home_ordered(setup.head).unwrap();
+    for column in ["recovery_record", "device_seal", "recovery_seal"] {
+        let raw = h.raw();
+        let bytes: Vec<u8> = raw
+            .query_row(
+                &format!("SELECT {column} FROM account_initial_bootstrap"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut changed = bytes.clone();
+        let index = changed.len() / 2;
+        changed[index] ^= 1;
+        raw.execute(
+            &format!("UPDATE account_initial_bootstrap SET {column}=?1"),
+            [&changed],
+        )
+        .unwrap();
+        assert!(
+            owner.initial_bootstrap(&cap).is_err(),
+            "accepted altered {column}"
+        );
+        assert!(ready(owner.open_personal(&cap)).is_err());
+        raw.execute(
+            &format!("UPDATE account_initial_bootstrap SET {column}=?1"),
+            [&bytes],
+        )
+        .unwrap();
+    }
+    h.raw()
+        .execute(
+            "UPDATE account_initial_bootstrap SET head_hash=zeroblob(32)",
+            [],
+        )
+        .unwrap();
+    assert!(owner.initial_bootstrap(&cap).is_err());
+}
+
+#[test]
+fn retained_ciphertexts_are_not_overwritten_by_a_pending_retry() {
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    owner.confirm_kit_saved().unwrap();
+    let raw = h.raw();
+    let mut bytes: Vec<u8> = raw
+        .query_row(
+            "SELECT device_seal FROM account_initial_bootstrap",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bytes[800] ^= 1;
+    raw.execute(
+        "UPDATE account_initial_bootstrap SET device_seal=?1",
+        [&bytes],
+    )
+    .unwrap();
+    assert!(owner.confirm_home_ordered(setup.head).is_err());
+    assert!(h.journal().pending_setup().unwrap().is_some());
+    let after: Vec<u8> = raw
+        .query_row(
+            "SELECT device_seal FROM account_initial_bootstrap",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, bytes,
+        "never silently replace retained originals on retry"
+    );
+}
+
+#[test]
+fn late_native_content_and_personal_results_are_discarded() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    h.store.state_mut().advance_generation_on_load = true;
+    assert!(matches!(
+        ready(owner.open_personal(&cap)),
+        Err(OwnerError::Stale)
+    ));
+    h.store.state_mut().advance_generation_on_load = false;
+    let cap = activate(&mut owner);
+    h.store.state_mut().advance_generation_on_sign = true;
+    assert!(matches!(
+        ready(owner.sign_content(&cap, b"discard")),
+        Err(OwnerError::Stale)
+    ));
+}
+
+#[test]
+fn ephemeral_journal_accepts_two_successors_without_projection_cursor() {
+    let generation = AccountGeneration::new();
+    let store = FakeStore::new(generation.clone());
+    let database = std::sync::Arc::new(std::sync::Mutex::new(
+        bh_storage::DeviceDatabase::open(":memory:").unwrap(),
+    ));
+    let journal = DeviceJournal::from_shared(database.clone());
+    let mut owner =
+        bh_account::owner::AccountOwner::new(journal, store, PlainProtector, generation);
+    ready(owner.begin_first_device(
+        ControlKeyPolicy::AppEnforcedOwnerConfirmation,
+        &Password::new("ephemeral successor test").unwrap(),
+    ))
+    .unwrap();
+    owner.confirm_kit_saved().unwrap();
+    let cap = activate(&mut owner);
+    for tag in [30, 40] {
+        let keys =
+            bh_account::DevicePublicKeys::new([tag; 32], [tag + 1; 32], [tag + 2; 1216]).unwrap();
+        let request = owner.prepare_add_device(&cap, keys).unwrap();
+        let event = ready(owner.sign_control(&cap, &request)).unwrap();
+        owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    }
+    assert_eq!(owner.verified(&cap).unwrap().head().position, 5);
+    assert_eq!(
+        database
+            .lock()
+            .unwrap()
+            .account_state()
+            .unwrap()
+            .unwrap()
+            .head_position,
+        5
+    );
+}
+
+#[test]
+fn successor_writes_only_current_summary_and_changed_index_rows() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let old = owner.verified(&cap).unwrap().clone();
+    let raw = h.raw();
+    raw.execute_batch(
+        "CREATE TABLE writes(kind TEXT, size INTEGER);
+        CREATE TRIGGER summary_write AFTER UPDATE ON account_projection BEGIN
+          INSERT INTO writes VALUES ('summary',length(NEW.summary)); END;
+        CREATE TRIGGER device_write AFTER INSERT ON account_devices BEGIN
+          INSERT INTO writes VALUES ('device',length(NEW.keys)); END;
+        CREATE TRIGGER key_write AFTER INSERT ON account_key_use BEGIN
+          INSERT INTO writes VALUES ('key',length(NEW.key)); END;",
+    )
+    .unwrap();
+    for i in 0..300u32 {
+        let mut receiver = [9; 1216];
+        receiver[..4].copy_from_slice(&i.to_be_bytes());
+        let keys = bh_account::DevicePublicKeys::new(
+            bh_account::crypto::SigningKey::generate().public(),
+            bh_account::crypto::SigningKey::generate().public(),
+            receiver,
+        )
+        .unwrap();
+        let request = owner.prepare_add_device(&cap, keys.clone()).unwrap();
+        let event = ready(owner.sign_control(&cap, &request)).unwrap();
+        raw.execute("DELETE FROM writes", []).unwrap();
+        owner.apply_incoming(&[event.as_bytes()]).unwrap();
+        let (rows, bytes): (i64, i64) = raw
+            .query_row("SELECT count(*),sum(size) FROM writes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rows, 5);
+        assert!(bytes < 5000, "one addition rewrote {bytes} bytes");
+        assert!(!old.seen_device(keys.id()).unwrap());
+        assert!(
+            owner
+                .verified(&cap)
+                .unwrap()
+                .seen_device(keys.id())
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn captured_history_pages_do_not_follow_later_appends() {
+    use bh_account::journal::HistoryCursor;
+    let h = Harness::new();
+    let setup = complete(&h);
+    let journal = h.journal();
+    assert!(journal.has_account().unwrap());
+    assert!(journal.history_prefix(None, 0).is_err());
+    assert!(journal.history_prefix(None, 257).is_err());
+    let first = journal.history_prefix(None, 1).unwrap().unwrap();
+    assert_eq!(first.events, setup.submission[..1]);
+    assert_eq!(first.events[0].len(), 2724);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let request = owner.prepare_remove_self(&cap).unwrap();
+    let event = ready(owner.sign_control(&cap, &request)).unwrap();
+    owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    let page = journal.history_prefix(first.next, 256).unwrap().unwrap();
+    assert_eq!(page.cut, setup.head);
+    assert_eq!(page.events, setup.submission[1..]);
+    assert!(page.next.is_none());
+    assert_eq!(page.first_position, 2);
+    let cursor = Some(HistoryCursor {
+        anchor: setup.anchor,
+        cut: setup.head,
+        next_position: 1,
+    });
+    h.raw()
+        .execute(
+            "UPDATE account_events SET bytes=zeroblob(1000000) WHERE id=2",
+            [],
+        )
+        .unwrap();
+    assert!(journal.history_prefix(cursor, 256).is_err());
+    h.raw()
+        .execute("DELETE FROM account_events WHERE id=2", [])
+        .unwrap();
+    assert!(journal.history_prefix(cursor, 256).is_err());
+}
+
+#[test]
+fn evidence_unavailable_preserves_head_generation_and_allows_same_view_retry() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let keys = bh_account::DevicePublicKeys::new([71; 32], [72; 32], [73; 1216]).unwrap();
+    let request = owner.prepare_add_device(&cap, keys.clone()).unwrap();
+    let event = ready(owner.sign_control(&cap, &request)).unwrap();
+    let before = owner.verified(&cap).unwrap().head();
+    let generation = h.generation.current();
+    h.raw()
+        .execute("ALTER TABLE account_key_use RENAME TO hidden_keys", [])
+        .unwrap();
+    assert!(matches!(
+        owner.apply_incoming(&[event.as_bytes()]),
+        Err(OwnerError::Invalid(bh_account::Error::Unavailable))
+    ));
+    assert_eq!(owner.verified(&cap).unwrap().head(), before);
+    assert_eq!(h.generation.current(), generation);
+    assert!(!h.stored().stopped);
+    h.raw()
+        .execute("ALTER TABLE hidden_keys RENAME TO account_key_use", [])
+        .unwrap();
+    owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    assert_eq!(owner.verified(&cap).unwrap().head(), event.head());
+}
+
+fn append_devices(owner: &mut Owner, cap: &AccountCapability, count: u32) {
+    for i in 0..count {
+        let mut receiver = [44; 1216];
+        receiver[..4].copy_from_slice(&i.to_be_bytes());
+        let keys = bh_account::DevicePublicKeys::new(
+            bh_account::crypto::SigningKey::generate().public(),
+            bh_account::crypto::SigningKey::generate().public(),
+            receiver,
+        )
+        .unwrap();
+        let request = owner.prepare_add_device(cap, keys).unwrap();
+        let event = ready(owner.sign_control(cap, &request)).unwrap();
+        owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    }
+}
+
+#[test]
+fn interrupted_rebuild_resumes_verified_cut_without_rereading_its_prefix() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 600);
+    let expected = owner.verified(&cap).unwrap().head();
+    let old_view = owner.verified(&cap).unwrap().clone();
+    let raw = h.raw();
+    raw.execute("DELETE FROM account_projection", []).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER interrupt_rebuild BEFORE UPDATE ON account_projection
+        WHEN NEW.through_position>257 BEGIN SELECT RAISE(FAIL,'interrupted'); END;",
+    )
+    .unwrap();
+    let mut resumed = h.owner();
+    assert!(matches!(
+        ready(resumed.activate()),
+        Err(OwnerError::Journal(_))
+    ));
+    let (epoch, through): (i64, i64) = raw
+        .query_row(
+            "SELECT epoch,through_position FROM account_projection",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(through, 257);
+    assert!(epoch > 1);
+    assert!(matches!(
+        old_view.seen_device(bh_account::DeviceId([99; 32])),
+        Err(bh_account::Error::Unavailable)
+    ));
+    assert!(old_view.has_seen_device(bh_account::DeviceId([99; 32])));
+    raw.execute_batch("DROP TRIGGER interrupt_rebuild; UPDATE account_events SET bytes=42 WHERE id>=2 AND id<257;").unwrap();
+    assert_eq!(activate(&mut resumed).head(), expected);
+    assert_eq!(
+        raw.query_row("SELECT through_position FROM account_projection", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        603
+    );
+}
+
+#[test]
+fn epoch_cleanup_is_bounded_and_active_corruption_repairs_without_reusing_an_epoch() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 300);
+    let old = owner.verified(&cap).unwrap().clone();
+    let raw = h.raw();
+    raw.execute_batch("CREATE TABLE reclaimed(kind INTEGER);
+        CREATE TRIGGER deleted_device AFTER DELETE ON account_devices BEGIN INSERT INTO reclaimed VALUES(0); END;
+        CREATE TRIGGER deleted_key AFTER DELETE ON account_key_use BEGIN INSERT INTO reclaimed VALUES(1); END;
+        PRAGMA ignore_check_constraints=ON;
+        UPDATE account_devices SET keys=42 WHERE added=4;").unwrap();
+    let mut journal = h.journal();
+    let first = journal.load_projection().unwrap().unwrap();
+    assert_eq!(first.account.head().position, 1);
+    assert!(matches!(
+        old.seen_device(bh_account::DeviceId([99; 32])),
+        Err(bh_account::Error::Unavailable)
+    ));
+    let epoch: i64 = raw
+        .query_row("SELECT epoch FROM account_projection", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(epoch, 2);
+    for _ in 0..3 {
+        raw.execute("DELETE FROM reclaimed", []).unwrap();
+        let p = journal.load_projection().unwrap().unwrap();
+        let removed: Vec<i64> = raw
+            .prepare("SELECT count(*) FROM reclaimed GROUP BY kind")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(removed.iter().all(|n| *n <= 256));
+        if p.account.head() == p.target {
+            break;
+        }
+        let page = journal
+            .history_prefix(
+                Some(bh_account::journal::HistoryCursor {
+                    anchor: p.account.id(),
+                    cut: p.target,
+                    next_position: p.account.head().position + 1,
+                }),
+                256,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(page.events.len() <= 256);
+        assert!(page.events.iter().map(Vec::len).sum::<usize>() <= 697344);
+        let refs: Vec<_> = page.events.iter().map(Vec::as_slice).collect();
+        let candidate = p.account.applied_batch(&refs).unwrap();
+        journal.advance_projection(&candidate).unwrap();
+    }
+    assert_eq!(activate(&mut h.owner()).head().position, 303);
+}
+
+#[test]
+fn rebuild_extends_a_captured_target_only_with_verified_appends() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 300);
+    let before = owner.verified(&cap).unwrap().head();
+    let request = owner
+        .prepare_add_device(
+            &cap,
+            bh_account::DevicePublicKeys::new([77; 32], [78; 32], [79; 1216]).unwrap(),
+        )
+        .unwrap();
+    let extra = ready(owner.sign_control(&cap, &request)).unwrap();
+    let expected = extra.head();
+    let anchor = cap.account_id();
+    let mut once = Some(extra);
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    let journal = indexed_journal::HookJournal {
+        inner: h.journal(),
+        pages: Default::default(),
+        after_advance: Box::new(move |j| {
+            if let Some(event) = once.take() {
+                j.commit_verified(anchor, &[event.as_bytes()], event.head(), false)
+                    .unwrap();
+            }
+        }),
+    };
+    let mut resumed = bh_account::owner::AccountOwner::new(
+        journal,
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    let AccountLoad::Active(cap) = ready(resumed.activate()).unwrap() else {
+        panic!("complete authority required")
+    };
+    assert_eq!(cap.head(), expected);
+    assert_eq!(cap.head().position, before.position + 1);
+}
+
+#[test]
+fn generation_change_during_rebuild_keeps_progress_but_publishes_no_capability() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 300);
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    let generation = h.generation.clone();
+    let journal = indexed_journal::HookJournal {
+        inner: h.journal(),
+        pages: Default::default(),
+        after_advance: Box::new(move |_| {
+            generation.advance();
+        }),
+    };
+    let mut resumed = bh_account::owner::AccountOwner::new(
+        journal,
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    assert!(matches!(ready(resumed.activate()), Err(OwnerError::Stale)));
+    assert_eq!(
+        h.raw()
+            .query_row("SELECT through_position FROM account_projection", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        257
+    );
+    h.raw()
+        .execute(
+            "UPDATE account_events SET bytes=42 WHERE id>1 AND id<257",
+            [],
+        )
+        .unwrap();
+    assert_eq!(activate(&mut h.owner()).head().position, 303);
+}
+
+#[test]
+fn stale_rebuild_candidate_cannot_commit_after_an_epoch_reset() {
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    append_devices(&mut owner, &cap, 2);
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    let mut journal = h.journal();
+    let p = journal.load_projection().unwrap().unwrap();
+    let page = journal
+        .history_prefix(
+            Some(bh_account::journal::HistoryCursor {
+                anchor: p.account.id(),
+                cut: p.target,
+                next_position: 2,
+            }),
+            256,
+        )
+        .unwrap()
+        .unwrap();
+    let refs: Vec<_> = page.events.iter().map(Vec::as_slice).collect();
+    let candidate = p.account.applied_batch(&refs).unwrap();
+    h.raw()
+        .execute("UPDATE account_projection SET summary=x'00'", [])
+        .unwrap();
+    let reset = journal.load_projection().unwrap().unwrap();
+    assert_eq!(reset.account.head().position, 1);
+    assert!(journal.advance_projection(&candidate).is_err());
+    assert_eq!(activate(&mut h.owner()).head().position, 5);
+}
+
+#[test]
+fn removed_keys_remain_indexed_while_old_views_observe_only_their_cut() {
+    use bh_account::crypto::SigningKey;
+    use bh_account::{DevicePublicKeys, Error};
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let before = owner.verified(&cap).unwrap().clone();
+    let control = SigningKey::generate();
+    let keys = DevicePublicKeys::new([80; 32], control.public(), [82; 1216]).unwrap();
+    let draft = owner.prepare_add_device(&cap, keys.clone()).unwrap();
+    let add = ready(owner.sign_control(&cap, &draft)).unwrap();
+    owner.apply_incoming(&[add.as_bytes()]).unwrap();
+    let with_child = owner.verified(&cap).unwrap().clone();
+    let draft = with_child.remove_self(keys.id()).unwrap();
+    let remove = draft.finish(control.sign(draft.signing_bytes())).unwrap();
+    owner.apply_incoming(&[remove.as_bytes()]).unwrap();
+    assert!(with_child.active_device(keys.id()).is_ok());
+    assert!(before.add_device(cap.device_id(), keys.clone()).is_ok());
+    assert!(!before.seen_device(keys.id()).unwrap());
+    assert!(
+        owner
+            .verified(&cap)
+            .unwrap()
+            .seen_device(keys.id())
+            .unwrap()
+    );
+    let mut reopened = h.owner();
+    let cap = activate(&mut reopened);
+    assert_eq!(
+        reopened
+            .prepare_add_device(
+                &cap,
+                DevicePublicKeys::new([83; 32], [84; 32], [82; 1216]).unwrap()
+            )
+            .err(),
+        Some(OwnerError::Invalid(Error::KeyReuse))
+    );
+    assert_eq!(
+        reopened.prepare_add_device(&cap, keys).err(),
+        Some(OwnerError::Invalid(Error::DuplicateDevice))
+    );
+    drop(owner);
+    assert_eq!(
+        before.seen_device(bh_account::DeviceId([99; 32])),
+        Err(Error::Unavailable)
+    );
+}
+
+#[test]
+fn captured_history_refuses_changed_cut_account_and_invalid_cursor() {
+    use bh_account::journal::HistoryCursor;
+    let h = Harness::new();
+    let setup = complete(&h);
+    let journal = h.journal();
+    let cursor = HistoryCursor {
+        anchor: setup.anchor,
+        cut: setup.head,
+        next_position: 2,
+    };
+    assert!(
+        journal
+            .history_prefix(
+                Some(HistoryCursor {
+                    next_position: 0,
+                    ..cursor
+                }),
+                1
+            )
+            .is_err()
+    );
+    assert!(
+        journal
+            .history_prefix(
+                Some(HistoryCursor {
+                    next_position: 4,
+                    ..cursor
+                }),
+                1
+            )
+            .is_err()
+    );
+    h.raw()
+        .execute(
+            "UPDATE account_state SET head_hash=?1",
+            [[88u8; 32].as_slice()],
+        )
+        .unwrap();
+    assert!(journal.history_prefix(Some(cursor), 1).is_err());
+    h.raw()
+        .execute(
+            "UPDATE account_state SET head_hash=?1",
+            [setup.head.hash.as_slice()],
+        )
+        .unwrap();
+    h.raw()
+        .execute("UPDATE account_events SET bytes=x'00' WHERE id=3", [])
+        .unwrap();
+    assert!(journal.history_prefix(Some(cursor), 1).is_err());
+    h.raw()
+        .execute(
+            "UPDATE account_events SET bytes=?1 WHERE id=3",
+            [&setup.submission[2]],
+        )
+        .unwrap();
+    h.raw()
+        .execute(
+            "UPDATE account_state SET anchor=?1",
+            [[99u8; 32].as_slice()],
+        )
+        .unwrap();
+    assert!(journal.history_prefix(Some(cursor), 1).is_err());
+}
+
+#[test]
+fn native_absent_account_does_not_enter_full_history_fallback() {
+    let h = Harness::new();
+    let journal = indexed_journal::HookJournal {
+        inner: h.journal(),
+        pages: Default::default(),
+        after_advance: Box::new(|_| {}),
+    };
+    let mut owner = bh_account::owner::AccountOwner::new(
+        journal,
+        h.store.clone(),
+        PlainProtector,
+        h.generation.clone(),
+    );
+    assert!(matches!(
+        ready(owner.activate()).unwrap(),
+        AccountLoad::Uninitialized
+    ));
+}
+
+#[test]
+fn projection_reopen_does_not_replay_all_history() {
+    let h = Harness::new();
+    let status = complete(&h);
+    assert!(h.journal().load_projection().unwrap().is_some());
+    // Corrupt an interior event only after a verified snapshot has committed.
+    // Reopening checks signed edges and bounded projection, not the interior log.
+    h.raw()
+        .execute("UPDATE account_events SET bytes=x'00' WHERE id=2", [])
+        .unwrap();
+    let mut reopened = h.owner();
+    assert!(activate(&mut reopened).account_id() == status.anchor);
+}
+
+#[test]
+fn wrong_projection_head_falls_back_to_signed_replay() {
+    let h = Harness::new();
+    complete(&h);
+    h.raw()
+        .execute(
+            "UPDATE account_projection SET through_hash=?1",
+            [[21u8; 32].as_slice()],
+        )
+        .unwrap();
+    h.raw()
+        .execute("UPDATE account_events SET bytes=x'00' WHERE id=2", [])
+        .unwrap();
+    let mut owner = h.owner();
+    assert!(matches!(
+        ready(owner.activate()).unwrap(),
+        AccountLoad::AdmissionRequired(AdmissionReason::CorruptHistory)
+    ));
+}
 
 #[test]
 fn shared_journal_uses_the_exact_container_connection_and_poison_is_storage() {
@@ -784,6 +1492,13 @@ fn scanner_status_uses_verified_sqlite_facts_not_relay_hints() {
     journal
         .commit_verified(setup.anchor, &original, setup.head, false)
         .unwrap();
+    assert_eq!(
+        scanner_status(&journal),
+        Err(bh_account::pairing::PairError::Unavailable)
+    );
+    let partial = journal.load_projection().unwrap().unwrap();
+    let checked = partial.account.applied_batch(&original[1..]).unwrap();
+    journal.advance_projection(&checked).unwrap();
     assert_eq!(scanner_status(&journal).unwrap(), ScannerStatus::Pending);
     let mut owner = showing.owner();
     let capability = activate(&mut owner);
@@ -794,6 +1509,13 @@ fn scanner_status_uses_verified_sqlite_facts_not_relay_hints() {
     journal
         .commit_verified(setup.anchor, &[event.as_bytes()], event.head(), false)
         .unwrap();
+    assert_eq!(
+        scanner_status(&journal),
+        Err(bh_account::pairing::PairError::Unavailable)
+    );
+    let partial = journal.load_projection().unwrap().unwrap();
+    let checked = partial.account.applied_batch(&[event.as_bytes()]).unwrap();
+    journal.advance_projection(&checked).unwrap();
     drop(journal);
     let journal = scanner.journal();
     assert_eq!(
@@ -966,23 +1688,40 @@ fn kit_saved_before_ordering_survives_restart_and_deletes_after_ordering() {
     let mut owner = h.owner();
     let status = begin(&mut owner);
     let code = owner.pending_kit_code().unwrap().expose().to_owned();
+    let objects_before = owner.pending_home_objects().unwrap();
 
-    // The person confirms the kit while the home has not ordered yet.
+    // The person confirms the kit while no production home exists. The
+    // account becomes locally usable without keeping the recoverable code.
     owner
         .confirm_kit_saved()
         .expect("confirmed before ordering");
     let resumed = owner.setup_status().unwrap().unwrap();
     assert!(resumed.kit_saved);
-    assert_eq!(owner.pending_kit_code().unwrap().expose(), &code);
+    assert_eq!(h.stored().head, status.head);
+    assert!(matches!(
+        owner.pending_kit_code(),
+        Err(SetupError::NotStarted)
+    ));
+    let pending = h.journal().pending_setup().unwrap().unwrap();
     assert!(
-        h.journal().pending_setup().unwrap().is_some(),
-        "code retained until ordering"
+        !pending.blob.windows(code.len()).any(|bytes| bytes == code),
+        "kit code must not survive in the protected pending material"
     );
+    let objects_after = owner.pending_home_objects().unwrap();
+    assert_eq!(objects_before.record, objects_after.record);
+    assert_eq!(objects_before.device_seal, objects_after.device_seal);
+    assert_eq!(objects_before.recovery_seal, objects_after.recovery_seal);
+    assert!(activate(&mut owner).account_id() == status.anchor);
+    assert_ne!(code, [0; 16]);
 
     // The confirmation survives a restart, and ordering then deletes the blob.
     drop(owner);
     let mut owner = h.owner();
     assert!(owner.setup_status().unwrap().unwrap().kit_saved);
+    assert!(matches!(
+        owner.pending_kit_code(),
+        Err(SetupError::NotStarted)
+    ));
     owner
         .confirm_home_ordered(status.head)
         .expect("home ordered");
@@ -993,6 +1732,193 @@ fn kit_saved_before_ordering_survives_restart_and_deletes_after_ordering() {
         Err(SetupError::NotStarted)
     ));
     assert!(h.journal().load().unwrap().is_some());
+}
+
+#[test]
+fn saved_kit_makes_old_sqlite_backup_unopenable_even_if_it_kept_the_original_blob() {
+    use bh_account::journal::PendingSetupProtector;
+    let h = Harness::new();
+    let protector = protector::RotatingProtector::default();
+    let mut owner = bh_account::owner::AccountOwner::new(
+        h.journal(),
+        h.store.clone(),
+        protector.clone(),
+        h.generation.clone(),
+    );
+    let status = ready(
+        owner.begin_first_device(ControlKeyPolicy::AppEnforcedOwnerConfirmation, &password()),
+    )
+    .unwrap();
+    let backup = h.dir.path().join("before-kit-save.sqlite");
+    h.raw()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    let old = DeviceJournal::open(&backup)
+        .unwrap()
+        .pending_setup()
+        .unwrap()
+        .unwrap();
+    assert!(
+        protector.clone().open(&old.blob).is_ok(),
+        "backup was readable before save"
+    );
+    owner.confirm_kit_saved().unwrap();
+    assert!(
+        matches!(
+            protector.clone().open(&old.blob),
+            Err(bh_account::journal::ProtectorError::Unavailable)
+        ),
+        "old WAL or backup ciphertext must not remain decryptable with retained Keychain keys"
+    );
+    assert!(matches!(
+        owner.pending_kit_code(),
+        Err(SetupError::NotStarted)
+    ));
+    assert_eq!(h.stored().head, status.head);
+    drop(owner);
+    let mut resumed = bh_account::owner::AccountOwner::new(
+        h.journal(),
+        h.store.clone(),
+        protector,
+        h.generation.clone(),
+    );
+    assert!(resumed.setup_status().unwrap().unwrap().kit_saved);
+    match ready(resumed.activate()).unwrap() {
+        AccountLoad::Active(capability) => assert!(capability.account_id() == status.anchor),
+        other => panic!("expected active account, got {other:?}"),
+    }
+}
+
+#[test]
+fn home_ack_retries_retirement_before_clearing_its_only_reference() {
+    use bh_account::journal::PendingSetupProtector;
+    let h = Harness::new();
+    let protector = protector::RotatingProtector::default();
+    let mut owner = bh_account::owner::AccountOwner::new(
+        h.journal(),
+        h.store.clone(),
+        protector.clone(),
+        h.generation.clone(),
+    );
+    let status = ready(
+        owner.begin_first_device(ControlKeyPolicy::AppEnforcedOwnerConfirmation, &password()),
+    )
+    .unwrap();
+    let old = h.journal().pending_setup().unwrap().unwrap();
+    protector.fail_next_retirement();
+    assert!(owner.confirm_kit_saved().is_err());
+    protector.fail_next_retirement();
+    assert!(owner.confirm_home_ordered(status.head).is_err());
+    assert!(h.journal().pending_setup().unwrap().is_some());
+    assert!(protector.clone().open(&old.blob).is_ok());
+    owner.confirm_home_ordered(status.head).unwrap();
+    assert!(h.journal().pending_setup().unwrap().is_none());
+    assert!(protector.clone().open(&old.blob).is_err());
+    assert_eq!(h.stored().history, status.submission);
+}
+
+#[test]
+fn restart_after_no_code_commit_retires_lingering_old_key_before_activation() {
+    use bh_account::journal::PendingSetupProtector;
+    let h = Harness::new();
+    let protector = protector::RotatingProtector::default();
+    let mut owner = bh_account::owner::AccountOwner::new(
+        h.journal(),
+        h.store.clone(),
+        protector.clone(),
+        h.generation.clone(),
+    );
+    let _ = ready(
+        owner.begin_first_device(ControlKeyPolicy::AppEnforcedOwnerConfirmation, &password()),
+    )
+    .unwrap();
+    let backup = h.dir.path().join("old-code-backup.sqlite");
+    h.raw()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    let old = DeviceJournal::open(&backup)
+        .unwrap()
+        .pending_setup()
+        .unwrap()
+        .unwrap();
+    protector.fail_next_retirement();
+    assert!(matches!(
+        owner.confirm_kit_saved(),
+        Err(SetupError::Protector(_))
+    ));
+    let saved = h.journal().pending_setup().unwrap().unwrap();
+    assert!(
+        saved.kit_saved,
+        "no-code replacement must commit before deleting old key"
+    );
+    assert!(
+        protector.clone().open(&old.blob).is_ok(),
+        "injected deletion failure retains old key"
+    );
+    drop(owner);
+    let mut owner = bh_account::owner::AccountOwner::new(
+        h.journal(),
+        h.store.clone(),
+        protector.clone(),
+        h.generation.clone(),
+    );
+    // Reading status has no hidden Keychain deletion. Activation explicitly
+    // retires the key before granting any capability, including after a crash.
+    assert!(owner.setup_status().unwrap().unwrap().kit_saved);
+    assert!(protector.clone().open(&old.blob).is_ok());
+    protector.fail_next_retirement();
+    assert!(matches!(
+        ready(owner.activate()),
+        Err(bh_account::owner::OwnerError::Protector(_))
+    ));
+    assert!(protector.clone().open(&old.blob).is_ok());
+    assert!(matches!(
+        ready(owner.activate()).unwrap(),
+        AccountLoad::Uninitialized
+    ));
+    assert!(matches!(
+        protector.clone().open(&old.blob),
+        Err(bh_account::journal::ProtectorError::Unavailable)
+    ));
+    owner.confirm_kit_saved().unwrap();
+    assert!(matches!(
+        ready(owner.activate()).unwrap(),
+        AccountLoad::Active(_)
+    ));
+}
+
+#[test]
+fn failed_local_commit_after_kit_confirmation_resumes_without_code_or_new_account() {
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let status = begin(&mut owner);
+    let code = owner.pending_kit_code().unwrap().expose().to_owned();
+    h.raw().execute_batch("CREATE TRIGGER fail_local BEFORE INSERT ON account_events BEGIN SELECT RAISE(FAIL, 'disk full'); END;").unwrap();
+    assert!(matches!(
+        owner.confirm_kit_saved(),
+        Err(SetupError::Journal(_))
+    ));
+    assert!(h.journal().load().unwrap().is_none());
+    assert!(matches!(
+        owner.pending_kit_code(),
+        Err(SetupError::NotStarted)
+    ));
+    let pending = h.journal().pending_setup().unwrap().unwrap();
+    assert!(!pending.blob.windows(code.len()).any(|bytes| bytes == code));
+    assert!(matches!(
+        ready(
+            owner.begin_first_device(ControlKeyPolicy::AppEnforcedOwnerConfirmation, &password())
+        ),
+        Err(SetupError::AlreadyStarted)
+    ));
+    h.raw().execute_batch("DROP TRIGGER fail_local").unwrap();
+    drop(owner);
+    let mut resumed = h.owner();
+    assert!(resumed.setup_status().unwrap().unwrap().kit_saved);
+    resumed.confirm_kit_saved().unwrap();
+    assert_eq!(h.stored().history.len(), 3);
+    assert_eq!(h.stored().head, status.head);
+    assert!(activate(&mut resumed).account_id() == status.anchor);
 }
 
 #[test]

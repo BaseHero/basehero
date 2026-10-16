@@ -97,15 +97,34 @@ recorded device identity; and a versioned, opaque, native-protected pending-setu
 blob with its stage. It is not a key-value store, and a head is never durable
 without the bytes that produced it.
 
-`owner::AccountOwner` replays persisted original history from the anchor against
-the remembered head on activation. While active it keeps that verified projection:
-successor batches make one transactional copy, and staged-admission reconciliation
-compares the exact staged bytes with its verified positional hash instead of
-replaying the journal. Its historic signing/control and receiving-key indexes
-include removed devices and reject cross-role signing/control reuse. The projection
-is in memory only; a durable projection tied to the remembered head can be added
-once account-local storage has its own container. It honours a persisted stop (retaining the last verified
-state and never clearing remembered heads), loads the native device with
+`owner::AccountOwner` loads a fixed-size current summary and current active
+devices, bound to the trusted account anchor, projection epoch and verified cut.
+Historical device/key evidence remains in indexed SQLite rows; original events
+are the positional evidence. Views pin their epoch/cut, so later additions and
+removals do not change their answers. The reader handle is weak: closure, an
+epoch reset or a read failure returns `Error::Unavailable`, never absence.
+A transient failure leaves the accepted view, head, generation and stop unchanged;
+retry that view after recovery, or reload if its epoch/container became obsolete.
+`seen_device` is fallible; the compatibility `has_seen_device` conservatively
+returns true on unavailable evidence and is not an authoritative status API.
+
+Missing/corrupt projections rebuild in persisted batches of at most 256 original
+events, with no capability until the coherent current target is reached.
+Reset advances the epoch; maintenance deletes at most 256 obsolete rows per table
+per pass. A successor transaction writes only affected device/key rows and the
+fixed summary, together with its original bytes and head. Accepted views then
+rebase to the committed indexed cut, dropping the recent candidate overlay.
+
+`AccountJournal::history_prefix(None, limit)` captures an original-history cut.
+Follow its `HistoryCursor` to export contiguous pages bounded by that same cut,
+even across later appends. Limits are 1..=256; the codec bounds each original to
+2724 bytes (697344 encoded bytes per full page). Missing gaps, changed cuts or
+accounts, and oversized stored payloads fail the entire page. A cursor carries
+no authority: native callers must still check capability/generation around export.
+Pending setup checks only its exact initial prefix, not the lifetime tail.
+
+The owner honours a persisted stop (retaining the last verified state and never clearing remembered
+heads), loads the native device with
 `load_matching`, requires those keys to be an active device in verified history
 with `materials_ready`, and only then mints an opaque generation-bound
 `AccountCapability`. That capability is offline, last-verified authority; it is
@@ -118,21 +137,43 @@ resets a remembered head.
 Incoming history is verified in memory and then persisted as original bytes plus
 the resulting head in one commit; invalid input persists the stop and keeps the
 last good head. The first-device setup state machine stages the exact signed
-bytes and protected pending material, resumes at `Prepared` or `HomePending`
-without regenerating genesis or code, and derives home ordering from the journal
-holding the staged anchor and bytes. It reconciles an uncertain home response
-against the exact signed bytes, keeps a kit-save confirmation made before
-ordering, and deletes pending code/recovery material only once both home ordering
-and an explicit kit-save confirmation hold. An opened save destination is not
-success. Home ordering requires that the home acknowledged the ordered events
-**and** the three private objects (recovery record and both personal-key seals);
-the three objects are not proven by the signed head alone.
+bytes and protected pending material, resumes at `Prepared`, `HomePending` or
+`HomeOrdered` without regenerating genesis or code, and never infers home
+ordering from locally committed history. An explicit kit-save confirmation
+replaces the code-bearing blob under a distinct per-setup wrapping key,
+retires its old Keychain wrapping key once the replacement is durable, and
+commits the signed prefix locally, so the first device works before a production
+home exists. After a crash between the SQLite replacement and Keychain deletion,
+opening saved setup retires the lingering old key first; a failed local commit
+retries from the no-code staged blob without making a second account. The three encrypted private objects and exact signed bytes stay
+pending for future home submission. Only a home acknowledgement for both the
+ordered events and the three private objects permits clearing that pending
+submission. An opened save destination is not success.
+
+Before pending setup can be deleted, `retain_initial_bootstrap` checks or copies
+the immutable recovery-record and two personal-seal ciphertexts, bound to the
+initial three-event head/hash and anchor, in the same transaction as deletion.
+This retained record has no recovery code, recovery private key, or opened seed.
+The encrypted initial-device seal remains available after home acknowledgement.
+
+`AccountOwner::initial_prefix(cap)` reads and verifies exactly those three signed
+originals at the recorded cut, not the current history length.
+`initial_bootstrap(cap)` returns that public `InitialAccountPrefix` and a separate
+`PendingHomeObjects` value after authenticating **all three** encrypted objects
+against their signed digests. Do not serialize the latter into public account
+history. Both APIs are native-only; no roots are exported.
+`open_personal(cap)` opens only the initial-device seal, checking current device
+admission separately from the historical prefix and fencing native awaits.
+It does not fall back to a pairing delivery. `PersonalKey::decapsulate` returns
+a zeroizing shared secret, never the receiver seed. `sign_content(cap, bytes)`
+uses the ordinary native signing key, validates the returned signature, and
+checks the capability around each native await; it is not control approval.
 
 `storage::DeviceJournal` implements the contract over the device-local SQLite
 journal (`libs/storage`), which stores only typed opaque rows and keeps no
 dependency on this library. Production still needs a native pending-blob
-protector, private-object delivery and a real home/checker lane; the identity
-protector is test-only and provides no protection. As a
+private-object delivery and a real home/checker lane. The Mac login-Keychain
+protector is native-only; the portable identity protector is test-only. As a
 known limit, linking `DeviceJournal` makes every consumer of this library link
 the bundled SQLite device store, including verifiers that never touch it;
 revisit by hiding it behind a feature or moving it to the client before hosted
@@ -197,6 +238,11 @@ control Ed25519 key (32), and X-Wing receiver key (1216), in that order.
 - Tag `4`: personal X-Wing public key (1216 bytes), first-device and recovery
   full-envelope digests (32 bytes each), position 3 only after tag 3, signed by
   the first device. Duplicate/reordered bootstrap controls are rejected.
+
+The kit renders the 16 raw code bytes as 26 uppercase base32 characters
+plus two checksum characters, grouped into seven four-character sections
+separated by dashes (34 characters). The grouping and checksum are presentation,
+not extra recovery entropy; the password/code KDF still uses the raw bytes.
 
 The private recovery record is exactly 242 bytes: eight-byte `BHREC01` with NUL,
 version 1 (u16), account id (32), recovery-key id (32), nonce (24), encrypted

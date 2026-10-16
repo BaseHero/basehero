@@ -41,6 +41,7 @@ pub struct Opened {
     pub state: Vec<u8>,
     pub generation: u64,
     pub sequence: u64,
+    pub writer: Option<crate::writers::WriterLease>,
 }
 pub struct Ack {
     pub request_id: [u8; 16],
@@ -104,6 +105,9 @@ impl<A: AuthoritySource> Coordinator<A> {
     pub fn authority_mut(&mut self) -> &mut A {
         &mut self.authority
     }
+    pub fn authority(&self) -> &A {
+        &self.authority
+    }
     pub fn note_revision(&self, key: NoteKey) -> u64 {
         *self.note_revisions.get(&key).unwrap_or(&0)
     }
@@ -129,6 +133,7 @@ impl<A: AuthoritySource> Coordinator<A> {
             state,
             generation,
             sequence: self.sequence,
+            writer: None,
         })
     }
     pub fn is_current(&self, window: &str, generation: u64) -> bool {
@@ -172,6 +177,7 @@ impl<A: AuthoritySource> Coordinator<A> {
             state,
             generation,
             sequence: self.sequence,
+            writer: None,
         })
     }
 

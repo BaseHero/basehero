@@ -1,14 +1,21 @@
 //! One native-only owner for device-local account containers and note surfaces.
 //! A database row is not account authority: registration takes the independently
 //! verified account state and compares its exact anchored head to the stored row.
-//! There is no production session issuer yet; the app remains on setup.
+//! Note authority comes only from `authorize` with a current account capability
+//! and its verified own base; `register` takes fixture authority for tests.
+pub mod base_keys;
 mod compaction;
+mod containers;
 pub mod coordinator;
+pub mod own_base;
+pub mod writers;
 
-use bh_account::{AccountEvent, AccountId, VerifiedAccount, crypto::hash};
+use bh_account::{
+    AccountEvent, AccountId, VerifiedAccount, crypto::hash, owner::AccountCapability,
+};
 use bh_core::note::Note;
 use bh_crypto::random;
-use bh_storage::{DeviceDatabase, NoteKey, StoreError};
+use bh_storage::{DeviceDatabase, NoteEntry, NoteKey, OpenError, StoreError, ViewRecord};
 use compaction::Scheduler;
 use coordinator::{Ack, AuthoritySource, Coordinator, Delivery, HostError, Opened};
 use std::{
@@ -23,7 +30,65 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ContainerId(pub [u8; 16]);
 
-type Session = Arc<Mutex<Coordinator<Box<dyn AuthoritySource + Send>>>>;
+const ORDINARY_AUDIENCE: [u8; 32] = [0; 32];
+/// Largest encoded Yjs selection position a restart record may carry.
+pub const MAX_SELECTION_BYTES: usize = 1024;
+
+/// Only native verified admission installs Account; fixture authority is separate.
+enum AccountAuthority {
+    Unbound,
+    Account {
+        capability: Arc<AccountCapability>,
+        own_base: [u8; 32],
+        windows: HashMap<String, [u8; 32]>,
+    },
+    Fixture(Box<dyn AuthoritySource + Send>),
+}
+impl AuthoritySource for AccountAuthority {
+    fn bound_scope(&self, window: &str) -> Option<coordinator::Scope> {
+        match self {
+            Self::Account {
+                capability,
+                own_base,
+                windows,
+            } if capability.is_current() => windows.get(window).map(|note| coordinator::Scope {
+                account: capability.account_id().0,
+                key: NoteKey {
+                    base: *own_base,
+                    audience: ORDINARY_AUDIENCE,
+                    note: *note,
+                },
+            }),
+            Self::Fixture(source) => source.bound_scope(window),
+            _ => None,
+        }
+    }
+}
+impl AccountAuthority {
+    fn capability(&self) -> Option<&Arc<AccountCapability>> {
+        match self {
+            Self::Account { capability, .. } => Some(capability),
+            _ => None,
+        }
+    }
+    /// Own base and capability only while that capability is current.
+    fn current(&self) -> Option<([u8; 32], Arc<AccountCapability>)> {
+        match self {
+            Self::Account {
+                own_base,
+                capability,
+                ..
+            } if capability.is_current() => Some((*own_base, Arc::clone(capability))),
+            _ => None,
+        }
+    }
+    fn forget(&mut self, window: &str) {
+        if let Self::Account { windows, .. } = self {
+            windows.remove(window);
+        }
+    }
+}
+type Session = Arc<Mutex<Coordinator<AccountAuthority>>>;
 type NoteWork = Mutex<HashMap<(ContainerId, NoteKey), Weak<Mutex<()>>>>;
 struct WorkSlot<'a> {
     owner: &'a Owner,
@@ -62,7 +127,35 @@ struct WindowRoute {
 struct Registry {
     containers: HashMap<ContainerId, Container>,
     windows: HashMap<String, WindowRoute>,
+    // Lifecycle holds: Quit/update holds every window, a close only its own.
+    all_held: Option<u64>,
+    held_windows: HashMap<String, u64>,
+    // Windows whose page replied drained under that fence: no further writes.
+    drained: HashMap<String, u64>,
+    next_fence: u64,
 }
+impl Registry {
+    fn held(&self, window: &str) -> bool {
+        self.all_held.is_some() || self.held_windows.contains_key(window)
+    }
+    fn holds(&self, window: &str, fence: DrainFence) -> bool {
+        self.all_held == Some(fence.0) || self.held_windows.get(window) == Some(&fence.0)
+    }
+    fn fence(&mut self) -> DrainFence {
+        self.next_fence = self
+            .next_fence
+            .checked_add(1)
+            .expect("drain fence exhausted");
+        DrainFence(self.next_fence)
+    }
+}
+/// A native close/Quit/update drain. It never leaves native code and is not
+/// note authority; ending an older fence cannot release a newer one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DrainFence(u64);
+fn noop() {}
+type Hooks = (fn(), fn(), fn());
+const NO_HOOKS: Hooks = (noop, noop, noop);
 const DELIVERY_LIMIT: usize = 64;
 const DELIVERY_BYTES: usize = 256 * 1024;
 #[derive(Default)]
@@ -80,16 +173,21 @@ pub struct Owner {
     next_drain_token: AtomicU64,
     compaction: Scheduler,
     note_work: NoteWork,
+    writers: writers::Writers,
 }
 
 #[derive(Debug)]
 pub enum OwnerError {
     Store(StoreError),
+    Open(OpenError),
+    Io(std::io::Error),
+    Busy,
     Unbound,
     UnknownContainer,
     Changed,
     DuplicateAnchor,
     AnchorMismatch,
+    WriterUnavailable,
 }
 impl From<StoreError> for OwnerError {
     fn from(error: StoreError) -> Self {
@@ -210,6 +308,395 @@ fn verified_anchor(
 }
 
 impl Owner {
+    fn account_session(&self, id: ContainerId) -> Result<Session, OwnerError> {
+        let registry = self.registry.lock().expect("owner registry lock");
+        Ok(Arc::clone(
+            &registry
+                .containers
+                .get(&id)
+                .ok_or(OwnerError::UnknownContainer)?
+                .session,
+        ))
+    }
+    /// Remove every route into this container and its queued deliveries.
+    /// Call with that container's session guard held.
+    fn drop_routes(
+        &self,
+        id: ContainerId,
+        guard: &mut Coordinator<AccountAuthority>,
+    ) -> Vec<String> {
+        let affected: Vec<_> = {
+            let mut registry = self.registry.lock().expect("owner registry lock");
+            let affected: Vec<_> = registry
+                .windows
+                .iter()
+                .filter(|(_, route)| route.container == id)
+                .map(|(window, _)| window.clone())
+                .collect();
+            for window in &affected {
+                registry.windows.remove(window);
+                guard.invalidate(window);
+            }
+            affected
+        };
+        self.writers
+            .active
+            .lock()
+            .expect("writer leases")
+            .retain(|_, writer| writer.container != id);
+        let mut queues = self.deliveries.lock().expect("delivery lock");
+        for window in &affected {
+            queues.remove(window);
+        }
+        affected
+    }
+    /// Native caller supplies the ordinary own BaseId verified by account
+    /// admission. This API cannot validate that external proof; it never derives
+    /// a base from a filename, account ID or page input. Anchor alone is not note
+    /// authority. Reinstalling the same capability keeps windows bound; a new
+    /// capability ends every earlier load in this container.
+    pub fn authorize(
+        &self,
+        id: ContainerId,
+        capability: Arc<AccountCapability>,
+        own_base: [u8; 32],
+    ) -> Result<(), OwnerError> {
+        let session = self.account_session(id)?;
+        let mut guard = session.lock().expect("container session lock");
+        let database = guard.shared_database();
+        let _writer = database.lock().expect("container writer lock");
+        // Replacing authority would end loads that Quit/update is draining.
+        if self
+            .registry
+            .lock()
+            .expect("owner registry lock")
+            .all_held
+            .is_some()
+        {
+            return Err(OwnerError::Busy);
+        }
+        if !capability.is_current()
+            || self
+                .registry
+                .lock()
+                .expect("owner registry lock")
+                .containers
+                .get(&id)
+                .and_then(|c| c.anchor)
+                != Some(capability.account_id().0)
+        {
+            return Err(OwnerError::Unbound);
+        }
+        if guard
+            .authority()
+            .current()
+            .is_some_and(|(base, current)| base == own_base && Arc::ptr_eq(&current, &capability))
+        {
+            return Ok(());
+        }
+        self.drop_routes(id, &mut guard);
+        *guard.authority_mut() = AccountAuthority::Account {
+            capability,
+            own_base,
+            windows: HashMap::new(),
+        };
+        Ok(())
+    }
+    /// Lock may have already revoked the capability. Do not wait for a browser
+    /// reply; return the labels whose native pages must reload.
+    pub fn deauthorize(&self, id: ContainerId) -> Result<Vec<String>, OwnerError> {
+        let session = self.account_session(id)?;
+        let mut guard = session.lock().expect("container session lock");
+        let affected = self.drop_routes(id, &mut guard);
+        *guard.authority_mut() = AccountAuthority::Unbound;
+        Ok(affected)
+    }
+    /// Native routing only: the container a window's note belongs to.
+    pub fn bound_container(&self, window: &str) -> Option<ContainerId> {
+        let registry = self.registry.lock().expect("owner registry lock");
+        let route = registry.windows.get(window)?;
+        registry
+            .containers
+            .get(&route.container)?
+            .anchor
+            .map(|_| route.container)
+    }
+    /// Run `write` with the container's own base while its capability is
+    /// current, under the session and writer guards that fence replacement.
+    fn with_authorized_writer<R>(
+        &self,
+        id: ContainerId,
+        write: impl FnOnce(&mut DeviceDatabase, [u8; 32]) -> Result<R, OwnerError>,
+    ) -> Result<R, OwnerError> {
+        let session = self.account_session(id)?;
+        let guard = session.lock().expect("container session lock");
+        let database = guard.shared_database();
+        let mut db = database.lock().expect("container writer lock");
+        let (base, _) = guard.authority().current().ok_or(OwnerError::Unbound)?;
+        write(&mut db, base)
+    }
+    pub fn create_note(&self, id: ContainerId) -> Result<[u8; 32], OwnerError> {
+        self.with_authorized_writer(id, |db, base| Ok(db.create_note(base, ORDINARY_AUDIENCE)?))
+    }
+    pub fn home_note(&self, id: ContainerId) -> Result<[u8; 32], OwnerError> {
+        self.with_authorized_writer(id, |db, base| Ok(db.home_note(base, ORDINARY_AUDIENCE)?))
+    }
+    /// True only for an ordinary note in this container's authorized own base.
+    pub fn has_note(&self, id: ContainerId, note: [u8; 32]) -> Result<bool, OwnerError> {
+        self.with_authorized_writer(id, |db, base| {
+            Ok(db.note_exists(NoteKey {
+                base,
+                audience: ORDINARY_AUDIENCE,
+                note,
+            })?)
+        })
+    }
+    pub fn open_home(&self, window: &str, id: ContainerId) -> Result<[u8; 32], OwnerError> {
+        let note = self.home_note(id)?;
+        self.show_note(window, id, note)?;
+        Ok(note)
+    }
+    /// Native-only route; a note must exist under the full own-base/zero-audience
+    /// key. The window's earlier load stops at once: every open, commit and
+    /// delivery checks this route, so another container's stale binding cannot
+    /// write or deliver. Its session is not locked here, which could wait for
+    /// (or, from a commit hook, deadlock on) that container's save.
+    pub fn show_note(
+        &self,
+        window: &str,
+        id: ContainerId,
+        note: [u8; 32],
+    ) -> Result<(), OwnerError> {
+        let session = self.account_session(id)?;
+        {
+            let mut guard = session.lock().expect("container session lock");
+            let database = guard.shared_database();
+            let db = database.lock().expect("container writer lock");
+            let (base, capability) = guard.authority().current().ok_or(OwnerError::Unbound)?;
+            if !db.note_exists(NoteKey {
+                base,
+                audience: ORDINARY_AUDIENCE,
+                note,
+            })? {
+                return Err(OwnerError::Unbound);
+            }
+            let mut registry = self.registry.lock().expect("owner registry lock");
+            if registry.held(window) {
+                return Err(OwnerError::Busy);
+            }
+            if registry.containers.get(&id).and_then(|c| c.anchor)
+                != Some(capability.account_id().0)
+            {
+                return Err(OwnerError::Unbound);
+            }
+            registry.windows.insert(
+                window.to_owned(),
+                WindowRoute {
+                    container: id,
+                    generation: None,
+                },
+            );
+            guard.invalidate(window);
+            if let AccountAuthority::Account { windows, .. } = guard.authority_mut() {
+                windows.insert(window.to_owned(), note);
+            }
+            guard.allow_bound_window(window);
+        }
+        self.deliveries
+            .lock()
+            .expect("delivery lock")
+            .remove(window);
+        Ok(())
+    }
+    /// Read-pool query, with authority rechecked before returning results.
+    pub fn list_notes(
+        &self,
+        id: ContainerId,
+        after: Option<(i64, [u8; 32])>,
+        limit: usize,
+    ) -> Result<Vec<NoteEntry>, OwnerError> {
+        let session = self.account_session(id)?;
+        let (base, capability, pool) = {
+            let guard = session.lock().expect("container session lock");
+            let (base, capability) = guard.authority().current().ok_or(OwnerError::Unbound)?;
+            let pool = guard
+                .shared_database()
+                .lock()
+                .expect("container writer lock")
+                .read_pool();
+            (base, capability, pool)
+        };
+        let rows =
+            pool.ok_or(OwnerError::Unbound)?
+                .list_notes(base, ORDINARY_AUDIENCE, after, limit)?;
+        let guard = session.lock().expect("container session lock");
+        if guard
+            .authority()
+            .current()
+            .is_none_or(|(current_base, current)| {
+                current_base != base || !Arc::ptr_eq(&current, &capability)
+            })
+        {
+            return Err(OwnerError::Unbound);
+        }
+        Ok(rows)
+    }
+    /// Consume restart presentation only after authorize. A row never grants
+    /// authority: discard non-own-base, non-zero-audience or absent notes and
+    /// call show_note again for every chosen destination before any page bind.
+    /// `anchor`/`head` are the page's encoded Yjs selection positions (bounded
+    /// presentation bytes, not an account): the per-account container and the
+    /// current capability and own base supply the authority.
+    pub fn take_authorized_view_records(
+        &self,
+        id: ContainerId,
+    ) -> Result<Vec<ViewRecord>, OwnerError> {
+        let session = self.account_session(id)?;
+        let guard = session.lock().expect("container session lock");
+        let database = guard.shared_database();
+        let mut writer = database.lock().expect("container writer lock");
+        let (base, _) = guard.authority().current().ok_or(OwnerError::Unbound)?;
+        let mut applicable = Vec::new();
+        for record in writer.take_view_records()? {
+            if record.anchor.len() <= MAX_SELECTION_BYTES
+                && record.head.len() <= MAX_SELECTION_BYTES
+                && record.key.base == base
+                && record.key.audience == ORDINARY_AUDIENCE
+                && writer.note_exists(record.key)?
+            {
+                applicable.push(record);
+            }
+        }
+        Ok(applicable)
+    }
+    /// Hold every window for Quit or update: no new route, load or account
+    /// authorization starts, while already accepted writing keeps saving
+    /// until each window replies drained.
+    pub fn begin_drain(&self) -> Result<DrainFence, OwnerError> {
+        let mut registry = self.registry.lock().expect("owner registry lock");
+        if registry.all_held.is_some() || !registry.held_windows.is_empty() {
+            return Err(OwnerError::Busy);
+        }
+        let fence = registry.fence();
+        registry.all_held = Some(fence.0);
+        Ok(fence)
+    }
+    /// Hold one closing window; other windows and accounts carry on.
+    pub fn begin_window_drain(&self, window: &str) -> Result<DrainFence, OwnerError> {
+        let mut registry = self.registry.lock().expect("owner registry lock");
+        if registry.held(window) {
+            return Err(OwnerError::Busy);
+        }
+        let fence = registry.fence();
+        registry.held_windows.insert(window.to_owned(), fence.0);
+        Ok(fence)
+    }
+    /// Ends exactly this fence and its drained marks; a stale one is ignored.
+    pub fn end_drain(&self, fence: DrainFence) {
+        let mut registry = self.registry.lock().expect("owner registry lock");
+        if registry.all_held == Some(fence.0) {
+            registry.all_held = None;
+        }
+        registry.held_windows.retain(|_, held| *held != fence.0);
+        registry.drained.retain(|_, held| *held != fence.0);
+    }
+    fn drained(&self, window: &str) -> bool {
+        self.registry
+            .lock()
+            .expect("owner registry lock")
+            .drained
+            .contains_key(window)
+    }
+    /// The page replied that it drained under `fence`. Serialized with COMMIT
+    /// under the note lease: a save already inside it finishes first, none
+    /// starts after. A loading or note-less surface is fenced the same way.
+    /// Returns the note only for an open ordinary own-base load, the one kind
+    /// a restart record may name.
+    pub fn mark_drained(
+        &self,
+        window: &str,
+        fence: DrainFence,
+    ) -> Result<Option<(ContainerId, NoteKey)>, OwnerError> {
+        let route = {
+            let mut registry = self.registry.lock().expect("owner registry lock");
+            if !registry.holds(window, fence) {
+                return Err(OwnerError::Unbound);
+            }
+            match registry.windows.get(window).copied() {
+                Some(WindowRoute {
+                    container,
+                    generation: Some(generation),
+                }) => (container, generation),
+                _ => {
+                    registry.drained.insert(window.to_owned(), fence.0);
+                    return Ok(None);
+                }
+            }
+        };
+        let Some((id, key)) = self.bound_work_key(window, route.1) else {
+            // A closed or revoked load can no longer write: nothing to wait for.
+            let mut registry = self.registry.lock().expect("owner registry lock");
+            if !registry.holds(window, fence) {
+                return Err(OwnerError::Unbound);
+            }
+            registry.drained.insert(window.to_owned(), fence.0);
+            return Ok(None);
+        };
+        let work = self.work_lock(id, key);
+        let _lease = work
+            .lock
+            .as_ref()
+            .unwrap()
+            .lock()
+            .expect("exclusive note work lock");
+        if self.bound_work_key(window, route.1) != Some((id, key)) {
+            return Err(OwnerError::Unbound);
+        }
+        let ordinary = self
+            .account_session(id)?
+            .lock()
+            .expect("container session lock")
+            .authority()
+            .current()
+            .is_some_and(|(base, _)| key.base == base && key.audience == ORDINARY_AUDIENCE);
+        let mut registry = self.registry.lock().expect("owner registry lock");
+        if !registry.holds(window, fence)
+            || registry.windows.get(window)
+                != Some(&WindowRoute {
+                    container: id,
+                    generation: Some(route.1),
+                })
+        {
+            return Err(OwnerError::Unbound);
+        }
+        registry.drained.insert(window.to_owned(), fence.0);
+        Ok(ordinary.then_some((id, key)))
+    }
+    /// Every anchored container's writer, including those with no open
+    /// window, so a restart replaces each one's records. Never a setup file.
+    pub fn anchored_databases(&self) -> Vec<(ContainerId, Arc<Mutex<DeviceDatabase>>)> {
+        let mut sessions: Vec<_> = {
+            let registry = self.registry.lock().expect("owner registry lock");
+            registry
+                .containers
+                .iter()
+                .filter(|(_, c)| c.anchor.is_some())
+                .map(|(id, c)| (*id, Arc::clone(&c.session)))
+                .collect()
+        };
+        // A stable order, so a partial failure is reproducible.
+        sessions.sort_by_key(|(id, _)| id.0);
+        sessions
+            .into_iter()
+            .map(|(id, session)| {
+                let database = session
+                    .lock()
+                    .expect("container session lock")
+                    .shared_database();
+                (id, database)
+            })
+            .collect()
+    }
     /// Native-only existing writer; does not create a second account store or
     /// grant note authority. A setup container remains unanchored until anchor.
     pub fn shared_database(
@@ -230,6 +717,20 @@ impl Owner {
             .lock()
             .expect("container session lock")
             .shared_database())
+    }
+    /// True only for a never-anchored container with no durable account,
+    /// pending setup, staged admission or device identity. A caller may reuse
+    /// an empty unanchored file left by an interrupted signup.
+    pub fn is_empty(&self, id: ContainerId) -> Result<bool, OwnerError> {
+        let database = self.shared_database(id)?;
+        let db = database.lock().expect("container writer lock");
+        let empty = db.account_container_empty()?;
+        let registry = self.registry.lock().expect("owner registry lock");
+        let container = registry
+            .containers
+            .get(&id)
+            .ok_or(OwnerError::UnknownContainer)?;
+        Ok(empty && container.anchor.is_none())
     }
     /// Promote the same setup container after its journal is committed. Keep
     /// its writer locked through the short registry insertion so validation
@@ -275,6 +776,17 @@ impl Owner {
             (Some(_), Some(proof)) => Some(verified_anchor(&database, proof)?),
             _ => return Err(OwnerError::AnchorMismatch),
         };
+        self.install(database, anchor, AccountAuthority::Fixture(authority))
+    }
+
+    // An opened file deliberately starts without authority even when it has a
+    // stored account. Only anchor() compares the independently verified log.
+    fn install(
+        &self,
+        database: DeviceDatabase,
+        anchor: Option<[u8; 32]>,
+        authority: AccountAuthority,
+    ) -> Result<ContainerId, OwnerError> {
         let mut registry = self.registry.lock().expect("owner registry lock");
         if anchor.is_some_and(|a| registry.containers.values().any(|c| c.anchor == Some(a))) {
             return Err(OwnerError::DuplicateAnchor);
@@ -299,16 +811,22 @@ impl Owner {
         self.compaction.schedule_backfill(id, &writer);
         Ok(id)
     }
-    /// Only native routing calls this; no IPC accepts a ContainerId.
+    /// Setup and fixture routing only. Account routes require show_note's full
+    /// key existence and capability check; bind cannot revive an old assignment.
     pub fn bind(&self, window: &str, id: ContainerId) -> Result<(), OwnerError> {
-        let (old, new) = {
+        let new = self.account_session(id)?;
+        let old = {
+            // Hold the session so authorize cannot install account authority
+            // between this check and the route.
+            let guard = new.lock().expect("container session lock");
+            if matches!(guard.authority(), AccountAuthority::Account { .. }) {
+                return Err(OwnerError::Unbound);
+            }
             let mut registry = self.registry.lock().expect("owner registry lock");
-            let new = registry
-                .containers
-                .get(&id)
-                .map(|c| Arc::clone(&c.session))
-                .ok_or(OwnerError::UnknownContainer)?;
-            let old = registry
+            if registry.held(window) {
+                return Err(OwnerError::Busy);
+            }
+            registry
                 .windows
                 .insert(
                     window.into(),
@@ -322,8 +840,7 @@ impl Owner {
                         .containers
                         .get(&route.container)
                         .map(|c| Arc::clone(&c.session))
-                });
-            (old, new)
+                })
         };
         self.deliveries
             .lock()
@@ -426,9 +943,24 @@ impl Owner {
         &self,
         window: &str,
         note: [u8; 32],
+        after_snapshot: impl FnMut(u8),
+    ) -> Result<Opened, OwnerError> {
+        self.open_mode(window, note, after_snapshot, false, None)
+    }
+    fn open_mode(
+        &self,
+        window: &str,
+        note: [u8; 32],
         mut after_snapshot: impl FnMut(u8),
+        leased: bool,
+        retire: Option<[u8; 32]>,
     ) -> Result<Opened, OwnerError> {
         let (id, session, anchor) = self.routed(window)?;
+        // Checked before this open advances the window's generation, so a
+        // stale or foreign token changes nothing; rechecked under the fences.
+        let retiring = retire
+            .map(|token| self.retiring_writer(window, id, note, token))
+            .transpose()?;
         let generation = self
             .next_generation
             .fetch_add(1, Ordering::Relaxed)
@@ -436,6 +968,9 @@ impl Owner {
             .expect("generation exhausted");
         {
             let mut registry = self.registry.lock().expect("owner registry lock");
+            if registry.held(window) {
+                return Err(OwnerError::Busy);
+            }
             let route = registry
                 .windows
                 .get_mut(window)
@@ -497,24 +1032,56 @@ impl Owner {
                 // generation. A later open can reconstruct it if needed.
                 return Err(OwnerError::Unbound);
             }
-            if database
-                .lock()
-                .expect("container writer lock")
-                .local_frontier(scope.key)?
-                != frontier
+            // Account lock fences under this writer: recheck authority here,
+            // not only in the earlier scope read.
+            let mut db = database.lock().expect("container writer lock");
+            if let Some(capability) = guard.authority().capability()
+                && (!capability.is_current() || !db.note_exists(scope.key)?)
             {
+                return Err(OwnerError::Unbound);
+            }
+            if db.local_frontier(scope.key)? != frontier {
+                drop(db);
                 drop(guard);
                 drop(lease);
                 continue;
             }
-            match guard.open_with_state(window, note, generation, expected, state) {
+            if !self.route_current(window, id, generation) {
+                return Err(OwnerError::Unbound);
+            }
+            let active = if leased {
+                let cap = guard
+                    .authority()
+                    .capability()
+                    .ok_or(OwnerError::WriterUnavailable)?;
+                let principal = (cap.account_id().0, cap.device_id().0);
+                let retire = retiring
+                    .map(|old| self.recheck_retiring(window, old, scope.key, principal))
+                    .transpose()?;
+                Some(self.allocate_writer(
+                    window, id, generation, &mut db, scope.key, principal, &built, retire,
+                )?)
+            } else {
+                None
+            };
+            let result = guard.open_with_state(window, note, generation, expected, state);
+            drop(db);
+            match result {
                 Err(HostError::Changed) => {
                     drop(guard);
                     drop(lease);
                     continue;
                 }
                 other => {
-                    let opened = other?;
+                    let mut opened = other?;
+                    if let Some(active) = active {
+                        opened.writer = Some(active.lease);
+                        self.writers
+                            .active
+                            .lock()
+                            .expect("writer leases")
+                            .insert(window.to_owned(), active);
+                    }
                     // Reuse the exact owned Note for first save. A checkpoint
                     // gets the already encoded state; no second history replay.
                     let checkpoint = checkpoint_bytes.and_then(|state| {
@@ -556,7 +1123,7 @@ impl Owner {
         mut deliver: impl FnMut(Delivery),
     ) -> Result<Ack, OwnerError> {
         let (ack, targets, _) =
-            self.commit_queued_with_work_hook(window, generation, request, update, || {})?;
+            self.commit_queued_with_work_hook(window, generation, request, update, NO_HOOKS, None)?;
         for target in targets {
             self.drain_surface(&target, &mut deliver);
         }
@@ -572,7 +1139,7 @@ impl Owner {
         update: &[u8],
     ) -> Result<(Ack, Vec<String>), OwnerError> {
         let (ack, targets, _) =
-            self.commit_queued_with_work_hook(window, generation, request, update, || {})?;
+            self.commit_queued_with_work_hook(window, generation, request, update, NO_HOOKS, None)?;
         Ok((ack, targets))
     }
     /// Opt-in local instrumentation: SQL CAS/INSERT duration excludes mutex
@@ -584,7 +1151,7 @@ impl Owner {
         request: [u8; 16],
         update: &[u8],
     ) -> Result<(Ack, Vec<String>, Duration), OwnerError> {
-        self.commit_queued_with_work_hook(window, generation, request, update, || {})
+        self.commit_queued_with_work_hook(window, generation, request, update, NO_HOOKS, None)
     }
     /// Native-only test seam: the callback runs with only this note's exclusive
     /// ownership, never with the container, writer or process registry guard.
@@ -598,12 +1165,58 @@ impl Owner {
         prepare: impl FnOnce(),
         mut deliver: impl FnMut(Delivery),
     ) -> Result<Ack, OwnerError> {
-        let (ack, targets, _) =
-            self.commit_queued_with_work_hook(window, generation, request, update, prepare)?;
+        let (ack, targets, _) = self.commit_queued_with_work_hook(
+            window,
+            generation,
+            request,
+            update,
+            (prepare, noop, noop),
+            None,
+        )?;
         for target in targets {
             self.drain_surface(&target, &mut deliver);
         }
         Ok(ack)
+    }
+    /// Test seam after the final session/route check and before the writer.
+    #[doc(hidden)]
+    pub fn commit_with_writer_hook(
+        &self,
+        window: &str,
+        generation: u64,
+        request: [u8; 16],
+        update: &[u8],
+        before_writer: impl FnOnce(),
+    ) -> Result<Ack, OwnerError> {
+        self.commit_queued_with_work_hook(
+            window,
+            generation,
+            request,
+            update,
+            (noop, before_writer, noop),
+            None,
+        )
+        .map(|(ack, _, _)| ack)
+    }
+    /// Test seam while holding the exact account writer guard, before SQL COMMIT.
+    #[doc(hidden)]
+    pub fn commit_with_writer_guard_hook(
+        &self,
+        window: &str,
+        generation: u64,
+        request: [u8; 16],
+        update: &[u8],
+        inside_writer: impl FnOnce(),
+    ) -> Result<Ack, OwnerError> {
+        self.commit_queued_with_work_hook(
+            window,
+            generation,
+            request,
+            update,
+            (noop, noop, inside_writer),
+            None,
+        )
+        .map(|(ack, _, _)| ack)
     }
     fn commit_queued_with_work_hook(
         &self,
@@ -611,8 +1224,10 @@ impl Owner {
         generation: u64,
         request: [u8; 16],
         update: &[u8],
-        prepare: impl FnOnce(),
+        hooks: (impl FnOnce(), impl FnOnce(), impl FnOnce()),
+        writer_token: Option<[u8; 32]>,
     ) -> Result<(Ack, Vec<String>, Duration), OwnerError> {
+        let (prepare, before_writer, inside_writer) = hooks;
         let (id, session, anchor) = self.routed(window)?;
         let scope = {
             let guard = session.lock().expect("container session lock");
@@ -633,6 +1248,11 @@ impl Owner {
             .lock()
             .expect("exclusive note work lock");
         let outcome = (|| -> Result<_, OwnerError> {
+            // mark_drained takes this same note lease: a reply either waits
+            // for this save or this save sees the reply and writes nothing.
+            if self.drained(window) {
+                return Err(OwnerError::Unbound);
+            }
             let database = {
                 let guard = session.lock().expect("container session lock");
                 if guard.bound_scope(window) != Some(scope)
@@ -644,10 +1264,18 @@ impl Owner {
                 guard.shared_database()
             };
             let replayed = {
-                database
-                    .lock()
-                    .expect("container writer lock")
-                    .committed_request(scope.key, request, update)?
+                let guard = session.lock().expect("container session lock");
+                let writer = database.lock().expect("container writer lock");
+                if guard.bound_scope(window) != Some(scope)
+                    || !self.route_current(window, id, generation)
+                    || guard
+                        .authority()
+                        .capability()
+                        .is_some_and(|capability| !capability.is_current())
+                {
+                    return Err(OwnerError::Unbound);
+                }
+                writer.committed_request(scope.key, request, update)?
             };
             if let Some(replayed) = replayed {
                 return Ok((
@@ -660,7 +1288,16 @@ impl Owner {
                     Duration::ZERO,
                 ));
             }
+            let active = writer_token
+                .map(|token| self.writer_for(window, id, generation, token, scope.key))
+                .transpose()?;
             let (mut working, frontier, weight) = load_working_note(&database, scope.key, true)?;
+            let attempt = active
+                .map(|active| {
+                    let db = database.lock().expect("container writer lock");
+                    self.attempt_fence(active, &db, &working)
+                })
+                .transpose()?;
             prepare();
             {
                 let guard = session.lock().expect("container session lock");
@@ -671,24 +1308,85 @@ impl Owner {
                     return Err(OwnerError::Unbound);
                 }
             }
-            working
-                .apply_update(update)
-                .map_err(|_| StoreError::InvalidUpdate)?;
+            if let Some(active) = active {
+                working
+                    .apply_writer_update(update, active.slot.client_id)
+                    .map_err(|_| StoreError::InvalidUpdate)?;
+            } else {
+                working
+                    .apply_update(update)
+                    .map_err(|_| StoreError::InvalidUpdate)?;
+            }
+            // Bounded read of the exclusively owned candidate, committed with
+            // its delta; derived before any session or writer guard.
+            let title = working.title_preview();
+            // Session ownership fences authority replacement until COMMIT; the
+            // writer guard fences an account lock. yrs work is already done.
+            let guard = session.lock().expect("container session lock");
+            if guard.bound_scope(window) != Some(scope)
+                || !guard.is_current(window, generation)
+                || !self.route_current(window, id, generation)
             {
-                let guard = session.lock().expect("container session lock");
-                if guard.bound_scope(window) != Some(scope)
-                    || !guard.is_current(window, generation)
-                    || !self.route_current(window, id, generation)
-                {
-                    return Err(OwnerError::Unbound);
-                }
+                return Err(OwnerError::Unbound);
+            }
+            before_writer();
+            let mut writer = database.lock().expect("container writer lock");
+            if let Some(capability) = guard.authority().capability()
+                && (!capability.is_current() || !writer.note_exists(scope.key)?)
+            {
+                return Err(OwnerError::Unbound);
+            }
+            inside_writer();
+            // The window may have shown another container's note meanwhile.
+            // Do not hold the process registry through COMMIT: other accounts
+            // must not wait for this file. A switch after this check still
+            // saves writing typed into this exact authorized note.
+            if !self.route_current(window, id, generation) || self.drained(window) {
+                return Err(OwnerError::Unbound);
             }
             // The only SQLite write section is this scoped CAS and insert.
             // A stale candidate is discarded, never installed or fanned out.
-            let (committed, sql_hold) = database
-                .lock()
-                .expect("container writer lock")
-                .commit_working_update_timed(scope.key, frontier, anchor, request, update)?;
+            let (committed, sql_hold) = if let (Some(active), Some(attempt)) = (active, attempt) {
+                self.writer_for(window, id, generation, active.lease.token, scope.key)?;
+                let cap = guard
+                    .authority()
+                    .capability()
+                    .ok_or(OwnerError::WriterUnavailable)?;
+                if active.slot.account != cap.account_id().0
+                    || active.slot.device != cap.device_id().0
+                {
+                    return Err(OwnerError::WriterUnavailable);
+                }
+                self.final_fence(active, &writer, &working, attempt)?;
+                let start = std::time::Instant::now();
+                let commit = writer.commit_writer_update_with_title(
+                    frontier,
+                    anchor,
+                    request,
+                    update,
+                    &active.slot,
+                    &title,
+                )?;
+                let held = start.elapsed();
+                // Valid terminal progress leaves no clock: end this producer
+                // now. Allocation retires the slot before further authoring.
+                if working.writer_end(active.slot.client_id) == Some(u32::MAX) {
+                    self.writers
+                        .active
+                        .lock()
+                        .expect("writer leases")
+                        .remove(window);
+                }
+                (commit, held)
+            } else {
+                // Raw fixture APIs cannot publish from a real account surface.
+                if guard.authority().capability().is_some() {
+                    return Err(OwnerError::WriterUnavailable);
+                }
+                writer.commit_working_update_timed(scope.key, frontier, anchor, request, update)?
+            };
+            drop(writer);
+            drop(guard);
             if !committed.replayed {
                 database
                     .lock()
@@ -1026,6 +1724,11 @@ impl Owner {
             let mut guard = session.lock().expect("container session lock");
             if guard.is_current(window, generation) {
                 guard.close_generation(window, generation);
+                self.writers
+                    .active
+                    .lock()
+                    .expect("writer leases")
+                    .remove(window);
                 self.deliveries
                     .lock()
                     .expect("delivery lock")
@@ -1048,10 +1751,14 @@ impl Owner {
             .expect("delivery lock")
             .remove(window);
         if let Some(session) = previous {
-            session
+            let mut guard = session.lock().expect("container session lock");
+            self.writers
+                .active
                 .lock()
-                .expect("container session lock")
-                .invalidate(window);
+                .expect("writer leases")
+                .remove(window);
+            guard.invalidate(window);
+            guard.authority_mut().forget(window);
         }
     }
 }

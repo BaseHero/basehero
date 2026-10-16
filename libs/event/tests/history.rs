@@ -1,4 +1,7 @@
-use bh_account::{AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount};
+use bh_account::{
+    AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount,
+    journal::AccountJournal, storage::DeviceJournal,
+};
 use bh_core::note::Note;
 use bh_crypto::{KemKey, Secret, SigningKey, aead_open, aead_seal, derive_key};
 use bh_event::{
@@ -316,6 +319,77 @@ fn unrelated_metadata_root_cannot_rewrap_a_valid_content_original() {
     assert_eq!(f.history.head(), head_before);
     assert_eq!(f.history.floor(), floor_before);
     assert!(f.history.is_stopped());
+}
+
+#[test]
+fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view() {
+    let mut f = Fixture::new();
+    let unique = u128::from_be_bytes(bh_crypto::random::<16>());
+    let folder = format!("bh-event-index-{}-{unique:032x}", std::process::id());
+    let dir = std::env::temp_dir().join(folder);
+    let hidden = dir.with_extension("hidden");
+    std::fs::create_dir(&dir).unwrap();
+    let mut journal = DeviceJournal::open(dir.join("account.sqlite")).unwrap();
+    let id = f.account.id();
+    journal
+        .commit_verified(id, &[&f.account_genesis], f.account.head(), false)
+        .unwrap();
+    let indexed = journal.load_projection().unwrap().unwrap();
+    assert_eq!(indexed.account.head(), f.account.head());
+    f.history = History::with_account(&indexed.account, f.base, 1).unwrap();
+    let genesis_order = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
+    assert_eq!(
+        f.history.apply(
+            &genesis_order,
+            &f.genesis.descriptor,
+            Some(&f.genesis.body),
+            &f.metadata,
+            None,
+            NoteTarget {
+                id: [7; 32],
+                note: &mut f.note
+            },
+        ),
+        Outcome::Accepted
+    );
+    let req = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let original = req
+        .finish(f.first.control.sign(req.signing_bytes()))
+        .unwrap();
+    let (event, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        original.as_bytes(),
+        &f.first.control,
+        None,
+    );
+    let before_head = f.history.head();
+    let before_account = f.history.account_head();
+    let before_note = f.note.state();
+    std::fs::rename(&dir, &hidden).unwrap();
+    assert_eq!(
+        indexed
+            .account
+            .clone()
+            .applied_batch(&[original.as_bytes()])
+            .err(),
+        Some(bh_account::Error::Unavailable),
+    );
+    assert_eq!(f.apply(&event, &order, false), Outcome::UnavailablePause);
+    assert_eq!(f.history.head(), before_head);
+    assert_eq!(f.history.account_head(), before_account);
+    assert_eq!(f.note.state(), before_note);
+    assert!(!f.history.is_stopped());
+    std::fs::rename(&hidden, &dir).unwrap();
+    assert_eq!(f.apply(&event, &order, false), Outcome::Accepted);
+    assert_eq!(f.history.head(), order.head());
+    assert_eq!(f.history.account_head(), original.head());
+    assert!(!f.history.is_stopped());
+    drop(journal);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

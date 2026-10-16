@@ -115,6 +115,35 @@ and archive validation do not authorize a release: the separately signed release
 metadata must name the exact archive hash/version/platform/source commit before
 an installed app can use it. Ad-hoc signing is not that release signature.
 
+For a separately identified test app, `--identifier app.example.notes` builds
+that identity into Tauri, the bundle, app data directory and Keychain service
+names. Use the same identifier for both versions of an update test; an update
+for another identifier is refused.
+
+### Release signature and updates
+
+`cargo run --locked -p bh-release --bin release-sign -- generate` creates a
+release key. Run it only in a private terminal: it prints the public key and
+seed once. Store the seed only in the signing secret store; never in source,
+logs, build configuration or an application. Apps carry only the public key.
+
+The signer accepts `sign VERSION PLATFORM CHANNEL SOURCE_COMMIT ARCHIVE NOTES_FILE`.
+It reads the 64-character lowercase hex seed from stdin (hidden when interactive),
+prints the public key to stderr and signed metadata JSON to stdout. Metadata
+binds the exact archive hash, integer version, platform, channel, public source
+commit and plain-text release notes. Build jobs need no seed; a separately
+approved signing step receives it through stdin and releases only metadata.
+
+Mac updates are disabled without all three build-time settings:
+`BH_UPDATE_METADATA_URL`, `BH_UPDATE_ARTIFACT_BASE` (HTTPS, the latter ending in
+`/`) and `BH_UPDATE_PUBLIC_KEY` (64 lowercase hex characters). The app checks
+shortly after launch, then at jittered roughly six-hour intervals. Only Install
+update downloads the artifact. After signature, hash and bundle checks, the
+native save barrier commits every window and records its place before exchange
+and restart. A failed save leaves writing open and offers Try again, never
+discard. The relaunch waits for the old process to exit and release its account
+locks. An installed update that cannot restart asks the person to quit and reopen.
+
 ## Developer boundaries
 
 The native host mounts the bundled note editor only when a note is bound to
