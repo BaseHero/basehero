@@ -371,8 +371,31 @@ impl DeviceKeyStore for MacKeyStore {
 /// LA prompt below is a UI gate, NOT key-bound authentication. Code running as
 /// this Mac user can bypass it and use the software control seed. The legacy
 /// keychain asks again only when the Keychain helper's own bytes change.
-#[derive(Clone, Copy)]
-pub(crate) struct MacLoginKeyStore;
+///
+/// One confirmed first-device genesis covers its two chained setup events;
+/// a confirmed pairing addition covers its one exact base copy. Every later
+/// control action asks again (`bh_host::confirm`). Clones share one gate.
+#[derive(Clone, Default)]
+pub(crate) struct MacLoginKeyStore {
+    gate: bh_host::confirm::ActionGate,
+}
+
+async fn approve() -> Result<(), KeyStoreError> {
+    approve_control().await.map_err(|error| match error {
+        GateError::AuthenticationCancelled => KeyStoreError::AuthenticationCancelled,
+        GateError::Unavailable => KeyStoreError::Unavailable,
+    })
+}
+
+impl bh_host::accounts::HostKeyStore for MacLoginKeyStore {
+    const JOIN_POLICY: ControlKeyPolicy = ControlKeyPolicy::AppEnforcedOwnerConfirmation;
+    fn action_gate(&self) -> Option<bh_host::confirm::ActionGate> {
+        Some(self.gate.clone())
+    }
+    fn confirm_owner(&mut self) -> impl std::future::Future<Output = Result<(), KeyStoreError>> {
+        approve()
+    }
+}
 
 /// Every M1 login-keychain call goes through the Keychain helper beside the
 /// app executable. The helper creates the items, so their access list and
@@ -532,13 +555,15 @@ impl DeviceKeyStore for MacLoginKeyStore {
         handle: KeyHandle,
         message: Vec<u8>,
     ) -> Result<[u8; 64], KeyStoreError> {
-        // Fresh context on every use; cancellation never signs. The gate is
-        // consciously not cryptographically tied to keychain seed access.
-        approve_control().await.map_err(|error| match error {
-            GateError::AuthenticationCancelled => KeyStoreError::AuthenticationCancelled,
-            GateError::Unavailable => KeyStoreError::Unavailable,
-        })?;
-        sign_with_control(&mut LoginIdentityIo, &handle, &message)
+        // Fresh context on every use except the two strictly chained signup
+        // continuations or the exact copy of a confirmed pairing action.
+        // The gate is consciously not cryptographically tied to keychain
+        // seed access.
+        let key = login_control_public(&handle).inspect_err(|_| self.gate.revoke_signups())?;
+        bh_host::confirm::sign_control_gated(&self.gate, key, &message, approve(), || {
+            sign_with_control(&mut LoginIdentityIo, &handle, &message)
+        })
+        .await
     }
     async fn sign_content(
         &mut self,
@@ -575,7 +600,7 @@ impl DeviceKeyStore for MacLoginKeyStore {
 /// The code-bearing key belongs to one setup. The no-code home submission
 /// has a different key; an old WAL or backup ciphertext cannot be opened with
 /// the keys retained after a confirmed save.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct MacPendingSetupProtector;
 
 fn read_wrapping_key(handle: &[u8; 32]) -> Result<Secret<32>, ProtectorError> {
@@ -855,7 +880,7 @@ mod tests {
                 }
             }
         }
-        let mut store = MacLoginKeyStore;
+        let mut store = MacLoginKeyStore::default();
         let identity = tauri::async_runtime::block_on(
             store.create(ControlKeyPolicy::AppEnforcedOwnerConfirmation),
         )

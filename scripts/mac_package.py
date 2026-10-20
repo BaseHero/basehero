@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tarfile
 
+from sync_endpoint import prepare_endpoint, record_endpoint
+
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "BaseHero-macos-aarch64.app.tar.gz"
 BUNDLE = "BaseHero.app"
@@ -221,7 +223,7 @@ def bundle_notices(app):
                  notices / "eff_large_wordlist-LICENSE.md")
 
 
-def build(version, output, identifier="app.basehero.client", signing_root=None):
+def build(version, output, identifier="app.basehero.client", signing_root=None, *, sync_endpoint=None, local_only=False):
     bundle_identifier(identifier)
     root = certificate_root(signing_root)
     if sys.platform != "darwin" or os.uname().machine != "arm64":
@@ -250,7 +252,8 @@ def build(version, output, identifier="app.basehero.client", signing_root=None):
         app.unlink()
     elif app.is_dir():
         shutil.rmtree(app)
-    build_env = {**os.environ, "CARGO_TARGET_DIR": str(target_dir), "CARGO_BUILD_TARGET": triple}
+    build_env, endpoint_proof = prepare_endpoint(sync_endpoint, local_only, output, os.environ)
+    build_env.update({"CARGO_TARGET_DIR": str(target_dir), "CARGO_BUILD_TARGET": triple})
     # CLI overlay enables only the app bundle; the committed config remains
     # inactive for ordinary development builds. Tauri version stays semver.
     # Tauri's trailing arguments pass --locked to its Cargo runner.
@@ -286,6 +289,7 @@ def build(version, output, identifier="app.basehero.client", signing_root=None):
     run("codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app))
     validate_bundle(app, version, identifier)
     archive_bundle(app, output / NAME)
+    record_endpoint(output, endpoint_proof, output / NAME)
     # A changed helper makes macOS ask once per Keychain item after the update.
     print(f"{app}\n{output / NAME}\nkeychain helper sha256 (before signing) {sha256(helper_bytes)}")
 
@@ -298,12 +302,16 @@ def main():
                         help="bundle identity; a separate identity keeps separate app data and keys")
     parser.add_argument("--signing-root", required=True, type=certificate_root,
                         help="lowercase SHA-1 of the app-signing certificate the Keychain helper trusts")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--sync-endpoint', type=Path, help='reviewed public hardware endpoint JSON')
+    mode.add_argument('--local-only', action='store_true', help='explicit development build without sync')
     args = parser.parse_args()
     number = release_number(args.release_number)
     output = args.output.resolve()
     if output.is_relative_to(ROOT):
         parser.error("output must be outside the source export")
-    build(number, output, args.identifier, args.signing_root)
+    build(number, output, args.identifier, args.signing_root,
+          sync_endpoint=args.sync_endpoint, local_only=args.local_only)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+The Android QR scanner uses these Apache-2.0 libraries:
+
+AndroidX CameraX 1.5.1: camera-core, camera-camera2, camera-lifecycle,
+camera-view and transitively camera-video. Copyright The Android Open Source
+Project. https://developer.android.com/jetpack/androidx/releases/camera
+
+ZXing core 3.5.4. Copyright ZXing authors. https://github.com/zxing/zxing
+
+The full Apache License, Version 2.0 is in Apache-2.0.txt beside this file.

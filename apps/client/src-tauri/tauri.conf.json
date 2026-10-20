@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "capabilities": ["basehero-client-notes", "basehero-client-setup", "basehero-client-window"],
+      "capabilities": ["basehero-client-notes", "basehero-client-setup", "basehero-client-pairing", "basehero-client-window", "basehero-client-camera-scan"],
       "csp": "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'"
     }
   },

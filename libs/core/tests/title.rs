@@ -12,7 +12,7 @@ fn note_from(build: impl FnOnce(&mut TransactionMut, &XmlFragmentRef)) -> Note {
     let mut tx = doc.transact_mut();
     let frag = tx.get_or_insert_xml_fragment("default");
     build(&mut tx, &frag);
-    let mut note = Note::new();
+    let mut note = Note::new().unwrap();
     note.apply_update(&tx.encode_update_v1()).unwrap();
     note
 }
@@ -26,26 +26,26 @@ fn paragraph(tx: &mut TransactionMut, parent: &impl XmlFragment, text: &str) {
 
 #[test]
 fn first_nonempty_supported_block_is_the_trimmed_title() {
-    let mut note = Note::new();
-    note.append_paragraph("");
-    note.append_paragraph(" 🦀  café ");
-    note.append_paragraph("later");
-    assert_eq!(note.title_preview(), "🦀  café");
+    let mut note = Note::new().unwrap();
+    note.append_paragraph("").unwrap();
+    note.append_paragraph(" 🦀  café ").unwrap();
+    note.append_paragraph("later").unwrap();
+    assert_eq!(note.title_preview().unwrap(), "🦀  café");
     let nested = note_from(|tx, frag| {
         let list = frag.push_back(tx, XmlElementPrelim::empty("bulletList"));
         let item = list.push_back(tx, XmlElementPrelim::empty("listItem"));
         paragraph(tx, &item, "nested");
     });
-    assert_eq!(nested.title_preview(), "nested");
+    assert_eq!(nested.title_preview().unwrap(), "nested");
     let after_unknown = note_from(|tx, frag| {
         let unknown = frag.push_back(tx, XmlElementPrelim::empty("futureWidget"));
         unknown.push_back(tx, XmlTextPrelim::new("secret"));
         paragraph(tx, frag, "visible");
     });
-    assert_eq!(after_unknown.title_preview(), "visible");
-    assert_eq!(Note::new().title_preview(), "");
+    assert_eq!(after_unknown.title_preview().unwrap(), "visible");
+    assert_eq!(Note::new().unwrap().title_preview().unwrap(), "");
     let empty = note_from(|tx, frag| paragraph(tx, frag, ""));
-    assert_eq!(empty.title_preview(), "");
+    assert_eq!(empty.title_preview().unwrap(), "");
 }
 
 #[test]
@@ -77,16 +77,19 @@ fn marks_embeds_and_attributes_never_leak_into_literal_title() {
         heading.push_back(tx, XmlElementPrelim::empty("hardBreak"));
         heading.push_back(tx, XmlTextPrelim::new("line"));
     });
-    assert_eq!(note.title_preview(), "<title> café 🦀 code italic line");
+    assert_eq!(
+        note.title_preview().unwrap(),
+        "<title> café 🦀 code italic line"
+    );
     for fixture in [
         include_bytes!("../../../apps/client/editor/test/mark.bin").as_slice(),
         include_bytes!("../../../apps/client/editor/test/attr.bin").as_slice(),
         include_bytes!("../../../apps/client/editor/test/value.bin").as_slice(),
         include_bytes!("../../../apps/client/editor/test/textAttr.bin").as_slice(),
     ] {
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         note.apply_update(fixture).unwrap();
-        assert_eq!(note.title_preview(), "hello");
+        assert_eq!(note.title_preview().unwrap(), "hello");
     }
 }
 
@@ -102,9 +105,9 @@ fn long_first_paragraph_keeps_its_exact_first_80_scalars() {
             format!("{}🦀", "a".repeat(79)),
         ),
     ] {
-        let mut note = Note::new();
-        note.append_paragraph(&source);
-        assert_eq!(note.title_preview(), expected);
+        let mut note = Note::new().unwrap();
+        note.append_paragraph(&source).unwrap();
+        assert_eq!(note.title_preview().unwrap(), expected);
     }
 }
 
@@ -113,13 +116,13 @@ fn truncated_whitespace_never_selects_a_later_paragraph() {
     let short = note_from(|tx, frag| {
         paragraph(tx, frag, &format!("{}hello", " ".repeat(10)));
     });
-    assert_eq!(short.title_preview(), "hello");
+    assert_eq!(short.title_preview().unwrap(), "hello");
     // 80 leading spaces cannot prove the first block is empty.
     let long = note_from(|tx, frag| {
         paragraph(tx, frag, &format!("{}hidden", " ".repeat(100)));
         paragraph(tx, frag, "later");
     });
-    assert_eq!(long.title_preview(), "");
+    assert_eq!(long.title_preview().unwrap(), "");
 }
 
 #[test]
@@ -132,9 +135,9 @@ fn deleted_text_is_not_a_stale_title() {
     let text = p.push_back(&mut tx, XmlTextPrelim::new("secret visible"));
     frag.remove(&mut tx, 0);
     text.remove_range(&mut tx, 0, 7);
-    let mut note = Note::new();
+    let mut note = Note::new().unwrap();
     note.apply_update(&tx.encode_update_v1()).unwrap();
-    assert_eq!(note.title_preview(), "visible");
+    assert_eq!(note.title_preview().unwrap(), "visible");
 }
 
 #[test]
@@ -147,18 +150,18 @@ fn nesting_beyond_16_levels_is_untitled() {
             }
             paragraph(tx, &quote, "deep");
         });
-        assert_eq!(note.title_preview(), expected, "{levels} levels");
+        assert_eq!(note.title_preview().unwrap(), expected, "{levels} levels");
     }
 }
 
 #[test]
 fn many_leading_empty_blocks_exhaust_the_source_budget() {
-    let mut note = Note::new();
+    let mut note = Note::new().unwrap();
     for _ in 0..300 {
-        note.append_paragraph("");
+        note.append_paragraph("").unwrap();
     }
-    note.append_paragraph("beyond budget");
-    assert_eq!(note.title_preview(), "");
+    note.append_paragraph("beyond budget").unwrap();
+    assert_eq!(note.title_preview().unwrap(), "");
 }
 
 #[test]
@@ -171,7 +174,7 @@ fn whitespace_blocks_share_one_utf8_byte_budget() {
             paragraph(tx, frag, "title");
         });
         assert_eq!(
-            note.title_preview(),
+            note.title_preview().unwrap(),
             expected,
             "{blocks} blocks of 60 spaces"
         );
@@ -196,10 +199,14 @@ fn tombstone_history_before_the_title_is_bounded_and_never_stale() {
         let bytes = doc
             .transact()
             .encode_state_as_update_v1(&StateVector::default());
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         note.apply_update(&bytes).unwrap();
         // Each deleted block stays a linked source item after apply/GC.
-        assert_eq!(note.title_preview(), expected, "{deleted} deleted blocks");
+        assert_eq!(
+            note.title_preview().unwrap(),
+            expected,
+            "{deleted} deleted blocks"
+        );
     }
 }
 
@@ -215,16 +222,16 @@ fn early_nested_title_survives_many_later_siblings() {
             paragraph(tx, frag, "");
         }
     });
-    assert_eq!(note.title_preview(), "first");
+    assert_eq!(note.title_preview().unwrap(), "first");
 }
 
 #[test]
 fn extraction_leaves_the_note_state_unchanged() {
-    let mut note = Note::new();
-    note.append_paragraph("unchanged");
-    let before = note.state();
-    assert_eq!(note.title_preview(), "unchanged");
-    assert_eq!(note.state(), before);
+    let mut note = Note::new().unwrap();
+    note.append_paragraph("unchanged").unwrap();
+    let before = note.state().unwrap();
+    assert_eq!(note.title_preview().unwrap(), "unchanged");
+    assert_eq!(note.state().unwrap(), before);
 }
 
 #[test]

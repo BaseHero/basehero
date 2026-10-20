@@ -1,10 +1,12 @@
 //! Portable product rules, independent of storage and platform frameworks.
 
+#[cfg(not(target_family = "wasm"))]
+pub mod contained;
 pub mod note;
 pub mod note_schema;
 
 /// Local SQLite layout version. This is not an event, protocol or release version.
-pub const LOCAL_DATA_VERSION: u32 = 10;
+pub const LOCAL_DATA_VERSION: u32 = 12;
 
 /// An older client must never downgrade or reset newer local data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

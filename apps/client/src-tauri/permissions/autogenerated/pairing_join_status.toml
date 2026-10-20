@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pairing-join-status"
+description = "Enables the pairing_join_status command without any pre-configured scope."
+commands.allow = ["pairing_join_status"]
+
+[[permission]]
+identifier = "deny-pairing-join-status"
+description = "Denies the pairing_join_status command without any pre-configured scope."
+commands.deny = ["pairing_join_status"]

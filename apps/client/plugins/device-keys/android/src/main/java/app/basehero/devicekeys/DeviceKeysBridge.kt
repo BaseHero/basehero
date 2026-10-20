@@ -31,7 +31,7 @@ object DeviceKeysBridge {
     const val INVALIDATED = 3
     const val FAILURE = 4
     private const val PREFIX = "app.basehero.device-keys.v1."
-    private const val PENDING = PREFIX + "pending"
+    private const val PENDING = PREFIX + "pending."
     private const val STRONG = BiometricManager.Authenticators.BIOMETRIC_STRONG
     private val store get() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     private val activityBinding = CurrentActivity<FragmentActivity>()
@@ -311,21 +311,36 @@ object DeviceKeysBridge {
     }
 
     // Direct Keystore GCM, not portable XChaCha framing: no exportable wrapping
-    // key crosses JNI; version + purpose are authenticated as AAD.
+    // key crosses JNI; version, purpose and key handle are authenticated as AAD.
+    // Every seal gets its own fresh key, so retiring one setup's code-bearing
+    // key never touches its no-code replacement or another setup.
     @Suppress("UNUSED_PARAMETER")
-    @JvmStatic fun sealPending(activity: Activity, plaintext: ByteArray, ticket: Long) {
+    @JvmStatic fun sealPending(activity: Activity, handle: String, plaintext: ByteArray, ticket: Long) {
         try {
             reply(ticket) {
-                if (key(PENDING) == null) generate(PENDING, false)
-                encrypt(key(PENDING) ?: throw Missing(), "BaseHero pending setup v1".toByteArray(), plaintext)
+                val associatedData = BlobFraming.pendingAd(handle) // validate before naming an alias
+                if (store.containsAlias(PENDING + handle)) throw IllegalStateException()
+                generate(PENDING + handle, false)
+                encrypt(key(PENDING + handle) ?: throw Missing(), associatedData, plaintext)
             }
         } finally { plaintext.fill(0) }
     }
+    /** Opening never creates a replacement key: a missing key is Unavailable. */
     @Suppress("UNUSED_PARAMETER")
-    @JvmStatic fun openPending(activity: Activity, blob: ByteArray, ticket: Long) {
+    @JvmStatic fun openPending(activity: Activity, handle: String, blob: ByteArray, ticket: Long) {
         reply(ticket) {
-            val wrapper = key(PENDING) ?: throw UnsupportedOperationException()
-            decrypt(wrapper, "BaseHero pending setup v1".toByteArray(), blob)
+            val associatedData = BlobFraming.pendingAd(handle)
+            val wrapper = key(PENDING + handle) ?: throw UnsupportedOperationException()
+            decrypt(wrapper, associatedData, blob)
+        }
+    }
+    /** Idempotent: an absent key was already retired. */
+    @Suppress("UNUSED_PARAMETER")
+    @JvmStatic fun retirePending(activity: Activity, handle: String, ticket: Long) {
+        reply(ticket) {
+            BlobFraming.pendingAd(handle)
+            if (store.containsAlias(PENDING + handle)) store.deleteEntry(PENDING + handle)
+            byteArrayOf()
         }
     }
 }

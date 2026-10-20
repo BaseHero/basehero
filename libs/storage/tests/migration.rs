@@ -170,7 +170,7 @@ fn failed_v8_to_v9_rolls_back_projection_and_preserves_pending_work() {
     .unwrap();
     conn.execute("INSERT INTO pending_note_work(update_id) VALUES (1)", [])
         .unwrap();
-    conn.execute_batch("DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; PRAGMA user_version=8; CREATE TABLE own_base(bogus INTEGER);").unwrap();
+    conn.execute_batch("DROP TABLE note_outbox_members; DROP TABLE joined_device; DROP TABLE base_control_outbox; DROP TABLE registration; DROP TABLE sync_alarm; DROP TABLE note_outbox_progress; DROP TABLE writer_binding; DROP TABLE accepted_note_tail; DROP TABLE accepted_note; DROP TABLE log_floor; DROP TABLE log_account_change; DROP TABLE log_event_id; DROP TABLE log_seen; DROP TABLE log_progress; DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; PRAGMA user_version=8; CREATE TABLE own_base(bogus INTEGER);").unwrap();
     drop(conn);
     assert!(DeviceDatabase::open(&path).is_err());
     let conn = Connection::open(&path).unwrap();
@@ -196,7 +196,10 @@ fn v6_to_v7_removes_only_unused_index_and_preserves_rows_and_checkpoint() {
     let path = dir.path().join("v6.sqlite");
     write_v6(&path);
     let conn = Connection::open(&path).unwrap();
-    let delta = bh_core::note::Note::new().append_paragraph("retained");
+    let delta = bh_core::note::Note::new()
+        .unwrap()
+        .append_paragraph("retained")
+        .unwrap();
     conn.execute(
         "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
         params![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 16], delta.as_slice()],
@@ -336,8 +339,8 @@ fn v5_backfill_pages_empty_scopes_then_dual_maintains_new_pending_writes() {
         .pending_page([1; 32], [2; 32], None, 0, 10, 4096)
         .unwrap();
     assert_eq!(indexed.rows.len(), 10);
-    let mut note = bh_core::note::Note::new();
-    let delta = note.append_paragraph("new");
+    let mut note = bh_core::note::Note::new().unwrap();
+    let delta = note.append_paragraph("new").unwrap();
     let newest = db
         .apply_local_update(
             bh_storage::NoteKey {
@@ -485,8 +488,8 @@ fn v3_to_v4_preserves_pending_notes_and_account_journal() {
     let path = dir.path().join("v3.sqlite");
     {
         let mut db = DeviceDatabase::open(&path).unwrap();
-        let mut note = bh_core::note::Note::new();
-        let delta = note.append_paragraph("existing");
+        let mut note = bh_core::note::Note::new().unwrap();
+        let delta = note.append_paragraph("existing").unwrap();
         let key = bh_storage::NoteKey {
             base: [1; 32],
             audience: [2; 32],
@@ -500,7 +503,7 @@ fn v3_to_v4_preserves_pending_notes_and_account_journal() {
     // addition is note_outbox. Keep the actual note and account rows untouched.
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE pending_scope_backfill; DROP TABLE pending_scope; DROP TABLE note_checkpoints; DROP INDEX IF EXISTS note_updates_audience_id; DROP TABLE account_staged_admission; DROP TABLE note_outbox; PRAGMA user_version=3",
+        "DROP TABLE note_outbox_members; DROP TABLE joined_device; DROP TABLE base_control_outbox; DROP TABLE registration; DROP TABLE sync_alarm; DROP TABLE note_outbox_progress; DROP TABLE writer_binding; DROP TABLE accepted_note_tail; DROP TABLE accepted_note; DROP TABLE log_floor; DROP TABLE log_account_change; DROP TABLE log_event_id; DROP TABLE log_seen; DROP TABLE log_progress; DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE pending_scope_backfill; DROP TABLE pending_scope; DROP TABLE note_checkpoints; DROP INDEX IF EXISTS note_updates_audience_id; DROP TABLE account_staged_admission; DROP TABLE note_outbox; PRAGMA user_version=3",
     )
     .unwrap();
     drop(conn);
@@ -538,7 +541,10 @@ fn v4_to_v5_preserves_existing_note_and_outbox_rows() {
     let path = dir.path().join("v4.sqlite");
     write_v4(&path);
     let conn = Connection::open(&path).unwrap();
-    let delta = bh_core::note::Note::new().append_paragraph("existing");
+    let delta = bh_core::note::Note::new()
+        .unwrap()
+        .append_paragraph("existing")
+        .unwrap();
     conn.execute(
         "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
         params![
@@ -584,7 +590,10 @@ fn failed_v5_migration_keeps_v4_layout_and_version() {
     let path = dir.path().join("v4-conflict.sqlite");
     write_v4(&path);
     let conn = Connection::open(&path).unwrap();
-    let delta = bh_core::note::Note::new().append_paragraph("retained");
+    let delta = bh_core::note::Note::new()
+        .unwrap()
+        .append_paragraph("retained")
+        .unwrap();
     conn.execute(
         "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
         params![

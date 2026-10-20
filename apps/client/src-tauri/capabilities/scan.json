@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "basehero-client-camera-scan",
+  "description": "User-initiated QR camera scan on the Android main window only. The scanner has no account authority.",
+  "platforms": ["android"],
+  "windows": ["main"],
+  "permissions": [
+    "qr-scan:allow-request-permissions",
+    "qr-scan:allow-scan",
+    "qr-scan:allow-cancel"
+  ]
+}

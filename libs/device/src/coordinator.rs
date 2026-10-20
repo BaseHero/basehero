@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use bh_core::note::OrderedState;
 use bh_storage::{DeviceDatabase, LocalCommit, NoteKey, StoreError};
 
 /// Issued by an authenticated account/session source, never reconstructed from
@@ -38,7 +39,8 @@ impl From<StoreError> for HostError {
 }
 
 pub struct Opened {
-    pub state: Vec<u8>,
+    /// The note's updates in integration order; a view applies them in turn.
+    pub state: OrderedState,
     pub generation: u64,
     pub sequence: u64,
     pub writer: Option<crate::writers::WriterLease>,
@@ -55,10 +57,19 @@ pub struct Delivery {
     /// Exact committed local row the snapshot must cover before this sequence
     /// may be delivered as a resync marker.
     pub through_update_id: i64,
+    /// One committed delta; empty for a resync.
     pub update: Vec<u8>,
-    /// Full durable Yjs state to merge into the existing editing copy, never
-    /// a request to close and recreate it (which would lose unsaved work).
+    /// The durable note to merge into the existing editing copy, never a
+    /// request to close and recreate it (which would lose unsaved work).
+    /// Its state is `segments`, applied in order.
     pub resync: bool,
+    /// A resync's note as ordered updates: merging them into one state could
+    /// integrate concurrent text in a different order.
+    pub segments: Vec<Vec<u8>>,
+    /// The native note was rebuilt from accepted state with a structure the
+    /// window's copy cannot reach by merging: once it has no unsaved
+    /// writing, the window replaces its copy with `segments`.
+    pub reload: bool,
 }
 #[derive(Clone, Copy)]
 struct Binding {
@@ -117,7 +128,7 @@ impl<A: AuthoritySource> Coordinator<A> {
         note: [u8; 32],
         generation: u64,
         expected: u64,
-        state: Vec<u8>,
+        state: OrderedState,
     ) -> Result<Opened, HostError> {
         let scope = self.bound_scope(window).ok_or(HostError::Unbound)?;
         if scope.key.note != note {
@@ -169,7 +180,7 @@ impl<A: AuthoritySource> Coordinator<A> {
             return Err(HostError::Unbound);
         }
         // A failed read must not change the previous window binding.
-        let state = self.database().note_state(scope.key)?;
+        let state = self.database().note_ordered(scope.key)?;
         self.generation = self.generation.max(generation);
         self.bindings
             .insert(window.into(), Binding { scope, generation });
@@ -207,6 +218,8 @@ impl<A: AuthoritySource> Coordinator<A> {
                         through_update_id: commit.update_id,
                         update: update.to_vec(),
                         resync: false,
+                        segments: Vec::new(),
+                        reload: false,
                     });
                 }
             }
@@ -214,6 +227,58 @@ impl<A: AuthoritySource> Coordinator<A> {
         Ack {
             request_id,
             replayed: commit.replayed,
+        }
+    }
+    /// Publish committed remote rows of one note to every window bound to it,
+    /// each in its own sequence, or one reload marker covering `reload`'s
+    /// frontier. Every bound window gets them: no window originated them.
+    pub fn publish_remote(
+        &mut self,
+        key: NoteKey,
+        updates: &[(i64, Vec<u8>)],
+        reload: Option<i64>,
+        mut deliver: impl FnMut(Delivery),
+    ) {
+        if updates.is_empty() && reload.is_none() {
+            return;
+        }
+        *self.note_revisions.entry(key).or_default() += 1;
+        let windows: Vec<(String, Binding)> = self
+            .bindings
+            .iter()
+            .filter(|(window, b)| b.scope.key == key && self.bound_scope(window) == Some(b.scope))
+            .map(|(window, b)| (window.clone(), *b))
+            .collect();
+        if let Some(frontier) = reload {
+            self.sequence = self.sequence.checked_add(1).expect("sequence exhausted");
+            for (window, binding) in &windows {
+                deliver(Delivery {
+                    window: window.clone(),
+                    generation: binding.generation,
+                    sequence: self.sequence,
+                    through_update_id: frontier,
+                    update: Vec::new(),
+                    resync: true,
+                    segments: Vec::new(),
+                    reload: true,
+                });
+            }
+            return;
+        }
+        for (row, update) in updates {
+            self.sequence = self.sequence.checked_add(1).expect("sequence exhausted");
+            for (window, binding) in &windows {
+                deliver(Delivery {
+                    window: window.clone(),
+                    generation: binding.generation,
+                    sequence: self.sequence,
+                    through_update_id: *row,
+                    update: update.clone(),
+                    resync: false,
+                    segments: Vec::new(),
+                    reload: false,
+                });
+            }
         }
     }
     /// Single-thread storage fixture helper. Native owner does NOT use this

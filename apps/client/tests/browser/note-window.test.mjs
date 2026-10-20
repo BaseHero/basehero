@@ -10,7 +10,7 @@ function boundHost() {
   const surface = crypto.randomUUID();
   window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface}));
   window.__bhIpc.handle('note_selection', () => []);
-  window.__bhIpc.handle('note_open', () => ({clientId:2002468231004600,writerToken:Array(32).fill(9),state: [0, 0], generation: 7, sequence: 0 }));
+  window.__bhIpc.handle('note_open', () => ({clientId:2002468231004600,writerToken:Array(32).fill(9),updates: [[0, 0]], generation: 7, sequence: 0 }));
   window.__bhIpc.handle('note_commit', args => ({ requestId: args.requestId }));
   window.__bhIpc.handle('note_close', () => null);
 }

@@ -125,15 +125,15 @@ fn malformed() -> Vec<(&'static str, Vec<u8>)> {
 #[test]
 fn rejects_invalid_widths_and_duplicate_sections_before_mutating_note() {
     for (name, bytes) in malformed() {
-        let mut note = Note::new();
-        note.append_paragraph("before");
-        let before = note.state();
+        let mut note = Note::new().unwrap();
+        note.append_paragraph("before").unwrap();
+        let before = note.state().unwrap();
         let result = note.apply_update(&bytes);
         assert!(
             matches!(result, Err(NoteError::Decode(_))),
             "{name}: {result:?}"
         );
-        assert_eq!(note.state(), before, "{name} changed note");
+        assert_eq!(note.state().unwrap(), before, "{name} changed note");
     }
 }
 
@@ -156,7 +156,7 @@ fn accepts_valid_numeric_boundaries() {
         ("i64-max", any_int(&i64_max.to_vec())),
         ("i64-minus-300", any_int(&[0xec, 0x04])),
     ] {
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         assert!(note.apply_update(&bytes).is_ok(), "valid {name} rejected");
         if let Some(want) = match name {
             "i64-min" => Some(i64::MIN),
@@ -166,11 +166,11 @@ fn accepts_valid_numeric_boundaries() {
         } {
             use yrs::updates::decoder::Decode;
             use yrs::{Any, Array, Doc, Number, Out, Transact};
-            let mut restored = Note::new();
+            let mut restored = Note::new().unwrap();
             restored
-                .apply_update(&note.state())
+                .apply_update(&note.state().unwrap())
                 .expect("signed integer round-trip");
-            for state in [note.state(), restored.state()] {
+            for state in [note.state().unwrap(), restored.state().unwrap()] {
                 let doc = Doc::new();
                 doc.transact_mut()
                     .apply_update(yrs::Update::decode_v1(&state).unwrap())
@@ -202,10 +202,12 @@ fn yjs_rich_state_and_merged_gaps_decode_through_note() {
             include_bytes!("../../../tests/interop/checked-yrs-gap.bin").as_slice(),
         ),
     ] {
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         note.apply_update(bytes).expect("Yjs v1 fixture");
-        let mut restored = Note::new();
-        restored.apply_update(&note.state()).expect("yrs snapshot");
+        let mut restored = Note::new().unwrap();
+        restored
+            .apply_update(&note.state().unwrap())
+            .expect("yrs snapshot");
         // Hash-map key serialization order need not be byte-identical after reload.
         // The native reader must retain Yjs's client clocks and rendered content.
         let inspect = |state: &[u8]| {
@@ -234,7 +236,7 @@ fn yjs_rich_state_and_merged_gaps_decode_through_note() {
             (vector, text.get_string(&tx), ints)
         };
         let want = &expected[name];
-        for state in [note.state(), restored.state()] {
+        for state in [note.state().unwrap(), restored.state().unwrap()] {
             let (vector, text, ints) = inspect(&state);
             assert_eq!(serde_json::json!(vector), want["vector"], "{name} vector");
             if name == "rich" {

@@ -12,26 +12,33 @@ function capabilitiesIn(parsed) {
   return parsed.capabilities ?? [parsed];
 }
 
-test("shell bundles its assets and grants no plugin or remote permissions, and core only to move its window", async () => {
+test("shell bundles its assets and grants only Android main-window camera scan, and core only to move its window", async () => {
   assert.equal(config.identifier, "app.basehero.client");
   assert.equal(config.build.frontendDist, "../ui");
   assert.equal(config.build.devUrl, undefined);
-  assert.deepEqual(config.app.security.capabilities, ["basehero-client-notes", "basehero-client-setup", "basehero-client-window"]);
+  assert.deepEqual(config.app.security.capabilities, ["basehero-client-notes", "basehero-client-setup", "basehero-client-pairing", "basehero-client-window", "basehero-client-camera-scan"]);
 
-  // command-acl.test.mjs checks the exact command union. Here: only app-command
-  // permissions, no plugin grants, no remote origins, and on a Mac only the two
-  // core window grants its location bar needs to move and zoom the window.
+  // command-acl.test.mjs checks the exact app-command union. The only plugin
+  // grant is the Android main window's request/scan/cancel trio. No remote
+  // origins; on a Mac only the core window grants needed for its location bar.
   const capabilitiesDir = new URL("src-tauri/capabilities/", root);
   const entries = await readdir(capabilitiesDir, { recursive: true });
   const capabilityFiles = entries.filter((name) => /\.(json|toml|json5)$/.test(name));
-  assert.deepEqual(capabilityFiles.sort(), ["shell.json", "signup.json", "window.json"]);
+  assert.deepEqual(capabilityFiles.sort(), ["pairing.json", "scan.json", "shell.json", "signup.json", "window.json"]);
   for (const name of capabilityFiles) {
     assert(name.endsWith(".json"), `capability ${name} must be JSON so the check can parse it`);
     const parsed = JSON.parse(await readFile(new URL(name, capabilitiesDir), "utf8"));
     for (const capability of capabilitiesIn(parsed)) {
-      const prefixes = { "shell.json": ["allow-note-", "allow-update-", "allow-window-sidebar"], "signup.json": ["allow-account-"],
+      const prefixes = { "shell.json": ["allow-note-", "allow-update-", "allow-window-sidebar"],
+        "signup.json": ["allow-account-", "allow-pairing-join"], "pairing.json": ["allow-pairing-", "allow-sync-status"],
+        "scan.json": ["qr-scan:allow-request-permissions", "qr-scan:allow-scan", "qr-scan:allow-cancel"],
         "window.json": ["core:window:allow-start-dragging", "core:window:allow-internal-toggle-maximize"] }[name];
       if (name === "window.json") assert.deepEqual(capability.platforms, ["macOS"]);
+      if (name === "scan.json") {
+        assert.deepEqual(capability.platforms, ["android"]);
+        assert.deepEqual(capability.windows, ["main"]);
+        assert.deepEqual(capability.permissions, ["qr-scan:allow-request-permissions", "qr-scan:allow-scan", "qr-scan:allow-cancel"]);
+      }
       for (const permission of capability.permissions) assert(prefixes.some((prefix) => permission.startsWith(prefix)), permission);
       assert.equal(capability.remote, undefined);
     }
@@ -41,6 +48,22 @@ test("shell bundles its assets and grants no plugin or remote permissions, and c
     assert(!match[1].includes(":") && !match[1].startsWith("/"));
     await access(new URL("ui/" + match[1], root));
   }
+});
+
+test("Android QR scanning is the app's own algorithmic adapter: CameraX and ZXing only", async () => {
+  // Source declarations only; scripts/android_no_models.py checks the resolved
+  // Gradle graph and packaged APK for models and ML/Play Services components.
+  const app = await readFile(new URL("src-tauri/gen/android/app/build.gradle.kts", root), "utf8");
+  const plugin = await readFile(new URL("plugins/qr-scan/android/build.gradle.kts", root), "utf8");
+  const manifest = await readFile(new URL("plugins/qr-scan/android/src/main/AndroidManifest.xml", root), "utf8");
+  assert.match(app, /implementation\(project\(":qr-scan"\)\)/);
+  assert.doesNotMatch(app, /mlkit|play-services|firebase|tensorflow/i);
+  const deps = [...plugin.matchAll(/^\s*(?:implementation|api)\((.+)\)$/gm)].map(match => match[1]);
+  assert.deepEqual(deps, ['"androidx.camera:camera-core:$camerax"', '"androidx.camera:camera-camera2:$camerax"',
+    '"androidx.camera:camera-lifecycle:$camerax"', '"androidx.camera:camera-view:$camerax"',
+    '"com.google.zxing:core:3.5.4"', '"androidx.appcompat:appcompat:1.7.1"', 'project(":tauri-android")']);
+  assert.deepEqual([...manifest.matchAll(/uses-permission android:name="([^"]+)"/g)].map(match => match[1]), ["android.permission.CAMERA"]);
+  assert.match(manifest, /android\.hardware\.camera\.any" android:required="false"/);
 });
 
 test("Android source has a stable release-only unsigned arm64 package", async () => {

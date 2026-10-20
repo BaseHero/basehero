@@ -12,7 +12,9 @@ pub struct OwnBaseRecord {
     pub initial_key_package: Vec<u8>,
 }
 
-fn read(connection: &rusqlite::Connection) -> Result<Option<OwnBaseRecord>, StoreError> {
+pub(crate) fn read_own_base(
+    connection: &rusqlite::Connection,
+) -> Result<Option<OwnBaseRecord>, StoreError> {
     let row = connection.query_row(
         "SELECT account,base,genesis_descriptor,genesis_body,initial_key_package FROM own_base WHERE id=1", [],
         |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
@@ -33,7 +35,7 @@ fn read(connection: &rusqlite::Connection) -> Result<Option<OwnBaseRecord>, Stor
 
 impl DeviceDatabase {
     pub fn own_base(&self) -> Result<Option<OwnBaseRecord>, StoreError> {
-        read(&self.connection)
+        read_own_base(&self.connection)
     }
 
     /// The native caller supplies a current-generation predicate; inspect it
@@ -57,7 +59,7 @@ impl DeviceDatabase {
         if !current() || anchor.as_deref() != Some(record.account.as_slice()) {
             return Err(StoreError::AuthorityChanged);
         }
-        if let Some(winner) = read(&tx)? {
+        if let Some(winner) = read_own_base(&tx)? {
             if winner.account != record.account {
                 return Err(StoreError::AuthorityChanged);
             }

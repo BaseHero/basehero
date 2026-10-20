@@ -20,7 +20,7 @@ use crate::journal::{
 };
 use crate::platform::{DeviceKeyStore, KeyStoreError, StoredDevice};
 use crate::recovery::{Password, RecoveryCode, RecoveryKeys, prepare_record};
-use crate::{AccountEvent, personal};
+use crate::{AccountEvent, device_auth, personal};
 
 const PENDING_MAGIC: &[u8; 8] = b"BHPEND01";
 const MAX_BLOB_PART: usize = 1 << 20;
@@ -134,7 +134,18 @@ pub enum OwnerError {
     Stale,
     Device(KeyStoreError),
     Protector(ProtectorError),
+    /// From `apply_incoming`: authenticated history contradicting this
+    /// owner's, now stopped; or `Unavailable` local evidence, nothing
+    /// applied and no stop.
     Invalid(Error),
+    /// Incoming bytes that are not this account's next verified history
+    /// (malformed, badly signed, not next, or a signed event breaking the
+    /// rules). Nothing applied and no stop: a member or server cannot stop
+    /// the account with them.
+    Refused(Error),
+    /// The next incoming event needs a newer build. Nothing applied and no
+    /// stop: the account pauses until it can read it.
+    Unsupported(Error),
     /// No staged admission exists for reconciliation.
     NoStagedAdmission,
 }
@@ -432,8 +443,9 @@ where
     }
 
     /// Apply incoming ordered history. Valid input commits the original bytes and
-    /// the resulting head together; invalid input commits a sticky stop while
-    /// keeping the last good head and bytes.
+    /// the resulting head together. Only authenticated contradiction (a fork)
+    /// commits a sticky stop, keeping the last good head and bytes; anything
+    /// else invalid or unreadable is refused or paused with nothing applied.
     pub fn apply_incoming(&mut self, events: &[&[u8]]) -> Result<Head, OwnerError> {
         let (anchor, device_id) = {
             let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
@@ -490,6 +502,10 @@ where
                 Ok(head)
             }
             Err(Error::Unavailable) => Err(OwnerError::Invalid(Error::Unavailable)),
+            Err(error @ (Error::UnsupportedVersion | Error::UnsupportedControl)) => {
+                Err(OwnerError::Unsupported(error))
+            }
+            Err(error) if error != Error::Fork => Err(OwnerError::Refused(error)),
             Err(error) => {
                 // Stop the session before the durable write: a storage failure
                 // must not leave this owner active with usable capabilities.
@@ -706,6 +722,24 @@ where
         Ok(event)
     }
 
+    /// Complete a base control (such as the base copy of an account change)
+    /// with the native second key, under the same confirmation and generation
+    /// checks as [`Self::sign_control`]. Only base-event originals are
+    /// signed here; account events go through their own request.
+    pub async fn sign_base_control(
+        &mut self,
+        capability: &AccountCapability,
+        expected: &[u8; 32],
+        message: &[u8],
+    ) -> Result<[u8; 64], OwnerError> {
+        const BASE_ORIGINAL: &[u8] = b"bh/original-envelope/v1\0";
+        self.check(capability)?;
+        if !message.starts_with(BASE_ORIGINAL) {
+            return Err(OwnerError::Invalid(Error::Malformed));
+        }
+        self.sign_native(capability, message, Some(expected)).await
+    }
+
     /// Ordinary native device signing, not control approval. No database guard
     /// is held during either native operation; late results are discarded.
     pub async fn sign_content(
@@ -713,24 +747,231 @@ where
         capability: &AccountCapability,
         message: &[u8],
     ) -> Result<[u8; 64], OwnerError> {
+        self.sign_native(capability, message, None).await
+    }
+
+    /// `expected` selects control signing and binds it to the producer's key;
+    /// ordinary signing has no separate producer key to compare.
+    async fn sign_native(
+        &mut self,
+        capability: &AccountCapability,
+        message: &[u8],
+        expected: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], OwnerError> {
         self.check(capability)?;
         let device = self
             .loaded
             .as_ref()
             .and_then(|l| l.device.clone())
             .ok_or(OwnerError::NotActive)?;
+        let key = match expected {
+            Some(expected) if device.keys.control() != expected => {
+                return Err(OwnerError::Device(KeyStoreError::WrongKey));
+            }
+            Some(_) => device.keys.control(),
+            None => device.keys.signing(),
+        };
         let loaded = self.store.load_matching(&device).await;
         self.check(capability)?;
         loaded.map_err(OwnerError::Device)?;
-        let signature = self
-            .store
-            .sign_content(device.handle, message.to_vec())
-            .await;
+        let signature = if expected.is_some() {
+            self.store
+                .sign_control(device.handle, message.to_vec())
+                .await
+        } else {
+            self.store
+                .sign_content(device.handle, message.to_vec())
+                .await
+        };
         self.check(capability)?;
         let signature = signature.map_err(OwnerError::Device)?;
-        crate::crypto::verify(device.keys.signing(), message, &signature)
+        crate::crypto::verify(key, message, &signature)
             .map_err(|_| OwnerError::Invalid(Error::BadSignature))?;
         Ok(signature)
+    }
+
+    /// Prove ordinary device-key possession for a protected session's binding
+    /// and fresh challenge. This is not current hosted authority: the caller
+    /// must check it independently and consume the challenge in that session.
+    pub async fn prove_sync_device(
+        &mut self,
+        capability: &AccountCapability,
+        context: device_auth::Context,
+    ) -> Result<device_auth::Proof, OwnerError> {
+        let request =
+            device_auth::prepare(self.verified(capability)?, capability.device_id(), context)
+                .map_err(OwnerError::Invalid)?;
+        let signature = self.sign_content(capability, request.message()).await?;
+        request.finish(signature).map_err(OwnerError::Invalid)
+    }
+
+    /// As [`Self::prove_sync_device`], at an earlier verified head of this
+    /// account: one an account home that has not caught up yet still holds.
+    /// The view at `position` is replayed from the journal's verified prefix.
+    /// A position past the current head, or one this device was not active
+    /// at, is refused before anything is signed.
+    pub async fn prove_sync_device_at(
+        &mut self,
+        capability: &AccountCapability,
+        position: u64,
+        context: device_auth::Context,
+    ) -> Result<device_auth::Proof, OwnerError> {
+        let current = self.verified(capability)?;
+        let head = current.head();
+        let view = if position == head.position {
+            current.clone()
+        } else if position == 0 || position > head.position {
+            return Err(OwnerError::Invalid(Error::InvalidCredentials));
+        } else {
+            self.view_at(current.id(), head, position)?
+        };
+        let request = device_auth::prepare(&view, capability.device_id(), context)
+            .map_err(OwnerError::Invalid)?;
+        let signature = self.sign_content(capability, request.message()).await?;
+        request.finish(signature).map_err(OwnerError::Invalid)
+    }
+
+    /// The account at an earlier verified `position` (or the current head),
+    /// replayed from the journal's original history.
+    pub fn verified_at(
+        &self,
+        capability: &AccountCapability,
+        position: u64,
+    ) -> Result<VerifiedAccount, OwnerError> {
+        let current = self.verified(capability)?;
+        let head = current.head();
+        if position == head.position {
+            return Ok(current.clone());
+        }
+        if position == 0 || position > head.position {
+            return Err(OwnerError::Invalid(Error::InvalidCredentials));
+        }
+        self.view_at(current.id(), head, position)
+    }
+
+    // ---- A device joining by QR ----
+
+    /// Prove possession of this device's journaled ordinary key at `head` of
+    /// `account`, the head the showing device reported, before this device
+    /// holds any of its history. Nothing here is verified: the service checks
+    /// the proof against its own verified history, and admission is only the
+    /// history this device then reads and verifies itself. Refused for a
+    /// journal that already holds another account.
+    pub async fn prove_joining(
+        &mut self,
+        account: AccountId,
+        head: Head,
+        context: device_auth::Context,
+    ) -> Result<device_auth::Proof, OwnerError> {
+        if let Some(stored) = self.journal.load()?
+            && stored.anchor != account
+        {
+            return Err(OwnerError::Stale);
+        }
+        let identity = self.journal.device()?.ok_or(OwnerError::NotActive)?;
+        let device = stored(&identity);
+        self.store
+            .load_matching(&device)
+            .await
+            .map_err(OwnerError::Device)?;
+        let request = device_auth::prepare_joining(account, &device.keys, head, context);
+        let signature = self
+            .store
+            .sign_content(device.handle.clone(), request.message().to_vec())
+            .await
+            .map_err(OwnerError::Device)?;
+        request.finish(signature).map_err(OwnerError::Invalid)
+    }
+
+    /// Commit the account history a joining device read, verified here from
+    /// `anchor` (the code's account): original signed bytes from genesis, in
+    /// which this device's journaled keys are active exactly. Anything else
+    /// is refused and nothing is kept. A journal that already holds this
+    /// account (an interrupted earlier admission) is kept as it is.
+    pub fn adopt_joined(
+        &mut self,
+        anchor: AccountId,
+        history: &[&[u8]],
+    ) -> Result<Head, OwnerError> {
+        let identity = self.journal.device()?.ok_or(OwnerError::NotActive)?;
+        if let Some(stored) = self.journal.load()? {
+            if stored.anchor != anchor {
+                return Err(OwnerError::Stale);
+            }
+            return Ok(stored.head);
+        }
+        let (genesis, rest) = history
+            .split_first()
+            .ok_or(OwnerError::Invalid(Error::TruncatedHistory))?;
+        let mut view =
+            VerifiedAccount::from_genesis(anchor, genesis).map_err(OwnerError::Invalid)?;
+        view.apply_batch(rest).map_err(OwnerError::Invalid)?;
+        if view
+            .active_device(identity.keys.id())
+            .map_err(OwnerError::Invalid)?
+            != &identity.keys
+        {
+            return Err(OwnerError::Invalid(Error::NotActive));
+        }
+        self.journal
+            .commit_verified(anchor, history, view.head(), false)?;
+        Ok(view.head())
+    }
+
+    /// Open the personal key delivered to this device by the addition at
+    /// `added_at`: the exact signed delivery frame that addition carried,
+    /// checked against the verified account at that position before the
+    /// native receiver opens it.
+    pub async fn open_delivered_personal(
+        &mut self,
+        capability: &AccountCapability,
+        frame: &[u8],
+        added_at: u64,
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        let view = self.verified_at(capability, added_at)?;
+        let device = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.device.clone())
+            .ok_or(OwnerError::NotActive)?;
+        let result = personal::open_for_device(&view, frame, &device, &mut self.store).await;
+        self.check(capability)?;
+        result.map_err(OwnerError::Invalid)
+    }
+
+    /// The account at `position`, before `head`, replayed from the journal.
+    fn view_at(
+        &self,
+        anchor: AccountId,
+        head: Head,
+        position: u64,
+    ) -> Result<VerifiedAccount, OwnerError> {
+        let mut cursor = Some(HistoryCursor {
+            anchor,
+            cut: head,
+            next_position: 1,
+        });
+        let mut events = Vec::new();
+        while let Some(next) = cursor
+            && (events.len() as u64) < position
+        {
+            let page = self
+                .journal
+                .history_prefix(Some(next), 256)?
+                .ok_or(JournalError::Corrupt)?;
+            events.extend(page.events);
+            cursor = page.next;
+        }
+        events.truncate(position as usize);
+        let (genesis, rest) = events.split_first().ok_or(JournalError::Corrupt)?;
+        let mut view =
+            VerifiedAccount::from_genesis(anchor, genesis).map_err(OwnerError::Invalid)?;
+        let rest: Vec<&[u8]> = rest.iter().map(Vec::as_slice).collect();
+        view.apply_batch(&rest).map_err(OwnerError::Invalid)?;
+        if view.head().position != position {
+            return Err(OwnerError::Journal(JournalError::Corrupt));
+        }
+        Ok(view)
     }
 
     /// Read exactly the remembered signup cut, never the current history length.
@@ -1194,19 +1435,10 @@ fn authenticate_initial_objects(
     account: &VerifiedAccount,
     row: &crate::journal::InitialBootstrapRecord,
 ) -> Result<(), Error> {
-    let (record_digest, personal) = account.initial_materials()?;
-    if row.anchor != account.id()
-        || row.head != account.head()
-        || row.recovery_record.len() != 242
-        || row.device_seal.len() != 1299
-        || row.recovery_seal.len() != 1299
-        || crate::recovery::commitment(&row.recovery_record)? != *record_digest
-        || personal::commitment(&row.device_seal) != *personal.device_digest()
-        || personal::commitment(&row.recovery_seal) != *personal.recovery_digest()
-    {
+    if row.anchor != account.id() || row.head != account.head() {
         return Err(Error::InvalidCredentials);
     }
-    Ok(())
+    account.verify_initial_objects(&row.recovery_record, &row.device_seal, &row.recovery_seal)
 }
 
 fn expected_head(material: &PendingMaterial) -> Result<Head, SetupError> {

@@ -1,5 +1,5 @@
 {
   "order": ["foundation", "libs", "services", "apps", "tests"],
-  "foundation": ["libs/core", "libs/crypto"],
+  "foundation": ["libs/core", "libs/crypto", "libs/note-engine/artifact"],
   "prefixes": {"libs/": "libs", "services/": "services", "apps/": "apps", "tests/": "tests"}
 }

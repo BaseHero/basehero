@@ -40,7 +40,11 @@ pub enum Error {
     UnsupportedControl,
     BadSignature,
     WrongAccount,
+    /// Not the next position, or a genesis naming a predecessor.
     WrongPredecessor,
+    /// Authenticated history contradicting this history: a signed event at
+    /// the next position naming another predecessor, or a replay holding
+    /// another head at the remembered position.
     Fork,
     TruncatedHistory,
     DuplicateDevice,
@@ -169,6 +173,23 @@ impl PersonalPublication {
     }
 }
 
+/// Strictly decoded, unsigned first-device setup request for the app-gated Mac store.
+/// This describes the message, not authorization to sign it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SignupKind {
+    Genesis,
+    RecoveryRecord,
+    PersonalKey,
+}
+
+#[derive(Clone, Copy)]
+pub struct SignupMessage {
+    pub kind: SignupKind,
+    pub account: AccountId,
+    pub author: DeviceId,
+    pub previous: [u8; 32],
+}
+
 /// Canonical signed account control. Decoding is not verification.
 #[derive(Clone)]
 pub struct AccountEvent {
@@ -203,6 +224,38 @@ impl SigningRequest {
 }
 
 impl AccountEvent {
+    /// Parse the exact unsigned signing bytes using the canonical event decoder.
+    /// The placeholder signature is never verified or used as authority; the
+    /// signing key is checked against the genesis's actual first device.
+    pub fn signup_message(message: &[u8], key: &[u8; 32]) -> Option<SignupMessage> {
+        if message.len() < HEADER_LEN || message.len() > MAX_EVENT_LEN - SIGNATURE_LEN {
+            return None;
+        }
+        let mut complete = Vec::with_capacity(message.len() + SIGNATURE_LEN);
+        complete.extend_from_slice(message);
+        complete.extend_from_slice(&[0; SIGNATURE_LEN]);
+        let event = Self::decode(&complete).ok()?;
+        let kind = match &event.control {
+            Control::Genesis { first, .. }
+                if event.position == 1
+                    && event.previous == [0; 32]
+                    && event.account == AccountId([0; 32])
+                    && event.author == first.id()
+                    && first.control() == key =>
+            {
+                SignupKind::Genesis
+            }
+            Control::RecoveryRecord(_) if event.position == 2 => SignupKind::RecoveryRecord,
+            Control::PersonalKey(_) if event.position == 3 => SignupKind::PersonalKey,
+            _ => return None,
+        };
+        Some(SignupMessage {
+            kind,
+            account: event.account,
+            author: event.author,
+            previous: event.previous,
+        })
+    }
     /// Genesis is self-certified by the first device's control key. Its hash must
     /// arrive over a trusted introduction, never be replaced with a server's id.
     pub fn genesis(first: DevicePublicKeys, recovery: RecoveryPublicKeys) -> SigningRequest {
@@ -635,12 +688,16 @@ impl VerifiedAccount {
                 .position
                 .checked_add(1)
                 .ok_or(Error::PositionOverflow)?
-            || event.previous != self.head.hash
         {
             return Err(Error::WrongPredecessor);
         }
         let signer = self.active_device(event.author)?;
         event.verify_signature(&signer.control)?;
+        // Checked after the signature, so only authenticated history reports
+        // a fork: an active device signed another successor of this head.
+        if event.previous != self.head.hash {
+            return Err(Error::Fork);
+        }
         match &event.control {
             Control::Genesis { .. } => return Err(Error::UnsupportedControl),
             Control::AddDevice(keys) => {

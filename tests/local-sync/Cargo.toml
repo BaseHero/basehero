@@ -1,0 +1,38 @@
+[package]
+name = "bh-local-sync-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Opt in only for local integration tests; no normal/build release edge enables it.
+synthetic-attestation = ["bh-sync-client/synthetic-attestation", "bh-host/synthetic-attestation"]
+
+# Everything here is a test or the tests' device process (an example, so it
+# may use the test-only dependencies); nothing is a normal dependency.
+[dev-dependencies]
+bh-account.workspace = true
+bh-authz-proto.workspace = true
+bh-core.workspace = true
+bh-crypto.workspace = true
+bh-device.workspace = true
+bh-host = { workspace = true, features = ["test-support"] }
+bh-storage.workspace = true
+bh-sync.workspace = true
+bh-sync-client.workspace = true
+futures-util.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+yrs.workspace = true
+
+[[example]]
+name = "local_sync_device"
+path = "examples/device.rs"
+
+[lints]
+workspace = true

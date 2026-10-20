@@ -100,7 +100,7 @@ fn ten_busy_mib_bases_in_one_container() {
                 &window,
                 open.generation,
                 [0; 16],
-                &Note::new().append_paragraph(&big),
+                &Note::new().unwrap().append_paragraph(&big).unwrap(),
             )
             .unwrap();
         bindings.push((window, open.generation));
@@ -115,12 +115,12 @@ fn ten_busy_mib_bases_in_one_container() {
             let owner = Arc::clone(&owner);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let mut source = Note::new();
+                let mut source = Note::new().unwrap();
                 let mut saves = Vec::new();
                 let mut sql = Vec::new();
                 barrier.wait();
                 for n in 0..100u16 {
-                    let delta = source.append_paragraph("small change");
+                    let delta = source.append_paragraph("small change").unwrap();
                     let mut request = [0u8; 16];
                     request[0] = (index + 1) as u8;
                     request[1..3].copy_from_slice(&n.to_be_bytes());

@@ -106,6 +106,20 @@ test('dependency layers reject library to service and service to app including d
   assert.match(check().stderr, /core.*high/);
 });
 
+test('core can load its bundled engine artifact but the artifact cannot depend on higher libraries', t => {
+  const f = fixture(t);
+  f.crate('libs/note-engine', 'engine');
+  f.crate('libs/note-engine/artifact', 'artifact');
+  f.crate('libs/core', 'core', `[dependencies]\nartifact = { path = "${up(1)}/note-engine/artifact" }\n`);
+  const check = () => f.run('node', [script, '--layers']);
+  const allowed = check();
+  assert.equal(allowed.status, 0, allowed.stderr);
+  f.put('libs/note-engine/artifact/Cargo.toml', `[package]\nname = "artifact"\nversion = "0.1.0"\nedition = "2021"\n[build-dependencies]\nhigh = { path = "${up(2)}/high" }\n`);
+  const forbidden = check();
+  assert.notEqual(forbidden.status, 0);
+  assert.match(forbidden.stderr, /artifact.*high/);
+});
+
 test('path families select JS, interop, the Rust interop consumer and website', t => {
   const f = fixture(t);
   f.crate('libs/core', 'bh-core');

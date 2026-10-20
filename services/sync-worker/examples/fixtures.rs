@@ -2,7 +2,7 @@
 use bh_crypto::{Secret, SigningKey};
 use bh_sync::{
     Approval, BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent,
-    Operation, SignedApproval,
+    Operation, Route, SignedApproval,
 };
 use serde_json::json;
 fn hex(bytes: &[u8]) -> String {
@@ -50,7 +50,7 @@ fn main() {
         sequence: 0,
         checker_key: key.public(),
     };
-    let commitment = Commitment::order(base, Head::EMPTY, &event).unwrap();
+    let commitment = Commitment::order(base, Head::EMPTY, &event, Route::Control).unwrap();
     let append = Operation::Append(event.clone());
     let read = Operation::read(vec![event.digest()]).unwrap();
     let after = GateState {
@@ -60,9 +60,11 @@ fn main() {
     };
     let conflicting = descriptor(event.id().0, body_a.commitment().0, 0x3c);
     let second = descriptor([4; 32], body_b.commitment().0, 0x4c);
-    let second_commitment = Commitment::order(base, commitment.head(), &second).unwrap();
+    let second_commitment =
+        Commitment::order(base, commitment.head(), &second, Route::Content).unwrap();
     let third = descriptor([6; 32], body_c.commitment().0, 0x6d);
-    let third_commitment = Commitment::order(base, second_commitment.head(), &third).unwrap();
+    let third_commitment =
+        Commitment::order(base, second_commitment.head(), &third, Route::Content).unwrap();
     let after_second = GateState {
         head: second_commitment.head(),
         sequence: 2,
@@ -94,7 +96,8 @@ fn main() {
     // main body fixture appends the genesis first, then stages, then appends.
     let staged = body(0xb4);
     let staged_event = descriptor([8; 32], staged.commitment().0, 0x8e);
-    let staged_commitment = Commitment::order(base, commitment.head(), &staged_event).unwrap();
+    let staged_commitment =
+        Commitment::order(base, commitment.head(), &staged_event, Route::Content).unwrap();
     let missing = body(0xb5);
     let missing_event = descriptor([9; 32], missing.commitment().0, 0x9f);
     let stage_op = Operation::stage_body(staged.clone());

@@ -7,13 +7,20 @@ pub mod base_keys;
 mod compaction;
 mod containers;
 pub mod coordinator;
+mod copy;
+pub mod incoming;
+pub mod join;
 pub mod own_base;
+mod seal;
+mod sync_fence;
 pub mod writers;
+pub use seal::SealRefusal;
+pub use sync_fence::SyncFence;
 
 use bh_account::{
     AccountEvent, AccountId, VerifiedAccount, crypto::hash, owner::AccountCapability,
 };
-use bh_core::note::Note;
+use bh_core::note::{Note, OrderedState};
 use bh_crypto::random;
 use bh_storage::{DeviceDatabase, NoteEntry, NoteKey, OpenError, StoreError, ViewRecord};
 use compaction::Scheduler;
@@ -188,10 +195,49 @@ pub enum OwnerError {
     DuplicateAnchor,
     AnchorMismatch,
     WriterUnavailable,
+    /// The log is stopped by a proven contradiction.
+    Stopped,
+    /// The base is not registered here, so it has no accepted log yet.
+    NotRegistered,
+    /// The batch does not continue this device's verified progress, or
+    /// does not prove itself one verified run ending at its receipt's head.
+    InvalidBatch,
+    /// Verification cannot run here as configured (a History pinned to
+    /// another hosting root than the log's, or local state that does not
+    /// reproduce its continuation): `UnavailablePause`, nothing judged.
+    Unavailable,
+    /// The local note engine could not run. No content or account verdict;
+    /// retain exact work and retry without changing verified progress.
+    NoteUnavailable,
+    /// Not the next account event after the base's copy of the account, or
+    /// this device is not active in that copy: nothing to copy.
+    CopyRefused,
+    /// A container that joined by pairing is not usable before its
+    /// bootstrap activated it.
+    NotActivated,
+    /// The pending update cannot be sealed now; its work stays pending.
+    SealRefused(SealRefusal),
 }
 impl From<StoreError> for OwnerError {
     fn from(error: StoreError) -> Self {
-        Self::Store(error)
+        match error {
+            StoreError::NoteUnavailable => Self::NoteUnavailable,
+            StoreError::LogStopped => Self::Stopped,
+            other => Self::Store(other),
+        }
+    }
+}
+impl From<bh_core::note::NoteError> for OwnerError {
+    fn from(error: bh_core::note::NoteError) -> Self {
+        StoreError::from(error).into()
+    }
+}
+impl From<bh_core::note::WriterError> for OwnerError {
+    fn from(error: bh_core::note::WriterError) -> Self {
+        match error {
+            bh_core::note::WriterError::Update(e) => e.into(),
+            _ => StoreError::InvalidUpdate.into(),
+        }
     }
 }
 impl From<HostError> for OwnerError {
@@ -199,7 +245,7 @@ impl From<HostError> for OwnerError {
         match error {
             HostError::Unbound => Self::Unbound,
             HostError::Changed => Self::Changed,
-            HostError::Store(e) => Self::Store(e),
+            HostError::Store(e) => e.into(),
         }
     }
 }
@@ -222,7 +268,7 @@ fn load_working_note(
     if let Some(pool) = pool {
         let loaded = pool.load_note(key)?;
         let weight = if weigh_cold {
-            loaded.note.state().len().max(1)
+            loaded.note.state()?.len().max(1)
         } else {
             0
         };
@@ -230,7 +276,7 @@ fn load_working_note(
     }
     let (note, frontier) = rebuild_from_writer(database, key)?;
     let weight = if weigh_cold {
-        note.state().len().max(1)
+        note.state()?.len().max(1)
     } else {
         0
     };
@@ -244,11 +290,7 @@ fn rebuild_from_writer(
         .lock()
         .expect("container writer lock")
         .note_seed(key)?;
-    let mut note = Note::new();
-    if !seed.encoded.is_empty() {
-        note.apply_update(&seed.encoded)
-            .map_err(|_| StoreError::InvalidUpdate)?;
-    }
+    let mut note = Note::from_ordered(&seed.state)?;
     let mut after = seed.covered;
     while after < seed.target {
         let page = database
@@ -259,24 +301,42 @@ fn rebuild_from_writer(
             return Err(StoreError::InvalidUpdate);
         }
         for (id, delta) in page {
-            note.apply_update(&delta)
-                .map_err(|_| StoreError::InvalidUpdate)?;
+            note.apply_update(&delta)?;
             after = id;
         }
     }
     Ok((note, seed.target))
 }
-fn durable_snapshot(
+/// The ordered updates a loaded note integrated, read without holding the
+/// writer across pages, and the frontier they reach.
+fn durable_ordered(
     database: &Arc<Mutex<DeviceDatabase>>,
     key: NoteKey,
-) -> Result<(Vec<u8>, i64), StoreError> {
+) -> Result<(OrderedState, i64), StoreError> {
     let pool = database.lock().expect("container writer lock").read_pool();
     if let Some(pool) = pool {
-        let read = pool.note_state(key)?;
-        return Ok((read.state, read.frontier));
+        return pool.note_ordered(key);
     }
-    let (note, frontier) = rebuild_from_writer(database, key)?;
-    Ok((note.state(), frontier))
+    let seed = database
+        .lock()
+        .expect("container writer lock")
+        .note_seed(key)?;
+    let mut ordered = seed.state;
+    let mut after = seed.covered;
+    while after < seed.target {
+        let page = database
+            .lock()
+            .expect("container writer lock")
+            .note_seed_page(key, after, seed.target)?;
+        if page.is_empty() {
+            return Err(StoreError::InvalidUpdate);
+        }
+        for (id, delta) in page {
+            ordered.push(delta);
+            after = id;
+        }
+    }
+    Ok((ordered, seed.target))
 }
 
 fn verified_anchor(
@@ -308,6 +368,50 @@ fn verified_anchor(
 }
 
 impl Owner {
+    fn anchored(&self, id: ContainerId) -> bool {
+        self.registry
+            .lock()
+            .expect("owner registry lock")
+            .containers
+            .get(&id)
+            .is_some_and(|c| c.anchor.is_some())
+    }
+    /// Queue committed deliveries in order, atomically with their sequence
+    /// numbers. Overflow replaces only committed queued bytes with one
+    /// bounded marker, which keeps any reload it replaced; an off-guard
+    /// reader hydrates it before delivery. Returns the windows to wake.
+    fn enqueue(&self, id: ContainerId, targets: Vec<Delivery>) -> Vec<String> {
+        let mut windows = Vec::with_capacity(targets.len());
+        let mut queues = self.deliveries.lock().expect("delivery lock");
+        for item in targets {
+            windows.push(item.window.clone());
+            let queue = queues.entry(item.window.clone()).or_default();
+            if queue.pending.len() >= DELIVERY_LIMIT
+                || queue.bytes.saturating_add(item.update.len()) > DELIVERY_BYTES
+            {
+                let reload = item.reload || queue.pending.iter().any(|(_, d)| d.reload);
+                queue.pending.clear();
+                queue.bytes = 0;
+                queue.pending.push_back((
+                    id,
+                    Delivery {
+                        window: item.window,
+                        generation: item.generation,
+                        sequence: item.sequence,
+                        through_update_id: item.through_update_id,
+                        update: Vec::new(),
+                        resync: true,
+                        segments: Vec::new(),
+                        reload,
+                    },
+                ));
+            } else {
+                queue.bytes = queue.bytes.saturating_add(item.update.len());
+                queue.pending.push_back((id, item));
+            }
+        }
+        windows
+    }
     fn account_session(&self, id: ContainerId) -> Result<Session, OwnerError> {
         let registry = self.registry.lock().expect("owner registry lock");
         Ok(Arc::clone(
@@ -364,7 +468,10 @@ impl Owner {
         let session = self.account_session(id)?;
         let mut guard = session.lock().expect("container session lock");
         let database = guard.shared_database();
-        let _writer = database.lock().expect("container writer lock");
+        let writer = database.lock().expect("container writer lock");
+        if writer.joined()?.is_some_and(|joined| !joined.activated) {
+            return Err(OwnerError::NotActivated);
+        }
         // Replacing authority would end loads that Quit/update is draining.
         if self
             .registry
@@ -1007,15 +1114,25 @@ impl Owner {
                 .lock()
                 .expect("exclusive note work lock");
             let (built, frontier, _) = load_working_note(&database, scope.key, false)?;
-            let state = built.state();
-            let weight = state.len().max(1);
+            // The view integrates the same updates in the same order; a
+            // merged state could reopen concurrent text elsewhere.
+            let (source, read) = durable_ordered(&database, scope.key)?;
+            if read != frontier {
+                drop(lease);
+                continue;
+            }
             let due = {
                 database
                     .lock()
                     .expect("container writer lock")
                     .checkpoint_due(scope.key)?
             };
-            let checkpoint_bytes = due.then(|| state.clone());
+            // Opening tries only one full state, one rebuild. A note that
+            // needs more opens from its stored order and is compacted by the
+            // background checkpoint scheduled below.
+            let checkpoint_state = due.then(|| built.merged()).transpose()?.flatten();
+            let state = checkpoint_state.clone().unwrap_or(source);
+            let weight = state.segments().iter().map(Vec::len).sum::<usize>().max(1);
             drop(lease);
             after_snapshot(attempt);
             let lease = work
@@ -1083,12 +1200,13 @@ impl Owner {
                             .insert(window.to_owned(), active);
                     }
                     // Reuse the exact owned Note for first save. A checkpoint
-                    // gets the already encoded state; no second history replay.
-                    let checkpoint = checkpoint_bytes.and_then(|state| {
+                    // gets the state already verified for the view; no second
+                    // history replay.
+                    let checkpoint = checkpoint_state.and_then(|state| {
                         database
                             .lock()
                             .expect("container writer lock")
-                            .prepare_loaded_checkpoint(scope.key, frontier, state)
+                            .prepare_loaded_checkpoint(scope.key, frontier, &state)
                             .ok()
                             .flatten()
                     });
@@ -1309,17 +1427,18 @@ impl Owner {
                 }
             }
             if let Some(active) = active {
-                working
-                    .apply_writer_update(update, active.slot.client_id)
-                    .map_err(|_| StoreError::InvalidUpdate)?;
+                working.apply_writer_update(update, active.slot.client_id)?;
             } else {
-                working
-                    .apply_update(update)
-                    .map_err(|_| StoreError::InvalidUpdate)?;
+                working.apply_update(update)?;
             }
             // Bounded read of the exclusively owned candidate, committed with
             // its delta; derived before any session or writer guard.
-            let title = working.title_preview();
+            let title = working.title_preview()?;
+            let exhausted = active
+                .map(|a| working.writer_end(a.slot.client_id))
+                .transpose()?
+                .flatten()
+                == Some(u32::MAX);
             // Session ownership fences authority replacement until COMMIT; the
             // writer guard fences an account lock. yrs work is already done.
             let guard = session.lock().expect("container session lock");
@@ -1370,7 +1489,7 @@ impl Owner {
                 let held = start.elapsed();
                 // Valid terminal progress leaves no clock: end this producer
                 // now. Allocation retires the slot before further authoring.
-                if working.writer_end(active.slot.client_id) == Some(u32::MAX) {
+                if exhausted {
                     self.writers
                         .active
                         .lock()
@@ -1405,35 +1524,7 @@ impl Owner {
                     targets.push(d)
                 });
                 // Queue order is atomic with the subscription/sequence change.
-                // Overflow replaces only committed queued bytes with one bounded
-                // marker. An off-guard reader hydrates it before delivery.
-                let mut windows = Vec::with_capacity(targets.len());
-                let mut queues = self.deliveries.lock().expect("delivery lock");
-                for item in targets {
-                    windows.push(item.window.clone());
-                    let queue = queues.entry(item.window.clone()).or_default();
-                    if queue.pending.len() >= DELIVERY_LIMIT
-                        || queue.bytes.saturating_add(item.update.len()) > DELIVERY_BYTES
-                    {
-                        queue.pending.clear();
-                        queue.bytes = 0;
-                        queue.pending.push_back((
-                            id,
-                            Delivery {
-                                window: item.window,
-                                generation: item.generation,
-                                sequence: item.sequence,
-                                through_update_id: item.through_update_id,
-                                update: Vec::new(),
-                                resync: true,
-                            },
-                        ));
-                    } else {
-                        queue.bytes = queue.bytes.saturating_add(item.update.len());
-                        queue.pending.push_back((id, item));
-                    }
-                }
-                (result, windows)
+                (result, self.enqueue(id, targets))
             };
             Ok((result, windows, database, sql_hold))
         })();
@@ -1468,7 +1559,7 @@ impl Owner {
                 .lock()
                 .expect("container session lock")
                 .shared_database();
-            durable_snapshot(&database, key)
+            durable_ordered(&database, key)
         })
     }
     /// Native WebView dispatch takes at most one item, and must wait for the
@@ -1480,7 +1571,7 @@ impl Owner {
                 .lock()
                 .expect("container session lock")
                 .shared_database();
-            durable_snapshot(&database, key)
+            durable_ordered(&database, key)
         })
     }
     /// Test seam for deterministic snapshot failure. No callback runs under a
@@ -1490,7 +1581,7 @@ impl Owner {
         &self,
         window: &str,
         deliver: &mut impl FnMut(Delivery),
-        snapshot: impl FnMut(NoteKey) -> Result<(Vec<u8>, i64), StoreError>,
+        snapshot: impl FnMut(NoteKey) -> Result<(OrderedState, i64), StoreError>,
     ) -> bool {
         self.drain_with_snapshot(window, deliver, false, snapshot)
     }
@@ -1499,7 +1590,7 @@ impl Owner {
         window: &str,
         deliver: &mut impl FnMut(Delivery),
         once: bool,
-        mut snapshot: impl FnMut(NoteKey) -> Result<(Vec<u8>, i64), StoreError>,
+        mut snapshot: impl FnMut(NoteKey) -> Result<(OrderedState, i64), StoreError>,
     ) -> bool {
         let token = {
             let mut queues = self.deliveries.lock().expect("delivery lock");
@@ -1572,7 +1663,7 @@ impl Owner {
                 // claiming the marker's sequence. Later deltas remain queued.
                 match snapshot(scope.key) {
                     Ok((state, frontier)) if frontier >= item.through_update_id => {
-                        item.update = state
+                        item.segments = state.into_segments()
                     }
                     _ => {
                         // A transient read failure cannot grow the raw-delta
@@ -1592,18 +1683,25 @@ impl Owner {
                                 }) {
                                     return true;
                                 }
-                                if !queue.pending.iter().any(|(id, d)| {
-                                    *id == origin
-                                        && d.generation == item.generation
-                                        && d.resync
-                                        && d.sequence >= item.sequence
-                                }) {
+                                if let Some((_, later)) =
+                                    queue.pending.iter_mut().find(|(id, d)| {
+                                        *id == origin
+                                            && d.generation == item.generation
+                                            && d.resync
+                                            && d.sequence >= item.sequence
+                                    })
+                                {
+                                    // That later marker covers this one.
+                                    later.reload |= item.reload;
+                                } else {
                                     if let Some((_, last)) = queue.pending.back() {
                                         item.sequence = item.sequence.max(last.sequence);
                                         item.through_update_id =
                                             item.through_update_id.max(last.through_update_id);
                                     }
+                                    item.reload |= queue.pending.iter().any(|(_, d)| d.reload);
                                     item.update.clear();
+                                    item.segments.clear();
                                     queue.pending.clear();
                                     queue.bytes = 0;
                                     queue.pending.push_front((origin, item));
@@ -1671,6 +1769,7 @@ impl Owner {
         {
             return;
         }
+        let reload = item.reload || queue.pending.iter().any(|(_, later)| later.reload);
         let (sequence, through_update_id) =
             queue
                 .pending
@@ -1692,6 +1791,8 @@ impl Owner {
                 through_update_id,
                 update: Vec::new(),
                 resync: true,
+                segments: Vec::new(),
+                reload,
             },
         ));
     }

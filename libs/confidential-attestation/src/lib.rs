@@ -290,7 +290,11 @@ pub fn compose(log: &[u8], rtmr3: &[u8; 48]) -> Result<[u8; 32], Error> {
             continue;
         }
         let entry = event.to_runtime_event().ok_or(Error::EventLog)?;
-        if event.digest.as_slice() != entry.sha384_digest() {
+        // V1 runtime digests may be stripped by dstack; RTMR3 replay below
+        // still binds the recomputed digest to the authenticated register.
+        if event.digest.as_slice() != entry.sha384_digest()
+            && !(event.version == cc_eventlog::EventLogVersion::V1 && event.digest.is_empty())
+        {
             return Err(Error::EventLog);
         }
         if entry.event == "compose-hash" {
@@ -354,6 +358,63 @@ fn assemble(
         },
         machine: bh_crypto::sha256(&claims.platform.pck.ppid),
     })
+}
+
+/// Local-only synthetic attestation, compiled only with the
+/// `synthetic-attestation` feature, which no release build enables. Its
+/// "quote" is a fixed label and the exact report data: it is NOT hardware
+/// evidence and proves nothing about where the peer runs. It still requires the
+/// server's fresh keys and the client's nonce, and the signed policy must list
+/// its fixed build and machine like any other.
+#[cfg(feature = "synthetic-attestation")]
+pub mod synthetic {
+    use super::{
+        Build, Error, Evidence, Expected, Measured, Role, Time, VerifiedEvidence, checked_time,
+        report_data,
+    };
+
+    const QUOTE_DOMAIN: &[u8] = b"basehero.synthetic-quote.v1\0";
+
+    /// The labelled synthetic quote for this report data.
+    pub fn quote(report_data: &[u8; 64]) -> Vec<u8> {
+        [QUOTE_DOMAIN, report_data].concat()
+    }
+    /// The fixed build every synthetic quote claims for `role`.
+    pub fn build(role: Role) -> Build {
+        Build {
+            role,
+            compose_sha256: bh_crypto::sha256(b"basehero synthetic compose"),
+            boot: std::array::from_fn(|_| vec![0x5a; 48]),
+        }
+    }
+    /// The fixed machine every synthetic quote claims.
+    pub fn machine() -> [u8; 32] {
+        bh_crypto::sha256(b"basehero synthetic machine")
+    }
+    /// The synthetic counterpart of `verify_evidence`: the quote must be exactly
+    /// the label and the report data for the expected keys and nonce.
+    pub fn verify_evidence(
+        evidence: Evidence<'_>,
+        expected: &Expected,
+        time: Option<Time>,
+    ) -> Result<VerifiedEvidence, Error> {
+        let time = checked_time(time)?;
+        let report = report_data(&expected.signing, &expected.receiving, &expected.nonce);
+        if evidence.quote != quote(&report) {
+            return Err(Error::Binding);
+        }
+        Ok(VerifiedEvidence {
+            measured: Measured {
+                signing: expected.signing,
+                receiving: expected.receiving,
+                build: build(expected.role),
+                machine: machine(),
+            },
+            nonce: expected.nonce,
+            valid_from: time.earliest,
+            valid_until: u64::MAX,
+        })
+    }
 }
 
 // Crate-private synthetic full assembly. Also source-included by channel unit
@@ -473,6 +534,41 @@ mod tests {
         assert_eq!(compose(b"not json", &register), Err(Error::Encoding));
     }
     #[test]
+    fn stripped_v1_runtime_digests_replay_to_same_compose_hash() {
+        let (events, register) = log_and_register();
+        let expected = replay(&events, &register).unwrap();
+        let mut stripped = events;
+        for event in &mut stripped {
+            if event.imr == 3 {
+                assert_eq!(event.version, cc_eventlog::EventLogVersion::V1);
+                event.digest.clear();
+            }
+        }
+        assert_eq!(replay(&stripped, &register), Ok(expected));
+    }
+    #[test]
+    fn stripped_v1_runtime_digest_cannot_hide_changed_payload() {
+        let (mut events, register) = log_and_register();
+        for event in &mut events {
+            if event.imr == 3 {
+                event.digest.clear();
+            }
+        }
+        let compose = events
+            .iter_mut()
+            .find(|e| e.imr == 3 && e.event == "compose-hash")
+            .unwrap();
+        compose.event_payload[0] ^= 1;
+        assert_eq!(replay(&events, &register), Err(Error::EventLog));
+    }
+    #[test]
+    fn nonempty_wrong_v1_runtime_digest_is_rejected() {
+        let (mut events, register) = log_and_register();
+        let runtime = events.iter_mut().find(|e| e.imr == 3).unwrap();
+        runtime.digest[0] ^= 1;
+        assert_eq!(replay(&events, &register), Err(Error::EventLog));
+    }
+    #[test]
     fn v2_runtime_requires_canonical_digest_preimage() {
         let (mut events, _) = log_and_register();
         let pos = events
@@ -489,6 +585,9 @@ mod tests {
         let register = replay_events::<ez_hash::Sha384>(&runtime, None);
         // This register is synthetic and never a verified TDX quote.
         assert!(replay(&events, &register).is_ok());
+        let mut bad = events.clone();
+        bad[pos].digest.clear();
+        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
         let mut bad = events.clone();
         bad[pos].preimage = None;
         assert_eq!(replay(&bad, &register), Err(Error::EventLog));
@@ -747,9 +846,6 @@ mod tests {
         assert_eq!(replay(&bad, &register), Err(Error::EventLog));
         let mut bad = events.clone();
         bad.remove(pos);
-        assert_eq!(replay(&bad, &register), Err(Error::EventLog));
-        let mut bad = events.clone();
-        bad[pos].digest.clear();
         assert_eq!(replay(&bad, &register), Err(Error::EventLog));
         let mut bad = events.clone();
         bad[pos].event_type = 123;

@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -826,4 +826,97 @@ async fn synchronous_completion_after_deadline_does_not_qualify_time() {
         Err(Unavailable::Cold),
         "late success must not leave an anchor"
     );
+}
+
+// Answers every request with a signed reply until aborted, so a test can drive
+// many refreshes without sleeps. `corrupt` makes replies fail verification.
+async fn serving_fixture(
+    seed: u8,
+    corrupt: Arc<AtomicBool>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let mut response = reply(seed, &nonce(&buf[..n]), 1_000_000_000);
+            if corrupt.load(Ordering::SeqCst) {
+                corrupt_response_signature(&mut response);
+            }
+            socket.send_to(&response, peer).await.unwrap();
+        }
+    });
+    (addr, task)
+}
+struct Serving {
+    sampler: TimeSampler,
+    ticks: Ticks,
+    corrupt: Arc<AtomicBool>,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+impl Drop for Serving {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+async fn serving(refreshes: u32) -> Serving {
+    let corrupt = Arc::new(AtomicBool::new(false));
+    let (a, task_a) = serving_fixture(1, corrupt.clone()).await;
+    let (b, task_b) = serving_fixture(2, corrupt.clone()).await;
+    let sampler = TimeSampler::new(
+        [(a, root(1)), (b, root(2))],
+        config(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let ticks = Ticks::new();
+    for i in 0..refreshes {
+        assert!(
+            sampler.refresh(&ticks).await.is_ok(),
+            "refresh {i} must succeed"
+        );
+        assert!(sampler.now(&ticks).is_ok(), "time after refresh {i}");
+    }
+    Serving {
+        sampler,
+        ticks,
+        corrupt,
+        tasks: [task_a, task_b],
+    }
+}
+
+// One clock holds 4096 nonces, two per refresh: a 60 s refresher would stop
+// after about 34 hours unless the sampler replaces its clock.
+#[tokio::test]
+async fn refreshes_continue_past_one_clocks_nonce_history() {
+    serving(5_000).await;
+}
+
+// Replacing the clock keeps its counter floor: a step back that the old clock
+// would catch is still caught when the next refresh replaces it.
+#[tokio::test]
+async fn clock_replacement_keeps_counter_rollback_detection() {
+    let s = serving(TimeSampler::REFRESHES_PER_CLOCK).await;
+    s.ticks.set(50_000);
+    assert!(s.sampler.now(&s.ticks).is_ok());
+    s.ticks.set(20_000); // still after the last anchor's receipt
+    assert!(s.sampler.refresh(&s.ticks).await.is_err());
+    assert_eq!(s.sampler.now(&s.ticks), Err(Unavailable::Counter));
+    assert!(s.sampler.refresh(&s.ticks).await.is_err());
+}
+
+// A failed refresh that would replace the clock leaves no anchor at all, then
+// the next good refresh qualifies time again.
+#[tokio::test]
+async fn failed_replacing_refresh_serves_no_old_anchor() {
+    let s = serving(TimeSampler::REFRESHES_PER_CLOCK).await;
+    s.corrupt.store(true, Ordering::SeqCst);
+    assert!(s.sampler.refresh(&s.ticks).await.is_err());
+    assert_eq!(s.sampler.now(&s.ticks), Err(Unavailable::Cold));
+    s.corrupt.store(false, Ordering::SeqCst);
+    assert!(s.sampler.refresh(&s.ticks).await.is_ok());
+    assert!(s.sampler.now(&s.ticks).is_ok());
 }

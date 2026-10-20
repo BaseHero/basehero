@@ -22,6 +22,22 @@ use bh_storage::{DeviceDatabase, NoteKey, ViewRecord};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+/// Android backgrounding: this device has nothing to show, so its caret goes
+/// at once and its presence join closes. Each window's selection is kept for
+/// the resume.
+#[cfg(target_os = "android")]
+pub(crate) fn paused(sync: &bh_host::sync::SyncHost) {
+    sync.leave_presence();
+}
+
+/// Android resumed: presence rejoins, resends the kept carets and shows the
+/// other devices' again; a fold's pause leaves the page's focus unchanged, so
+/// no new selection need arrive.
+#[cfg(target_os = "android")]
+pub(crate) fn resumed(sync: &bh_host::sync::SyncHost) {
+    sync.resume_presence();
+}
+
 /// Why a close, Quit or update drain did not finish. Deliberately names no
 /// account, base, note or window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -6,10 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Explicit test oracle; not enabled by any normal product dependency.
+native-oracle = []
+
+[dev-dependencies]
+bh-core = { path = ".", features = ["native-oracle"] }
+
 [dependencies]
 yrs.workspace = true
 serde_json.workspace = true
 url.workspace = true
+
+# Elsewhere notes run contained; on Wasm, the engine itself included, natively.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bh-note-engine-artifact.workspace = true
+wasmtime = { workspace = true, features = ["runtime", "std", "pulley", "anyhow"] }
 
 [lints]
 workspace = true

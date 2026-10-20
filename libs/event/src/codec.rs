@@ -3,21 +3,127 @@ use bh_core::note::Note;
 use bh_crypto::{
     KemKey, Secret, SecretBytes, SigningKey, aead_open, aead_seal, derive_key, hash, verify,
 };
-use bh_sync::{EventId, Head, OpaqueEvent};
+use bh_sync::{BODY_SIZES, EventId, Head, OpaqueEvent, receipt::RECEIPT_LEN, referenced_body};
 
 pub const CLASS_CONTENT: u8 = 0;
 pub const CLASS_CONTROL: u8 = 1;
 pub const NOTE: u16 = 1;
+/// A note payload starts with its 32-byte ID and the producing writer's
+/// 99-byte declaration; the Yjs update follows.
+pub const NOTE_PREFIX: usize = 32 + 99;
+
+/// A note event's payload: `note || writer.encode() || update`.
+pub fn note_payload(
+    note: [u8; 32],
+    writer: crate::writer::DeviceWriterDeclaration,
+    update: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(NOTE_PREFIX + update.len());
+    data.extend(note);
+    data.extend(writer.encode());
+    data.extend(update);
+    data
+}
+
+/// A note event by this device, for its ordinary key to sign outside this
+/// library.
+pub struct NoteSigningRequest(EventSigningRequest);
+impl NoteSigningRequest {
+    pub fn signing_bytes(&self) -> &[u8] {
+        self.0.signing_bytes()
+    }
+    pub fn expected_key(&self) -> &[u8; 32] {
+        self.0.expected_key()
+    }
+    pub fn finish(self, signature: [u8; 64]) -> Result<Encoded, Error> {
+        self.0.finish(signature)
+    }
+}
+
+/// One local note update to seal: its event id, note, producing writer and
+/// Yjs update.
+pub struct NoteDraft<'a> {
+    pub event_id: EventId,
+    pub note: [u8; 32],
+    pub writer: crate::writer::DeviceWriterDeclaration,
+    pub update: &'a [u8],
+}
+
+/// Prepare the note event carrying `note_payload(note, writer, update)` in
+/// the content epoch of `content`. `seen` is what the
+/// author's verified history of the base had applied at its head and
+/// `receipt` the hosting receipt for that head, which the caller must have
+/// verified: sealing cannot check it. `base_account` is the base's copy of
+/// the account; the writer must be this account's `device`, active there.
+#[allow(clippy::too_many_arguments)] // One note event's exact signed fields.
+pub fn prepare_note(
+    base: bh_sync::BaseId,
+    base_account: &bh_account::VerifiedAccount,
+    device: DeviceId,
+    seen: crate::Seen,
+    receipt: [u8; RECEIPT_LEN],
+    draft: NoteDraft<'_>,
+    metadata: &Secret<32>,
+    content: &Secret<32>,
+) -> Result<NoteSigningRequest, Error> {
+    let NoteDraft {
+        event_id,
+        note,
+        writer,
+        update,
+    } = draft;
+    if seen.head.position == 0
+        || seen.account != base_account.head()
+        || writer.account != base_account.id().0
+        || writer.device != device.0
+    {
+        return Err(Error::Invalid);
+    }
+    let expected = *base_account
+        .active_device(device)
+        .map_err(|_| Error::Invalid)?
+        .signing();
+    let data = note_payload(note, writer, update);
+    Ok(NoteSigningRequest(prepare_seal(
+        Binding {
+            version: 2,
+            highest: 2,
+            mode: 0,
+            base: base.0,
+            audience: [0; 32],
+            epoch: key_id(content),
+            event_id,
+            account: base_account.id(),
+            device,
+            account_head: seen.account,
+            seen: seen.head,
+            seen_control: seen.control,
+            class: CLASS_CONTENT,
+            padded: 0,
+            commitment: [0; 32],
+            seen_receipt: receipt,
+        },
+        Payload {
+            kind: NOTE,
+            data: &data,
+        },
+        expected,
+        metadata,
+        Some(content),
+    )?))
+}
 pub const GENESIS: u16 = 0x0100;
 pub const ACCOUNT_CHANGE: u16 = 0x0101;
 const SIGNED_DOMAIN: &[u8] = b"bh/original-envelope/v1\0";
 const BODY_DOMAIN: &[u8] = b"bh/payload-object/v1\0";
 const BODY_AAD: &[u8] = b"bh/payload-aad/v1\0";
 const BIND_AAD: &[u8] = b"bh/author-binding-aad/v1\0";
-const S_LEN: usize = 346;
+/// Version 1 (genesis only) signs the header; version 2 appends the receipt.
+const S_LEN_V1: usize = 346;
+const S_LEN_V2: usize = S_LEN_V1 + RECEIPT_LEN;
 const BIND_PLAIN: usize = 952;
-const BODY_SIZES: [usize; 4] = [1024, 4096, 16384, 65536];
-static ZERO_PADDING: [u8; 65536] = [0; 65536];
+const MAX_BODY: usize = BODY_SIZES[BODY_SIZES.len() - 1];
+static ZERO_PADDING: [u8; MAX_BODY] = [0; MAX_BODY];
 
 /// Fixed classifications contain no names, identities, keys or content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +135,9 @@ pub enum Error {
 
 /// Author-controlled signed fields. `seal` is a packaging primitive, not an
 /// authority grant: the receiver must check every field against verified history.
+/// Version 1 is the base genesis only and has no receipt (`seen_receipt` is
+/// zero). Every later event is version 2 and signs `seen_receipt`, the hosting
+/// receipt for `seen`; the encoder does not check it, the verifier does.
 #[derive(Clone, Copy)]
 pub struct Binding {
     pub version: u16,
@@ -46,6 +155,7 @@ pub struct Binding {
     pub class: u8,
     pub padded: u32,
     pub commitment: [u8; 32],
+    pub seen_receipt: [u8; RECEIPT_LEN],
 }
 pub struct Payload<'a> {
     pub kind: u16,
@@ -79,7 +189,7 @@ impl EventSigningRequest {
         let binding_plain = SecretBytes::from_parts(&[
             &signed_bytes,
             &signature,
-            &ZERO_PADDING[..BIND_PLAIN - S_LEN - 64],
+            &ZERO_PADDING[..BIND_PLAIN - signed_bytes.len() - 64],
         ])
         .map_err(|_| Error::Invalid)?;
         let (bind_nonce, bind_cipher) = aead_seal(
@@ -138,6 +248,9 @@ fn binding_ad(s: &Binding, digest: &[u8; 32]) -> Vec<u8> {
     out.extend(digest);
     out
 }
+fn signed_len(version: u16) -> usize {
+    if version == 1 { S_LEN_V1 } else { S_LEN_V2 }
+}
 fn commitment(size: u32, body: &[u8]) -> [u8; 32] {
     let mut bytes = BODY_DOMAIN.to_vec();
     bytes.extend(size.to_be_bytes());
@@ -146,7 +259,8 @@ fn commitment(size: u32, body: &[u8]) -> [u8; 32] {
 }
 impl Binding {
     pub(crate) fn encode_for_verify(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(S_LEN);
+        let len = signed_len(self.version);
+        let mut out = Vec::with_capacity(len);
         out.extend(self.version.to_be_bytes());
         out.extend(self.highest.to_be_bytes());
         out.push(self.mode);
@@ -168,11 +282,14 @@ impl Binding {
         out.push(self.class);
         out.extend(self.padded.to_be_bytes());
         out.extend(self.commitment);
-        assert_eq!(out.len(), S_LEN);
+        if len == S_LEN_V2 {
+            out.extend(self.seen_receipt);
+        }
+        assert_eq!(out.len(), len);
         out
     }
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != S_LEN {
+    fn decode(bytes: &[u8], version: u16) -> Result<Self, Error> {
+        if bytes.len() != signed_len(version) {
             return Err(Error::Invalid);
         }
         let mut r = Reader(bytes);
@@ -198,6 +315,11 @@ impl Binding {
             class: r.take::<1>()?[0],
             padded: u32::from_be_bytes(r.take()?),
             commitment: r.take()?,
+            seen_receipt: if version == 1 {
+                [0; RECEIPT_LEN]
+            } else {
+                r.take()?
+            },
         };
         if !r.0.is_empty() {
             return Err(Error::Invalid);
@@ -235,8 +357,11 @@ pub(crate) fn prepare_seal(
     metadata: &Secret<32>,
     content: Option<&Secret<32>>,
 ) -> Result<EventSigningRequest, Error> {
-    if signed.version != 1
-        || signed.highest != 1
+    // Genesis writes (1,1); every later event writes (2,2) with its receipt.
+    let version = if signed.mode == 1 { 1 } else { 2 };
+    if signed.version != version
+        || signed.highest != version
+        || (version == 1 && signed.seen_receipt != [0; RECEIPT_LEN])
         || signed.class > 1
         || signed.mode > 1
         || signed.event_id.0 == [0; 32]
@@ -315,12 +440,14 @@ pub(crate) fn open_binding(
         class: 0,
         padded: 0,
         commitment: digest,
+        seen_receipt: [0; RECEIPT_LEN],
     };
     let key = derive_key(metadata, b"bhBind01", 0);
     let nonce: &[u8; 24] = env[32..56].try_into().map_err(|_| Error::Invalid)?;
-    // Recognise the next version's authenticated header as unsupported without
-    // interpreting its content. This does not implement v2 algorithms or upgrade.
-    let (ad_version, plaintext) = [1u16, 2]
+    // Recognise the next version's authenticated header, read with the v2
+    // layout, as unsupported without interpreting its content. This does not
+    // implement v3 algorithms or upgrade.
+    let (ad_version, plaintext) = [1u16, 2, 3]
         .into_iter()
         .find_map(|version| {
             let mut candidate = probe;
@@ -331,10 +458,11 @@ pub(crate) fn open_binding(
         })
         .ok_or(Error::Invalid)?;
     let bytes = plaintext.expose();
-    if bytes.len() != BIND_PLAIN || bytes[S_LEN + 64..].iter().any(|&b| b != 0) {
+    let len = signed_len(ad_version);
+    if bytes.len() != BIND_PLAIN || bytes[len + 64..].iter().any(|&b| b != 0) {
         return Err(Error::Invalid);
     }
-    let signed = Binding::decode(&bytes[..S_LEN])?;
+    let signed = Binding::decode(&bytes[..len], ad_version)?;
     if signed.version != ad_version
         || signed.mode != probe.mode
         || signed.base != expected_base
@@ -345,10 +473,21 @@ pub(crate) fn open_binding(
     {
         return Err(Error::Invalid);
     }
-    let sig = bytes[S_LEN..S_LEN + 64]
+    let sig = bytes[len..len + 64]
         .try_into()
         .map_err(|_| Error::Invalid)?;
     Ok((signed, sig))
+}
+
+/// The content epoch a sealed event's author bound it to, read back from its
+/// own descriptor with M. Nothing else about the event is checked: this is
+/// for a device naming the epoch of a package it sealed itself.
+pub fn sealed_epoch(
+    descriptor: &OpaqueEvent,
+    metadata: &Secret<32>,
+    base: bh_sync::BaseId,
+) -> Result<[u8; 32], Error> {
+    open_binding(descriptor, metadata, base.0, false).map(|(binding, _)| binding.epoch)
 }
 
 pub(crate) struct OpenPayload {
@@ -361,6 +500,18 @@ impl OpenPayload {
         &self.plaintext.expose()[6..6 + self.len]
     }
 }
+/// Whether these are exactly the bytes the descriptor names, whatever its
+/// author signed about them.
+pub(crate) fn body_named(descriptor: &OpaqueEvent, body: &[u8]) -> bool {
+    u32::try_from(body.len()).is_ok_and(|size| {
+        referenced_body(descriptor).is_ok_and(|named| named.0 == commitment(size, body))
+    })
+}
+/// Whether these are exactly the bytes the binding committed to.
+pub(crate) fn body_committed(s: &Binding, body: &[u8]) -> bool {
+    body.len() == s.padded as usize && commitment(s.padded, body) == s.commitment
+}
+
 pub(crate) fn open_body(
     s: &Binding,
     body: &[u8],
@@ -392,9 +543,9 @@ pub(crate) fn open_body(
 
 /// Replay a committed Note into a disposable instance; yrs errors may leave the
 /// disposable transaction changed. Never publish it after failure.
-pub(crate) fn apply_note(prior: &Note, delta: &[u8]) -> Result<Note, ()> {
-    let mut copy = Note::new();
-    copy.apply_update(&prior.state()).map_err(|_| ())?;
-    copy.apply_update(delta).map_err(|_| ())?;
+pub(crate) fn apply_note(prior: &Note, delta: &[u8]) -> Result<Note, bh_core::note::NoteError> {
+    let mut copy = Note::new()?;
+    copy.apply_update(&prior.state()?)?;
+    copy.apply_update(delta)?;
     Ok(copy)
 }

@@ -2,8 +2,9 @@
 //! is never compiled into production. Shared across test binaries, so unused
 //! helpers are allowed.
 #![allow(dead_code)]
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 
 use bh_account::crypto::{self, KemKey, Secret, SigningKey};
 use bh_account::owner::AccountGeneration;
@@ -30,8 +31,48 @@ pub struct StoreState {
     /// Advance the owner's generation while a control signature is in flight,
     /// standing in for a concurrent lock, removal or stop.
     pub advance_generation_on_sign: bool,
+    /// Hold each control signature until the gate opens, as a native prompt
+    /// the person has not answered yet.
+    pub sign_gate: Option<Rc<SignGate>>,
     pub create_calls: usize,
     pub sign_calls: usize,
+    pub content_sign_calls: usize,
+    pub wrong_content_signature: bool,
+    pub content_error: Option<KeyStoreError>,
+}
+
+/// A held control signature: `entered` once one waits, released by `open`.
+#[derive(Default)]
+pub struct SignGate {
+    entered: Cell<bool>,
+    open: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl SignGate {
+    pub fn entered(&self) -> bool {
+        self.entered.get()
+    }
+
+    pub fn open(&self) {
+        self.open.set(true);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    async fn pass(&self) {
+        self.entered.set(true);
+        std::future::poll_fn(|cx| {
+            if self.open.get() {
+                Poll::Ready(())
+            } else {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -56,8 +97,12 @@ impl FakeStore {
                 wrong_public: false,
                 advance_generation_on_load: false,
                 advance_generation_on_sign: false,
+                sign_gate: None,
                 create_calls: 0,
                 sign_calls: 0,
+                content_sign_calls: 0,
+                wrong_content_signature: false,
+                content_error: None,
             })),
         }
     }
@@ -141,6 +186,10 @@ impl DeviceKeyStore for FakeStore {
         handle: KeyHandle,
         message: Vec<u8>,
     ) -> Result<[u8; 64], KeyStoreError> {
+        let gate = self.state.borrow().sign_gate.clone();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         let (signature, advance) = {
             let mut state = self.state.borrow_mut();
             state.sign_calls += 1;
@@ -162,12 +211,21 @@ impl DeviceKeyStore for FakeStore {
         handle: KeyHandle,
         message: Vec<u8>,
     ) -> Result<[u8; 64], KeyStoreError> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
+        state.content_sign_calls += 1;
         if handle != state.handle {
             return Err(KeyStoreError::Unavailable);
         }
-        let ordinary = state.ordinary.as_ref().ok_or(KeyStoreError::Invalidated)?;
-        let signature = ordinary.sign(&message);
+        if let Some(error) = state.content_error {
+            return Err(error);
+        }
+        let signer = if state.wrong_content_signature {
+            state.control.as_ref()
+        } else {
+            state.ordinary.as_ref()
+        }
+        .ok_or(KeyStoreError::Invalidated)?;
+        let signature = signer.sign(&message);
         if state.advance_generation_on_sign {
             self.generation.advance();
         }

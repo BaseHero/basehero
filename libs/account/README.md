@@ -169,6 +169,18 @@ a zeroizing shared secret, never the receiver seed. `sign_content(cap, bytes)`
 uses the ordinary native signing key, validates the returned signature, and
 checks the capability around each native await; it is not control approval.
 
+`device_auth::prepare(account, device, context)` builds a fixed v1 sync-device
+possession message from a verified account head and its active ordinary signing
+key. `SigningRequest::finish` checks the native signature before yielding exact
+proof bytes; `verify_at(account, expected, bytes)` verifies at the supplied head
+only. Native `AccountOwner::prove_sync_device(cap, context)` uses the fenced
+`sign_content` path so a lock or removal during native work discards the result.
+The protected protocol must establish the channel binding and fresh server
+challenge, keep identity-bearing bytes inside its encrypted session, enforce
+challenge consumption/session lifetime and check live account/base/audience
+authority independently. Possession at an old projection is not currentness,
+hosted admission or key-release permission. No WebView signing surface is added.
+
 `storage::DeviceJournal` implements the contract over the device-local SQLite
 journal (`libs/storage`), which stores only typed opaque rows and keeps no
 dependency on this library. Production still needs a native pending-blob

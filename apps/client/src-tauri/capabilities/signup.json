@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "basehero-client-setup",
-  "description": "First-account setup commands only on the main window; no note-* window receives recovery-kit access.",
+  "description": "First-account setup and joining an account by QR, only on the main window; no note-* window receives recovery-kit access.",
   "windows": ["main"],
   "permissions": [
     "allow-account-screen",
@@ -13,6 +13,8 @@
     "allow-account-print-kit",
     "allow-account-email-kit",
     "allow-account-save-kit-file",
-    "allow-account-open-note"
+    "allow-account-open-note",
+    "allow-pairing-join",
+    "allow-pairing-join-status"
   ]
 }

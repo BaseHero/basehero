@@ -1,0 +1,24 @@
+[package]
+name = "bh-note-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Built for wasm32-unknown-unknown by bh-note-engine-artifact; on other
+# targets it only compiles, for checks.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bh-core.workspace = true
+
+# The C ABI needs unsafe export attributes and one documented buffer handover.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"

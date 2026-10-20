@@ -1,4 +1,6 @@
-use bh_confidential_policy::{Build, Error, Limits, Policy, PolicyGate, Role, TimeBounds};
+use bh_confidential_policy::{
+    Build, Error, Limits, Policy, PolicyGate, Role, TimeBounds, signing_message,
+};
 use bh_crypto::{Secret, SigningKey};
 
 // Synthetic measurements and times; signatures exercise the real verification path.
@@ -51,6 +53,100 @@ fn check_at(gate: &mut PolicyGate, earliest: u64, latest: u64) -> Result<(), Err
 }
 fn check(gate: &mut PolicyGate) -> Result<(), Error> {
     check_at(gate, 120, 121)
+}
+
+#[test]
+fn policy_signing_message_preserves_exact_bytes_and_bound() {
+    let payload = [0, 255, b'\n', b'{'];
+    assert_eq!(
+        signing_message(&payload).unwrap(),
+        [b"basehero.confidential-policy.v1\0".as_slice(), &payload].concat()
+    );
+    let maximum = vec![0xa5; 65_536];
+    let message = signing_message(&maximum).unwrap();
+    assert_eq!(&message[..32], b"basehero.confidential-policy.v1\0");
+    assert_eq!(&message[32..], maximum);
+    assert_eq!(signing_message(&[0; 65_537]), Err(Error::TooLarge));
+    // The message builder does not parse or approve a policy.
+    assert_eq!(signing_message(b"not JSON").unwrap()[32..], *b"not JSON");
+}
+
+#[test]
+fn offline_structure_does_not_claim_currentness() {
+    let limits = Limits {
+        max_lifetime_secs: 100,
+        max_uncertainty_secs: 5,
+    };
+    let p = policy(1);
+    assert_eq!(p.validate_structure(limits), Ok(()));
+    let mut withdrawn = p.clone();
+    withdrawn.builds.clear();
+    withdrawn.machines.clear();
+    assert_eq!(withdrawn.validate_structure(limits), Ok(()));
+    for (altered, want) in [
+        (
+            {
+                let mut p = p.clone();
+                p.version = 2;
+                p
+            },
+            Error::Version,
+        ),
+        (
+            {
+                let mut p = p.clone();
+                p.expires_at = 100;
+                p
+            },
+            Error::Lifetime,
+        ),
+        (
+            {
+                let mut p = p.clone();
+                p.expires_at = 201;
+                p
+            },
+            Error::Lifetime,
+        ),
+        (
+            {
+                let mut p = p.clone();
+                p.builds[0].boot[3].pop();
+                p
+            },
+            Error::Measurements,
+        ),
+    ] {
+        assert_eq!(altered.validate_structure(limits), Err(want));
+    }
+    assert_eq!(
+        p.validate_structure(Limits {
+            max_lifetime_secs: 0,
+            ..limits
+        }),
+        Err(Error::Configuration)
+    );
+    let mut g = gate();
+    push(&mut g, &p).unwrap();
+    assert_eq!(
+        g.check_measurements(Role::Runner, &build(), &[2; 32], None),
+        Err(Error::TimeUnavailable)
+    );
+    assert_eq!(check_at(&mut g, 99, 100), Err(Error::NotYetValid));
+    assert_eq!(check_at(&mut g, 200, 200), Err(Error::Expired));
+    let mut g = gate();
+    g.mark_unavailable();
+    assert_eq!(check(&mut g), Err(Error::PolicyUnavailable));
+    // Runtime time/floor/failure checks still precede structural rejection.
+    let mut invalid = policy(2);
+    invalid.version = 2;
+    push(&mut g, &invalid).unwrap();
+    assert_eq!(
+        g.check_measurements(Role::Runner, &build(), &[2; 32], None),
+        Err(Error::TimeUnavailable)
+    );
+    assert_eq!(check_at(&mut g, 119, 120), Err(Error::Version));
+    assert_eq!(push(&mut g, &policy(1)), Err(Error::PolicyRollback));
 }
 
 #[test]

@@ -36,7 +36,33 @@
       "account_print_kit",
       "account_email_kit",
       "account_save_kit_file",
-      "account_open_note"
+      "account_open_note",
+      "pairing_join",
+      "pairing_join_status"
+    ]
+  },
+  "basehero-client-pairing": {
+    "windows": [
+      "main",
+      "note-*"
+    ],
+    "commands": [
+      "pairing_show",
+      "pairing_status",
+      "pairing_approve",
+      "pairing_cancel",
+      "pairing_reconfirm",
+      "sync_status"
+    ]
+  },
+  "basehero-client-camera-scan": {
+    "windows": ["main"],
+    "platforms": ["android"],
+    "commands": [],
+    "plugins": [
+      "qr-scan:allow-request-permissions",
+      "qr-scan:allow-scan",
+      "qr-scan:allow-cancel"
     ]
   },
   "basehero-client-window": {

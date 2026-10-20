@@ -8,7 +8,24 @@ use bh_event::{
     ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, GENESIS, History, NOTE,
     NoteTarget, Outcome, Payload, key_id, seal,
 };
-use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent};
+use bh_sync::receipt::{self, RECEIPT_LEN};
+use bh_sync::{BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, Route};
+
+/// The fixtures' pinned hosting root, fixed so re-signed bindings can carry a
+/// fresh receipt for whatever head they claim to have seen.
+fn hosting_root() -> SigningKey {
+    SigningKey::from_seed(&Secret::from_slice(&[0x61; 32]).unwrap())
+}
+fn root() -> [u8; 32] {
+    hosting_root().public()
+}
+fn receipt_for(base: BaseId, head: Head) -> [u8; RECEIPT_LEN] {
+    let key = SigningKey::from_seed(&Secret::from_slice(&[0x62; 32]).unwrap());
+    let certificate =
+        receipt::verify_certificate(&root(), &receipt::certify(&hosting_root(), key.public()))
+            .unwrap();
+    receipt::sign(&certificate, &key, base, head).unwrap()
+}
 
 struct Device {
     signing: SigningKey,
@@ -75,6 +92,7 @@ impl Fixture {
             class: CLASS_CONTROL,
             padded: 0,
             commitment: [0; 32],
+            seen_receipt: [0; RECEIPT_LEN],
         };
         let mut data = Vec::new();
         data.extend(id.0);
@@ -97,9 +115,10 @@ impl Fixture {
         assert_eq!(genesis.descriptor.encode().len(), 1062);
         assert_eq!(genesis.body.len(), 1024);
         let base = BaseId::from_genesis(&genesis.descriptor);
-        let ordered = Commitment::order(base, Head::EMPTY, &genesis.descriptor).unwrap();
-        let mut history = History::new(id, account_genesis.as_bytes(), base, 1).unwrap();
-        let mut note = Note::new();
+        let ordered =
+            Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+        let mut history = History::new(id, account_genesis.as_bytes(), base, root(), 1).unwrap();
+        let mut note = Note::new().unwrap();
         assert_eq!(
             history
                 .inspect(&ordered, &genesis.descriptor, &metadata)
@@ -137,8 +156,8 @@ impl Fixture {
     }
     fn binding(&self, device: &Device, class: u8) -> Binding {
         Binding {
-            version: 1,
-            highest: 1,
+            version: 2,
+            highest: 2,
             mode: 0,
             base: self.base.0,
             audience: [0; 32],
@@ -156,6 +175,7 @@ impl Fixture {
             class,
             padded: 0,
             commitment: [0; 32],
+            seen_receipt: receipt_for(self.base, self.history.head()),
         }
     }
     fn create(
@@ -166,6 +186,11 @@ impl Fixture {
         signer: &SigningKey,
         content: Option<&Secret<32>>,
     ) -> (Encoded, Commitment) {
+        let route = if binding.class == CLASS_CONTROL {
+            Route::Control
+        } else {
+            Route::Content
+        };
         let event = seal(
             binding,
             Payload { kind, data },
@@ -174,7 +199,8 @@ impl Fixture {
             content,
         )
         .unwrap();
-        let ordered = Commitment::order(self.base, self.history.head(), &event.descriptor).unwrap();
+        let ordered =
+            Commitment::order(self.base, self.history.head(), &event.descriptor, route).unwrap();
         (event, ordered)
     }
     fn content(&self, device: &Device, kind: u16, data: &[u8]) -> (Encoded, Commitment) {
@@ -214,7 +240,7 @@ fn rewrap_metadata(
 ) -> OpaqueEvent {
     let env = event.envelope();
     let mut aad = b"bh/author-binding-aad/v1\0".to_vec();
-    aad.extend(1u16.to_be_bytes());
+    aad.extend(2u16.to_be_bytes());
     aad.push(0);
     aad.extend(base.0);
     aad.extend(event.id().0);
@@ -231,10 +257,22 @@ fn rewrap_metadata(
 }
 
 fn note_delta(text: &str) -> (Vec<u8>, Note) {
-    let mut note = Note::new();
-    let mut data = vec![7; 32];
-    data.extend(note.append_paragraph(text));
+    let mut note = Note::new().unwrap();
+    let data = with_writer(&note.append_paragraph(text).unwrap());
     (data, note)
+}
+/// Note 7's payload from an arbitrary declared writer; history checks only
+/// that the declaration decodes.
+fn with_writer(update: &[u8]) -> Vec<u8> {
+    bh_event::note_payload(
+        [7; 32],
+        bh_event::writer::DeviceWriterDeclaration {
+            account: [4; 32],
+            device: [5; 32],
+            nonce: [6; 32],
+        },
+        update,
+    )
 }
 // Real re-signing/re-encryption reaches history validation, not just O's hash.
 fn rebind(
@@ -257,15 +295,27 @@ fn rebind(
     };
     let key = derive_key(metadata, b"bhBind01", 0);
     let nonce: &[u8; 24] = env[32..56].try_into().unwrap();
-    let mut plain = aead_open(&key, nonce, &aad(1), &env[56..])
+    let mut plain = [1u16, 2, 3]
+        .into_iter()
+        .find_map(|v| aead_open(&key, nonce, &aad(v), &env[56..]).ok())
         .unwrap()
         .expose()
         .to_vec();
     change(&mut plain[..346]);
-    let mut signed = b"bh/original-envelope/v1\0".to_vec();
-    signed.extend(&plain[..346]);
-    plain[346..410].copy_from_slice(&signer.sign(&signed));
+    // Later versions sign a receipt for the (possibly changed) seen head.
     let version = u16::from_be_bytes(plain[..2].try_into().unwrap());
+    let len = if version == 1 { 346 } else { 346 + RECEIPT_LEN };
+    if version != 1 {
+        let seen = Head {
+            position: u64::from_be_bytes(plain[237..245].try_into().unwrap()),
+            hash: Digest(plain[245..277].try_into().unwrap()),
+        };
+        plain[346..len].copy_from_slice(&receipt_for(base, seen));
+    }
+    plain[len..].fill(0);
+    let mut signed = b"bh/original-envelope/v1\0".to_vec();
+    signed.extend(&plain[..len]);
+    plain[len..len + 64].copy_from_slice(&signer.sign(&signed));
     let (nonce, body) = aead_seal(&key, &aad(version), &plain).unwrap();
     plain.fill(0);
     let mut envelope = digest.to_vec();
@@ -280,7 +330,7 @@ fn unrelated_metadata_root_cannot_rewrap_a_valid_content_original() {
     let (prior, _) = note_delta("prior");
     let (first, order) = f.content(&f.first, NOTE, &prior);
     assert_eq!(f.apply(&first, &order, true), Outcome::Accepted);
-    let note_before = f.note.state();
+    let note_before = f.note.state().unwrap();
     let head_before = f.history.head();
     let floor_before = f.history.floor();
     let (data, _) = note_delta("next");
@@ -294,31 +344,35 @@ fn unrelated_metadata_root_cannot_rewrap_a_valid_content_original() {
     assert_ne!(key_id(&unrelated_m), key_id(&f.metadata));
     let rewrapped = rewrap_metadata(&event.descriptor, f.base, &f.metadata, &unrelated_m);
     assert_ne!(rewrapped.digest(), event.descriptor.digest());
-    let rewrapped_order = Commitment::order(f.base, head_before, &rewrapped).unwrap();
+    let rewrapped_order =
+        Commitment::order(f.base, head_before, &rewrapped, Route::Content).unwrap();
+    // A root other than the base's is a key this device lacks, not proof.
     assert_eq!(
         f.history
             .inspect(&rewrapped_order, &rewrapped, &unrelated_m)
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::UnavailablePause)
     );
+    // Under the base's own root the rewrapped original does not open.
     assert_eq!(
         f.history.apply(
             &rewrapped_order,
             &rewrapped,
             Some(&event.body),
-            &unrelated_m,
+            &f.metadata,
             Some(&f.epoch),
             NoteTarget {
                 id: [7; 32],
                 note: &mut f.note
             }
         ),
-        Outcome::IntegrityStop
+        Outcome::Rejected
     );
-    assert_eq!(f.note.state(), note_before);
-    assert_eq!(f.history.head(), head_before);
+    // Ordered with no effect: the note and floor stay, verification goes on.
+    assert_eq!(f.note.state().unwrap(), note_before);
+    assert_eq!(f.history.head(), rewrapped_order.head());
     assert_eq!(f.history.floor(), floor_before);
-    assert!(f.history.is_stopped());
+    assert!(!f.history.is_stopped());
 }
 
 #[test]
@@ -336,8 +390,9 @@ fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view
         .unwrap();
     let indexed = journal.load_projection().unwrap().unwrap();
     assert_eq!(indexed.account.head(), f.account.head());
-    f.history = History::with_account(&indexed.account, f.base, 1).unwrap();
-    let genesis_order = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
+    f.history = History::with_account(&indexed.account, f.base, root(), 1).unwrap();
+    let genesis_order =
+        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
     assert_eq!(
         f.history.apply(
             &genesis_order,
@@ -368,7 +423,7 @@ fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view
     );
     let before_head = f.history.head();
     let before_account = f.history.account_head();
-    let before_note = f.note.state();
+    let before_note = f.note.state().unwrap();
     std::fs::rename(&dir, &hidden).unwrap();
     assert_eq!(
         indexed
@@ -381,7 +436,7 @@ fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view
     assert_eq!(f.apply(&event, &order, false), Outcome::UnavailablePause);
     assert_eq!(f.history.head(), before_head);
     assert_eq!(f.history.account_head(), before_account);
-    assert_eq!(f.note.state(), before_note);
+    assert_eq!(f.note.state().unwrap(), before_note);
     assert!(!f.history.is_stopped());
     std::fs::rename(&hidden, &dir).unwrap();
     assert_eq!(f.apply(&event, &order, false), Outcome::Accepted);
@@ -393,12 +448,12 @@ fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view
 }
 
 #[test]
-fn signed_inner_unknown_account_version_pauses_but_bad_original_stops() {
+fn signed_inner_unknown_account_version_pauses_but_a_bad_inner_event_is_rejected() {
     let mut f = Fixture::new();
     let (prior, _) = note_delta("prior");
     let (first, order) = f.content(&f.first, NOTE, &prior);
     assert_eq!(f.apply(&first, &order, true), Outcome::Accepted);
-    let note_before = f.note.state();
+    let note_before = f.note.state().unwrap();
     let head_before = f.history.head();
     let account_before = f.history.account_head();
     let floor_before = f.history.floor();
@@ -435,7 +490,7 @@ fn signed_inner_unknown_account_version_pauses_but_bad_original_stops() {
     assert_eq!(f.history.head(), head_before);
     assert_eq!(f.history.account_head(), account_before);
     assert_eq!(f.history.floor(), floor_before);
-    assert_eq!(f.note.state(), note_before);
+    assert_eq!(f.note.state().unwrap(), note_before);
     assert!(!f.history.is_stopped());
     let mut corrupt = original.as_bytes().to_vec();
     *corrupt.last_mut().unwrap() ^= 1;
@@ -451,11 +506,11 @@ fn signed_inner_unknown_account_version_pauses_but_bad_original_stops() {
             .inspect(&order, &event.descriptor, &f.metadata)
             .is_ok()
     );
-    assert_eq!(f.apply(&event, &order, false), Outcome::IntegrityStop);
-    assert_eq!(f.history.head(), head_before);
+    assert_eq!(f.apply(&event, &order, false), Outcome::Rejected);
+    assert_eq!(f.history.head(), order.head());
     assert_eq!(f.history.account_head(), account_before);
-    assert_eq!(f.note.state(), note_before);
-    assert!(f.history.is_stopped());
+    assert_eq!(f.note.state().unwrap(), note_before);
+    assert!(!f.history.is_stopped());
 }
 
 #[test]
@@ -486,7 +541,7 @@ fn real_genesis_note_and_selective_descriptor() {
         Outcome::UnavailablePause
     );
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    assert_eq!(f.note.state(), edited.state());
+    assert_eq!(f.note.state().unwrap(), edited.state().unwrap());
     assert_eq!(f.history.head().position, 2);
 }
 
@@ -496,19 +551,17 @@ fn malformed_authentic_note_rejects_content_then_accepts_next() {
     let (data, mut edited) = note_delta("prior");
     let (event, order) = f.content(&f.first, NOTE, &data);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    let before = f.note.state();
-    let mut bad = vec![7; 32];
-    bad.extend([0xff, 0xff, 0xff]);
+    let before = f.note.state().unwrap();
+    let bad = with_writer(&[0xff, 0xff, 0xff]);
     let (event, order) = f.content(&f.first, NOTE, &bad);
     assert_eq!(f.apply(&event, &order, true), Outcome::ContentRejected);
-    assert_eq!(f.note.state(), before);
+    assert_eq!(f.note.state().unwrap(), before);
     assert_eq!(f.history.head(), order.head());
-    assert_eq!(f.history.floor(), 1);
-    let mut next = vec![7; 32];
-    next.extend(edited.append_paragraph("later"));
+    assert_eq!(f.history.floor(), 2);
+    let next = with_writer(&edited.append_paragraph("later").unwrap());
     let (event, order) = f.content(&f.first, NOTE, &next);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    assert_eq!(f.note.state(), edited.state());
+    assert_eq!(f.note.state().unwrap(), edited.state().unwrap());
 }
 
 #[test]
@@ -517,12 +570,12 @@ fn unsupported_semantics_pause_and_ciphertext_tamper_stops_without_losing_note()
     let (data, _) = note_delta("prior");
     let (event, order) = f.content(&f.first, NOTE, &data);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    let before = f.note.state();
+    let before = f.note.state().unwrap();
     let head = f.history.head();
     let (unknown, order) = f.content(&f.first, 0xf123, &data);
     assert_eq!(f.apply(&unknown, &order, true), Outcome::UnsupportedPause);
     assert_eq!(f.history.head(), head);
-    assert_eq!(f.note.state(), before);
+    assert_eq!(f.note.state().unwrap(), before);
     let (unknown, order) = f.create(
         f.binding(&f.first, CLASS_CONTROL),
         0xf124,
@@ -534,9 +587,9 @@ fn unsupported_semantics_pause_and_ciphertext_tamper_stops_without_losing_note()
     assert_eq!(f.history.head(), head);
     let (mut bad, _) = f.content(&f.first, NOTE, &data);
     bad.body[31] ^= 1; // recompute untrusted outer order: body commitment remains signed and rejects
-    let order = Commitment::order(f.base, head, &bad.descriptor).unwrap();
+    let order = Commitment::order(f.base, head, &bad.descriptor, Route::Content).unwrap();
     assert_eq!(f.apply(&bad, &order, true), Outcome::IntegrityStop);
-    assert_eq!(f.note.state(), before);
+    assert_eq!(f.note.state().unwrap(), before);
     assert_eq!(f.history.head(), head);
     assert!(f.history.is_stopped());
 }
@@ -546,6 +599,20 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
     let f = Fixture::new();
     let (data, _) = note_delta("one");
     let (event, _) = f.content(&f.first, NOTE, &data);
+    // `rebind` plays the hosting service: it signs a fresh receipt for the
+    // changed seen head. A hosting receipt for another hash at a verified
+    // position contradicts that history and stops; every other false claim
+    // is the author's and is rejected. An audience this version does not
+    // know (offset 37) pauses.
+    let expected = |offset: usize| {
+        if (245..277).contains(&offset) {
+            Outcome::IntegrityStop
+        } else if (37..69).contains(&offset) {
+            Outcome::UnsupportedPause
+        } else {
+            Outcome::Rejected
+        }
+    };
     for mutate in [
         245usize, 277, 197, 205, 133, 165, 37, 69, 101, 309, 310, 314,
     ] {
@@ -556,9 +623,9 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
             &f.first.signing,
             |s| s[mutate] ^= 1,
         );
-        let order = Commitment::order(f.base, f.history.head(), &altered).unwrap();
+        let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
         let mut history = f.history.clone();
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         assert_eq!(
             history.apply(
                 &order,
@@ -571,10 +638,20 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
                     note: &mut note
                 }
             ),
-            Outcome::IntegrityStop,
+            expected(mutate),
             "S offset {mutate}"
         );
-        assert_eq!(note.state(), Note::new().state());
+        assert_eq!(note.state().unwrap(), Note::new().unwrap().state().unwrap());
+        if expected(mutate) == Outcome::Rejected {
+            assert_eq!(history.head(), order.head());
+            assert!(!history.is_stopped());
+        } else if expected(mutate) == Outcome::UnsupportedPause {
+            assert_eq!(history.head(), f.history.head());
+            assert!(!history.is_stopped());
+        } else {
+            assert_eq!(history.head(), f.history.head());
+            assert!(history.is_stopped());
+        }
     }
     let altered = rebind(
         &event.descriptor,
@@ -583,21 +660,22 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
         &SigningKey::generate(),
         |_| {},
     );
-    let order = Commitment::order(f.base, f.history.head(), &altered).unwrap();
+    let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
     assert_eq!(
         f.history.inspect(&order, &altered, &f.metadata).err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     let wrong = Secret::<32>::random();
     assert_eq!(
         f.history
             .inspect(
-                &Commitment::order(f.base, f.history.head(), &event.descriptor).unwrap(),
+                &Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
+                    .unwrap(),
                 &event.descriptor,
                 &wrong
             )
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::UnavailablePause)
     );
 }
 
@@ -625,7 +703,7 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         f.history
             .inspect(&ordinary_order, &ordinary.descriptor, &f.metadata)
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     let (event, order) = f.create(
         binding,
@@ -634,7 +712,9 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         &f.first.control,
         None,
     );
-    // Correct current predecessor but fabricated seen chain: genuinely re-signed.
+    // Correct current predecessor but fabricated seen chain: genuinely
+    // re-signed, with a hosting receipt for that other head (`rebind` plays
+    // the service), so the service contradicts verified history.
     let fork = rebind(
         &event.descriptor,
         f.base,
@@ -642,7 +722,7 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         &f.first.control,
         |s| s[245] ^= 1,
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork).unwrap();
+    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
         Some(Outcome::IntegrityStop)
@@ -658,10 +738,10 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
             s[245..277].fill(0);
         },
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork).unwrap();
+    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     assert_eq!(f.apply(&event, &order, false), Outcome::Accepted);
     f.account.apply(add.as_bytes()).unwrap();
@@ -678,9 +758,10 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         &f.second.control,
         None,
     );
-    let genesis_head = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor)
-        .unwrap()
-        .head();
+    let genesis_head =
+        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control)
+            .unwrap()
+            .head();
     let original_account_head = AccountEvent::decode(&f.account_genesis).unwrap().head();
     let fork = rebind(
         &candidate.descriptor,
@@ -695,10 +776,10 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
             // signed predecessor remains add's digest, correct at ordering but wrong at seen.
         },
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork).unwrap();
+    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     let (data, _) = note_delta("second device");
     let (note_event, note_order) = f.content(&f.second, NOTE, &data);
@@ -722,7 +803,7 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         f.history
             .inspect(&ordered, &old.descriptor, &f.metadata)
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     assert_eq!(f.history.head(), checkpoint);
     // M-only control by remaining device progresses without K_e.
@@ -747,8 +828,8 @@ fn event_version_floor_capability_and_duplicate_identity() {
     let (data, _) = note_delta("version");
     let (event, _) = f.content(&f.first, NOTE, &data);
     for (offset, bytes, expected) in [
-        (2usize, [0, 0], Outcome::IntegrityStop),
-        (2, [0, 2], Outcome::Accepted),
+        (2usize, [0, 1], Outcome::Rejected),
+        (2, [0, 3], Outcome::Accepted),
     ] {
         let changed = rebind(
             &event.descriptor,
@@ -757,9 +838,9 @@ fn event_version_floor_capability_and_duplicate_identity() {
             &f.first.signing,
             |s| s[offset..offset + 2].copy_from_slice(&bytes),
         );
-        let order = Commitment::order(f.base, f.history.head(), &changed).unwrap();
+        let order = Commitment::order(f.base, f.history.head(), &changed, Route::Content).unwrap();
         let mut state = f.history.clone();
-        let mut note = Note::new();
+        let mut note = Note::new().unwrap();
         assert_eq!(
             state.apply(
                 &order,
@@ -774,12 +855,16 @@ fn event_version_floor_capability_and_duplicate_identity() {
             ),
             expected
         );
-        assert_eq!(state.floor(), 1);
+        // Accepting the first v2 event raises the floor from genesis's v1.
+        let floor = if expected == Outcome::Accepted { 2 } else { 1 };
+        assert_eq!(state.floor(), floor);
     }
-    let mut high = History::new(f.account.id(), &f.account_genesis, f.base, 2).unwrap();
-    // A remembered v2 floor rejects even a correctly signed v1 genesis.
-    let first = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
-    let mut note = Note::new();
+    let mut high = History::new(f.account.id(), &f.account_genesis, f.base, root(), 3).unwrap();
+    // Genesis is v1 forever and opens under any remembered floor; a v3 floor
+    // then refuses a correctly signed v2 event.
+    let first =
+        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    let mut note = Note::new().unwrap();
     assert_eq!(
         high.apply(
             &first,
@@ -792,21 +877,28 @@ fn event_version_floor_capability_and_duplicate_identity() {
                 note: &mut note
             }
         ),
-        Outcome::IntegrityStop
+        Outcome::Accepted
     );
-    assert_eq!(high.floor(), 2);
-    assert_eq!(high.head(), Head::EMPTY);
+    assert_eq!(high.floor(), 3);
+    assert_eq!(high.head(), first.head());
+    let order = Commitment::order(f.base, high.head(), &event.descriptor, Route::Content).unwrap();
+    assert_eq!(
+        high.inspect(&order, &event.descriptor, &f.metadata).err(),
+        Some(Outcome::Rejected)
+    );
+    // A signed v3 binding is recognised and paused, not read as v2.
     let upgraded = rebind(
         &event.descriptor,
         f.base,
         &f.metadata,
         &f.first.signing,
         |s| {
-            s[..2].copy_from_slice(&2u16.to_be_bytes());
-            s[2..4].copy_from_slice(&2u16.to_be_bytes());
+            s[..2].copy_from_slice(&3u16.to_be_bytes());
+            s[2..4].copy_from_slice(&3u16.to_be_bytes());
         },
     );
-    let upgrade_order = Commitment::order(f.base, f.history.head(), &upgraded).unwrap();
+    let upgrade_order =
+        Commitment::order(f.base, f.history.head(), &upgraded, Route::Content).unwrap();
     assert_eq!(
         f.history
             .inspect(&upgrade_order, &upgraded, &f.metadata)
@@ -814,8 +906,9 @@ fn event_version_floor_capability_and_duplicate_identity() {
         Some(Outcome::UnsupportedPause)
     );
     let mut accepted = f.history.clone();
-    let mut note = Note::new();
-    let order = Commitment::order(f.base, accepted.head(), &event.descriptor).unwrap();
+    let mut note = Note::new().unwrap();
+    let order =
+        Commitment::order(f.base, accepted.head(), &event.descriptor, Route::Content).unwrap();
     assert_eq!(
         accepted.apply(
             &order,
@@ -830,16 +923,18 @@ fn event_version_floor_capability_and_duplicate_identity() {
         ),
         Outcome::Accepted
     );
-    let repeat = Commitment::order(f.base, accepted.head(), &event.descriptor).unwrap();
+    let repeat =
+        Commitment::order(f.base, accepted.head(), &event.descriptor, Route::Content).unwrap();
     assert_eq!(
         accepted
             .inspect(&repeat, &event.descriptor, &f.metadata)
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
     let mut next = f.binding(&f.first, CLASS_CONTENT);
     next.event_id = event.descriptor.id();
     next.seen = accepted.head();
+    next.seen_receipt = receipt_for(f.base, next.seen);
     let different = seal(
         next,
         Payload {
@@ -851,24 +946,31 @@ fn event_version_floor_capability_and_duplicate_identity() {
         Some(&f.epoch),
     )
     .unwrap();
-    let repeat = Commitment::order(f.base, accepted.head(), &different.descriptor).unwrap();
+    let repeat = Commitment::order(
+        f.base,
+        accepted.head(),
+        &different.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     assert_eq!(
         accepted
             .inspect(&repeat, &different.descriptor, &f.metadata)
             .err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::Rejected)
     );
 }
 
 #[test]
-fn body_padding_authenticated_but_noncanonical_stops_at_plaintext_validation() {
+fn body_padding_authenticated_but_noncanonical_is_rejected_at_plaintext_validation() {
     let mut f = Fixture::new();
     let (data, _) = note_delta("padding");
     let (event, _) = f.content(&f.first, NOTE, &data);
     let signed = f
         .history
         .inspect(
-            &Commitment::order(f.base, f.history.head(), &event.descriptor).unwrap(),
+            &Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
+                .unwrap(),
             &event.descriptor,
             &f.metadata,
         )
@@ -903,7 +1005,7 @@ fn body_padding_authenticated_but_noncanonical_stops_at_plaintext_validation() {
     let old = event.descriptor.envelope();
     let bind_key = derive_key(&f.metadata, b"bhBind01", 0);
     let mut bind_ad = b"bh/author-binding-aad/v1\0".to_vec();
-    bind_ad.extend(1u16.to_be_bytes());
+    bind_ad.extend(2u16.to_be_bytes());
     bind_ad.push(0);
     bind_ad.extend(f.base.0);
     bind_ad.extend(event.descriptor.id().0);
@@ -919,8 +1021,8 @@ fn body_padding_authenticated_but_noncanonical_stops_at_plaintext_validation() {
     .to_vec();
     bind_plain[314..346].copy_from_slice(&digest);
     let mut to_sign = b"bh/original-envelope/v1\0".to_vec();
-    to_sign.extend(&bind_plain[..346]);
-    bind_plain[346..410].copy_from_slice(&f.first.signing.sign(&to_sign));
+    to_sign.extend(&bind_plain[..646]);
+    bind_plain[646..710].copy_from_slice(&f.first.signing.sign(&to_sign));
     let end = bind_ad.len();
     bind_ad[end - 32..].copy_from_slice(&digest);
     let (nonce, cipher) = aead_seal(&bind_key, &bind_ad, &bind_plain).unwrap();
@@ -929,7 +1031,7 @@ fn body_padding_authenticated_but_noncanonical_stops_at_plaintext_validation() {
     envelope.extend(nonce);
     envelope.extend(cipher);
     let descriptor = OpaqueEvent::new(event.descriptor.id(), envelope).unwrap();
-    let order = Commitment::order(f.base, f.history.head(), &descriptor).unwrap();
+    let order = Commitment::order(f.base, f.history.head(), &descriptor, Route::Content).unwrap();
     assert!(f.history.inspect(&order, &descriptor, &f.metadata).is_ok());
     assert_eq!(
         f.history.apply(
@@ -943,8 +1045,10 @@ fn body_padding_authenticated_but_noncanonical_stops_at_plaintext_validation() {
                 note: &mut f.note
             }
         ),
-        Outcome::IntegrityStop
+        Outcome::Rejected
     );
+    assert_eq!(f.history.head(), order.head());
+    assert!(!f.history.is_stopped());
     body.fill(0);
 }
 
@@ -968,7 +1072,8 @@ fn old_truthful_content_seen_head_remains_valid_after_intervening_content() {
     )
     .unwrap();
     assert_eq!(f.apply(&one, &one_order, true), Outcome::Accepted);
-    let two_order = Commitment::order(f.base, f.history.head(), &two.descriptor).unwrap();
+    let two_order =
+        Commitment::order(f.base, f.history.head(), &two.descriptor, Route::Content).unwrap();
     assert_eq!(f.apply(&two, &two_order, true), Outcome::Accepted);
 }
 
@@ -977,10 +1082,11 @@ fn wrong_roots_body_substitution_and_unknown_inner_control_are_distinct() {
     let mut f = Fixture::new();
     let (data, _) = note_delta("first");
     let (event, order) = f.content(&f.first, NOTE, &data);
-    // An audience key alone cannot open the independent metadata binding.
+    // An audience key alone cannot open the independent metadata binding:
+    // a caller with only that lacks the metadata root and waits.
     assert_eq!(
         f.history.inspect(&order, &event.descriptor, &f.epoch).err(),
-        Some(Outcome::IntegrityStop)
+        Some(Outcome::UnavailablePause)
     );
     assert_eq!(
         f.history.apply(
@@ -1010,8 +1116,10 @@ fn wrong_roots_body_substitution_and_unknown_inner_control_are_distinct() {
                 note: &mut f.note
             }
         ),
-        Outcome::IntegrityStop
+        Outcome::UnavailablePause
     );
+    assert_eq!(f.history.head().position, 1);
+    assert!(!f.history.is_stopped());
     let mut f = Fixture::new();
     let (first, order) = f.content(&f.first, NOTE, &data);
     let (other, _) = f.content(&f.first, NOTE, &data);
@@ -1057,7 +1165,7 @@ fn missing_content_key_refuses_before_packaging_and_wrong_note_target_stops_safe
     let (data, _) = note_delta("prior");
     let (event, order) = f.content(&f.first, NOTE, &data);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    let note_before = f.note.state();
+    let note_before = f.note.state().unwrap();
     let head_before = f.history.head();
     let binding = f.binding(&f.first, CLASS_CONTENT);
     assert!(matches!(
@@ -1074,7 +1182,7 @@ fn missing_content_key_refuses_before_packaging_and_wrong_note_target_stops_safe
         Err(bh_event::Error::Unavailable)
     ));
     assert_eq!(f.history.head(), head_before);
-    assert_eq!(f.note.state(), note_before);
+    assert_eq!(f.note.state().unwrap(), note_before);
     let mut wrong_note = vec![8; 32];
     wrong_note.extend(&data[32..]);
     let (event, order) = f.content(&f.first, NOTE, &wrong_note);
@@ -1085,19 +1193,19 @@ fn missing_content_key_refuses_before_packaging_and_wrong_note_target_stops_safe
     );
     assert_eq!(f.apply(&event, &order, true), Outcome::IntegrityStop);
     assert_eq!(f.history.head(), head_before);
-    assert_eq!(f.note.state(), note_before);
+    assert_eq!(f.note.state().unwrap(), note_before);
     assert!(f.history.is_stopped());
 }
 
 #[test]
 fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
     let mut f = Fixture::new();
-    let mut first = Note::new();
-    let mut second = Note::new();
+    let mut first = Note::new().unwrap();
+    let mut second = Note::new().unwrap();
     for (id, text) in [([7; 32], "first"), ([8; 32], "second")] {
-        let mut authored = Note::new();
-        let mut data = id.to_vec();
-        data.extend(authored.append_paragraph(text));
+        let mut authored = Note::new().unwrap();
+        let mut data = with_writer(&authored.append_paragraph(text).unwrap());
+        data[..32].copy_from_slice(&id);
         let (event, order) = f.content(&f.first, NOTE, &data);
         let before = f.history.head();
         let prepared = f
@@ -1124,7 +1232,7 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
         } else {
             &mut first
         };
-        let wrong_before = wrong.state();
+        let wrong_before = wrong.state().unwrap();
         assert_eq!(
             f.history
                 .consume(
@@ -1137,7 +1245,7 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
                 .err(),
             Some(bh_event::ConsumeError::WrongTarget)
         );
-        assert_eq!(wrong.state(), wrong_before);
+        assert_eq!(wrong.state().unwrap(), wrong_before);
         assert!(!f.history.is_stopped());
         assert_eq!(f.history.head(), before);
         let prepared = f
@@ -1161,10 +1269,16 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
                 .map(|v| v.outcome()),
             Ok(Outcome::Accepted)
         );
-        assert_eq!(note.state(), authored.state());
+        assert_eq!(note.state().unwrap(), authored.state().unwrap());
     }
-    assert_ne!(first.state(), Note::new().state());
-    assert_ne!(second.state(), Note::new().state());
+    assert_ne!(
+        first.state().unwrap(),
+        Note::new().unwrap().state().unwrap()
+    );
+    assert_ne!(
+        second.state().unwrap(),
+        Note::new().unwrap().state().unwrap()
+    );
     let before = f.history.head();
     let (mut corrupt, order) = f.content(&f.first, NOTE, &[8; 32]);
     assert!(matches!(
@@ -1212,8 +1326,14 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
     ));
     assert!(f.history.is_stopped());
     assert_eq!(f.history.head(), before);
-    assert_ne!(first.state(), Note::new().state());
-    assert_ne!(second.state(), Note::new().state());
+    assert_ne!(
+        first.state().unwrap(),
+        Note::new().unwrap().state().unwrap()
+    );
+    assert_ne!(
+        second.state().unwrap(),
+        Note::new().unwrap().state().unwrap()
+    );
 }
 
 #[test]
@@ -1255,7 +1375,7 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
         )
         .unwrap();
     let mut candidate = f.history.clone();
-    let mut clone_note = Note::new();
+    let mut clone_note = Note::new().unwrap();
     assert_eq!(
         candidate
             .consume(
@@ -1281,7 +1401,7 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
             .map(|v| v.outcome()),
         Ok(Outcome::Accepted)
     );
-    let content = f.note.state();
+    let content = f.note.state().unwrap();
     assert_eq!(
         f.history
             .consume(
@@ -1294,7 +1414,7 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
             .err(),
         Some(bh_event::ConsumeError::StaleState)
     );
-    assert_eq!(f.note.state(), content);
+    assert_eq!(f.note.state().unwrap(), content);
     assert_ne!(f.history.head(), head);
     // An independently prepared event for the same predecessor is stale too,
     // even though its event ID and encrypted note target differ.
@@ -1341,7 +1461,7 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
                 pending,
                 Some(NoteTarget {
                     id: [8; 32],
-                    note: &mut Note::new()
+                    note: &mut Note::new().unwrap()
                 })
             )
             .err(),
@@ -1414,19 +1534,27 @@ fn prepared_events_require_exact_history_and_controls_need_no_note() {
         f.history.consume(stale, None).err(),
         Some(bh_event::ConsumeError::StaleState)
     );
-    assert_eq!(f.note.state(), content);
+    assert_eq!(f.note.state().unwrap(), content);
 }
 
 #[test]
 fn same_head_trust_context_refuses_prepared_genesis() {
     let f = Fixture::new();
     let other = Fixture::new();
-    let mut source = History::new(f.account.id(), &f.account_genesis, f.base, 1).unwrap();
-    let order = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
-    let floor_two = History::new(f.account.id(), &f.account_genesis, f.base, 2).unwrap();
-    let other_account =
-        History::new(other.account.id(), &other.account_genesis, f.base, 1).unwrap();
-    let other_base = History::new(f.account.id(), &f.account_genesis, other.base, 1).unwrap();
+    let mut source = History::new(f.account.id(), &f.account_genesis, f.base, root(), 1).unwrap();
+    let order =
+        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    let floor_two = History::new(f.account.id(), &f.account_genesis, f.base, root(), 2).unwrap();
+    let other_account = History::new(
+        other.account.id(),
+        &other.account_genesis,
+        f.base,
+        root(),
+        1,
+    )
+    .unwrap();
+    let other_base =
+        History::new(f.account.id(), &f.account_genesis, other.base, root(), 1).unwrap();
     assert_ne!(f.account.head(), other.account.head());
     assert_ne!(f.base, other.base);
     for mut destination in [floor_two, other_account, other_base] {
@@ -1471,12 +1599,12 @@ fn same_head_integrity_stop_refuses_prepared_note_without_losing_content() {
     let (prior, edited) = note_delta("retained");
     let (event, order) = f.content(&f.first, NOTE, &prior);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
-    assert_eq!(f.note.state(), edited.state());
+    assert_eq!(f.note.state().unwrap(), edited.state().unwrap());
     let before = (
         f.history.head(),
         f.history.account_head(),
         f.history.floor(),
-        f.note.state(),
+        f.note.state().unwrap(),
     );
     let (data, _) = note_delta("future");
     let (valid, valid_order) = f.content(&f.first, NOTE, &data);
@@ -1509,7 +1637,7 @@ fn same_head_integrity_stop_refuses_prepared_note_without_losing_content() {
             f.history.head(),
             f.history.account_head(),
             f.history.floor(),
-            f.note.state()
+            f.note.state().unwrap()
         ),
         before
     );
@@ -1530,7 +1658,7 @@ fn same_head_integrity_stop_refuses_prepared_note_without_losing_content() {
             f.history.head(),
             f.history.account_head(),
             f.history.floor(),
-            f.note.state()
+            f.note.state().unwrap()
         ),
         before
     );
@@ -1596,15 +1724,14 @@ fn applied_result_binds_ordered_original_body_and_typed_content() {
     match applied.kind() {
         AppliedKind::NoteAccepted { note_id, delta } => {
             assert_eq!(*note_id, [7; 32]);
-            assert_eq!(delta.expose(), &data[32..]);
+            assert_eq!(delta.expose(), &data[bh_event::NOTE_PREFIX..]);
         }
         _ => panic!("expected accepted note"),
     }
-    assert_eq!(f.note.state(), edited.state());
+    assert_eq!(f.note.state().unwrap(), edited.state().unwrap());
     assert!(!format!("{applied:?}").contains("bound note"));
 
-    let mut bad = vec![7; 32];
-    bad.extend([0xff, 0xff, 0xff]);
+    let bad = with_writer(&[0xff, 0xff, 0xff]);
     let (event, order) = f.content(&f.first, NOTE, &bad);
     let prepared = f
         .history
@@ -1631,7 +1758,7 @@ fn applied_result_binds_ordered_original_body_and_typed_content() {
     );
     assert_eq!(rejected.outcome(), Outcome::ContentRejected);
     assert_eq!(rejected.head(), order.head());
-    assert_eq!(f.note.state(), edited.state());
+    assert_eq!(f.note.state().unwrap(), edited.state().unwrap());
 
     let add = f
         .account
@@ -1689,7 +1816,7 @@ fn owned_materialization_deferred_publication_keeps_history_unpublished() {
             prepared,
             Some(OwnedNoteTarget {
                 id: [7; 32],
-                note: Note::new(),
+                note: Note::new().unwrap(),
             }),
         )
         .unwrap();
@@ -1703,7 +1830,7 @@ fn owned_materialization_deferred_publication_keeps_history_unpublished() {
             prepared,
             Some(OwnedNoteTarget {
                 id: [7; 32],
-                note: Note::new(),
+                note: Note::new().unwrap(),
             }),
         )
         .unwrap();
@@ -1713,13 +1840,13 @@ fn owned_materialization_deferred_publication_keeps_history_unpublished() {
     assert_eq!(original.descriptor_bytes(), event.descriptor.encode());
     assert_eq!(original.body_bytes(), event.body);
     assert!(
-        matches!(original.kind(), bh_event::AppliedKind::NoteAccepted { delta, .. } if delta.expose() == &data[32..])
+        matches!(original.kind(), bh_event::AppliedKind::NoteAccepted { delta, .. } if delta.expose() == &data[bh_event::NOTE_PREFIX..])
     );
     let applied = f.history.publish_committed(first.transition).unwrap();
     assert_eq!(applied.head(), order.head());
     assert_eq!(f.history.head(), order.head());
     match first.note.unwrap() {
-        WorkingNote::Accepted(note) => assert_eq!(note.state(), edited.state()),
+        WorkingNote::Accepted(note) => assert_eq!(note.state().unwrap(), edited.state().unwrap()),
         _ => panic!("expected accepted"),
     }
 }
@@ -1820,8 +1947,8 @@ fn owned_wrong_target_and_stale_prestate_return_working_note() {
             Some(&f.epoch),
         )
         .unwrap();
-    let mut working = Note::new();
-    working.append_paragraph("local work");
+    let mut working = Note::new().unwrap();
+    working.append_paragraph("local work").unwrap();
     let identity = working.replica_id();
     let failed = f
         .history
@@ -1900,7 +2027,7 @@ fn owned_integrity_stop_blocks_publication() {
             prepared,
             Some(OwnedNoteTarget {
                 id: [7; 32],
-                note: Note::new(),
+                note: Note::new().unwrap(),
             }),
         )
         .unwrap();
@@ -1930,11 +2057,10 @@ fn owned_integrity_stop_blocks_publication() {
 fn owned_decode_rejection_returns_exact_working_note() {
     use bh_event::{OwnedNoteTarget, WorkingNote};
     let mut f = Fixture::new();
-    let mut original = Note::new();
-    original.append_paragraph("retained");
-    let bytes = original.state();
-    let mut bad = vec![7; 32];
-    bad.extend([0xff, 0xff, 0xff]);
+    let mut original = Note::new().unwrap();
+    original.append_paragraph("retained").unwrap();
+    let bytes = original.state().unwrap();
+    let bad = with_writer(&[0xff, 0xff, 0xff]);
     let (event, order) = f.content(&f.first, NOTE, &bad);
     let prepared = f
         .history
@@ -1962,7 +2088,7 @@ fn owned_decode_rejection_returns_exact_working_note() {
         Outcome::ContentRejected
     );
     match result.note.unwrap() {
-        WorkingNote::Untouched(note) => assert_eq!(note.state(), bytes),
+        WorkingNote::Untouched(note) => assert_eq!(note.state().unwrap(), bytes),
         _ => panic!("expected untouched"),
     }
     f.history.publish_committed(result.transition).unwrap();
@@ -2011,8 +2137,7 @@ fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
     let mut f = Fixture::new();
     // Yjs v1: client 1's String block named "x" is the committed original.
     let valid = [1, 1, 1, 0, 4, 1, 1, b'x', 1, b'a', 0];
-    let mut data = vec![7; 32];
-    data.extend(valid);
+    let data = with_writer(&valid);
     let (initial, initial_order) = f.content(&f.first, NOTE, &data);
     let prepared = f
         .history
@@ -2030,7 +2155,7 @@ fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
             prepared,
             Some(OwnedNoteTarget {
                 id: [7; 32],
-                note: Note::new(),
+                note: Note::new().unwrap(),
             }),
         )
         .unwrap();
@@ -2042,24 +2167,27 @@ fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
         WorkingNote::Accepted(note) => note,
         _ => panic!("expected accepted note"),
     };
-    let committed = note.state();
+    let committed = note.state().unwrap();
     f.history.publish_committed(accepted.transition).unwrap();
     assert_eq!(f.history.head(), initial_order.head());
 
     // Client 2 first inserts z at root y, then uses client 1's primitive
     // String as a parent. Core must change its Doc before returning Apply.
     let partial = [1, 2, 2, 0, 4, 1, 1, b'y', 1, b'z', 4, 0, 1, 0, 1, b'b', 0];
-    let mut probe = Note::new();
+    let mut probe = Note::new().unwrap();
     probe.apply_update(&committed_delta).unwrap();
-    assert_eq!(probe.state(), committed);
+    assert_eq!(probe.state().unwrap(), committed);
     assert!(matches!(
         probe.apply_update(&partial),
         Err(NoteError::Apply(_))
     ));
-    assert_ne!(probe.state(), committed, "fixture must mutate before error");
+    assert_ne!(
+        probe.state().unwrap(),
+        committed,
+        "fixture must mutate before error"
+    );
 
-    let mut data = vec![7; 32];
-    data.extend(partial);
+    let data = with_writer(&partial);
     let (event, order) = f.content(&f.first, NOTE, &data);
     let prepared = f
         .history
@@ -2085,9 +2213,9 @@ fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
     ));
     assert!(matches!(result.note, Some(WorkingNote::Poisoned)));
     assert_eq!(f.history.head(), initial_order.head());
-    let mut rebuilt = Note::new();
+    let mut rebuilt = Note::new().unwrap();
     rebuilt.apply_update(&committed_delta).unwrap();
-    assert_eq!(rebuilt.state(), committed);
+    assert_eq!(rebuilt.state().unwrap(), committed);
     f.history.publish_committed(result.transition).unwrap();
     assert_eq!(f.history.head(), order.head());
 }
@@ -2096,12 +2224,15 @@ fn owned_partial_apply_rejects_without_exposing_working_note_and_can_rebuild() {
 fn owned_many_signed_updates_preserve_note_without_disposable_replay() {
     use bh_event::{OwnedNoteTarget, WorkingNote};
     let mut f = Fixture::new();
-    let mut author = Note::new();
-    let mut working = Note::new();
+    let mut author = Note::new().unwrap();
+    let mut working = Note::new().unwrap();
     let replica = working.replica_id();
     for i in 0..300 {
-        let mut data = vec![7; 32];
-        data.extend(author.append_paragraph(&format!("paragraph-{i}-{}", "x".repeat(256))));
+        let data = with_writer(
+            &author
+                .append_paragraph(&format!("paragraph-{i}-{}", "x".repeat(256)))
+                .unwrap(),
+        );
         let (event, order) = f.content(&f.first, NOTE, &data);
         let prepared = f
             .history
@@ -2140,7 +2271,7 @@ fn owned_many_signed_updates_preserve_note_without_disposable_replay() {
             .publish_committed(materialized.transition)
             .unwrap();
     }
-    assert_eq!(working.state(), author.state());
+    assert_eq!(working.state().unwrap(), author.state().unwrap());
     assert_eq!(f.history.head().position, 301);
 }
 
@@ -2197,7 +2328,9 @@ fn note_account_copy_scale_probe() {
             .collect();
         let start = Instant::now();
         for event in events {
-            let order = Commitment::order(f.base, f.history.head(), &event.descriptor).unwrap();
+            let order =
+                Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
+                    .unwrap();
             let prepared = f
                 .history
                 .prepare(
@@ -2232,7 +2365,8 @@ fn note_account_copy_scale_probe() {
 #[test]
 fn replay_verifies_records_from_anchors_without_applying_notes() {
     let mut f = Fixture::new();
-    let first_order = Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor).unwrap();
+    let first_order =
+        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
     let mut records = vec![(
         first_order,
         f.genesis.descriptor.encode(),
@@ -2264,7 +2398,8 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
         f.account.id(),
         &f.account_genesis,
         f.base,
-        1,
+        root(),
+        &[],
         &f.metadata,
         Some(&f.epoch),
         records.clone(),
@@ -2277,7 +2412,7 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
     assert_eq!(replay.epoch_id(), live.epoch_id());
     let (data, _) = note_delta("next");
     let (event, order) = f.content(&f.first, NOTE, &data);
-    let mut note = Note::new();
+    let mut note = Note::new().unwrap();
     // A preparation from the live history must consume on the replayed one:
     // this compares the full private predecessor, not just public accessors.
     let prepared = f
@@ -2311,7 +2446,8 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
             f.account.id(),
             &f.account_genesis,
             base,
-            1,
+            root(),
+            &[],
             &f.metadata,
             Some(&f.epoch),
             records,
@@ -2332,26 +2468,51 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
     let (alternate, _) = note_delta("another ciphertext");
     let (other, _) = f.content(&f.first, NOTE, &alternate);
     let mut changed = records.clone();
-    changed[1].0 = Commitment::order(f.base, records[0].0.head(), &other.descriptor).unwrap();
+    changed[1].0 = Commitment::order(
+        f.base,
+        records[0].0.head(),
+        &other.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     assert_eq!(
         check(changed[..2].to_vec(), f.base),
         Some(Outcome::IntegrityStop)
     );
     // A fresh, correctly signed next record with an already-used EventId is
-    // refused even though its outer commitment and predecessor are valid.
+    // rejected even though its outer commitment and predecessor are valid:
+    // it holds its position with no effect, and replay goes on.
     let mut repeated = f.binding(&f.first, CLASS_CONTENT);
     repeated.seen = records[2].0.head();
+    repeated.seen_receipt = receipt_for(f.base, repeated.seen);
     repeated.event_id = OpaqueEvent::decode(&records[1].1).unwrap().id();
     let (duplicate, _) = f.create(repeated, NOTE, &data, &f.first.signing, Some(&f.epoch));
-    let duplicate_order =
-        Commitment::order(f.base, records[2].0.head(), &duplicate.descriptor).unwrap();
+    let duplicate_order = Commitment::order(
+        f.base,
+        records[2].0.head(),
+        &duplicate.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     let mut changed = records.clone();
     changed.push((
         duplicate_order,
         duplicate.descriptor.encode(),
         duplicate.body,
     ));
-    assert_eq!(check(changed, f.base), Some(Outcome::IntegrityStop));
+    let replayed = History::replay(
+        f.account.id(),
+        &f.account_genesis,
+        f.base,
+        root(),
+        &[],
+        &f.metadata,
+        Some(&f.epoch),
+        changed,
+    )
+    .unwrap();
+    assert_eq!(replayed.head(), duplicate_order.head());
+    assert_eq!(replayed.account_head(), f.history.account_head());
     assert_eq!(
         check(records[1..].to_vec(), f.base),
         Some(Outcome::IntegrityStop)
@@ -2366,24 +2527,40 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
         check(records.clone(), BaseId([99; 32])),
         Some(Outcome::IntegrityStop)
     );
-    assert_eq!(
-        History::replay(
+    // Each event is judged under the floor in force at its own position. A
+    // floor of 3 for events after position 2 rejects the v2 account addition
+    // at position 3; the same rise after position 3 leaves it accepted, as
+    // live verification did. Under another pinned hosting root (whose
+    // receipts these are not) each later event is rejected.
+    let genesis_account = AccountEvent::decode(&f.account_genesis).unwrap().head();
+    for (root, rises, account, floor) in [
+        (root(), vec![(0, 2)], f.history.account_head(), 2),
+        (root(), vec![(2, 3)], genesis_account, 3),
+        (root(), vec![(3, 3)], f.history.account_head(), 3),
+        (SigningKey::generate().public(), vec![], genesis_account, 1),
+    ] {
+        let replayed = History::replay(
             f.account.id(),
             &f.account_genesis,
             f.base,
-            2,
+            root,
+            &rises,
             &f.metadata,
             Some(&f.epoch),
-            records.clone()
+            records.clone(),
         )
-        .err(),
-        Some(Outcome::IntegrityStop)
-    );
+        .unwrap();
+        assert_eq!(replayed.head(), records[2].0.head());
+        assert_eq!(replayed.account_head(), account);
+        assert_eq!(replayed.floor(), floor);
+        assert!(!replayed.is_stopped());
+    }
     let higher = History::replay(
         f.account.id(),
         &f.account_genesis,
         f.base,
-        2,
+        root(),
+        &[(0, 2)],
         &f.metadata,
         Some(&f.epoch),
         Vec::<(Commitment, Vec<u8>, Vec<u8>)>::new(),
@@ -2395,7 +2572,8 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
         f.account.id(),
         &f.account_genesis,
         f.base,
-        1,
+        root(),
+        &[],
         &f.metadata,
         Some(&f.epoch),
         records,
@@ -2417,4 +2595,462 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
             .err(),
         Some(Outcome::IntegrityStop)
     );
+}
+
+#[test]
+fn author_signed_padded_size_other_than_the_body_is_rejected_not_a_stop() {
+    let mut f = Fixture::new();
+    let (data, _) = note_delta("one");
+    let (event, _) = f.content(&f.first, NOTE, &data);
+    assert_eq!(event.body.len(), 1024);
+    // The author signs a padded size other than the body it staged; the
+    // body bytes are exactly what the ordered descriptor names, so the
+    // service changed nothing.
+    let altered = rebind(
+        &event.descriptor,
+        f.base,
+        &f.metadata,
+        &f.first.signing,
+        |s| s[310..314].copy_from_slice(&4096u32.to_be_bytes()),
+    );
+    assert_eq!(
+        bh_sync::referenced_body(&altered).unwrap(),
+        bh_sync::BodyObject::new(event.body.clone())
+            .unwrap()
+            .commitment()
+    );
+    let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
+    let event = Encoded {
+        descriptor: altered,
+        body: event.body,
+    };
+    let before = f.note.state().unwrap();
+    assert_eq!(f.apply(&event, &order, true), Outcome::Rejected);
+    assert!(!f.history.is_stopped());
+    assert_eq!(f.history.head(), order.head());
+    assert_eq!(f.note.state().unwrap(), before);
+    let (data, _) = note_delta("next");
+    let (next, order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(f.apply(&next, &order, true), Outcome::Accepted);
+}
+
+#[test]
+fn compatibility_apply_unavailable_pauses_and_identical_retry_succeeds() {
+    let mut f = Fixture::new();
+    let (data, _) = note_delta("retry unchanged");
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    let head = f.history.head();
+    let state = f.note.state().unwrap();
+    assert_eq!(
+        bh_core::contained::with_fuel(0, || f.apply(&event, &order, true)),
+        Outcome::UnavailablePause
+    );
+    assert_eq!(f.history.head(), head);
+    assert_eq!(f.note.state().unwrap(), state);
+    assert!(!f.history.is_stopped());
+    assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
+    assert_eq!(f.history.head(), order.head());
+    assert_ne!(f.note.state().unwrap(), state);
+}
+
+#[test]
+fn compatibility_apply_real_contained_trap_never_stops_history() {
+    let mut f = Fixture::new();
+    // A root Any containing deeply nested singleton arrays traps during apply,
+    // under ordinary fuel, after authenticated preparation has succeeded.
+    let mut bomb = vec![1, 1, 3, 0, 8, 1, 4, b'b', b'o', b'm', b'b', 1];
+    for _ in 0..100_000 {
+        bomb.extend_from_slice(&[117, 1]);
+    }
+    bomb.extend_from_slice(&[126, 0]);
+    let (event, order) = f.content(&f.first, NOTE, &with_writer(&bomb));
+    assert!(
+        f.history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch)
+            )
+            .is_ok()
+    );
+    let head = f.history.head();
+    let state = f.note.state().unwrap();
+    for _ in 0..2 {
+        assert_eq!(f.apply(&event, &order, true), Outcome::UnavailablePause);
+        assert_eq!(f.history.head(), head);
+        assert_eq!(f.note.state().unwrap(), state);
+        assert!(!f.history.is_stopped());
+    }
+}
+
+#[test]
+fn unavailable_history_operations_do_not_judge_advance_or_stop() {
+    for mode in 1..3 {
+        let mut f = Fixture::new();
+        let update = Note::with_writer(50)
+            .unwrap()
+            .append_paragraph("retained")
+            .unwrap();
+        let (event, order) = f.content(&f.first, NOTE, &with_writer(&update));
+        let prepared = f
+            .history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap();
+        let before_head = f.history.head();
+        let before_state = f.note.state().unwrap();
+        let owned =
+            Note::from_ordered(&bh_core::note::OrderedState::single(before_state.clone())).unwrap();
+        let result = bh_core::contained::with_fuel(0, || match mode {
+            0 => f.history.consume_unapplied(prepared).map(|_| ()),
+            1 => f
+                .history
+                .consume(
+                    prepared,
+                    Some(bh_event::NoteTarget {
+                        id: [7; 32],
+                        note: &mut f.note,
+                    }),
+                )
+                .map(|_| ()),
+            _ => f
+                .history
+                .materialize(
+                    prepared,
+                    Some(bh_event::OwnedNoteTarget {
+                        id: [7; 32],
+                        note: owned,
+                    }),
+                )
+                .map(|_| ())
+                .map_err(|e| e.reason),
+        });
+        assert_eq!(result, Err(bh_event::ConsumeError::Unavailable));
+        assert_eq!(f.history.head(), before_head);
+        assert!(!f.history.is_stopped());
+        assert_eq!(f.note.state().unwrap(), before_state);
+        let prepared = f
+            .history
+            .prepare(
+                &order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap();
+        assert_eq!(
+            f.history.consume_unapplied(prepared).unwrap().outcome(),
+            Outcome::Accepted
+        );
+    }
+}
+
+#[test]
+fn consume_unapplied_retains_bytes_without_running_the_engine() {
+    let mut f = Fixture::new();
+    let prepare = |f: &mut Fixture, event: &Encoded, order: &Commitment, content| {
+        f.history
+            .prepare(
+                order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                if content { Some(&f.epoch) } else { None },
+            )
+            .unwrap()
+    };
+    let update = Note::new().unwrap().append_paragraph("one").unwrap();
+    let (event, order) = f.content(&f.first, NOTE, &with_writer(&update));
+    let prepared = prepare(&mut f, &event, &order, true);
+    let applied =
+        bh_core::contained::with_fuel(0, || f.history.consume_unapplied(prepared)).unwrap();
+    match applied.kind() {
+        bh_event::AppliedKind::NoteAccepted { note_id, delta } => {
+            assert_eq!(*note_id, [7; 32]);
+            assert_eq!(delta.expose(), update.as_slice());
+        }
+        _ => panic!("accepted note expected"),
+    }
+    assert_eq!(f.history.head(), order.head());
+    // An update that decodes is the owner's to judge on accepted state,
+    // even one no Note could integrate here (a run that can never attach).
+    let mut other = Note::new().unwrap();
+    let dangling = {
+        let mut sender = Note::new().unwrap();
+        sender
+            .apply_update(&other.append_paragraph("unseen").unwrap())
+            .unwrap();
+        sender.append_paragraph("after the unseen one").unwrap()
+    };
+    let (event, order) = f.content(&f.first, NOTE, &with_writer(&dangling));
+    let prepared = prepare(&mut f, &event, &order, true);
+    assert_eq!(
+        f.history.consume_unapplied(prepared).unwrap().outcome(),
+        Outcome::Accepted
+    );
+    // Even decoding belongs to the note owner, not the history verifier.
+    let (event, order) = f.content(&f.first, NOTE, &with_writer(&[0xff, 0xff, 0xff]));
+    let prepared = prepare(&mut f, &event, &order, true);
+    assert!(matches!(
+        f.history.consume_unapplied(prepared).unwrap().kind(),
+        bh_event::AppliedKind::NoteAccepted { note_id, .. } if *note_id == [7; 32]
+    ));
+    assert_eq!(f.history.head(), order.head());
+    // A preparation against another predecessor is stale.
+    let (event, order) = f.content(&f.first, NOTE, &with_writer(&update));
+    let stale = prepare(&mut f, &event, &order, true);
+    let fresh = prepare(&mut f, &event, &order, true);
+    f.history.consume_unapplied(fresh).unwrap();
+    assert!(f.history.consume_unapplied(stale).is_err());
+}
+
+/// A store's durable verified rows, as a device keeps them per position and
+/// per event ID, read back only by point lookups.
+#[derive(Default)]
+struct Rows {
+    seen: std::sync::Mutex<std::collections::BTreeMap<u64, bh_event::Seen>>,
+    ids: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Digest>>,
+    changes: std::sync::Mutex<Vec<Vec<u8>>>,
+    reads: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+impl Rows {
+    fn record(&self, applied: &bh_event::AppliedEvent) {
+        self.seen
+            .lock()
+            .unwrap()
+            .insert(applied.head().position, applied.seen());
+        let ordered = applied.commitment();
+        self.ids
+            .lock()
+            .unwrap()
+            .entry(ordered.event_id().0)
+            .or_insert(ordered.event_digest());
+        if let Some(change) = applied.account_change() {
+            self.changes.lock().unwrap().push(change.to_vec());
+        }
+    }
+    fn read(&self) -> Result<(), bh_event::LookupError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(bh_event::LookupError);
+        }
+        Ok(())
+    }
+}
+impl bh_event::HistoryLookup for Rows {
+    fn seen(&self, position: u64) -> Result<Option<bh_event::Seen>, bh_event::LookupError> {
+        self.read()?;
+        Ok(self.seen.lock().unwrap().get(&position).copied())
+    }
+    fn event_digest(&self, event_id: [u8; 32]) -> Result<Option<Digest>, bh_event::LookupError> {
+        self.read()?;
+        Ok(self.ids.lock().unwrap().get(&event_id).copied())
+    }
+}
+
+/// Verify and consume one event as the device does, keeping its rows.
+fn step(
+    history: &mut History,
+    rows: &Rows,
+    f: &Fixture,
+    event: &Encoded,
+    order: &Commitment,
+    content: bool,
+) -> Outcome {
+    let prepared = match history.prepare(
+        order,
+        &event.descriptor,
+        Some(&event.body),
+        &f.metadata,
+        if content { Some(&f.epoch) } else { None },
+    ) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let applied = history.consume_unapplied(prepared).unwrap();
+    rows.record(&applied);
+    applied.outcome()
+}
+
+#[test]
+fn resume_continues_from_durable_rows_without_replay() {
+    let mut f = Fixture::new();
+    let anchor = VerifiedAccount::from_genesis(f.account.id(), &f.account_genesis).unwrap();
+    let rows = std::sync::Arc::new(Rows::default());
+    // Live verification from genesis, keeping only durable rows.
+    f.history = History::with_account(&anchor, f.base, root(), 1).unwrap();
+    let genesis = Encoded {
+        descriptor: f.genesis.descriptor.clone(),
+        body: f.genesis.body.clone(),
+    };
+    let order =
+        Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+    let mut live = f.history.clone();
+    assert_eq!(
+        step(&mut live, &rows, &f, &genesis, &order, false),
+        Outcome::Accepted
+    );
+    f.history = live.clone();
+    let (data, _) = note_delta("first");
+    let (first, order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(
+        step(&mut live, &rows, &f, &first, &order, true),
+        Outcome::Accepted
+    );
+    f.history = live.clone();
+    let add = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let add = add
+        .finish(f.first.control.sign(add.signing_bytes()))
+        .unwrap();
+    let (change, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        add.as_bytes(),
+        &f.first.control,
+        None,
+    );
+    let prepared = live
+        .prepare(
+            &order,
+            &change.descriptor,
+            Some(&change.body),
+            &f.metadata,
+            None,
+        )
+        .unwrap();
+    let applied = live.consume_unapplied(prepared).unwrap();
+    rows.record(&applied);
+    let continuation = applied.continuation().unwrap();
+    f.control = order.event_digest().0;
+    f.account.apply(add.as_bytes()).unwrap();
+    f.history = live.clone();
+    assert_eq!(rows.changes.lock().unwrap().len(), 1);
+
+    // Everything in memory is dropped; only the rows and the continuation
+    // remain. Resuming reads no original and replays nothing.
+    let changes = rows.changes.lock().unwrap().clone();
+    let mut resumed = History::resume(
+        &anchor,
+        f.base,
+        root(),
+        continuation,
+        &changes,
+        rows.clone(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(resumed.head(), live.head());
+    assert_eq!(resumed.account_head(), live.account_head());
+    assert_eq!(resumed.metadata_id(), live.metadata_id());
+    assert_eq!(resumed.epoch_id(), live.epoch_id());
+    assert_eq!(resumed.floor(), live.floor());
+
+    // The same events judged live and resumed reach the same outcomes: the
+    // new device's note, an old truthful observation, a reused event ID and
+    // a hosting receipt contradicting a verified head.
+    let reads = rows.reads.load(std::sync::atomic::Ordering::Relaxed);
+    let (data, _) = note_delta("from the added device");
+    let (added, order) = f.content(&f.second, NOTE, &data);
+    let mut old = f.binding(&f.first, CLASS_CONTENT);
+    old.seen = Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control)
+        .unwrap()
+        .head();
+    old.seen_receipt = receipt_for(f.base, old.seen);
+    old.account_head = anchor.head();
+    old.seen_control = order_digest(&f, &genesis);
+    let mut reused = f.binding(&f.first, CLASS_CONTENT);
+    reused.event_id = first.descriptor.id();
+    let mut forked = f.binding(&f.first, CLASS_CONTENT);
+    forked.seen = Head {
+        position: 1,
+        hash: Digest([3; 32]),
+    };
+    forked.seen_receipt = receipt_for(f.base, forked.seen);
+    let (data, _) = note_delta("next");
+    let scratch = Rows::default();
+    assert_eq!(
+        step(&mut live, &scratch, &f, &added, &order, true),
+        Outcome::Accepted
+    );
+    assert_eq!(
+        step(&mut resumed, &rows, &f, &added, &order, true),
+        Outcome::Accepted
+    );
+    f.history = live.clone();
+    for (binding, outcome) in [
+        (old, Outcome::Accepted),
+        (reused, Outcome::Rejected),
+        (forked, Outcome::IntegrityStop),
+    ] {
+        let (event, order) = f.create(binding, NOTE, &data, &f.first.signing, Some(&f.epoch));
+        assert_eq!(step(&mut live, &scratch, &f, &event, &order, true), outcome);
+        assert_eq!(step(&mut resumed, &rows, &f, &event, &order, true), outcome);
+        assert_eq!(resumed.head(), live.head());
+        f.history = live.clone();
+    }
+    assert!(live.is_stopped() && resumed.is_stopped());
+    assert!(
+        rows.reads.load(std::sync::atomic::Ordering::Relaxed) > reads,
+        "earlier positions and IDs were looked up"
+    );
+
+    // Local state that does not reproduce the continuation, or a store
+    // that cannot answer, waits: nothing is judged.
+    assert_eq!(
+        History::resume(
+            &anchor,
+            f.base,
+            root(),
+            continuation,
+            Vec::<Vec<u8>>::new(),
+            rows.clone(),
+            1
+        )
+        .err(),
+        Some(Outcome::UnavailablePause)
+    );
+    let empty = std::sync::Arc::new(Rows::default());
+    assert_eq!(
+        History::resume(&anchor, f.base, root(), continuation, &changes, empty, 1).err(),
+        Some(Outcome::UnavailablePause)
+    );
+    let mut waiting = History::resume(
+        &anchor,
+        f.base,
+        root(),
+        continuation,
+        &changes,
+        rows.clone(),
+        1,
+    )
+    .unwrap();
+    rows.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    f.history = waiting.clone();
+    let (event, order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(
+        step(&mut waiting, &rows, &f, &event, &order, true),
+        Outcome::UnavailablePause
+    );
+    assert!(!waiting.is_stopped());
+    assert_eq!(waiting.head(), continuation.seen.head);
+}
+
+fn order_digest(f: &Fixture, genesis: &Encoded) -> [u8; 32] {
+    Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control)
+        .unwrap()
+        .event_digest()
+        .0
 }

@@ -25,14 +25,20 @@ impl std::error::Error for TimeError {}
 pub struct TimeSampler {
     endpoints: [SocketAddr; 2],
     roots: [ServerRoot; 2],
-    clock: Mutex<QualifiedClock>,
+    config: Config,
+    clock: Mutex<Clock>,
     refresh_gate: tokio::sync::Mutex<()>,
     timeout: Duration,
+}
+// The current clock and the successful refreshes it has served.
+struct Clock {
+    clock: QualifiedClock,
+    refreshes: u32,
 }
 // A dropped refresh, including cancellation at an await, invalidates the old
 // anchor. Declared after the refresh gate, so it drops before the gate unlocks.
 struct InvalidateOnDrop<'a> {
-    clock: &'a Mutex<QualifiedClock>,
+    clock: &'a Mutex<Clock>,
     armed: bool,
 }
 impl Drop for InvalidateOnDrop<'_> {
@@ -41,11 +47,15 @@ impl Drop for InvalidateOnDrop<'_> {
             self.clock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .clock
                 .mark_unavailable();
         }
     }
 }
 impl TimeSampler {
+    /// Successful refreshes one clock instance serves before a refresh replaces it.
+    pub const REFRESHES_PER_CLOCK: u32 = 1000;
+
     pub fn new(
         servers: [(SocketAddr, ServerRoot); 2],
         config: Config,
@@ -62,7 +72,11 @@ impl TimeSampler {
         Ok(Self {
             endpoints: [servers[0].0, servers[1].0],
             roots,
-            clock: Mutex::new(clock),
+            config,
+            clock: Mutex::new(Clock {
+                clock,
+                refreshes: 0,
+            }),
             refresh_gate: tokio::sync::Mutex::new(()),
             timeout,
         })
@@ -94,8 +108,24 @@ impl TimeSampler {
         }
         // Counter reads in update/now are serialized with each other. The
         // update and its post-deadline check publish (or clear) as one operation.
-        let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
-        let result = clock
+        let mut current = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        // Replace the clock before its nonce history fills. One counter reading,
+        // seen by both clocks, carries the rollback floor across; a clock that
+        // has seen a rollback is never replaced. The new clock starts cold.
+        if current.refreshes >= Self::REFRESHES_PER_CLOCK {
+            let floor = Fixed(counter.ticks());
+            if current.clock.now(&floor) != Err(Unavailable::Counter) {
+                let mut clock =
+                    QualifiedClock::new(self.roots, self.config).map_err(|_| TimeError)?;
+                let _ = clock.now(&floor);
+                *current = Clock {
+                    clock,
+                    refreshes: 0,
+                };
+            }
+        }
+        let result = current
+            .clock
             .update(
                 &[
                     Sample {
@@ -119,10 +149,11 @@ impl TimeSampler {
         // timeout_at cannot preempt synchronous verification. A late success
         // must never become visible to another reader even briefly.
         if tokio::time::Instant::now() >= deadline {
-            clock.mark_unavailable();
+            current.clock.mark_unavailable();
             return Err(TimeError);
         }
         if result.is_ok() {
+            current.refreshes += 1;
             invalidation.armed = false;
         }
         result
@@ -133,7 +164,15 @@ impl TimeSampler {
         self.clock
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .clock
             .now(counter)
+    }
+}
+
+struct Fixed(u64);
+impl Counter for Fixed {
+    fn ticks(&self) -> u64 {
+        self.0
     }
 }
 

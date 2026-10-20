@@ -9,12 +9,16 @@ makes a hosted access approval or establishes private-audience membership.
 
 The descriptor uses `bh-sync::OpaqueEvent`: 32-byte ciphertext commitment followed
 by a 992-byte encrypted binding, yielding a 1024-byte envelope and 1062-byte
-framed event. The separately transported body is padded to 1024, 4096, 16384 or
-65536 bytes. Both encryptions use native libsodium XChaCha20-Poly1305 with random
+framed event. The separately transported body is padded to 1024, 4096, 16384,
+65536, 262144, 1048576 or 4194304 bytes (`bh_sync::BODY_SIZES`); envelopes keep
+`bh_sync::ENVELOPE_SIZES` (at most 65536) and this codec always writes 1024. A
+body adds 46 bytes to its payload (nonce, tag, kind and length), so a 1 MiB body
+holds up to 1048530 payload bytes. Both encryptions use native libsodium XChaCha20-Poly1305 with random
 24-byte nonces. The body commitment hashes its exact ciphertext, nonce, tag and
 size under `bh/payload-object/v1\0`; its signature binds that commitment,
 author/device/account head, both author-seen heads, event/base/audience/epoch,
-class, size, protocol version and capability. Its signed fields are encrypted
+class, size, protocol version and capability, and from version 2 the hosting
+receipt for the author's observed head. Its signed fields are encrypted
 under an independent metadata root, not exposed in the ordinary event framing.
 The content root never opens metadata/control bindings; the metadata root never
 opens note bodies. After genesis, **every** binding requires the supplied metadata
@@ -31,17 +35,57 @@ bytes for external signing; `finish` checks the signature and returns the origin
 and base ID. `verify_genesis` checks the original against that account at the named
 head and M, returning the base ID, author and M/K_e key IDs without needing K_e.
 `History::with_account` and `History::replay_with_account` start from that same
-anchored account snapshot. Later
+anchored account snapshot, plus the independently pinned hosting root that
+certifies receipt keys (`verify_genesis` needs no root: genesis has no receipt).
+Later
 events bind the final base ID; other control events use the device's second key.
 Only signed account genesis, device
 addition and self-removal are recognised in this slice; an outer control signature
 cannot mutate account history. Self-removal closes this fixed content epoch.
 No replacement-epoch, metadata-key distribution/rotation, private audience,
 seals, delayed removals, snapshots or body upload/read protocol is implemented.
-The version-1 encoder writes `(1,1)`; the verifier also recognises signed `(1,2)`
-as capability only and refuses an independently remembered higher event-version
-floor. A signed v2 binding is paused for unsupported semantics, not interpreted as
-version 1.
+Version 1 is the base genesis only; its signed fields are 346 bytes and its bytes
+are unchanged (`tests/fixtures/genesis-v1.txt` pins a complete genesis and its
+base ID). Every later event is version 2: the encoder writes `(2,2)` and appends
+the 300-byte `bh_sync::receipt` observed-head receipt for `seen` to the signed
+fields (646 bytes). The verifier requires that receipt to verify under the pinned
+hosting root for this base, with a head exactly equal to `seen`. A zeroed, wrong,
+foreign-root or mismatched receipt is rejected, never awaited, because the
+receipt carries its own root-signed certificate; without a pinned root a later
+event pauses as unavailable (local configuration, not evidence). A receipt that
+does verify but names another hash at a position this device verified is the
+service contradicting itself: an integrity stop, whoever carries it. A v1 event
+after genesis is rejected; an invalid genesis is an integrity stop. A higher
+signed capability is accepted; a signed v3 binding is paused for unsupported
+semantics, not interpreted as v2. A remembered event-version floor applies to
+events after genesis only, so a device that has accepted v2 events still opens
+its v1 genesis; a higher floor rejects v2.
+
+After genesis, an invalid submission under this protocol (an original that does
+not open or verify, a false claim about what its author had seen, an inactive
+author, a reused event ID, a signed body size or commitment other than the
+bytes the descriptor names, a malformed body or payload, an invalid account
+control) is `Rejected`: `prepare` returns a rejected event
+(`PreparedEvent::is_rejected`), and consuming it advances the chain with no
+content, account or floor effect (`AppliedKind::Rejected`). Only evidence
+against independently verified history stops: an order that does not continue
+the verified head, body bytes other than the ordered descriptor names, a verified
+receipt contradicting a verified head, or an invalid genesis. A metadata or
+content root other than the base's is a key this device lacks: it waits. An
+authentic event for an audience other than the base's ordinary one pauses as
+unsupported.
+Measured v2 sizes for a small note edit: 1024-byte envelope (1062 framed) and
+1024-byte body. The receipt fits inside the existing 952-byte binding plaintext
+(646 signed + 64 signature + zero padding), so no larger envelope class is used.
+
+A note payload is `note_id[32] || writer[99] || update`: the note's ID, the
+producing writer's `DeviceWriterDeclaration` and the Yjs v1 update
+(`note_payload` builds it). A payload too short for both is rejected; a
+declaration of an unsupported version or author tag pauses as unsupported.
+History only decodes the declaration. `AppliedEvent::writer()` returns it and
+`AppliedEvent::author()` the verified signer's account and device (None for a
+rejected submission), so the
+note owner can decide whether the declaration binds that author.
 
 `History::inspect` verifies a descriptor, original signature and historical heads
 without fetching a note body. `History::prepare(&mut self, ordered, descriptor,
@@ -74,31 +118,52 @@ before exposing accepted Note state.
 Cold Note loading is a separate store load path (local checkpoint plus per-note
 tail), not an O(delta) promise for a cache miss.
 
+`History::consume_unapplied(&mut self, prepared) -> Result<AppliedEvent,
+ConsumeError>` is the note owner's path: it advances against the exact
+predecessor and touches no Note. A note event is `NoteAccepted { delta }`
+unless its delta is not a Yjs v1 update (`NoteRejected`); whether it
+integrates is the owner's judgement on its own accepted state.
+
 `History::consume(&mut self, prepared, Option<NoteTarget>) ->
 Result<AppliedEvent, ConsumeError>` remains the older compatibility API. It
 compares the same predecessor and applies on a disposable full-state copy before
 advancing History; it is not the device-store per-event path.
 `kind()` distinguishes `NoteAccepted { note_id, delta }` (a wiped-on-drop
-`SecretBytes` with `expose()`), `NoteRejected { note_id }` (no delta), and
-`Control` (no Note). `outcome()` preserves the accepted/rejected classification.
+`SecretBytes` with `expose()`), `NoteRejected { note_id }` (no delta),
+`Control` (no Note) and `Rejected` (an invalid submission). `outcome()` preserves the accepted/rejected classification.
 Debug formatting never prints decrypted content. A stale or wrong local selection
 consumes the value but changes neither history nor Note and is not a remote
 integrity stop. An identical independently trusted clone of the predecessor may
 consume it; a changed state cannot. Preparation latches a stop on
 `IntegrityStop` without advancing the verified checkpoint. Persist a stop marker
 with the **unchanged prior verified head**, never the failing raw input. On open,
-`History::replay(account_id, account_genesis, base, remembered_floor, metadata,
-content, records)` reconstructs the verified history from independently anchored
+`History::replay(account_id, account_genesis, base, hosting_root, floor_rises,
+metadata, content, records)` reconstructs the verified history from independently anchored
 introductions and roots, re-verifying each `(Commitment, descriptor bytes, body
 bytes)` in order with prepare's checks, then advancing the chain and controls
 without applying Note updates. Supply only **persisted applied originals** to
 replay, never downloaded but unapplied ciphertext; after replay the adapter must
 compare `replay.head()` with its persisted verified cursor so a truncated store
 cannot silently become the new checkpoint. A gap, reorder, duplicate ID, bad
-original/body or wrong anchor refuses replay; a remembered version floor is never
-lowered. After replay, a stored stop marker calls `mark_stopped()`, which only
-restricts future consumption. Replay currently costs O(history) on each open and
-requires retained bodies and roots; no snapshot checkpoint is provided.
+original/body or wrong anchor refuses replay. `floor_rises` are the stored
+`(position, floor)` rises (`AppliedEvent::judged_floor` and `floor`): each event
+is judged under the floor in force when it was ordered, never a later one.
+After replay, a stored stop marker calls `mark_stopped()`, which only
+restricts future consumption. Replay costs O(history) and requires retained
+bodies and roots, so a routine reopen resumes instead.
+
+`History::resume(anchor, base, hosting_root, continuation, account_changes,
+lookup, remembered_floor)` continues from a durable verified continuation
+without replaying anything. A store keeps, per applied event,
+`AppliedEvent::seen()` by position and the first digest per event ID, plus the
+exact verified account events (`AppliedEvent::account_change()`) and the
+latest `AppliedEvent::continuation()`. `HistoryLookup` answers point queries
+for positions and IDs below the continuation, so memory holds only what was
+judged since. Resumed local state that does not reproduce the continuation,
+or a lookup that fails, is `UnavailablePause`; nothing is judged.
+`hosting_root` must be the root pinned when the base was registered, taken
+from its authenticated hosting association, never invented; the device store
+refuses any other (`AppliedEvent::hosting_root()`).
 Unsupported/missing inputs pause, not skip.
 `History::apply` remains an externally known-note compatibility wrapper around
 prepare/consume: a guessed wrong note ID retains its earlier integrity-stop

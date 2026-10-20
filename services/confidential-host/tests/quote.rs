@@ -159,6 +159,29 @@ async fn raw_report_data_and_current_schema_are_unverified() {
     );
 }
 #[tokio::test]
+async fn report_data_from_a_handshake_is_sent_unchanged() {
+    // A channel handshake exposes only its 64-byte report data, never its keys.
+    let dir = tempfile::tempdir().unwrap();
+    let response = serde_json::json!({"quote":"01", "event_log":"[]"});
+    let listener = serve(&dir.path().join("agent.sock"), move || {
+        http("200 OK", response.to_string().as_bytes())
+    })
+    .await;
+    let report = [9; 64];
+    let quote = socket(&dir)
+        .get_quote_for_report(&report, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let request = listener.await.unwrap();
+    let start = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let request_json: serde_json::Value = serde_json::from_slice(&request[start..]).unwrap();
+    assert_eq!(
+        request_json,
+        serde_json::json!({"report_data": hex::encode(report)})
+    );
+    assert_eq!(quote.quote(), &[1]);
+}
+#[tokio::test]
 async fn bad_status_schema_and_truncated_body_refuse() {
     for reply in [
         http("200 OK", b"{}"),

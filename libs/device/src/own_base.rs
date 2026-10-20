@@ -123,7 +123,7 @@ fn historical(prefix: &InitialAccountPrefix) -> Result<VerifiedAccount, OwnBaseE
 /// Reopen both seals provisionally, then verify the exact original genesis and
 /// both committed key ids. No OwnBase (and hence no scoped key access) escapes
 /// before all checks, including current requester authority, have succeeded.
-fn open_record(
+pub(crate) fn open_record(
     record: OwnBaseRecord,
     history: &VerifiedAccount,
     personal: &PersonalKey,
@@ -189,6 +189,32 @@ where
     P: PendingSetupProtector,
 {
     account.verified(&capability)?;
+    // A container that joined by pairing opens its base with the personal
+    // key its addition delivered; it never creates one.
+    let joined = database
+        .lock()
+        .map_err(|_| OwnBaseError::Storage)?
+        .joined()
+        .map_err(|_| OwnBaseError::Storage)?;
+    if let Some(joined) = joined {
+        let (Some(delivery), Some(added_at)) = (joined.delivery, joined.added_at) else {
+            return Err(OwnBaseError::Invalid);
+        };
+        let record = database
+            .lock()
+            .map_err(|_| OwnBaseError::Storage)?
+            .own_base()
+            .map_err(|_| OwnBaseError::Storage)?
+            .ok_or(OwnBaseError::Invalid)?;
+        let personal = account
+            .open_delivered_personal(&capability, &delivery, added_at)
+            .await?;
+        let history = account.verified_at(
+            &capability,
+            crate::join::package_head(&record.initial_key_package)?,
+        )?;
+        return open_record(record, &history, &personal, capability);
+    }
     let prefix = account.initial_prefix(&capability)?;
     let history = historical(&prefix)?;
     let existing = database

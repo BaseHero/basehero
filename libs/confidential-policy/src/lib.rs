@@ -93,6 +93,44 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// Frame exact policy bytes for signing or verification; does not parse or
+/// establish that the policy is usable.
+pub fn signing_message(payload: &[u8]) -> Result<Vec<u8>, Error> {
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return Err(Error::TooLarge);
+    }
+    let mut message = Vec::with_capacity(DOMAIN.len() + payload.len());
+    message.extend_from_slice(DOMAIN);
+    message.extend_from_slice(payload);
+    Ok(message)
+}
+
+impl Policy {
+    /// Offline structural checks only. Empty allowlists are valid withdrawals;
+    /// currentness, availability and measured identity require a live gate.
+    pub fn validate_structure(&self, limits: Limits) -> Result<(), Error> {
+        if limits.max_lifetime_secs == 0 {
+            return Err(Error::Configuration);
+        }
+        if self.version != 1 {
+            return Err(Error::Version);
+        }
+        if self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at > limits.max_lifetime_secs
+        {
+            return Err(Error::Lifetime);
+        }
+        if self
+            .builds
+            .iter()
+            .any(|b| b.boot.iter().any(|m| m.len() != 48))
+        {
+            return Err(Error::Measurements);
+        }
+        Ok(())
+    }
+}
+
 struct Accepted {
     policy: Policy,
     snapshot: Snapshot,
@@ -185,13 +223,8 @@ impl PolicyGate {
         payload: &[u8],
         signature: &[u8],
     ) -> Result<Candidate, Error> {
-        if payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(Error::TooLarge);
-        }
+        let message = signing_message(payload)?;
         let signature: &[u8; 64] = signature.try_into().map_err(|_| Error::Signature)?;
-        let mut message = Vec::with_capacity(DOMAIN.len() + payload.len());
-        message.extend_from_slice(DOMAIN);
-        message.extend_from_slice(payload);
         bh_crypto::verify(&self.root, &message, signature).map_err(|_| Error::Signature)?;
         let policy: Policy = serde_json::from_slice(payload).map_err(|_| {
             self.mark_unavailable();
@@ -316,21 +349,7 @@ impl PolicyGate {
             .as_ref()
             .ok_or(Error::PolicyUnavailable)?
             .policy;
-        if policy.version != 1 {
-            return Err(Error::Version);
-        }
-        if policy.expires_at <= policy.issued_at
-            || policy.expires_at - policy.issued_at > self.limits.max_lifetime_secs
-        {
-            return Err(Error::Lifetime);
-        }
-        if policy
-            .builds
-            .iter()
-            .any(|b| b.boot.iter().any(|m| m.len() != 48))
-        {
-            return Err(Error::Measurements);
-        }
+        policy.validate_structure(self.limits)?;
         if earliest < policy.issued_at {
             return Err(Error::NotYetValid);
         }

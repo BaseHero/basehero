@@ -1,10 +1,13 @@
 //! Classification for the versioned note inventory shared with the bundled
 //! editor. Never use this to reject storage of an unknown canonical Yjs update.
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 use serde_json::Value;
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 use yrs::types::xml::XmlOut;
-use yrs::updates::decoder::Decode;
-use yrs::{Doc, Out, ReadTxn, Text, Transact, Update, Xml, XmlFragment};
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
+use yrs::{Doc, Out, ReadTxn, Text, Transact, Xml, XmlFragment};
 
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 fn inventory() -> Value {
     serde_json::from_str(include_str!("../../../note-schema/v1.json"))
         .expect("checked static note schema")
@@ -12,6 +15,7 @@ fn inventory() -> Value {
 
 /// Inventory nodes without a children rule are ProseMirror leaves (one
 /// position, such as a hard break); every other element has open and close.
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 pub(crate) fn is_leaf(tag: &str) -> bool {
     static LEAVES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     LEAVES
@@ -32,6 +36,7 @@ pub(crate) fn is_leaf(tag: &str) -> bool {
         .any(|leaf| leaf == tag)
 }
 
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 fn value_matches(rule: &Value, value: &Value) -> bool {
     if let Some(choices) = rule.get("enum").and_then(Value::as_array) {
         return choices.contains(value);
@@ -54,16 +59,19 @@ fn value_matches(rule: &Value, value: &Value) -> bool {
     }
     false
 }
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 fn attribute_matches(rules: &Value, name: &str, value: &yrs::Any) -> bool {
     rules.get(name).is_some_and(|rule| {
         serde_json::to_value(value).is_ok_and(|value| value_matches(rule, &value))
     })
 }
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 fn permits(parent: &str, child: &str, spec: &Value) -> bool {
     spec["children"][parent]
         .as_array()
         .is_some_and(|children| children.iter().any(|name| name.as_str() == Some(child)))
 }
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
 fn supported<T: ReadTxn>(node: XmlOut, parent: &str, txn: &T, spec: &Value) -> bool {
     match node {
         XmlOut::Text(text) => {
@@ -113,23 +121,39 @@ fn supported<T: ReadTxn>(node: XmlOut, parent: &str, txn: &T, spec: &Value) -> b
 
 /// This is a UI compatibility check, never a condition for keeping a note in
 /// storage. An unsupported note remains intact and must not be editor-bound.
+#[cfg(not(target_family = "wasm"))]
 pub fn classify_note(bytes: &[u8]) -> Result<bool, crate::note::NoteError> {
-    let update = Update::decode_v1(bytes).map_err(crate::note::NoteError::Decode)?;
-    let doc = Doc::new();
-    doc.transact_mut()
-        .apply_update(update)
-        .map_err(crate::note::NoteError::Apply)?;
-    let txn = doc.transact();
-    let Some(fragment) = txn.get_xml_fragment("default") else {
-        return Ok(true);
-    };
-    let spec = inventory();
-    // children() stops at the first primitive in an XML sequence; get()
-    // returns None there. Visit every array position so later content cannot
-    // conceal an unsupported child from the editor compatibility gate.
-    Ok((0..fragment.len(&txn)).all(|index| {
-        fragment
-            .get(&txn, index)
-            .is_some_and(|child| supported(child, "default", &txn, &spec))
-    }))
+    crate::contained::classify_note(bytes)
+}
+#[cfg(target_family = "wasm")]
+pub use native::classify_note;
+
+#[cfg(any(target_family = "wasm", feature = "native-oracle"))]
+pub mod native {
+    use super::*;
+
+    /// [`super::classify_note`], run by the engine itself.
+    pub fn classify_note(bytes: &[u8]) -> Result<bool, crate::note::NoteError> {
+        let update = crate::note::native::decode(bytes)?;
+        let doc = Doc::with_options(yrs::Options::with_guid_and_client_id(
+            "classify".into(),
+            yrs::ClientID::new(crate::note::native::READER_REPLICA),
+        ));
+        doc.transact_mut()
+            .apply_update(update)
+            .map_err(crate::note::NoteError::Apply)?;
+        let txn = doc.transact();
+        let Some(fragment) = txn.get_xml_fragment("default") else {
+            return Ok(true);
+        };
+        let spec = inventory();
+        // children() stops at the first primitive in an XML sequence; get()
+        // returns None there. Visit every array position so later content cannot
+        // conceal an unsupported child from the editor compatibility gate.
+        Ok((0..fragment.len(&txn)).all(|index| {
+            fragment
+                .get(&txn, index)
+                .is_some_and(|child| supported(child, "default", &txn, &spec))
+        }))
+    }
 }

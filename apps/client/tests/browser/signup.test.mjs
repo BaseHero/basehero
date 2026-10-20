@@ -78,13 +78,14 @@ for (const engine of browserMatrix) {
         ipc.handle('note_binding',()=>bound?{note:Array(32).fill(4),surface:'1'}:null);
         ipc.handle('account_screen',()=>({screen:'ready'}));
         ipc.handle('account_open_note',()=>{bound=true;return null;});
-        ipc.handle('note_open',()=>({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:6,sequence:0}));
+        ipc.handle('note_open',()=>({clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:6,sequence:0}));
         ipc.handle('note_commit',args=>({requestId:args.requestId}));
         ipc.handle('note_close',()=>null);
       }]});
       await page.locator('.ProseMirror').waitFor();
       const commands=await page.evaluate(()=>window.__bhIpc.calls.map(c=>c.command).filter(c=>!c.startsWith('update_')));
-      assert.deepEqual(commands.slice(0,5),['note_binding','account_screen','account_open_note','note_binding','note_open']);
+      // The bound page asks for its account's status once it holds its page.
+      assert.deepEqual(commands.slice(0,6),['note_binding','account_screen','account_open_note','note_binding','sync_status','note_open']);
       assert.equal(await page.getByRole('heading',{name:'Choose your password'}).count(),0);
       await page.close();
     }finally{await browser.close();await server.close();}
@@ -134,7 +135,7 @@ for (const engine of browserMatrix) {
         const ipc=window.__bhIpc;
         let screen={screen:'welcome'};
         ipc.handle('note_binding',()=>screen.screen==='note'?{note:Array(32).fill(3),surface:'1'}:null);
-        ipc.handle('note_open',()=>({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:3,sequence:0}));
+        ipc.handle('note_open',()=>({clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:3,sequence:0}));
         ipc.handle('note_commit',args=>({requestId:args.requestId}));
         ipc.handle('note_close',()=>null);
         ipc.handle('account_screen',()=>screen);

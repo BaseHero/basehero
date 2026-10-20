@@ -5,7 +5,30 @@ use bh_event::{
     Binding, CLASS_CONTROL, GENESIS, History, Outcome, Payload, key_id, prepare_genesis, seal,
     verify_genesis,
 };
-use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent};
+use bh_sync::receipt::{self, RECEIPT_LEN};
+use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent, Route};
+
+/// A pinned hosting root and the receipt key it certifies.
+struct Hosting {
+    root: SigningKey,
+    key: SigningKey,
+}
+impl Hosting {
+    fn new() -> Self {
+        Self {
+            root: SigningKey::generate(),
+            key: SigningKey::generate(),
+        }
+    }
+    fn receipt(&self, base: BaseId, head: Head) -> [u8; RECEIPT_LEN] {
+        let certificate = receipt::verify_certificate(
+            &self.root.public(),
+            &receipt::certify(&self.root, self.key.public()),
+        )
+        .unwrap();
+        receipt::sign(&certificate, &self.key, base, head).unwrap()
+    }
+}
 
 fn make_account(
     signing: &SigningKey,
@@ -52,8 +75,10 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
     assert_eq!(verified.account_head, account.head());
     assert_eq!(verified.metadata_key_id, key_id(&m));
     assert_eq!(verified.content_key_id, key_id(&epoch));
-    let mut history = History::with_account(&account, base, 1).unwrap();
-    let ordered = Commitment::order(base, Head::EMPTY, &encoded.descriptor).unwrap();
+    let hosting = Hosting::new();
+    let mut history = History::with_account(&account, base, hosting.root.public(), 1).unwrap();
+    let ordered =
+        Commitment::order(base, Head::EMPTY, &encoded.descriptor, Route::Control).unwrap();
     let prepared = history
         .prepare(&ordered, &encoded.descriptor, Some(&encoded.body), &m, None)
         .unwrap();
@@ -62,19 +87,26 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
     // the older account head for the introduction's head.
     let old_account = VerifiedAccount::from_genesis(account.id(), &first).unwrap();
     assert!(verify_genesis(&old_account, &encoded.descriptor, &encoded.body, &m, 1).is_err());
-    let mut older = History::new(account.id(), &first, base, 1).unwrap();
+    let mut older = History::new(account.id(), &first, base, hosting.root.public(), 1).unwrap();
     assert!(matches!(
         older.prepare(&ordered, &encoded.descriptor, Some(&encoded.body), &m, None),
         Err(Outcome::IntegrityStop)
     ));
     let transition = history.materialize(prepared, None).unwrap().transition;
     history.publish_committed(transition).unwrap();
-    let mut data = vec![7; 32];
-    data.extend(Note::new().append_paragraph("hello"));
+    let data = bh_event::note_payload(
+        [7; 32],
+        bh_event::writer::DeviceWriterDeclaration {
+            account: account.id().0,
+            device: device.0,
+            nonce: [1; 32],
+        },
+        &Note::new().unwrap().append_paragraph("hello").unwrap(),
+    );
     let note = seal(
         Binding {
-            version: 1,
-            highest: 1,
+            version: 2,
+            highest: 2,
             mode: 0,
             base: base.0,
             audience: [0; 32],
@@ -88,6 +120,7 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
             class: bh_event::CLASS_CONTENT,
             padded: 0,
             commitment: [0; 32],
+            seen_receipt: hosting.receipt(base, history.head()),
         },
         Payload {
             kind: bh_event::NOTE,
@@ -98,11 +131,13 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
         Some(&epoch),
     )
     .unwrap();
-    let note_order = Commitment::order(base, history.head(), &note.descriptor).unwrap();
+    let note_order =
+        Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
     let replay = History::replay_with_account(
         &account,
         base,
-        1,
+        hosting.root.public(),
+        &[],
         &m,
         Some(&epoch),
         [
@@ -156,7 +191,8 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
         &Secret::<32>::random(),
         1,
     );
-    refuses(&account, &encoded.descriptor, &encoded.body, &m, 2);
+    // Genesis is version 1 forever: a remembered later-event floor still opens it.
+    assert!(verify_genesis(&account, &encoded.descriptor, &encoded.body, &m, 2).is_ok());
     let (other, _, _) = make_account(&SigningKey::generate(), &SigningKey::generate());
     refuses(&other, &encoded.descriptor, &encoded.body, &m, 1);
     let mut bad_body = encoded.body.clone();
@@ -187,6 +223,7 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
         class: CLASS_CONTROL,
         padded: 0,
         commitment: [0; 32],
+        seen_receipt: [0; RECEIPT_LEN],
     };
     let mut data = Vec::new();
     data.extend(account.id().0);
@@ -235,6 +272,8 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
     data[72] = 0;
     let non_genesis = seal(
         Binding {
+            version: 2,
+            highest: 2,
             mode: 0,
             base: base.0,
             ..binding
@@ -260,25 +299,31 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
         None,
     )
     .unwrap();
-    let mut history = History::with_account(&account, base, 1).unwrap();
-    let order = Commitment::order(base, Head::EMPTY, &encoded.descriptor).unwrap();
+    let mut history =
+        History::with_account(&account, base, Hosting::new().root.public(), 1).unwrap();
+    let order = Commitment::order(base, Head::EMPTY, &encoded.descriptor, Route::Control).unwrap();
     let prepared = history
         .prepare(&order, &encoded.descriptor, Some(&encoded.body), &m, None)
         .unwrap();
     history
         .publish_committed(history.materialize(prepared, None).unwrap().transition)
         .unwrap();
-    let second_order = Commitment::order(base, history.head(), &second.descriptor).unwrap();
-    assert!(matches!(
-        history.prepare(
-            &second_order,
-            &second.descriptor,
-            Some(&second.body),
-            &m,
-            None
-        ),
-        Err(Outcome::IntegrityStop)
-    ));
+    let second_order =
+        Commitment::order(base, history.head(), &second.descriptor, Route::Control).unwrap();
+    // A second genesis after the first is an invalid submission, not a fork.
+    assert!(
+        history
+            .prepare(
+                &second_order,
+                &second.descriptor,
+                Some(&second.body),
+                &m,
+                None
+            )
+            .unwrap()
+            .is_rejected()
+    );
+    assert!(!history.is_stopped());
     let remove = account.remove_self(device).unwrap();
     let remove = remove.finish(control.sign(remove.signing_bytes())).unwrap();
     let mut inactive = account.clone();
@@ -325,7 +370,7 @@ fn stopped_creator_account_refuses_genesis_even_at_its_last_verified_head() {
     assert!(account.is_stopped());
     assert_eq!(account.head(), head);
     assert!(prepare_genesis(&account, device, &m, &epoch).is_err());
-    assert!(History::with_account(&account, base, 1).is_err());
+    assert!(History::with_account(&account, base, Hosting::new().root.public(), 1).is_err());
     assert_eq!(
         verify_genesis(&account, &encoded.descriptor, &encoded.body, &m, 1).err(),
         Some(Outcome::IntegrityStop)

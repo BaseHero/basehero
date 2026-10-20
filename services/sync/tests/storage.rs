@@ -636,8 +636,8 @@ fn real_event_sealed_body_reference_matches_and_stages() {
     let content = Secret::from_slice(&[6; 32]).unwrap();
     let signer = SigningKey::from_seed(&Secret::from_slice(&[7; 32]).unwrap());
     let signed = bh_event::Binding {
-        version: 1,
-        highest: 1,
+        version: 2,
+        highest: 2,
         mode: 0,
         base: [1; 32],
         audience: [2; 32],
@@ -654,6 +654,8 @@ fn real_event_sealed_body_reference_matches_and_stages() {
         class: bh_event::CLASS_CONTENT,
         padded: 0,
         commitment: [0; 32],
+        // Packaging only: the hosted store never opens the binding.
+        seen_receipt: [0; bh_sync::receipt::RECEIPT_LEN],
     };
     let encoded = bh_event::seal(
         signed,

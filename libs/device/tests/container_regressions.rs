@@ -100,7 +100,10 @@ fn unanchored_container_with_pending_note_work_is_not_empty() {
         .apply_local_update(
             key,
             [4; 16],
-            &bh_core::note::Note::new().append_paragraph("unsent"),
+            &bh_core::note::Note::new()
+                .unwrap()
+                .append_paragraph("unsent")
+                .unwrap(),
         )
         .unwrap();
     assert!(

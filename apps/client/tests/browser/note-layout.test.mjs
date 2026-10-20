@@ -12,7 +12,7 @@ function layoutHost() {
   let current = id(1), surface = 0;
   window.__bhSidebar ??= true;
   ipc.handle("note_binding", () => ({ note: current, surface: String(++surface) }));
-  ipc.handle("note_open", () => ({ clientId: 2002468231004600, writerToken: id(9), state: [0, 0], generation: 7, sequence: 0 }));
+  ipc.handle("note_open", () => ({ clientId: 2002468231004600, writerToken: id(9), updates: [[0, 0]], generation: 7, sequence: 0 }));
   ipc.handle("note_commit", ({ requestId }) => ({ requestId }));
   ipc.handle("note_close", () => null);
   ipc.handle("note_selection", () => []);
@@ -23,6 +23,8 @@ function layoutHost() {
   ]);
   ipc.handle("note_show", ({ note }) => { current = note; return null; });
   ipc.handle("note_create", () => id(4));
+  // A local-only build: its notes stay on this device.
+  ipc.handle("sync_status", () => ({ revision: 1, state: "saved-local", pending: 0, network: "off", home: null, account: "active", confirm: false }));
   ipc.handle("note_new_window", () => null);
   ipc.handle("window_sidebar", ({ shown }) => {
     if (typeof shown === "boolean") window.__bhSidebar = shown;

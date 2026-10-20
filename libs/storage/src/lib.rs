@@ -3,15 +3,21 @@
 //! This adapter stores the device's local note deltas, pending-work references,
 //! each sealed pending outbound package and its exact ordered acknowledgement,
 //! and the typed opaque account journal (anchor, signed events, head, sticky
-//! stop, device identity, pending setup). The native app holds a database when
+//! stop, device identity, pending setup), and incoming sync state: each log's
+//! verified progress and each note's accepted state, kept apart from pending
+//! local work (see `sync_state`). The native app holds a database when
 //! a session installs one; no production session supplies a note binding yet.
 //! Pending local work is not an authenticated network event. Authority and
 //! rebuildable indexes stay apart.
 
 pub mod account;
 mod catalogue;
+pub mod held_notes;
+pub mod joined;
 pub mod note_writers;
 pub mod own_base;
+mod runs;
+pub mod sync_state;
 pub use catalogue::{MAX_NOTE_PAGE, MAX_NOTE_TITLE, NoteEntry};
 mod view_records;
 pub use view_records::ViewRecord;
@@ -29,7 +35,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bh_core::{LOCAL_DATA_VERSION, check_local_data_version, note::Note};
+use bh_core::{
+    LOCAL_DATA_VERSION, check_local_data_version,
+    note::{Note, OrderedState},
+};
 use bh_sync::{BodyObject, Commitment, EventId, OpaqueEvent, referenced_body};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
@@ -59,21 +68,19 @@ pub struct DeviceDatabase {
     tick: u64,
     data_version: u32,
 }
-// Resident Yrs Notes measured roughly 2.7–3.7x encoded bytes, plus
-// ~2.7 KiB per tiny Note. This is an approximate per-container budget,
-// not an exact heap cap; borrowed entries carry *unscaled* encoded weight.
-const NOTE_CACHE_OVERHEAD: usize = 4 * 1024;
-const NOTE_CACHE_ENCODED_MULTIPLIER: usize = 3;
-fn cache_weight(encoded: usize) -> usize {
-    encoded
-        .max(1)
-        .saturating_mul(NOTE_CACHE_ENCODED_MULTIPLIER)
-        .saturating_add(NOTE_CACHE_OVERHEAD)
+// Charge allocated guest linear memory, including its retained high-water mark,
+// plus a conservative 256 KiB allowance for each host Store/instance, handles,
+// and cache entry. The shared compiled module is not per-note. This is a cache
+// policy, NOT measured RSS or a process-memory cap (working Notes are excluded).
+const NOTE_CACHE_OVERHEAD: usize = 256 * 1024;
+fn cache_weight(note: &Note) -> Result<usize, bh_core::note::NoteError> {
+    Ok(note.memory_bytes()?.saturating_add(NOTE_CACHE_OVERHEAD))
 }
 struct CachedNote {
     note: Note,
     frontier: i64,
-    // Encoded-equivalent bytes plus fixed heap overhead, not an exact heap size.
+    // Replay bytes are caller bookkeeping, never a proxy for resident memory.
+    encoded_weight: usize,
     weight: usize,
     last: u64,
 }
@@ -93,6 +100,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid note update")]
     InvalidUpdate,
+    #[error("local note engine unavailable; durable state retained")]
+    NoteUnavailable,
     #[error("note is absent from the ordinary local catalogue")]
     MissingNote,
     #[error("note title exceeds the preview limit")]
@@ -133,6 +142,27 @@ pub enum StoreError {
     CorruptOwnBase,
     #[error("invalid or unavailable writer reservation")]
     InvalidWriter,
+    #[error("log is stopped by a proven contradiction")]
+    LogStopped,
+    #[error("batch does not continue the stored log progress")]
+    StaleProgress,
+    #[error("stored sync state is inconsistent")]
+    CorruptSyncState,
+    #[error("log has no registered continuation")]
+    MissingProgress,
+    #[error("another hosting root is pinned for this log")]
+    RootConflict,
+    #[error("publishing is stopped by a local alarm")]
+    PublishingStopped,
+}
+
+impl From<bh_core::note::NoteError> for StoreError {
+    fn from(error: bh_core::note::NoteError) -> Self {
+        match error {
+            bh_core::note::NoteError::Unavailable => Self::NoteUnavailable,
+            _ => Self::InvalidUpdate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,9 +183,14 @@ pub struct PendingNoteUpdate {
 }
 /// Seal `pending` with native authority only after releasing the owner/DB
 /// guards, then CAS-persist these exact bytes with publish_note_package.
+/// `pending` is the run it covers merged into one update, keyed by the
+/// run's last update.
 pub struct PackageCandidate {
     pub event_id: EventId,
     pub pending: PendingNoteUpdate,
+    /// The pending updates the package covers, oldest first; the last is
+    /// `pending.update_id`.
+    covers: Vec<i64>,
 }
 pub enum PackagePreparation {
     Existing(StoredNotePackage),
@@ -295,14 +330,11 @@ impl DeviceDatabase {
     pub fn take_cached_note(&mut self, key: NoteKey, frontier: i64) -> Option<(Note, usize)> {
         let entry = self.notes.remove(&key)?;
         self.cache_bytes = self.cache_bytes.saturating_sub(entry.weight);
-        (entry.frontier == frontier).then(|| {
-            (
-                entry.note,
-                entry.weight.saturating_sub(NOTE_CACHE_OVERHEAD) / NOTE_CACHE_ENCODED_MULTIPLIER,
-            )
-        })
+        (entry.frontier == frontier).then_some((entry.note, entry.encoded_weight))
     }
     /// Only a successfully committed or unchanged Note may re-enter this cache.
+    /// Retention is best-effort: a failed host memory query drops the instance,
+    /// never changes a committed save into an error or suppresses its Ack.
     pub fn return_committed_note(
         &mut self,
         key: NoteKey,
@@ -311,14 +343,20 @@ impl DeviceDatabase {
         encoded_weight: usize,
     ) {
         self.forget_note(key);
+        let Ok(weight) = cache_weight(&note) else {
+            return;
+        };
+        if weight > self.cache_budget {
+            return;
+        }
         self.tick = self.tick.checked_add(1).expect("LRU counter exhausted");
-        let weight = cache_weight(encoded_weight);
         self.cache_bytes = self.cache_bytes.saturating_add(weight);
         self.notes.insert(
             key,
             CachedNote {
                 note,
                 frontier,
+                encoded_weight,
                 weight,
                 last: self.tick,
             },
@@ -326,36 +364,31 @@ impl DeviceDatabase {
         self.evict_clean();
     }
 
+    // Reads can allocate too. Reweigh after the operation, before retaining the
+    // instance. A metric failure affects caching only, not an already read value
+    // or committed write. Failed engine operations separately discard the Note.
+    fn refresh_note_charge(&mut self, key: NoteKey) {
+        if let Some(entry) = self.notes.get_mut(&key) {
+            match cache_weight(&entry.note) {
+                Ok(weight) if weight <= self.cache_budget => {
+                    self.cache_bytes = self
+                        .cache_bytes
+                        .saturating_sub(entry.weight)
+                        .saturating_add(weight);
+                    entry.weight = weight;
+                }
+                _ => self.forget_note(key),
+            }
+        }
+        self.evict_clean();
+    }
+
     fn load_note(&mut self, key: NoteKey) -> Result<&mut Note, StoreError> {
         if !self.notes.contains_key(&key) {
-            let checkpoint:Option<(i64,Vec<u8>)>=self.connection.query_row(
-                "SELECT local_frontier,encoded_yjs FROM note_checkpoints WHERE base=?1 AND audience=?2 AND note=?3",
-                params![key.base.as_slice(),key.audience.as_slice(),key.note.as_slice()],
-                |r|Ok((r.get(0)?,r.get(1)?)),
-            ).optional()?;
-            let (covered, encoded) = checkpoint.unwrap_or((0, Vec::new()));
-            let mut stmt = self.connection.prepare_cached(
-                "SELECT delta FROM note_updates WHERE base=?1 AND audience=?2 AND note=?3 AND id>?4 ORDER BY id",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    key.base.as_slice(),
-                    key.audience.as_slice(),
-                    key.note.as_slice(),
-                    covered
-                ],
-                |r| r.get::<_, Vec<u8>>(0),
-            )?;
-            let mut note = Note::new();
-            if !encoded.is_empty() {
-                note.apply_update(&encoded)
-                    .map_err(|_| StoreError::InvalidUpdate)?;
-            }
-            for row in rows {
-                note.apply_update(&row?)
-                    .map_err(|_| StoreError::InvalidUpdate)?;
-            }
-            let weight = cache_weight(note.state().len());
+            let ordered = self.note_ordered(key)?;
+            let note = Note::from_ordered(&ordered)?;
+            let encoded_weight = ordered.segments().iter().map(Vec::len).sum();
+            let weight = cache_weight(&note)?;
             let frontier = self.local_frontier(key)?;
             self.cache_bytes = self.cache_bytes.saturating_add(weight);
             self.notes.insert(
@@ -363,6 +396,7 @@ impl DeviceDatabase {
                 CachedNote {
                     note,
                     frontier,
+                    encoded_weight,
                     weight,
                     last: self.tick,
                 },
@@ -374,10 +408,46 @@ impl DeviceDatabase {
         Ok(&mut entry.note)
     }
 
+    /// The checkpoint's ordered updates, then every later row: reopening
+    /// them in this order gives the note's integrated structure.
+    pub fn note_ordered(&self, key: NoteKey) -> Result<OrderedState, StoreError> {
+        let checkpoint:Option<(i64,Vec<u8>)>=self.connection.query_row(
+            "SELECT local_frontier,encoded_yjs FROM note_checkpoints WHERE base=?1 AND audience=?2 AND note=?3",
+            params![key.base.as_slice(),key.audience.as_slice(),key.note.as_slice()],
+            |r|Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let (covered, encoded) = checkpoint.unwrap_or((0, Vec::new()));
+        let mut ordered = OrderedState::decode(&encoded).map_err(|_| StoreError::InvalidUpdate)?;
+        let mut stmt = self.connection.prepare_cached(
+            "SELECT delta FROM note_updates WHERE base=?1 AND audience=?2 AND note=?3 AND id>?4 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                key.base.as_slice(),
+                key.audience.as_slice(),
+                key.note.as_slice(),
+                covered
+            ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?;
+        for row in rows {
+            ordered.push(row?);
+        }
+        Ok(ordered)
+    }
+
     pub fn note_state(&mut self, key: NoteKey) -> Result<Vec<u8>, StoreError> {
-        let state = self.load_note(key)?.state();
-        self.evict_clean();
-        Ok(state)
+        let state = self
+            .load_note(key)
+            .and_then(|note| note.state().map_err(StoreError::from));
+        if state.is_err() {
+            // A trapped read poisoned the working instance, not its durable
+            // prefix. Retry must rebuild rather than keep that dead cache entry.
+            self.forget_note(key);
+        } else {
+            self.refresh_note_charge(key);
+        }
+        state
     }
 
     /// The *same local request* can be retried without inserting duplicate work.
@@ -395,7 +465,7 @@ impl DeviceDatabase {
         if result.is_err() {
             self.forget_note(key);
         } else {
-            self.evict_clean();
+            self.refresh_note_charge(key);
         }
         result
     }
@@ -584,14 +654,7 @@ impl DeviceDatabase {
                 replayed: true,
             });
         }
-        self.load_note(key)?
-            .apply_update(bytes)
-            .map_err(|_| StoreError::InvalidUpdate)?;
-        if let Some(entry) = self.notes.get_mut(&key) {
-            let growth = bytes.len().saturating_mul(NOTE_CACHE_ENCODED_MULTIPLIER);
-            entry.weight = entry.weight.saturating_add(growth);
-            self.cache_bytes = self.cache_bytes.saturating_add(growth);
-        }
+        self.load_note(key)?.apply_update(bytes)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -618,6 +681,10 @@ impl DeviceDatabase {
         )?;
         catalogue::touch(&tx, key, None)?;
         tx.commit()?;
+        if let Some(entry) = self.notes.get_mut(&key) {
+            entry.frontier = id;
+            entry.encoded_weight = entry.encoded_weight.saturating_add(bytes.len());
+        }
         Ok(LocalCommit {
             update_id: id,
             replayed: false,
@@ -626,31 +693,55 @@ impl DeviceDatabase {
 
     /// Phase 1: release the database guard after this call. The native issuer
     /// seals immutable bytes outside all DB/owner guards; the prepared id is
-    /// never submitted until phase 2 succeeds.
+    /// never submitted until phase 2 succeeds. The package covers the note's
+    /// first bounded uncovered pending run through `update_id`, which
+    /// must be one writer's (or a single update); an update already covered
+    /// returns its package.
     pub fn prepare_note_package(&self, update_id: i64) -> Result<PackagePreparation, StoreError> {
+        if sync_state::publishing_stopped(&self.connection)? {
+            return Err(StoreError::PublishingStopped);
+        }
         if let Some(existing) = read_package(&self.connection, update_id)? {
             return Ok(PackagePreparation::Existing(existing));
         }
-        let row=self.connection.query_row(
-            "SELECT u.base,u.audience,u.note,u.delta FROM note_updates u JOIN pending_note_work p ON p.update_id=u.id WHERE u.id=?1",
-            [update_id],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?)),
-        ).optional()?.ok_or(StoreError::MissingPending)?;
+        let key = runs::update_key(&self.connection, update_id)?;
+        if let Some(package) = runs::covering(&self.connection, update_id)? {
+            let existing = read_package(&self.connection, package)?;
+            return existing
+                .map(PackagePreparation::Existing)
+                .ok_or(StoreError::CorruptOutbox);
+        }
+        runs::pending_key(&self.connection, update_id)?;
+        let run = runs::updates(&self.connection, key, 0, update_id)?;
+        if run.last().map(|u| u.id) != Some(update_id) {
+            return Err(StoreError::RequestConflict);
+        }
+        if run.len() > 1
+            && run.iter().map(|u| u.delta.len()).sum::<usize>() > runs::RUN_BYTES as usize
+        {
+            return Err(StoreError::InvalidPackage);
+        }
+        let covers: Vec<i64> = run.iter().map(|u| u.id).collect();
+        let bytes = match <[runs::RunUpdate; 1]>::try_from(run) {
+            Ok([only]) => only.delta,
+            Err(run) => {
+                bh_core::note::merge_updates(&run.into_iter().map(|u| u.delta).collect::<Vec<_>>())?
+            }
+        };
         Ok(PackagePreparation::Candidate(PackageCandidate {
             event_id: EventId(bh_crypto::random::<32>()),
             pending: PendingNoteUpdate {
                 update_id,
-                key: NoteKey {
-                    base: row.0.try_into().map_err(|_| StoreError::CorruptOutbox)?,
-                    audience: row.1.try_into().map_err(|_| StoreError::CorruptOutbox)?,
-                    note: row.2.try_into().map_err(|_| StoreError::CorruptOutbox)?,
-                },
-                bytes: row.3,
+                key,
+                bytes,
                 writer: note_writers::pending_writer(&self.connection, update_id)?,
             },
+            covers,
         }))
     }
-    /// Phase 2: the short IMMEDIATE CAS rejects a retired or changed pending
-    /// row, and an uncertain duplicate returns the already-persisted attempt.
+    /// Phase 2: the short IMMEDIATE CAS rejects a run that changed or whose
+    /// work retired. An uncertain duplicate at the same endpoint returns
+    /// its persisted attempt; overlapping candidates at other endpoints fail.
     pub fn publish_note_package(
         &mut self,
         candidate: PackageCandidate,
@@ -668,32 +759,46 @@ impl DeviceDatabase {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = read_package(&tx, candidate.pending.update_id)? {
+        if sync_state::publishing_stopped(&tx)? {
+            return Err(StoreError::PublishingStopped);
+        }
+        let update_id = candidate.pending.update_id;
+        if let Some(existing) = read_package(&tx, update_id)? {
             return Ok(existing);
         }
-        let row=tx.query_row(
-            "SELECT u.base,u.audience,u.note,u.delta FROM note_updates u JOIN pending_note_work p ON p.update_id=u.id WHERE u.id=?1",
-            [candidate.pending.update_id],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?)),
-        ).optional()?;
-        let Some((base, audience, note, delta)) = row else {
-            return Err(StoreError::MissingPending);
-        };
-        if base != candidate.pending.key.base
-            || audience != candidate.pending.key.audience
-            || note != candidate.pending.key.note
-            || delta != candidate.pending.bytes
+        let key = runs::pending_key(&tx, update_id)?;
+        if key != candidate.pending.key {
+            return Err(StoreError::RequestConflict);
+        }
+        if runs::covering(&tx, update_id)?.is_some() {
+            return Err(StoreError::RequestConflict);
+        }
+        let run = runs::updates(&tx, key, 0, update_id)?;
+        if run
+            .iter()
+            .map(|u| u.id)
+            .ne(candidate.covers.iter().copied())
+            || (run.len() == 1 && run[0].delta != candidate.pending.bytes)
         {
             return Err(StoreError::RequestConflict);
         }
         tx.execute(
             "INSERT INTO note_outbox(update_id,event_id,descriptor,body) VALUES (?1,?2,?3,?4)",
             params![
-                candidate.pending.update_id,
+                update_id,
                 id.0.as_slice(),
                 descriptor.encode(),
                 body.bytes()
             ],
         )?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO note_outbox_members(update_id,package_update_id) VALUES(?1,?2)",
+            )?;
+            for member in &candidate.covers {
+                insert.execute(params![member, update_id])?;
+            }
+        }
         tx.commit()?;
         Ok(StoredNotePackage {
             event_id: id,
@@ -719,8 +824,10 @@ impl DeviceDatabase {
         }
     }
 
-    /// Match the complete ordered record to the immutable descriptor before
-    /// retiring the pending row. A duplicate Ack must match byte-for-byte.
+    /// Match the complete ordered record to the immutable descriptor and
+    /// record the position it names. An ordered Ack is not acceptance: the
+    /// pending row stays until the verified echo of an accepted package
+    /// retires it. A duplicate Ack must match byte-for-byte.
     pub fn acknowledge_note_update(
         &mut self,
         update_id: i64,
@@ -749,22 +856,34 @@ impl DeviceDatabase {
                 Err(StoreError::AckConflict)
             };
         }
-        // The caller verifies the ordered chain and authenticates the receipt;
-        // this store checks only exact byte identity against its sealed package.
+        // This store checks only exact byte identity against its sealed
+        // package; the verified echo decides what became of it.
         tx.execute(
             "UPDATE note_outbox SET ack=?2 WHERE update_id=?1",
             params![update_id, ack.encode()],
         )?;
-        tx.execute("DELETE FROM pending_scope WHERE update_id=?1", [update_id])?;
-        if tx.execute(
-            "DELETE FROM pending_note_work WHERE update_id=?1",
-            [update_id],
-        )? != 1
-        {
-            return Err(StoreError::CorruptOutbox);
-        }
+        let position = i64::try_from(ack.head().position).map_err(|_| StoreError::CorruptOutbox)?;
+        tx.execute(
+            "INSERT INTO note_outbox_progress(update_id,staged,acked_position,outcome) VALUES (?1,1,?2,1)
+             ON CONFLICT(update_id) DO UPDATE SET staged=1,
+               acked_position=COALESCE(acked_position,excluded.acked_position),
+               outcome=COALESCE(outcome,1)",
+            params![update_id, position],
+        )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// The highest still-pending local update, if there is one: one indexed
+    /// lookup over the pending work's primary key, so its cost does not grow
+    /// with how many unsent rows there are. Used only for in-memory pacing
+    /// hints; the durable queue is unchanged.
+    pub fn highest_pending_update(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT MAX(update_id) FROM pending_note_work",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Legacy small-fixture helper. Production work uses scoped keyset pages;
@@ -878,6 +997,8 @@ const MIGRATIONS: &[(u32, u32, Migration)] = &[
     (7, 8, migrate_v7_to_v8),
     (8, 9, migrate_v8_to_v9),
     (9, 10, note_writers::migrate),
+    (10, 11, sync_state::migrate),
+    (11, 12, runs::migrate),
 ];
 
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
@@ -889,6 +1010,8 @@ fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
         let current = version(&transaction)?;
         ensure_supported(current)?;
         if current >= LOCAL_DATA_VERSION {
+            held_notes::ensure_layout(&transaction)?;
+            transaction.commit()?;
             return Ok(());
         }
         let Some((_, target, step)) = MIGRATIONS
@@ -1100,30 +1223,15 @@ fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result
 }
 
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
+mod outbox_cost_tests;
+#[cfg(test)]
+mod outbox_v12_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn borrowed_weights_stay_at_three_times_encoded_plus_overhead() {
-        let mut db = DeviceDatabase::open(":memory:").unwrap();
-        let key = NoteKey {
-            base: [1; 32],
-            audience: [2; 32],
-            note: [3; 32],
-        };
-        db.return_committed_note(key, Note::new(), 0, 1024);
-        assert_eq!(db.cache_bytes, 3 * 1024 + NOTE_CACHE_OVERHEAD);
-        for n in 1..100 {
-            let (note, encoded) = db.take_cached_note(key, n - 1).unwrap();
-            assert_eq!(encoded, 1024 + (n - 1) as usize);
-            assert_eq!(db.cache_bytes, 0);
-            db.return_committed_note(key, note, n, encoded + 1);
-            assert_eq!(
-                db.cache_bytes,
-                (1024 + n as usize) * 3 + NOTE_CACHE_OVERHEAD
-            );
-        }
-    }
 
     #[test]
     fn connection_requires_full_sync_and_foreign_keys() {

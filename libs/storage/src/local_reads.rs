@@ -2,7 +2,7 @@
 //! merely a device-local read projection, never signed history or permission to
 //! delete pending/outbox-referenced updates. Encoding runs outside SQLite locks.
 use crate::{DeviceDatabase, NoteKey, PendingNoteUpdate, StoreError};
-use bh_core::note::Note;
+use bh_core::note::{Note, OrderedState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 pub struct PendingPage {
@@ -44,7 +44,7 @@ fn note_page(
 /// Short SQLite seed. Replay of this immutable prefix happens after releasing
 /// the writer, even for an in-memory test container without a read-only pool.
 pub struct NoteSeed {
-    pub encoded: Vec<u8>,
+    pub state: OrderedState,
     pub covered: i64,
     pub target: i64,
 }
@@ -60,11 +60,9 @@ pub struct CheckpointSeed {
 }
 impl CheckpointSeed {
     pub fn start(self) -> Result<CheckpointJob, StoreError> {
-        let mut note = Note::new();
-        if !self.encoded.is_empty() {
-            note.apply_update(&self.encoded)
-                .map_err(|_| StoreError::InvalidUpdate)?;
-        }
+        let previous =
+            OrderedState::decode(&self.encoded).map_err(|_| StoreError::InvalidUpdate)?;
+        let note = Note::from_ordered(&previous)?;
         Ok(CheckpointJob {
             key: self.key,
             generation: self.generation,
@@ -73,6 +71,8 @@ impl CheckpointSeed {
             after: self.covered,
             anchor: self.anchor,
             note,
+            previous,
+            tail: Vec::new(),
         })
     }
 }
@@ -84,6 +84,9 @@ pub struct CheckpointJob {
     after: i64,
     anchor: Option<[u8; 32]>,
     note: Note,
+    // The updates `note` integrated, in order, for verified compaction.
+    previous: OrderedState,
+    tail: Vec<Vec<u8>>,
 }
 pub struct PreparedCheckpoint {
     key: NoteKey,
@@ -106,9 +109,8 @@ impl CheckpointJob {
             if *id <= self.after || *id > self.target {
                 return Err(StoreError::InvalidUpdate);
             }
-            self.note
-                .apply_update(bytes)
-                .map_err(|_| StoreError::InvalidUpdate)?;
+            self.note.apply_update(bytes)?;
+            self.tail.push(bytes.clone());
             self.after = *id;
         }
         Ok(())
@@ -116,15 +118,25 @@ impl CheckpointJob {
     pub fn after(&self) -> i64 {
         self.after
     }
-    pub fn finish(self) -> Option<PreparedCheckpoint> {
-        (self.after == self.target).then(|| PreparedCheckpoint {
+    /// Compaction keeps the order the updates were integrated in wherever a
+    /// merged state would reopen with a different structure. A result that
+    /// does not reopen as this note publishes nothing: the prior checkpoint
+    /// and its tail stay.
+    pub fn finish(self) -> Result<Option<PreparedCheckpoint>, StoreError> {
+        if self.after != self.target {
+            return Ok(None);
+        }
+        let Some(state) = self.note.ordered(&self.previous, &self.tail)? else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedCheckpoint {
             key: self.key,
             generation: self.generation,
             covered: self.covered,
             target: self.target,
             anchor: self.anchor,
-            encoded: self.note.state(),
-        })
+            encoded: state.encode(),
+        }))
     }
 }
 impl DeviceDatabase {
@@ -133,7 +145,7 @@ impl DeviceDatabase {
         let (covered, encoded) = prior.unwrap_or((0, Vec::new()));
         let target: i64 = self.local_frontier(key)?.max(covered);
         Ok(NoteSeed {
-            encoded,
+            state: OrderedState::decode(&encoded).map_err(|_| StoreError::InvalidUpdate)?,
             covered,
             target,
         })
@@ -378,13 +390,13 @@ impl DeviceDatabase {
     }
     /// Cold open already owns the fully rebuilt Note. Capture the checkpoint
     /// generation/frontier without loading or applying any old projection rows.
-    /// The caller supplies bytes encoded from that very Note outside locks.
+    /// The caller supplies that very Note's `ordered` state, made outside locks.
     /// CAS at publication rejects a concurrent checkpoint or authority change.
     pub fn prepare_loaded_checkpoint(
         &self,
         key: NoteKey,
         frontier: i64,
-        encoded: Vec<u8>,
+        state: &OrderedState,
     ) -> Result<Option<PreparedCheckpoint>, StoreError> {
         if !self.checkpoint_due(key)? || self.local_frontier(key)? != frontier {
             return Ok(None);
@@ -405,7 +417,7 @@ impl DeviceDatabase {
             covered,
             target: frontier,
             anchor,
-            encoded,
+            encoded: state.encode(),
         }))
     }
     pub fn checkpoint_page(

@@ -7,13 +7,23 @@ apk="$project/app/build/outputs/apk/universal/release/app-universal-release-unsi
 
 case "${1:-}" in
   build)
-    (cd apps/client && cargo tauri android build --target aarch64 --apk --ci)
+    case "${2:-}" in
+      --sync-endpoint) test "$#" = 3; endpoint_args=(--sync-endpoint "$(realpath "$3")") ;;
+      --local-only) test "$#" = 2; endpoint_args=(--local-only) ;;
+      *) echo 'build requires --sync-endpoint FILE or explicit --local-only' >&2; exit 2 ;;
+    esac
+    mkdir -p "${CARGO_TARGET_DIR:-target}"
+    endpoint_output=$(mktemp -d "${CARGO_TARGET_DIR:-target}/android-release-endpoint.XXXXXXXX")
+    python3 scripts/sync_endpoint.py "${endpoint_args[@]}" --output "$endpoint_output" \
+      --artifact "$apk" -- bash -c 'cd apps/client && cargo tauri android build --target aarch64 --apk --ci'
+    printf 'Endpoint provenance: %s/sync-endpoint-provenance.json\n' "$endpoint_output"
     ;;
   check) ;;
-  *) echo "usage: bash scripts/android-unsigned.sh [build|check]" >&2; exit 2 ;;
+  *) echo "usage: bash scripts/android-unsigned.sh build [--sync-endpoint FILE|--local-only] | check" >&2; exit 2 ;;
 esac
 
 python3 -m unittest discover -s scripts -p test_android_storage_boundary.py
+python3 -m unittest discover -s scripts -p test_android_no_models.py
 
 : "${ANDROID_HOME:?run in nix develop .#android}"
 test -f "$apk"
@@ -61,9 +71,15 @@ with zipfile.ZipFile(sys.argv[1]) as apk:
 print('unsigned release APK (apksigner: missing signature manifest)')
 PY
 
-# Whatever produced this APK, the release artifact must carry no WebDriver
-# plugin: no plugin classes in the dex, no native-lib markers, no manifest
-# entries. A build that accidentally enabled the default feature or leaked the
-# Gradle module fails here.
-node scripts/check-webdriver-markers.mjs "$apk" --expect absent
+# Whatever produced this APK, the release artifact must carry no test-only
+# code: no WebDriver plugin classes, native-lib markers or manifest entries, no
+# emulator fixture and no synthetic attestation. A build that accidentally
+# enabled a test feature or leaked the Gradle module fails here.
+bash scripts/android-release-check.sh "$apk"
 python3 scripts/android_device_keys_packaging.py "$apk"
+# No model, model runtime, ML Kit, Play Services, Firebase or data-transport
+# component: neither in the packaged APK nor in Gradle's resolved runtime graph.
+deps=$(mktemp)
+trap 'rm -f "$deps"' EXIT
+"$project/gradlew" -p "$project" :app:dependencies --configuration universalReleaseRuntimeClasspath --no-daemon -q > "$deps"
+python3 scripts/android_no_models.py "$apk" --gradle-deps "$deps" --expect-scanner

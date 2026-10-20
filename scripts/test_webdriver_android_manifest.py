@@ -5,12 +5,14 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 from webdriver_android_manifest import check_manifest, check_apk
+from android_storage_boundary import parse_aapt_tree
 
 NS = 'http://schemas.android.com/apk/res/android'
 
 
 def manifest(extra=''):
     return ET.fromstring(f'''<manifest xmlns:android="{NS}"><uses-permission android:name="android.permission.INTERNET"/>
+      <uses-permission android:name="android.permission.CAMERA"/>
       <application android:allowBackup="false" android:dataExtractionRules="@xml/app_data_extraction_rules"
         android:fullBackupContent="@xml/app_full_backup_rules"><activity android:name="app.basehero.client.MainActivity"/>
         {extra}</application></manifest>''')
@@ -34,11 +36,44 @@ class ManifestBoundary(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 check_manifest(manifest(extra))
 
-    def test_unexpected_permission_rejected(self):
+    def test_packaged_device_key_permissions_are_allowed(self):
         root = manifest()
-        ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': 'android.permission.CAMERA'})
-        with self.assertRaises(ValueError):
+        for permission in ('android.permission.USE_BIOMETRIC',
+                           'android.permission.USE_FINGERPRINT',
+                           'app.basehero.client.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'):
+            ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': permission})
+        check_manifest(root)
+        app = root.find('application')
+        app.set(f'{{{NS}}}dataExtractionRules', '@0x7f120000')
+        app.set(f'{{{NS}}}fullBackupContent', '@0x7f120001')
+        check_manifest(parse_aapt_tree(packaged_xml(root)), packaged=True)
+        # Expected device-key permissions must not admit unrelated capabilities.
+        ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': 'android.permission.ACCESS_NETWORK_STATE'})
+        with self.assertRaisesRegex(ValueError, 'permission'):
+            check_manifest(parse_aapt_tree(packaged_xml(root)), packaged=True)
+
+    def test_unexpected_permission_rejected(self):
+        for permission in ('android.permission.VIBRATE', 'android.permission.ACCESS_NETWORK_STATE'):
+            root = manifest()
+            ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': permission})
+            with self.subTest(permission=permission), self.assertRaises(ValueError):
+                check_manifest(root)
+
+    def test_camera_is_required_and_only_camerax_metadata_service_allowed(self):
+        root = manifest()
+        root.remove(root.findall('uses-permission')[1])
+        with self.assertRaisesRegex(ValueError, 'permission'):
             check_manifest(root)
+        root = manifest('<service android:name="androidx.camera.core.impl.MetadataHolderService" '
+                        'android:exported="false"/>')
+        check_manifest(root)
+        root.find('application/service').set(f'{{{NS}}}exported', 'true')
+        with self.assertRaisesRegex(ValueError, 'exported'):
+            check_manifest(root)
+        for name in ('com.google.mlkit.common.internal.MlKitComponentDiscoveryService',
+                     'com.google.android.datatransport.runtime.backends.TransportBackendDiscovery'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'service'):
+                check_manifest(manifest(f'<service android:name="{name}" android:exported="false"/>'))
 
     def test_supplied_apk_is_checked_even_when_unrelated_merged_xml_is_safe(self):
         # No Gradle path is passed. Each fake aapt response belongs to the
@@ -72,7 +107,7 @@ class ManifestBoundary(unittest.TestCase):
                 app.set(f'{{{NS}}}dataExtractionRules', '@0x7f120000')
                 app.set(f'{{{NS}}}fullBackupContent', '@0x7f120001')
                 if unsafe:
-                    ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': 'android.permission.CAMERA'})
+                    ET.SubElement(root, 'uses-permission', {f'{{{NS}}}name': 'android.permission.VIBRATE'})
                 outputs = {
                     ('xmltree', str(apk), 'AndroidManifest.xml'): packaged_xml(root),
                     ('--values', 'resources', str(apk)): resources,

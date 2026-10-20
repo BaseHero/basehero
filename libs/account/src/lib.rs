@@ -6,7 +6,9 @@
 
 pub use bh_crypto as crypto;
 
+pub mod device_auth;
 mod history;
+mod home_objects;
 pub mod journal;
 pub mod owner;
 pub mod pairing;
@@ -17,5 +19,5 @@ pub mod storage;
 
 pub use history::{
     AccountEvent, AccountId, DeviceId, DevicePublicKeys, Error, Head, PersonalPublication,
-    RecoveryPublicKeys, SigningRequest, VerifiedAccount,
+    RecoveryPublicKeys, SigningRequest, SignupKind, SignupMessage, VerifiedAccount,
 };

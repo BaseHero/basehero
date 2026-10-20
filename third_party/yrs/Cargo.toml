@@ -78,9 +78,9 @@ version = "0.1"
 [dependencies.dashmap]
 version = "6.2"
 
+# BaseHero: without upstream's "js" feature, so Wasm builds import nothing.
 [dependencies.fastrand]
 version = "2"
-features = ["js"]
 
 [dependencies.serde]
 version = "1.0"
@@ -91,6 +91,9 @@ features = [
 
 [dependencies.serde_json]
 version = "1.0"
+
+[dependencies.sha2]
+version = "0.10.9"
 
 [dependencies.smallstr]
 version = "0.3"

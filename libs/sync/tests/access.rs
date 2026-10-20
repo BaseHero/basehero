@@ -19,7 +19,7 @@ fn fixture() -> (GateState, bh_crypto::SigningKey) {
     let key = bh_crypto::SigningKey::from_seed(&seed);
     let genesis = event(1);
     let base = BaseId::from_genesis(&genesis);
-    let head = Commitment::order(base, Head::EMPTY, &genesis)
+    let head = Commitment::order(base, Head::EMPTY, &genesis, Route::Control)
         .unwrap()
         .head();
     (

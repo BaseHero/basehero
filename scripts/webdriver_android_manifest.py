@@ -10,11 +10,16 @@ from android_storage_boundary import (ANDROID, RULES, aapt_output, check_manifes
                                       check_rules, parse_aapt_tree, require, resource_path)
 
 PERMISSIONS = {'android.permission.INTERNET',
+               'android.permission.CAMERA',
+               'android.permission.USE_BIOMETRIC',
+               'android.permission.USE_FINGERPRINT',
                'app.basehero.client.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'}
 COMPONENTS = {
     'activity': {'app.basehero.client.MainActivity'},
     'provider': {'androidx.startup.InitializationProvider'},
     'receiver': {'androidx.profileinstaller.ProfileInstallReceiver'},
+    # CameraX's disabled metadata holder; it cannot be started.
+    'service': {'androidx.camera.core.impl.MetadataHolderService'},
 }
 
 
@@ -23,7 +28,7 @@ def check_manifest(root, packaged=False):
     attribute = 'android:name' if packaged else ANDROID + 'name'
     permissions = [node.get(attribute) for node in root.findall('uses-permission')]
     require(not set(permissions) - PERMISSIONS and len(permissions) == len(set(permissions))
-            and 'android.permission.INTERNET' in permissions,
+            and {'android.permission.INTERNET', 'android.permission.CAMERA'} <= set(permissions),
             f'unexpected feature APK permissions: {permissions}')
     app = root.find('application')
     for tag in ('activity', 'provider', 'receiver', 'service', 'activity-alias'):
@@ -32,6 +37,9 @@ def check_manifest(root, packaged=False):
         require(not set(found) - expected and len(found) == len(set(found))
                 and (tag != 'activity' or set(found) == expected),
                 f'unexpected feature APK {tag}: {found}')
+    for service in app.findall('service'):
+        require(service.get('android:exported' if packaged else ANDROID + 'exported') == 'false',
+                f'exported feature APK service: {service.get(attribute)}')
     return {name: app.get(('android:' if packaged else ANDROID) + attr)
             for attr, (name, _, _) in RULES.items()}
 
@@ -47,7 +55,7 @@ def check_apk(apk, aapt):
             require(path in archive.namelist(), f'{name}: missing packaged resource {path}')
             check_rules(parse_aapt_tree(aapt_output(aapt, 'xmltree', str(apk), path)), tag, sections)
             print(f'{name}: packaged exclusions verified at {path}')
-    print('feature APK: INTERNET only; no extra components; packaged backups and transfers excluded')
+    print('feature APK: only expected network/camera/device-key permissions; no extra components; packaged backups and transfers excluded')
 
 
 if __name__ == '__main__':

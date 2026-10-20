@@ -64,6 +64,17 @@ impl QuoteSocket {
         verifier_nonce: &[u8; 32],
         deadline: Duration,
     ) -> Result<UnverifiedQuote, Error> {
+        self.get_quote_for_report(&report_data(signing, receiving, verifier_nonce), deadline)
+            .await
+    }
+
+    /// The same request for report data the caller already holds, such as a
+    /// channel handshake's, which binds keys the caller cannot see.
+    pub async fn get_quote_for_report(
+        &self,
+        report_data: &[u8; 64],
+        deadline: Duration,
+    ) -> Result<UnverifiedQuote, Error> {
         if deadline.is_zero() {
             return Err(Error);
         }
@@ -87,16 +98,28 @@ impl QuoteSocket {
             .build()
             .map_err(|_| Error)?;
         tokio::time::timeout(deadline, async {
-            let request = serde_json::to_vec(&serde_json::json!({"report_data": hex::encode(report_data(signing, receiving, verifier_nonce))})).map_err(|_| Error)?;
-            let mut response = client.post("http://localhost/GetQuote")
+            let request =
+                serde_json::to_vec(&serde_json::json!({"report_data": hex::encode(report_data)}))
+                    .map_err(|_| Error)?;
+            let mut response = client
+                .post("http://localhost/GetQuote")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(request).send().await.map_err(|_| Error)?;
-            if !response.status().is_success() || response.content_length().is_some_and(|n| n > MAX_RESPONSE_BYTES as u64) {
+                .body(request)
+                .send()
+                .await
+                .map_err(|_| Error)?;
+            if !response.status().is_success()
+                || response
+                    .content_length()
+                    .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+            {
                 return Err(Error);
             }
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| Error)? {
-                if chunk.len() > MAX_RESPONSE_BYTES - body.len() { return Err(Error); }
+                if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+                    return Err(Error);
+                }
                 body.extend_from_slice(&chunk);
             }
             #[derive(Deserialize)]
@@ -111,8 +134,15 @@ impl QuoteSocket {
                 return Err(Error);
             }
             let quote = hex::decode(reply.quote).map_err(|_| Error)?;
-            if quote.len() > MAX_INPUT_BYTES { return Err(Error); }
-            Ok(UnverifiedQuote { quote, event_log: reply.event_log.into_bytes() })
-        }).await.map_err(|_| Error)?
+            if quote.len() > MAX_INPUT_BYTES {
+                return Err(Error);
+            }
+            Ok(UnverifiedQuote {
+                quote,
+                event_log: reply.event_log.into_bytes(),
+            })
+        })
+        .await
+        .map_err(|_| Error)?
     }
 }

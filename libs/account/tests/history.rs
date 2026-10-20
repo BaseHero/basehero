@@ -633,7 +633,8 @@ fn consumed_application_refuses_the_same_errors_as_mutable_application() {
     for (bytes, expected) in [
         (&wrong_account, Error::WrongAccount),
         (&wrong_position, Error::WrongPredecessor),
-        (&wrong_previous, Error::WrongPredecessor),
+        // Validly signed at the next position, extending another head.
+        (&wrong_previous, Error::Fork),
         (&bad_signature, Error::BadSignature),
         (&key_reuse, Error::KeyReuse),
     ] {

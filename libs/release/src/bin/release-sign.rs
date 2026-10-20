@@ -5,11 +5,13 @@ use std::{
     fs::File,
     io::{self, BufRead, IsTerminal, Read, Write},
     path::Path,
-    process::{Command, Stdio},
 };
 
 use bh_crypto::{Secret, Sha256, SigningKey};
-use bh_release::{Metadata, SignedRelease, decode_hex};
+use bh_release::{Metadata, SignedRelease, VerifyFor, decode_hex, verify_release};
+
+mod common;
+use common::HiddenEcho;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -27,37 +29,6 @@ fn seed_from_stdin(input: &mut impl BufRead) -> Result<Secret<32>, String> {
     // Clear the input buffer before returning (terminal and OS buffers remain outside us).
     line.into_bytes().fill(0);
     Ok(secret)
-}
-
-// An interactive paste must not be echoed into terminal scrollback. Pipes used
-// by test fixtures have no terminal to modify. Restore echo on every normal exit.
-struct HiddenEcho(bool);
-impl HiddenEcho {
-    fn for_stdin() -> Result<Self, String> {
-        if !io::stdin().is_terminal() {
-            return Ok(Self(false));
-        }
-        let status = Command::new("stty")
-            .arg("-echo")
-            .stdin(Stdio::inherit())
-            .status()
-            .map_err(|e| e.to_string())?;
-        if !status.success() {
-            return Err("cannot hide seed input on terminal".into());
-        }
-        Ok(Self(true))
-    }
-}
-impl Drop for HiddenEcho {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = Command::new("stty")
-                .arg("echo")
-                .stdin(Stdio::inherit())
-                .status();
-            eprintln!();
-        }
-    }
 }
 
 fn sign(seed: &Secret<32>, metadata: Metadata) -> Result<SignedRelease, String> {
@@ -81,6 +52,59 @@ fn file_hash(path: &Path) -> io::Result<String> {
         hash.update(&buf[..n]);
     }
     Ok(hex(&hash.finalize()))
+}
+
+fn verify_exact(
+    version: &str,
+    platform: &str,
+    channel: &str,
+    commit: &str,
+    public_key: &str,
+    metadata_file: &str,
+    artifact: &str,
+) -> Result<(), String> {
+    // A release metadata file is public but untrusted; bound its size before parsing.
+    // Never return input-dependent errors or print partial verification output.
+    let fail = || "release verification failed".to_string();
+    let expected_version: u64 = version.parse().map_err(|_| fail())?;
+    if expected_version == 0 {
+        return Err(fail());
+    }
+    let release_key = decode_hex::<32>(public_key).ok_or_else(fail)?;
+    let mut raw = Vec::new();
+    File::open(metadata_file)
+        .map_err(|_| fail())?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| fail())?;
+    if raw.len() > 1024 * 1024 {
+        return Err(fail());
+    }
+    let release: SignedRelease = serde_json::from_slice(&raw).map_err(|_| fail())?;
+    let basename = Path::new(artifact)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(fail)?;
+    if release.metadata.version != expected_version
+        || release.metadata.source_commit != commit
+        || release.metadata.file_name != basename
+    {
+        return Err(fail());
+    }
+    let file = File::open(artifact).map_err(|_| fail())?;
+    verify_release(
+        &release,
+        file,
+        VerifyFor {
+            release_key: &release_key,
+            platform,
+            channel,
+            running_version: expected_version - 1,
+        },
+    )
+    .map_err(|_| fail())?;
+    println!("release verified");
+    Ok(())
 }
 
 fn run() -> Result<(), String> {
@@ -111,14 +135,20 @@ fn run() -> Result<(), String> {
             metadata.signing_bytes().map_err(|e| e.to_string())?;
             eprint!("Paste release seed (64 hex characters), then press Enter: ");
             io::stderr().flush().map_err(|e| e.to_string())?;
-            let echo = HiddenEcho::for_stdin()?;
-            let seed = seed_from_stdin(&mut io::stdin().lock())?;
+            let echo = HiddenEcho::for_stdin().map_err(|_| "cannot hide seed input on terminal")?;
+            let seed_result = seed_from_stdin(&mut io::stdin().lock());
             drop(echo);
+            // Separate the terminal's hidden input from both success and error output.
+            if io::stdin().is_terminal() { eprintln!(); }
+            let seed = seed_result?;
             eprintln!("Release public key: {}", hex(&SigningKey::from_seed(&seed).public()));
             let release = sign(&seed, metadata)?;
             println!("{}", serde_json::to_string_pretty(&release).map_err(|e| e.to_string())?);
             Ok(())
         }
+        [_, command, version, platform, channel, commit, key, metadata, artifact]
+            if command == "verify" => verify_exact(version, platform, channel, commit, key, metadata, artifact),
+        [_, command, ..] if command == "verify" => Err("release verification failed".into()),
         _ => Err("usage: release-sign generate | sign VERSION PLATFORM CHANNEL SOURCE_COMMIT ARCHIVE NOTES_FILE (seed via stdin; signed JSON to stdout)".into()),
     }
 }

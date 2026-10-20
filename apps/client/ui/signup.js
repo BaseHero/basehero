@@ -1,11 +1,14 @@
 // First-run presentation only. Native account commands own identity, storage,
 // key release, kit destinations and the note binding. No account id, path,
 // key handle or recovery private material is supplied by this page.
+import { android, joinScreen } from './pairing.js';
+
 export function mountSignup(root, invoke, openBoundNote) {
   const location = document.querySelector('header strong');
   const footer = document.querySelector('footer');
   let screen;
   let printKit;
+  let joined = false;
   const element = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text != null) node.textContent = text;
@@ -28,12 +31,13 @@ export function mountSignup(root, invoke, openBoundNote) {
     row.append(...nodes);
     root.append(row);
   };
-  const heading = (step, title, explanation) => {
+  // A joining device makes no claim about cloud sync (`status` '').
+  const heading = (step, title, explanation, status = 'Cloud sync not connected') => {
     root.replaceChildren();
     root.className = 'signup';
     root.append(element('p', step, 'label'), element('h1', title), element('p', explanation, 'signup-intro'));
     location.textContent = step === 'WELCOME' ? 'START' : step;
-    footer.textContent = 'Cloud sync not connected';
+    footer.textContent = status;
   };
   const showError = (text) => {
     let error = root.querySelector('[role="alert"]');
@@ -51,13 +55,29 @@ export function mountSignup(root, invoke, openBoundNote) {
     } else if (next.screen !== 'confirm') {
       printKit = undefined;
     }
+    const join = ticket => joinScreen(root, invoke, {
+      heading,
+      ticket,
+      ready: async () => { joined = true; draw(await invoke('account_screen')); },
+      retry: async () => draw(await invoke('account_screen')),
+      back: android() ? null : () => draw({screen:'welcome'}),
+    });
     switch (next.screen) {
       case 'welcome':
+        // A phone joins the account another device already holds; it has no
+        // first-device signup of its own.
+        if (android()) { join(); break; }
         heading('WELCOME', 'A place for your thoughts.', 'Keep notes in your own space. You do not need an email to create an account.');
         controls(
           button('Create my account', async () => draw(await invoke('account_suggest_password')), true),
-          button('I already have an account', async () => draw(await invoke('account_return'))),
+          button('I already have an account', async () => join()),
         );
+        break;
+      case 'joining':
+        join(next.ticket);
+        break;
+      case 'stopped':
+        heading('ACCOUNT / STOPPED', 'Sync stopped', 'We could not verify this account’s history. Your verified notes and saved changes are still on this device.');
         break;
       case 'password': {
         heading('ACCOUNT / PASSWORD', 'Choose your password', 'You’ll need this and your recovery kit if you lose access to your devices. Keep your password somewhere you can reach without BaseHero.');
@@ -109,7 +129,8 @@ export function mountSignup(root, invoke, openBoundNote) {
         );
         break;
       case 'ready':
-        heading('ACCOUNT / READY', 'Opening your note', 'Your account is ready on this Mac.');
+        heading('ACCOUNT / READY', 'Opening your note', joined || android()
+          ? 'Your account is ready on this device.' : 'Your account is ready on this Mac.', joined ? '' : 'Cloud sync not connected');
         void (async () => {
           try { await invoke('account_open_note'); await openBoundNote(); }
           catch { showError('Your account is here. Notes will open after your own base is ready.'); }

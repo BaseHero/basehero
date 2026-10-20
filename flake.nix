@@ -20,6 +20,12 @@
       ];
     in
     {
+      packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system:
+        let
+          pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
+          rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        in import ./deploy/sync/authz-image.nix { inherit pkgs rust; src = ./.; }
+      );
       devShells = nixpkgs.lib.genAttrs systems (
         system:
         let
@@ -95,24 +101,26 @@
           llvm = "${ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin";
           # Use the native package's pinned upstream source, but compile against
           # the same NDK/API as Rust. Never expose the native .pc to Cargo.
-          androidSodium = pkgs.stdenv.mkDerivation {
+          mkAndroidSodium = target: pkgs.stdenv.mkDerivation {
             pname = "libsodium-android";
             inherit (pkgs.libsodium) version src;
             nativeBuildInputs = [ pkgs.autoreconfHook ];
             preConfigure = ''
-              export CC=${llvm}/aarch64-linux-android24-clang
+              export CC=${llvm}/${target}24-clang
               export AR=${llvm}/llvm-ar
               export RANLIB=${llvm}/llvm-ranlib
               export CFLAGS='-O2 -fPIC'
             '';
             configureFlags = [
-              "--host=aarch64-linux-android"
+              "--host=${target}"
               "--disable-shared"
               "--enable-static"
             ];
             makeFlags = [ "V=1" ]; # Show the actual NDK compiler and optimization flags.
             doCheck = false; # Target binaries cannot run on the build host.
           };
+          androidSodium = mkAndroidSodium "aarch64-linux-android";
+          androidEmulatorSodium = mkAndroidSodium "x86_64-linux-android";
         in
         {
           default = pkgs.mkShell {
@@ -174,7 +182,7 @@
           };
           # x86_64 emulator builds and the real-app WebDriver tests. The Rust
           # target lives in rust-toolchain.toml; this shell adds the ABI's
-          # linker and the emulator system image.
+          # linker, target libsodium and the emulator system image.
           androidEmulator = pkgs.mkShell {
             nativeBuildInputs = with pkgs; [
               rust
@@ -191,6 +199,11 @@
             CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang";
             CC_x86_64_linux_android = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang";
             AR_x86_64_linux_android = "${androidEmulatorPackages.androidsdk}/libexec/android-sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar";
+            PKG_CONFIG_LIBDIR_x86_64_linux_android = "${androidEmulatorSodium}/lib/pkgconfig";
+            # Keep inherited native paths out of the Android target lookup.
+            PKG_CONFIG_PATH_x86_64_linux_android = "";
+            PKG_CONFIG_ALLOW_CROSS_x86_64_linux_android = "1";
+            LIBSODIUM_STATIC = "1";
             GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidEmulatorPackages.androidsdk}/libexec/android-sdk/build-tools/35.0.0/aapt2";
           };
         }

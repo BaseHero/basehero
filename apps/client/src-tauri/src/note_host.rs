@@ -1,7 +1,7 @@
 //! Native-only adapter. No store is opened and no note is bound until a real
 //! verified account session supplies native authority. Setup has no note IPC.
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,7 +15,7 @@ use bh_account::VerifiedAccount;
 use bh_device::{ContainerId, Owner, OwnerError, coordinator::AuthoritySource};
 use bh_storage::{DeviceDatabase, MAX_NOTE_PAGE, NoteKey};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::lifecycle::{
@@ -46,7 +46,7 @@ struct CursorState {
     page: u64,
     peer: Peer,
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PeerTarget {
     label: String,
     container: ContainerId,
@@ -73,15 +73,20 @@ struct PeerCursors {
     windows: HashMap<String, (ContainerId, NoteKey)>,
 }
 impl PeerCursors {
-    fn publish(&mut self, window: &str, cursor: CursorState) -> (Vec<PeerTarget>, Vec<Peer>) {
+    /// Record this window's selection and say what its peers must draw. The
+    /// third value is true when the window has just joined this note (opened
+    /// it, or came from another one), so it also needs the remote carets the
+    /// note already shows.
+    fn publish(&mut self, window: &str, cursor: CursorState) -> (Vec<PeerTarget>, Vec<Peer>, bool) {
         let (container, note) = (cursor.container, cursor.note);
-        if self
-            .windows
-            .get(window)
-            .is_some_and(|previous| *previous != (container, note))
-        {
-            self.remove(window);
-        }
+        let joined = match self.windows.get(window) {
+            Some(previous) if *previous == (container, note) => false,
+            Some(_) => {
+                self.remove(window);
+                true
+            }
+            None => true,
+        };
         self.windows.insert(window.into(), (container, note));
         let group = self.groups.entry((container, note)).or_default();
         group.insert(window.into(), cursor);
@@ -95,7 +100,7 @@ impl PeerCursors {
         }
         targets.sort_by(|a, b| a.label.cmp(&b.label));
         visible.sort_by(|a, b| a.id.cmp(&b.id));
-        (targets, visible)
+        (targets, visible, joined)
     }
     fn remove(&mut self, window: &str) -> Vec<PeerTarget> {
         let Some(key) = self.windows.remove(window) else {
@@ -110,6 +115,167 @@ impl PeerCursors {
             self.groups.remove(&key);
         }
         targets
+    }
+    /// Every window bound to `note` in `container`, for one remote caret.
+    /// A container holds one own base; its note id is enough to find them.
+    fn targets_for(&self, container: ContainerId, note: [u8; 32]) -> Vec<PeerTarget> {
+        let mut targets: Vec<PeerTarget> = self
+            .groups
+            .iter()
+            .filter(|((id, key), _)| *id == container && key.note == note)
+            .flat_map(|(_, group)| {
+                group
+                    .iter()
+                    .map(|(name, cursor)| cursor.target(name))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        targets.sort_by(|a, b| a.label.cmp(&b.label));
+        targets
+    }
+    /// One bound window's delivery target. A window that has just opened the
+    /// note uses it to draw the remote carets the note already shows; the
+    /// lease and authority checks in `send_peers` still apply.
+    fn target_for(&self, window: &str) -> Option<PeerTarget> {
+        let key = self.windows.get(window)?;
+        self.groups
+            .get(key)?
+            .get(window)
+            .map(|cursor| cursor.target(window))
+    }
+}
+
+/// The other devices' carets this device shows, keyed by account. Memory
+/// only: never storage, a restart record, sync state or a note's saved bytes.
+#[derive(Default)]
+struct RemoteCarets {
+    shown: HashMap<ContainerId, Vec<(RemoteKey, ShownRemote)>>,
+    own: HashMap<ContainerId, u8>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RemoteKey {
+    handle: [u8; 16],
+    note: [u8; 32],
+}
+#[derive(Clone, PartialEq, Eq)]
+struct ShownRemote {
+    label: String,
+    colour: u8,
+    anchor: Vec<u8>,
+    head: Vec<u8>,
+}
+fn remote_id(handle: &[u8; 16]) -> String {
+    handle.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+impl RemoteCarets {
+    /// The carets this device currently shows for one note, so a window that
+    /// opens the note now draws them without waiting for the other device to
+    /// move. Hues are already the ones shown (collision-bumped).
+    fn shown_for(&self, container: ContainerId, note: [u8; 32]) -> Vec<PeerMessage> {
+        self.shown
+            .get(&container)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|(key, _)| key.note == note)
+            .map(|(key, shown)| PeerMessage::Remote {
+                id: remote_id(&key.handle),
+                label: shown.label.clone(),
+                colour: shown.colour,
+                anchor: shown.anchor.clone(),
+                head: shown.head.clone(),
+            })
+            .collect()
+    }
+    /// This device's own hue in `container`, so a remote caret never borrows it.
+    fn own_colour(&mut self, container: ContainerId, colour: u8) {
+        self.own.insert(container, colour.min(5));
+    }
+    /// Replace one account's remote state and say what its windows must draw
+    /// or remove. A hue that collides with this device's or another shown
+    /// caret is bumped to the next free preset, in handle order.
+    fn update(
+        &mut self,
+        container: ContainerId,
+        state: &[bh_host::sync::RemotePresence],
+    ) -> Vec<([u8; 32], PeerMessage)> {
+        let mut by_note: BTreeMap<[u8; 32], Vec<&bh_host::sync::RemotePresence>> = BTreeMap::new();
+        for presence in state {
+            by_note.entry(presence.note).or_default().push(presence);
+        }
+        let own = self.own.get(&container).copied();
+        let previous = self.shown.get(&container).map(Vec::as_slice).unwrap_or(&[]);
+        let mut next = Vec::new();
+        let mut messages = Vec::new();
+        for (note, mut entries) in by_note {
+            entries.sort_by_key(|presence| presence.handle);
+            let mut used = BTreeSet::new();
+            used.extend(own);
+            for presence in entries {
+                let mut colour = presence.colour.min(5);
+                for _ in 0..6 {
+                    if used.insert(colour) {
+                        break;
+                    }
+                    colour = (colour + 1) % 6;
+                }
+                let key = RemoteKey {
+                    handle: presence.handle,
+                    note,
+                };
+                let shown = ShownRemote {
+                    label: presence.label.clone(),
+                    colour,
+                    anchor: presence.anchor.clone(),
+                    head: presence.head.clone(),
+                };
+                let changed = !previous
+                    .iter()
+                    .any(|(old, value)| *old == key && *value == shown);
+                if changed {
+                    messages.push((
+                        note,
+                        PeerMessage::Remote {
+                            id: remote_id(&presence.handle),
+                            label: shown.label.clone(),
+                            colour,
+                            anchor: shown.anchor.clone(),
+                            head: shown.head.clone(),
+                        },
+                    ));
+                }
+                next.push((key, shown));
+            }
+        }
+        for (key, _) in previous {
+            if !next.iter().any(|(shown, _)| shown == key) {
+                messages.push((
+                    key.note,
+                    PeerMessage::Remove {
+                        id: remote_id(&key.handle),
+                    },
+                ));
+            }
+        }
+        self.shown.insert(container, next);
+        messages
+    }
+    /// Forget every caret this account is shown with, and say which windows
+    /// remove them. Used when the client that reported them has gone.
+    fn clear(&mut self, container: ContainerId) -> Vec<([u8; 32], PeerMessage)> {
+        self.shown
+            .remove(&container)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, _)| {
+                (
+                    key.note,
+                    PeerMessage::Remove {
+                        id: remote_id(&key.handle),
+                    },
+                )
+            })
+            .collect()
     }
 }
 /// A callback can arrive after navigation/reopen. Only its exact lease can
@@ -257,6 +423,8 @@ fn dispatch_surface(
             through_update_id: item.through_update_id,
             update: Vec::new(),
             resync: true,
+            segments: Vec::new(),
+            reload: item.reload,
         };
         if !owner.delivery_current(&retry) || !leases.current(label, token) {
             wake_after_drain = leases.finish(label, token) && owner.has_queued_delivery(label);
@@ -370,7 +538,7 @@ impl DeliveryDispatcher {
                         });
                         let (delivered, submitted) = dispatch_surface(&owner, &leases, &label, token, |item, callback| {
                             let payload = Incoming { generation:item.generation, sequence:item.sequence,
-                                update:item.update, resync:item.resync };
+                                update:item.update, resync:item.resync, updates:item.segments, reload:item.reload };
                             let Some(page) = leases.page(&label) else { return false; };
                             let Ok(json) = serde_json::to_string(&payload) else { return false; };
                             // The captured handle carries wry's webview_id, not a
@@ -387,7 +555,7 @@ impl DeliveryDispatcher {
                                 let retry = bh_device::coordinator::Delivery {
                                     window:label.clone(), generation:payload.generation,
                                     sequence:payload.sequence, through_update_id:item.through_update_id,
-                                    update:Vec::new(), resync:true,
+                                    update:Vec::new(), resync:true, segments:Vec::new(), reload:payload.reload,
                                 };
                                 // A queued eval after navigation must not construct
                                 // or dispatch a plaintext event in the new document.
@@ -505,6 +673,11 @@ pub struct NoteHost {
     admissions: Arc<Admission>,
     delivery: Arc<DeliveryDispatcher>,
     peers: Mutex<PeerCursors>,
+    // Other devices' carets, and the presence settings this host chose.
+    remotes: Mutex<RemoteCarets>,
+    configured: Mutex<HashMap<ContainerId, u8>>,
+    watching: Mutex<HashMap<ContainerId, u64>>,
+    next_watch: AtomicU64,
     // A new window's note, chosen natively before its page exists. Its first
     // note_binding rechecks authority through show_note; never a page value.
     intents: Mutex<HashMap<String, (ContainerId, [u8; 32])>>,
@@ -513,6 +686,10 @@ pub struct NoteHost {
     // Restored selection/reading position for a window's first binding of
     // that note: presentation only, never authority.
     hints: Mutex<HashMap<String, ([u8; 32], CapturedView)>>,
+    // Scripts handed to a window, so tests can see the command's fan-out
+    // without a display or main thread.
+    #[cfg(test)]
+    sent: Mutex<Vec<(String, String)>>,
     #[cfg(desktop)]
     next_window: AtomicU64,
 }
@@ -530,9 +707,15 @@ impl NoteHost {
             admissions: Arc::new(Admission::default()),
             delivery,
             peers: Mutex::new(PeerCursors::default()),
+            remotes: Mutex::new(RemoteCarets::default()),
+            configured: Mutex::new(HashMap::new()),
+            watching: Mutex::new(HashMap::new()),
+            next_watch: AtomicU64::new(0),
             intents: Mutex::new(HashMap::new()),
             lifecycle: Arc::new(Lifecycle::default()),
             hints: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            sent: Mutex::new(Vec::new()),
             #[cfg(desktop)]
             next_window: AtomicU64::new(0),
         }
@@ -612,6 +795,13 @@ fn note_id(note: Vec<u8>) -> Result<[u8; 32], &'static str> {
 fn bound_container(owner: &Owner, window: &str) -> Result<ContainerId, &'static str> {
     owner.bound_container(window).ok_or("note unavailable")
 }
+/// This device's position among the account's active devices, which is the
+/// preset hue every screen shows it with. `None` while no verified session
+/// names this container's device; presence then stays unavailable.
+fn presence_colour<R: Runtime>(app: &AppHandle<R>, container: ContainerId) -> Option<u8> {
+    app.try_state::<bh_host::sync::SyncHost>()?
+        .presence_colour(container)
+}
 /// The calling window's own container; the page names no account or base.
 pub(crate) fn list_bound(
     owner: &Owner,
@@ -689,6 +879,10 @@ impl NoteHost {
     pub fn has_binding(&self, window: &str) -> bool {
         self.owner.bound_note(window).is_some()
     }
+    /// The calling window's current note page, if it has one.
+    pub(crate) fn page(&self, window: &str) -> Option<u64> {
+        self.delivery.leases.page(window)
+    }
     fn clear_peer(&self, app: &AppHandle, window: &str) {
         let (id, targets) = {
             let mut peers = self.peers.lock().expect("peer lock");
@@ -702,8 +896,23 @@ impl NoteHost {
         if let Some(id) = id {
             self.send_peers(app, targets, &PeerMessage::Remove { id });
         }
+        // The note's presence caret belongs to this window: navigation,
+        // close and page replacement all leave it behind. The next note's
+        // first selection reports a new one.
+        if let Some(container) = self.owner.bound_container(window)
+            && let Some(presence) = app
+                .try_state::<bh_host::sync::SyncHost>()
+                .and_then(|sync| sync.presence(container))
+        {
+            presence.clear(window);
+        }
     }
-    fn send_peers(&self, app: &AppHandle, targets: Vec<PeerTarget>, message: &PeerMessage) {
+    fn send_peers<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        targets: Vec<PeerTarget>,
+        message: &PeerMessage,
+    ) {
         let Ok(json) = serde_json::to_string(message) else {
             return;
         };
@@ -723,6 +932,11 @@ impl NoteHost {
             let script = format!(
                 "(()=>{{if(window.__bhNotePage!==\"{page}\")return;window.__bhNotePeers?.({json})}})()"
             );
+            #[cfg(test)]
+            self.sent
+                .lock()
+                .expect("sent lock")
+                .push((label.clone(), script.clone()));
             let pinned = target.clone();
             let _ = target.run_on_main_thread(move || {
                 if leases.page(&label) == Some(page)
@@ -733,7 +947,130 @@ impl NoteHost {
             });
         }
     }
+    /// This device's own presence for `container`, configured once with the
+    /// pairing label and this device's hue among the account's active
+    /// devices. Dormant (nothing shown, no error) until the account and its
+    /// device order are known.
+    fn ensure_presence<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        container: ContainerId,
+    ) -> Option<bh_host::sync::Presence> {
+        let sync = app.try_state::<bh_host::sync::SyncHost>()?;
+        let presence = sync.presence(container)?;
+        let colour = {
+            let configured = self.configured.lock().expect("presence config");
+            configured.get(&container).copied()
+        };
+        if colour.is_none() {
+            let colour = presence_colour(app, container)?;
+            let raw = crate::pairing_host::device_label();
+            let label = String::from_utf8_lossy(&raw);
+            presence.configure(&label, colour);
+            presence.foreground(true);
+            self.remotes
+                .lock()
+                .expect("remote carets")
+                .own_colour(container, colour);
+            self.configured
+                .lock()
+                .expect("presence config")
+                .insert(container, colour);
+        }
+        self.watch_presence(app, container, &presence);
+        Some(presence)
+    }
+    /// Subscribe once per running client. The task ends when the client's
+    /// presence does (account stop or replacement) and frees the slot for the
+    /// next client.
+    fn watch_presence<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        container: ContainerId,
+        presence: &bh_host::sync::Presence,
+    ) {
+        let token = {
+            let mut watching = self.watching.lock().expect("presence watch");
+            if watching.contains_key(&container) {
+                return;
+            }
+            let token = self.next_watch.fetch_add(1, Ordering::Relaxed) + 1;
+            watching.insert(container, token);
+            token
+        };
+        let mut changes = presence.subscribe();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let state = changes.borrow_and_update().clone();
+                app.state::<NoteHost>()
+                    .deliver_remote(&app, container, state.entries());
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+            app.state::<NoteHost>().end_watch(&app, container, token);
+        });
+    }
+    /// The client that configured presence is gone: nothing it showed stays,
+    /// so a window that opens the note later draws nothing, and windows that
+    /// drew its carets remove them. Its replacement must configure its own
+    /// label and hue before a caret is sent. No replacement watch starts until
+    /// the entry is gone, so this cannot clear a newer client's carets.
+    fn end_watch<R: Runtime>(&self, app: &AppHandle<R>, container: ContainerId, token: u64) {
+        let messages = {
+            let mut watching = self.watching.lock().expect("presence watch");
+            if watching.get(&container) != Some(&token) {
+                return;
+            }
+            watching.remove(&container);
+            self.configured
+                .lock()
+                .expect("presence config")
+                .remove(&container);
+            self.remotes.lock().expect("remote carets").clear(container)
+        };
+        for (note, message) in messages {
+            let targets = self
+                .peers
+                .lock()
+                .expect("peer lock")
+                .targets_for(container, note);
+            self.send_peers(app, targets, &message);
+        }
+    }
+    /// Send the windows bound to each changed note the other devices' carets
+    /// through the same page leases and authority checks as local carets.
+    fn deliver_remote<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        container: ContainerId,
+        state: &[bh_host::sync::RemotePresence],
+    ) {
+        let messages = self
+            .remotes
+            .lock()
+            .expect("remote carets")
+            .update(container, state);
+        for (note, message) in messages {
+            let targets = self
+                .peers
+                .lock()
+                .expect("peer lock")
+                .targets_for(container, note);
+            self.send_peers(app, targets, &message);
+        }
+    }
+    /// A script handed to a window in this test, in scheduling order.
+    #[cfg(test)]
+    fn sent(&self) -> Vec<(String, String)> {
+        self.sent.lock().expect("sent lock").clone()
+    }
     fn invalidate(&self, app: &AppHandle, window: &str) {
+        // A page's pairing code ends with the page.
+        if let Some(pairing) = app.try_state::<bh_host::pairing::PairingHost>() {
+            pairing.window_gone(window);
+        }
         self.clear_peer(app, window);
         self.delivery.cancel(window);
         // The old page's lifecycle eval and any drain waiting on it are void.
@@ -743,16 +1080,30 @@ impl NoteHost {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum PeerMessage {
-    Set { id: String, anchor: u32, head: u32 },
-    Remove { id: String },
+    Set {
+        id: String,
+        anchor: u32,
+        head: u32,
+    },
+    Remote {
+        id: String,
+        label: String,
+        colour: u8,
+        anchor: Vec<u8>,
+        head: Vec<u8>,
+    },
+    Remove {
+        id: String,
+    },
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Opened {
-    state: Vec<u8>,
+    /// The note's Yjs updates, which the page applies in this order.
+    updates: Vec<Vec<u8>>,
     generation: u64,
     sequence: u64,
     client_id: u64,
@@ -770,6 +1121,10 @@ struct Incoming {
     sequence: u64,
     update: Vec<u8>,
     resync: bool,
+    /// A resync's note as ordered updates, applied in turn.
+    updates: Vec<Vec<u8>>,
+    /// Replace the copy with `updates` once it has no unsaved writing.
+    reload: bool,
 }
 
 /// Call once per document. A second binding call rotates the page token and
@@ -795,6 +1150,40 @@ struct Binding {
     surface: String,
     // Restart presentation for this note's first binding in a restored window.
     view: Option<CapturedView>,
+}
+/// The account's current sync status for the calling window's page, which
+/// asks once it has installed `surface`: a status published before then
+/// never reached it. Later ones arrive as `sync://status`; the page keeps
+/// the newer revision of the two. Nothing for another page or an unbound
+/// window, and `None` before the account's first status.
+#[tauri::command]
+fn sync_status(
+    window: WebviewWindow,
+    host: tauri::State<'_, NoteHost>,
+    surface: String,
+) -> Result<Option<bh_host::sync::StatusView>, &'static str> {
+    let sync = window.app_handle().try_state::<bh_host::sync::SyncHost>();
+    page_status(
+        &host.delivery.leases,
+        &host.owner,
+        window.label(),
+        &surface,
+        |id| sync?.view(id),
+    )
+}
+fn page_status<V>(
+    leases: &DeliveryLeases,
+    owner: &Owner,
+    label: &str,
+    surface: &str,
+    view: impl FnOnce(ContainerId) -> Option<V>,
+) -> Result<Option<V>, &'static str> {
+    let page = surface.parse::<u64>().map_err(|_| "status unavailable")?;
+    if leases.page(label) != Some(page) {
+        return Err("status unavailable");
+    }
+    let id = owner.bound_container(label).ok_or("status unavailable")?;
+    Ok(view(id))
 }
 #[tauri::command]
 async fn note_open(
@@ -830,7 +1219,7 @@ async fn note_open(
     })?;
     host.clear_peer(window.app_handle(), &label);
     Ok(Opened {
-        state: opened.state,
+        updates: opened.state.into_segments(),
         generation: opened.generation,
         sequence: opened.sequence,
         client_id: opened.writer.ok_or("writer unavailable")?.client_id,
@@ -868,6 +1257,10 @@ async fn note_commit(
             for target in targets {
                 delivery.wake(app.clone(), target.clone());
             }
+            // Durable local work: the account's sync looks for it now.
+            if let Some(sync) = app.try_state::<bh_host::sync::SyncHost>() {
+                sync.wake(id);
+            }
         }
         committed
     })
@@ -880,13 +1273,16 @@ async fn note_commit(
     Ok(Acknowledged { request_id })
 }
 #[tauri::command]
-fn note_selection(
-    window: WebviewWindow,
+#[allow(clippy::too_many_arguments)] // The page's selection contract, one field per value.
+fn note_selection<R: Runtime>(
+    window: WebviewWindow<R>,
     host: tauri::State<'_, NoteHost>,
     generation: u64,
     surface: String,
     anchor: u32,
     head: u32,
+    anchor_rel: Option<Vec<u8>>,
+    head_rel: Option<Vec<u8>>,
 ) -> Vec<Peer> {
     let label = window.label();
     let Ok(page) = surface.parse::<u64>() else {
@@ -898,7 +1294,7 @@ fn note_selection(
     let Some((container, note)) = host.owner.bound_work_key(label, generation) else {
         return Vec::new();
     };
-    let (targets, visible) = host.peers.lock().expect("peer lock").publish(
+    let (targets, visible, joined) = host.peers.lock().expect("peer lock").publish(
         label,
         CursorState {
             container,
@@ -921,6 +1317,29 @@ fn note_selection(
             head,
         },
     );
+    // A window that has just opened this note draws the other devices' carets
+    // where they already are, not only after the next move. Only this window
+    // gets them, and only through the same lease and authority checks.
+    if joined {
+        let target = host.peers.lock().expect("peer lock").target_for(label);
+        let shown = host
+            .remotes
+            .lock()
+            .expect("remote carets")
+            .shown_for(container, note.note);
+        if let Some(target) = target {
+            for message in shown {
+                host.send_peers(window.app_handle(), vec![target.clone()], &message);
+            }
+        }
+    }
+    // Cross-device presence is separate from the same-device relay above:
+    // relative bytes go to the client's own task, and nothing is retained.
+    if let (Some(anchor_rel), Some(head_rel)) = (anchor_rel, head_rel)
+        && let Some(presence) = host.ensure_presence(window.app_handle(), container)
+    {
+        presence.set(label, note.note, anchor_rel, head_rel);
+    }
     visible
 }
 #[tauri::command]
@@ -981,6 +1400,56 @@ fn frame(window: &WebviewWindow) -> Option<[f64; 4]> {
     let position = window.outer_position().ok()?.to_logical::<f64>(scale);
     let size = window.inner_size().ok()?.to_logical::<f64>(scale);
     Some([position.x, position.y, size.width, size.height])
+}
+
+/// The app's windows as the sync host reaches them: status only to windows
+/// bound to that account, each on its current page; deliveries through the
+/// one bounded dispatcher; reloads when an account's authority ends.
+pub(crate) struct AppWindows {
+    pub app: AppHandle,
+}
+impl bh_host::sync::StatusWindows for AppWindows {
+    fn post_status(&self, container: ContainerId, view: &bh_host::sync::StatusView) {
+        let Ok(json) = serde_json::to_string(view) else {
+            return;
+        };
+        let host = self.app.state::<NoteHost>();
+        for (label, window) in self.app.webview_windows() {
+            let Some(page) = host.delivery.leases.page(&label) else {
+                continue;
+            };
+            if host.owner.bound_container(&label) != Some(container) {
+                continue;
+            }
+            let owner = Arc::clone(&host.owner);
+            let leases = Arc::clone(&host.delivery.leases);
+            let pinned = window.clone();
+            let script = format!(
+                "(()=>{{if(window.__bhNotePage!==\"{page}\")return;window.dispatchEvent(new CustomEvent('sync://status',{{detail:{json}}}))}})()"
+            );
+            // Rechecked on the window's own thread, ordered with page loads.
+            let _ = window.run_on_main_thread(move || {
+                if leases.page(&label) == Some(page)
+                    && owner.bound_container(&label) == Some(container)
+                {
+                    let _ = pinned.eval(script);
+                }
+            });
+        }
+    }
+    fn wake_delivery(&self, window: String) {
+        let host = self.app.state::<NoteHost>();
+        host.delivery.wake(self.app.clone(), window);
+    }
+    fn authority_ended(&self, _: ContainerId, windows: Vec<String>) {
+        let host = self.app.state::<NoteHost>();
+        for label in windows {
+            host.invalidate(&self.app, &label);
+            if let Some(window) = self.app.get_webview_window(&label) {
+                let _ = window.reload();
+            }
+        }
+    }
 }
 
 /// Upper bound for one close, Quit or update drain; normally milliseconds.
@@ -1129,6 +1598,13 @@ impl NoteHost {
                     eprintln!("BaseHero: windows will not reopen; their records were not saved");
                 }
                 held.keep();
+                // Sync stops with the app; its exact bytes are already kept.
+                // Presence says nothing remains on screen before the socket
+                // closes, so the other device's caret goes at once.
+                if let Some(sync) = app.try_state::<bh_host::sync::SyncHost>() {
+                    sync.leave_presence();
+                    sync.shutdown_all().await;
+                }
                 true
             }
             Err(failure) if failure.refusal == Refusal::Busy => false,
@@ -1466,7 +1942,12 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     let owner = Arc::new(Owner::default());
     let builder = tauri::Builder::default()
         .manage(NoteHost::with_owner(Arc::clone(&owner)))
-        .manage(crate::account_host::AccountHost::with_owner(owner).into_state())
+        .manage(bh_host::sync::SyncHost::new(
+            crate::sync_host::configured(),
+            Arc::clone(&owner),
+        ))
+        .manage(crate::account_host::account_host(owner).into_state())
+        .manage(bh_host::pairing::PairingHost::default())
         .invoke_handler(tauri::generate_handler![
             note_binding,
             note_open,
@@ -1479,6 +1960,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             note_new_window,
             note_drained,
             note_drain_failed,
+            sync_status,
             crate::account_host::account_screen,
             crate::account_host::account_retry,
             crate::account_host::account_suggest_password,
@@ -1489,6 +1971,13 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             crate::account_host::account_email_kit,
             crate::account_host::account_save_kit_file,
             crate::account_host::account_open_note,
+            crate::pairing_host::pairing_show,
+            crate::pairing_host::pairing_status,
+            crate::pairing_host::pairing_approve,
+            crate::pairing_host::pairing_cancel,
+            crate::pairing_host::pairing_reconfirm,
+            crate::pairing_host::pairing_join,
+            crate::pairing_host::pairing_join_status,
             crate::mac_update::commands::update_status,
             crate::mac_update::commands::update_not_now,
             crate::mac_update::commands::update_install,
@@ -1515,6 +2004,20 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 let host = window.app_handle().state::<NoteHost>();
                 host.forget_window_intent(window.label());
                 host.invalidate(window.app_handle(), window.label());
+            }
+            // Android's onPause/onResume. Presence must never outlive the
+            // app being on screen, and may rejoin only once it returns.
+            #[cfg(target_os = "android")]
+            tauri::WindowEvent::Suspended => {
+                if let Some(sync) = window.app_handle().try_state::<bh_host::sync::SyncHost>() {
+                    lifecycle::paused(&sync);
+                }
+            }
+            #[cfg(target_os = "android")]
+            tauri::WindowEvent::Resumed => {
+                if let Some(sync) = window.app_handle().try_state::<bh_host::sync::SyncHost>() {
+                    lifecycle::resumed(&sync);
+                }
             }
             _ => {}
         })
@@ -1564,6 +2067,7 @@ mod tests {
         crypto::{KemKey, SigningKey},
     };
     use bh_device::coordinator::Scope;
+    use bh_host::sync::RemotePresence;
     use bh_storage::NoteKey;
     use std::collections::HashMap;
 
@@ -1600,7 +2104,7 @@ mod tests {
                 },
             );
         }
-        let (targets, visible) = peers.publish(
+        let (targets, visible, _) = peers.publish(
             "left",
             CursorState {
                 container: ContainerId([1; 16]),
@@ -1638,6 +2142,381 @@ mod tests {
             }]
         );
         assert!(peers.remove("right").is_empty());
+    }
+
+    fn remote(handle: u8, note: [u8; 32], label: &str, colour: u8) -> RemotePresence {
+        RemotePresence {
+            handle: [handle; 16],
+            note,
+            label: label.into(),
+            colour,
+            anchor: vec![handle, 1],
+            head: vec![handle, 2],
+        }
+    }
+    fn remote_names(peers: &PeerCursors, container: ContainerId, note: [u8; 32]) -> Vec<String> {
+        let mut names: Vec<String> = peers
+            .targets_for(container, note)
+            .into_iter()
+            .map(|target| target.label)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Test 1c: a remote device's caret reaches every window bound to that
+    /// note, and no window on another note or account. The pure fan-out picks
+    /// only windows in that note's group; `send_peers` then re-applies the page
+    /// lease and the note authority check before any window draws it.
+    #[test]
+    fn remote_caret_reaches_every_window_of_the_note() {
+        let container = ContainerId([1; 16]);
+        let key = NoteKey {
+            base: [1; 32],
+            audience: [2; 32],
+            note: [3; 32],
+        };
+        let other = NoteKey {
+            note: [4; 32],
+            ..key
+        };
+        let mut peers = PeerCursors::default();
+        for (name, id, note) in [
+            ("left", container, key),
+            ("right", container, key),
+            ("other-note", container, other),
+            ("other-container", ContainerId([2; 16]), key),
+        ] {
+            peers.publish(
+                name,
+                CursorState {
+                    container: id,
+                    note,
+                    generation: 7,
+                    page: 11,
+                    peer: Peer {
+                        id: "11".into(),
+                        anchor: 1,
+                        head: 2,
+                    },
+                },
+            );
+        }
+        let mut remotes = RemoteCarets::default();
+        remotes.own_colour(container, 0);
+        let changes = remotes.update(container, &[remote(9, key.note, "Pixel 10 Pro Fold", 1)]);
+        let [(note, message)] = changes.as_slice() else {
+            panic!("one note changed, got {changes:?}");
+        };
+        assert_eq!(*note, key.note);
+        let PeerMessage::Remote {
+            id,
+            label,
+            colour,
+            anchor,
+            head,
+        } = message
+        else {
+            panic!("not a remote caret");
+        };
+        assert_eq!(id, &"09".repeat(16));
+        assert_eq!(label, "Pixel 10 Pro Fold");
+        assert_eq!(*colour, 1);
+        assert_eq!(anchor, &vec![9, 1]);
+        assert_eq!(head, &vec![9, 2]);
+        assert_eq!(remote_names(&peers, container, key.note), ["left", "right"]);
+        assert_eq!(remote_names(&peers, container, other.note), ["other-note"]);
+        assert_eq!(
+            remote_names(&peers, ContainerId([2; 16]), key.note),
+            ["other-container"]
+        );
+
+        // Two senders whose own hues collide with this device's are bumped to
+        // the next free preset, in handle order.
+        let changes = remotes.update(
+            container,
+            &[
+                remote(8, key.note, "Mac", 0),
+                remote(9, key.note, "Pixel 10 Pro Fold", 1),
+            ],
+        );
+        let colours: Vec<u8> = changes
+            .iter()
+            .filter_map(|(_, message)| match message {
+                PeerMessage::Remote { colour, .. } => Some(*colour),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colours, [1, 2]);
+
+        // A departure reaches the same windows as the caret did.
+        let changes = remotes.update(container, &[]);
+        assert_eq!(changes.len(), 2);
+        for (note, message) in &changes {
+            assert_eq!(*note, key.note);
+            assert!(matches!(message, PeerMessage::Remove { .. }));
+        }
+    }
+
+    /// Test 1c, late join: a window that opens the note after a remote caret
+    /// already arrived is told to draw it now, through the same window target
+    /// `send_peers` re-checks the lease and authority for.
+    #[test]
+    fn window_that_opens_the_note_later_draws_the_shown_remote_caret() {
+        let container = ContainerId([1; 16]);
+        let key = NoteKey {
+            base: [1; 32],
+            audience: [2; 32],
+            note: [3; 32],
+        };
+        let other = NoteKey {
+            note: [4; 32],
+            ..key
+        };
+        let cursor = |note| CursorState {
+            container,
+            note,
+            generation: 7,
+            page: 11,
+            peer: Peer {
+                id: "11".into(),
+                anchor: 1,
+                head: 2,
+            },
+        };
+        let mut peers = PeerCursors::default();
+        let (_, _, joined) = peers.publish("first", cursor(key));
+        assert!(joined, "the note's first window joins it");
+        let mut remotes = RemoteCarets::default();
+        remotes.own_colour(container, 2);
+        remotes.update(
+            container,
+            &[
+                remote(8, other.note, "Mac", 0),
+                remote(9, key.note, "Pixel 10 Pro Fold", 1),
+            ],
+        );
+
+        // A second window on the same note draws what is already shown there.
+        let (_, _, joined) = peers.publish("second", cursor(key));
+        assert!(joined, "opening the note is a join");
+        let shown = remotes.shown_for(container, key.note);
+        assert_eq!(shown.len(), 1, "only this note's carets");
+        let PeerMessage::Remote {
+            id,
+            label,
+            colour,
+            anchor,
+            head,
+        } = &shown[0]
+        else {
+            panic!("not a remote caret");
+        };
+        assert_eq!(id, &"09".repeat(16));
+        assert_eq!(label, "Pixel 10 Pro Fold");
+        assert_eq!(*colour, 1, "the hue shown after the collision bump");
+        assert_eq!(anchor, &vec![9, 1]);
+        assert_eq!(head, &vec![9, 2]);
+        assert_eq!(remotes.shown_for(container, other.note).len(), 1);
+        assert!(
+            remotes.shown_for(ContainerId([2; 16]), key.note).is_empty(),
+            "another account shows nothing"
+        );
+        let target = peers.target_for("second").expect("a bound window");
+        assert_eq!(target.label, "second");
+        assert_eq!(target.note, key);
+        assert_eq!(target.generation, 7);
+        assert_eq!(target.page, 11);
+
+        // A later selection from the same window is not a join: it already has
+        // the carets, and nothing is sent again.
+        let (_, _, joined) = peers.publish("second", cursor(key));
+        assert!(!joined);
+        // Moving to another note is a join for that note.
+        let (_, _, joined) = peers.publish("second", cursor(other));
+        assert!(joined);
+        assert_eq!(remotes.shown_for(container, other.note).len(), 1);
+        assert!(peers.target_for("second").is_some());
+    }
+
+    type MockApp = tauri::App<tauri::test::MockRuntime>;
+    fn mock_app(owner: Arc<Owner>) -> MockApp {
+        tauri::test::mock_builder()
+            .manage(NoteHost::with_owner(owner))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app")
+    }
+    fn mock_window(app: &MockApp, label: &str) {
+        tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App("index.html".into()))
+            .build()
+            .expect("mock window");
+    }
+    /// A page binds its lease and reports a first selection, as the editor does.
+    fn select(app: &MockApp, label: &str, generation: u64) {
+        let page = app.state::<NoteHost>().delivery.leases.bind_page(label);
+        note_selection(
+            app.get_webview_window(label).expect("window"),
+            app.state::<NoteHost>(),
+            generation,
+            page.to_string(),
+            1,
+            2,
+            None,
+            None,
+        );
+    }
+
+    /// Test 1c through the command itself: the window that publishes second on
+    /// the note is told to draw the remote caret already shown there, while a
+    /// window on another note or base is not. Deleting the join branch in
+    /// `note_selection` fails this; the pure helpers stay green.
+    #[test]
+    fn note_selection_draws_shown_remote_caret_only_in_the_window_that_joins() {
+        let (owner, id, writer, _dir, scopes) = delivery_fixture_with_scopes();
+        let key = NoteKey {
+            base: [1; 32],
+            audience: [3; 32],
+            note: [4; 32],
+        };
+        let base_scope = scopes.lock().unwrap()["writer"];
+        let other_note = NoteKey {
+            note: [5; 32],
+            ..key
+        };
+        let other_base = NoteKey {
+            base: [9; 32],
+            note: [6; 32],
+            ..key
+        };
+        for (label, note) in [("other-note", other_note), ("other-base", other_base)] {
+            scopes.lock().unwrap().insert(
+                label.into(),
+                Scope {
+                    key: note,
+                    ..base_scope
+                },
+            );
+            owner.bind(label, id).unwrap();
+        }
+        let reader = owner.open("reader", key.note).unwrap().generation;
+        let other_note_generation = owner
+            .open("other-note", other_note.note)
+            .unwrap()
+            .generation;
+        let other_base_generation = owner
+            .open("other-base", other_base.note)
+            .unwrap()
+            .generation;
+        let app = mock_app(Arc::clone(&owner));
+        for label in ["writer", "reader", "other-note", "other-base"] {
+            mock_window(&app, label);
+        }
+        let host = app.state::<NoteHost>();
+        select(&app, "writer", writer);
+        host.deliver_remote(
+            app.handle(),
+            id,
+            &[remote(9, key.note, "Pixel 10 Pro Fold", 1)],
+        );
+        assert_eq!(host.sent().len(), 1, "the writer draws the late remote");
+
+        let before = host.sent().len();
+        select(&app, "reader", reader);
+        let sent = host.sent();
+        let joined: Vec<&(String, String)> = sent[before..]
+            .iter()
+            .filter(|(label, _)| label == "reader")
+            .collect();
+        let [(_, script)] = joined.as_slice() else {
+            panic!("the joining window gets one remote caret, got {joined:?}");
+        };
+        assert!(script.contains("\"type\":\"remote\""), "{script}");
+        assert!(script.contains(&"09".repeat(16)), "{script}");
+        assert!(script.contains("Pixel 10 Pro Fold"), "{script}");
+
+        // A window that joins another note, and one in another base, gets no
+        // remote caret: `shown_for` is keyed by this note.
+        let before = host.sent().len();
+        select(&app, "other-note", other_note_generation);
+        select(&app, "other-base", other_base_generation);
+        assert!(
+            host.sent()[before..]
+                .iter()
+                .all(|(_, script)| !script.contains("\"type\":\"remote\"")),
+            "another note or base shows nothing"
+        );
+        assert!(
+            host.sent()[before..]
+                .iter()
+                .all(|(label, _)| label != "other-note" && label != "other-base"),
+            "nothing at all is delivered to the other windows"
+        );
+    }
+
+    /// A stopped client's last carets are forgotten with its watch: open
+    /// windows remove them, and a window that opens the note later draws none.
+    #[test]
+    fn ending_a_presence_watch_removes_its_carets_everywhere() {
+        let (owner, id, writer, _dir, scopes) = delivery_fixture_with_scopes();
+        let key = NoteKey {
+            base: [1; 32],
+            audience: [3; 32],
+            note: [4; 32],
+        };
+        let base_scope = scopes.lock().unwrap()["writer"];
+        let app = mock_app(Arc::clone(&owner));
+        mock_window(&app, "writer");
+        let host = app.state::<NoteHost>();
+        select(&app, "writer", writer);
+        host.deliver_remote(app.handle(), id, &[remote(8, key.note, "Mac", 1)]);
+        assert_eq!(
+            host.remotes.lock().unwrap().shown_for(id, key.note).len(),
+            1
+        );
+        host.watching.lock().unwrap().insert(id, 42);
+        host.configured.lock().unwrap().insert(id, 1);
+
+        // A stale watcher's token changes nothing.
+        host.end_watch(app.handle(), id, 41);
+        assert_eq!(
+            host.remotes.lock().unwrap().shown_for(id, key.note).len(),
+            1
+        );
+
+        let before = host.sent().len();
+        host.end_watch(app.handle(), id, 42);
+        assert!(
+            host.remotes
+                .lock()
+                .unwrap()
+                .shown_for(id, key.note)
+                .is_empty(),
+            "the stopped client's shown carets are gone"
+        );
+        assert!(!host.watching.lock().unwrap().contains_key(&id));
+        assert!(!host.configured.lock().unwrap().contains_key(&id));
+        let sent = host.sent();
+        let removed = &sent[before..];
+        assert!(
+            removed.iter().any(|(label, script)| label == "writer"
+                && script.contains("\"type\":\"remove\"")
+                && script.contains(&"08".repeat(16))),
+            "the open window removes the caret: {removed:?}"
+        );
+
+        // The note opens fresh later: nothing is replayed.
+        scopes.lock().unwrap().insert("later".into(), base_scope);
+        owner.bind("later", id).unwrap();
+        let later = owner.open("later", key.note).unwrap().generation;
+        mock_window(&app, "later");
+        let before = host.sent().len();
+        select(&app, "later", later);
+        assert!(
+            host.sent()[before..]
+                .iter()
+                .all(|(_, script)| !script.contains("\"type\":\"remote\"")),
+            "a window opening the note later draws nothing"
+        );
     }
 
     type ScopeRoutes = Arc<Mutex<HashMap<String, Scope>>>;
@@ -2072,6 +2951,37 @@ mod tests {
         assert!(leases.start_if_page("reader", second).is_some());
         // The browser test exercises the actual bridge's old-token eval guard:
         // this old token returns 'stale' before calling __bhNoteDelivery.
+    }
+    #[test]
+    fn sync_status_answers_only_the_calling_windows_current_page() {
+        let (owner, id, _, _dir) = delivery_fixture();
+        let leases = DeliveryLeases::default();
+        let old = leases.bind_page("reader").to_string();
+        let page = leases.bind_page("reader").to_string();
+        let view = |container: ContainerId| (container == id).then_some("current");
+        assert_eq!(
+            page_status(&leases, &owner, "reader", &page, view),
+            Ok(Some("current"))
+        );
+        // The window's earlier page, a bad token, or another window's page.
+        assert!(page_status(&leases, &owner, "reader", &old, view).is_err());
+        assert!(page_status(&leases, &owner, "reader", "current", view).is_err());
+        assert!(page_status(&leases, &owner, "writer", &page, view).is_err());
+        let writer = leases.bind_page("writer").to_string();
+        assert_eq!(
+            page_status(&leases, &owner, "writer", &writer, view),
+            Ok(Some("current"))
+        );
+        // A page in a window bound to no account, and a page that has gone.
+        let unbound = leases.bind_page("unbound").to_string();
+        assert!(page_status(&leases, &owner, "unbound", &unbound, view).is_err());
+        leases.cancel("reader");
+        assert!(page_status(&leases, &owner, "reader", &page, view).is_err());
+        // Its account's status before any was published: nothing yet.
+        assert_eq!(
+            page_status(&leases, &owner, "writer", &writer, |_| None::<()>),
+            Ok(None)
+        );
     }
     #[test]
     fn delayed_eval_callback_owns_only_its_window_lease() {

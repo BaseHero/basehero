@@ -197,3 +197,73 @@ fn cancelled_session_never_accepts_late_signature() {
     );
     assert!(!persisted);
 }
+
+#[test]
+fn reply_encoding_is_exact_and_strict() {
+    let (account, _, showing, _) = fixture();
+    let session = ShowingSession::new(account.id(), showing.id());
+    let reply = Reply::make(&session.qr().unwrap(), keys(), b"Fold").unwrap();
+    let encoded = reply.encode();
+    assert_eq!(encoded.len(), 8 + 16 + 1280 + 2 + 4 + 40);
+    assert!(Reply::decode(&encoded).unwrap() == reply);
+    assert!(session.receive(&Reply::decode(&encoded).unwrap()).is_ok());
+    assert_eq!(
+        Reply::decode(&encoded[..encoded.len() - 1]).err(),
+        Some(PairError::Malformed)
+    );
+    assert_eq!(
+        Reply::decode(&[encoded.as_slice(), &[0]].concat()).err(),
+        Some(PairError::Malformed)
+    );
+    let mut magic = encoded.clone();
+    magic[0] ^= 1;
+    assert_eq!(Reply::decode(&magic).err(), Some(PairError::Malformed));
+    // An over-long label never decodes.
+    let mut long = encoded[..8 + 16 + 1280].to_vec();
+    long.extend(65u16.to_be_bytes());
+    long.extend([b'x'; 65]);
+    long.extend([0; 40]);
+    assert_eq!(Reply::decode(&long).err(), Some(PairError::Malformed));
+    // A changed byte decodes but no longer authenticates.
+    let mut changed = encoded.clone();
+    changed[30] ^= 1;
+    if let Ok(decoded) = Reply::decode(&changed) {
+        assert_eq!(session.receive(&decoded), Err(PairError::InvalidReply));
+    }
+}
+
+#[test]
+fn relay_keys_agree_hide_the_secret_and_end_with_the_session() {
+    let (account, _, showing, _) = fixture();
+    let session = ShowingSession::new(account.id(), showing.id());
+    let qr = session.qr().unwrap();
+    let shown = session.relay().unwrap();
+    let scanned = qr.relay();
+    assert_eq!(shown.name(), scanned.name());
+    let raw = qr.encode();
+    assert_ne!(&shown.name()[..], &raw[90..], "the name is not the secret");
+    let other = ShowingSession::new(account.id(), showing.id());
+    assert_ne!(other.relay().unwrap().name(), shown.name());
+
+    let sealed = shown.seal_show(b"ordered at 4").unwrap();
+    assert_eq!(
+        scanned.open_show(&sealed).unwrap().expose(),
+        b"ordered at 4"
+    );
+    // Each side's messages open only as that side's.
+    assert!(scanned.open_join(&sealed).is_err());
+    let reply = scanned.seal_join(b"a reply").unwrap();
+    assert_eq!(shown.open_join(&reply).unwrap().expose(), b"a reply");
+    assert!(shown.open_show(&reply).is_err());
+    assert!(other.relay().unwrap().open_show(&sealed).is_err());
+    let mut changed = sealed.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    assert!(scanned.open_show(&changed).is_err());
+    assert!(scanned.open_show(&sealed[..10]).is_err());
+
+    session.cancel();
+    assert!(matches!(session.relay(), Err(PairError::Ended)));
+    let _ = Secret::<32>::random();
+    let _ = crypto::hash(b"");
+}

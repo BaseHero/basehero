@@ -1,0 +1,37 @@
+[package]
+name = "bh-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Local-only appraisal of a local stack's labelled synthetic attestation.
+# Never part of a release build.
+synthetic-attestation = ["bh-sync-client/synthetic-attestation"]
+# Labelled software key store and helpers for headless tests only. Never
+# part of an app build.
+test-support = []
+
+[dependencies]
+bh-account.workspace = true
+bh-confidential-policy.workspace = true
+bh-crypto.workspace = true
+bh-device.workspace = true
+bh-storage.workspace = true
+bh-sync.workspace = true
+bh-sync-client.workspace = true
+futures-util.workspace = true
+qrcode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

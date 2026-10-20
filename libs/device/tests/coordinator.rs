@@ -28,7 +28,7 @@ fn fixture(db: DeviceDatabase) -> Coordinator<Fixture> {
     Coordinator::new(db, source)
 }
 fn update(text: &str) -> Vec<u8> {
-    Note::new().append_paragraph(text)
+    Note::new().unwrap().append_paragraph(text).unwrap()
 }
 
 #[test]
@@ -250,7 +250,10 @@ fn kill_reopen_retains_acknowledged_note() {
     let state = host.open("one", KEY.note).unwrap().state;
     let pending = host.database().pending_note_updates().unwrap();
     assert_eq!(pending.len(), 1);
-    let mut expected = Note::new();
+    let mut expected = Note::new().unwrap();
     expected.apply_update(&pending[0].bytes).unwrap();
-    assert_eq!(state, expected.state());
+    assert_eq!(
+        Note::from_ordered(&state).unwrap().state().unwrap(),
+        expected.state().unwrap()
+    );
 }

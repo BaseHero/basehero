@@ -144,12 +144,42 @@ and restart. A failed save leaves writing open and offers Try again, never
 discard. The relaunch waits for the old process to exit and release its account
 locks. An installed update that cannot restart asks the person to quit and reopen.
 
+### Sync endpoint
+
+An app syncs only with the one endpoint fixed at build time. Without
+`BH_SYNC_ENDPOINT` the build is local-only: notes are saved on the device and
+its status line says cloud sync is not connected. `BH_SYNC_ENDPOINT` names a
+JSON file with exactly these fields; none has a default, and a file that is
+empty, missing a field or does not parse fails the build:
+
+```json
+{
+  "edge_url": "https://edge.example",
+  "hosting_root": "<64 hex characters: the hosting association's root>",
+  "app_root": "<64 hex characters: the root that signs the service policy>",
+  "policy": "<hex of the signed policy, or empty>",
+  "policy_signature": "<hex of its signature, or empty with no policy>",
+  "max_lifetime_secs": 86400,
+  "max_uncertainty_secs": 0,
+  "build_floor": 1760000000,
+  "appraisal": "hardware"
+}
+```
+
+Neither root may be all zeros. `appraisal: "synthetic"` (and a plain `http://`
+edge) is accepted only by a local build with the `synthetic-attestation`
+feature, for a local stack; release builds and their checks never enable it.
+No page, setting or runtime value can change the endpoint.
+
 ## Developer boundaries
 
-The native host mounts the bundled note editor only when a note is bound to
-its window. No production account session supplies a binding yet, so the shell
-still shows setup; the libraries are not a complete app account or hosted sync
-flow. `libs/storage` keeps transactional note updates and pending local work
+The native signup/open path verifies the local account, creates or opens its own
+base, and supplies account-bound note authority to its windows. The host mounts
+the bundled editor after binding the note; the shell is no longer setup-only.
+With a configured sync endpoint, a ready account also starts sync: the host
+publishes pending local work and applies verified incoming events, and another
+device joins by QR pairing. A local-only build does neither.
+`libs/storage` keeps transactional note updates and pending local work
 (those are not signed network event IDs), each sealed pending outbound package
 and its exact ordered acknowledgement. Native note commands open and commit
 bound notes before acknowledging the editor. The editor classifies canonical

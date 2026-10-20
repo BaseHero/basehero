@@ -31,4 +31,14 @@ class BlobFramingTest {
         try { BlobFraming.ad("../", "control"); fail("accepted path traversal") }
         catch (_: IllegalArgumentException) { }
     }
+    @Test fun pendingKeyHandleBindsAssociatedData() {
+        val first = "a".repeat(64)
+        val second = "b".repeat(64)
+        assertFalse(BlobFraming.pendingAd(first).contentEquals(BlobFraming.pendingAd(second)))
+        assertFalse(BlobFraming.pendingAd(first).contentEquals(BlobFraming.ad(first, "ordinary")))
+        for (bad in listOf("../", "A".repeat(64), "a".repeat(63))) {
+            try { BlobFraming.pendingAd(bad); fail("accepted pending handle $bad") }
+            catch (_: IllegalArgumentException) { }
+        }
+    }
 }

@@ -10,12 +10,10 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bh-crypto.workspace = true
 bh-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-bh-crypto.workspace = true
 
 # Only the minimal exported Wasm buffer interface needs unsafe export attributes.
 [lints.rust]

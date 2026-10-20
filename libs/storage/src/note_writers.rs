@@ -51,10 +51,8 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> rusqlite::Result<()> {
       BEGIN SELECT RAISE(ABORT,'immutable update writer'); END;")
 }
 
-// Registration must call this inside the verified receipt/continuation/binding
-// transaction, never publish a synthetic Ready projection. No production caller
-// exists until that integration is installed.
-#[allow(dead_code)]
+// Registration calls this inside the verified registration transaction
+// (`record_registration`), never to publish a synthetic Ready projection.
 pub(crate) fn mark_registered(tx: &Transaction<'_>, base: [u8; 32]) -> Result<(), StoreError> {
     tx.execute("INSERT INTO base_writer_phase(base,phase) VALUES (?1,1) ON CONFLICT(base) DO UPDATE SET phase=1",[base])?;
     Ok(())

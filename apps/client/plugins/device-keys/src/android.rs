@@ -28,6 +28,7 @@ use jni::{
 use crate::{
     decode_record, encode_record,
     identity::{self, IdentityIo},
+    pending,
 };
 
 const CLASS: &str = "app.basehero.devicekeys.DeviceKeysBridge";
@@ -187,7 +188,13 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
             ],
             "sealPending" | "openPending" => vec![
                 JValue::Object(activity.as_obj()),
+                JValue::Object(&h),
                 JValue::Object(&arrays[0]),
+                JValue::Long(id),
+            ],
+            "retirePending" => vec![
+                JValue::Object(activity.as_obj()),
+                JValue::Object(&h),
                 JValue::Long(id),
             ],
             _ => return Err(BridgeError::Storage),
@@ -195,8 +202,10 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
         let sig = match method {
             "create" => "(Landroid/app/Activity;Ljava/lang/String;[B[B[BJ)V",
             "readOrdinary" => "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;J)V",
-            "readControl" | "readControlPublic" => "(Landroid/app/Activity;Ljava/lang/String;J)V",
-            _ => "(Landroid/app/Activity;[BJ)V",
+            "readControl" | "readControlPublic" | "retirePending" => {
+                "(Landroid/app/Activity;Ljava/lang/String;J)V"
+            }
+            _ => "(Landroid/app/Activity;Ljava/lang/String;[BJ)V",
         };
         let result = env.call_static_method(klass, method, sig, &args);
         if result.is_err() {
@@ -295,7 +304,8 @@ impl IdentityIo for NativeIdentityIo {
     }
 }
 
-/// Constructed only when app integration qualifies the packaged plugin.
+/// Constructed by the app's native account code on a dedicated blocking worker.
+#[derive(Clone, Copy, Default)]
 pub struct AndroidKeyStore;
 impl DeviceKeyStore for AndroidKeyStore {
     async fn create(&mut self, policy: ControlKeyPolicy) -> Result<StoredDevice, KeyStoreError> {
@@ -370,21 +380,72 @@ impl DeviceKeyStore for AndroidKeyStore {
     }
 }
 
+/// Each seal creates its own no-auth Keystore key named in the blob
+/// (`pending::frame`); opening never creates a replacement key.
+#[derive(Clone, Copy, Default)]
 pub struct AndroidPendingSetupProtector;
+fn protector_error(error: KeyStoreError) -> ProtectorError {
+    if error == KeyStoreError::Unavailable {
+        ProtectorError::Unavailable
+    } else {
+        ProtectorError::Failed
+    }
+}
+fn seal_with_fresh_key(
+    kind: u8,
+    retired: Option<&[u8; 32]>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ProtectorError> {
+    let key: [u8; 32] = crypto::random();
+    // Kotlin refuses an existing alias rather than overwrite another setup's key.
+    let sealed = call(
+        "sealPending",
+        &[plaintext],
+        Some(&handle_name(&KeyHandle(key))),
+        None,
+    )
+    .map_err(protector_error)?;
+    Ok(pending::frame(kind, &key, retired, sealed.expose()))
+}
 impl PendingSetupProtector for AndroidPendingSetupProtector {
     fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ProtectorError> {
-        call("sealPending", &[plaintext], None, None)
-            .map(|v| v.expose().to_vec())
-            .map_err(|_| ProtectorError::Failed)
+        seal_with_fresh_key(pending::KIT, None, plaintext)
     }
     fn open(&mut self, blob: &[u8]) -> Result<SecretBytes, ProtectorError> {
-        call("openPending", &[blob], None, None).map_err(|e| {
-            if e == KeyStoreError::Unavailable {
-                ProtectorError::Unavailable
-            } else {
-                ProtectorError::Failed
-            }
-        })
+        let blob = pending::parse(blob)?;
+        call(
+            "openPending",
+            &[blob.sealed],
+            Some(&handle_name(&KeyHandle(blob.key))),
+            None,
+        )
+        .map_err(protector_error)
+    }
+    fn reseal_without_code(
+        &mut self,
+        old: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProtectorError> {
+        let old = pending::parse(old)?;
+        if old.kind != pending::KIT {
+            return Err(ProtectorError::Failed);
+        }
+        seal_with_fresh_key(pending::HOME, Some(&old.key), plaintext)
+    }
+    fn retire_kit_key(&mut self, saved: &[u8]) -> Result<(), ProtectorError> {
+        let saved = pending::parse(saved)?;
+        let Some(retired) = saved.retired else {
+            return Err(ProtectorError::Failed);
+        };
+        // Idempotent: a missing alias was already retired.
+        call(
+            "retirePending",
+            &[],
+            Some(&handle_name(&KeyHandle(retired))),
+            None,
+        )
+        .map(drop)
+        .map_err(protector_error)
     }
 }
 const _: fn() = || {

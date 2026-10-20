@@ -6,8 +6,10 @@
 //
 // It asserts the real first-run welcome screen DOM text and a valid non-empty PNG, and ends
 // the session. It is not a browser stub: the client must already be running.
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { remote } from "webdriverio";
+import { startPeer } from "./presence-peer.mjs";
 
 const shotPath = process.argv[2] ?? "session-screenshot.png";
 const port = 4445;
@@ -32,7 +34,41 @@ mark("create session");
 const sessionId = browser.sessionId;
 
 const failures = [];
+const presence = process.env.WEBDRIVER_PRESENCE === "1";
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function waitFor(action, label, timeout = 60_000) {
+  let last;
+  for (const end = Date.now() + timeout; Date.now() < end; await sleep(250)) {
+    last = await action();
+    if (last) return last;
+  }
+  throw Error(`timeout: ${label}; last=${JSON.stringify(last)}`);
+}
+// Where the remote caret is drawn: the paragraph text position whose caret
+// box its 2 px line stands on. Not a hit test: the format bubble may cover it.
+const remoteCaret = () => browser.execute(() => {
+  const widget = document.querySelector(".bh-remote-cursor");
+  if (!widget) return null;
+  const view = document.querySelector(".ProseMirror").editor.view;
+  const box = widget.getBoundingClientRect();
+  let at = null;
+  view.state.doc.forEach((paragraph, start) => {
+    for (let offset = 0; !at && offset <= paragraph.content.size; offset++) {
+      const caret = view.coordsAtPos(start + 1 + offset, -1);
+      if (Math.abs(caret.left - box.left) < 1.5 && Math.abs(caret.bottom - box.bottom) < 1.5)
+        at = { offset, text: paragraph.textContent };
+    }
+  });
+  if (!at) return null;
+  const label = widget.querySelector(".bh-remote-label")?.textContent ?? null;
+  return { label: widget.dataset.label ?? null, drawn: label, offset: at.offset,
+    collapsed: widget.hasAttribute("data-collapsed"), text: at.text };
+});
 try {
+  if (presence) {
+    await waitFor(async () => (await browser.execute(
+      () => document.querySelector("main .label")?.textContent === "WELCOME")), "welcome screen", 60_000);
+  }
   const h1 = await browser.$("h1");
   mark("find h1");
   const heading = await h1.getText();
@@ -103,6 +139,84 @@ try {
   if (inline) failures.push("the page's own inline script ran despite the CSP");
   if (urlAfterClick !== url) failures.push("click changed the url: " + JSON.stringify(urlAfterClick));
 
+  if (presence) {
+    const root = process.env.SYNC_RUN;
+    const shots = process.env.PRESENCE_SHOTS;
+    if (!root || !shots) throw Error("presence run needs SYNC_RUN and PRESENCE_SHOTS");
+    mkdirSync(shots, { recursive: true });
+    const peer = await startPeer({ root, endpoint: process.env.SYNC_HOST_ENDPOINT,
+      bin: process.env.SYNC_PEER_BIN });
+    try {
+      await peer.call("signup", { password: "ripple amber horizon nectar willow" });
+      const identity = await peer.call("open");
+      await peer.call("save", { window: "main", note: identity.home, text: "Existing peer note" });
+      await peer.until(async () => (await peer.call("status")).view?.state === "synced",
+        "peer note accepted");
+      const shown = await peer.call("show");
+
+      // The desktop joins the peer's account through its own paste flow.
+      await browser.execute(() => {
+        const button = [...document.querySelectorAll("main button")]
+          .find(node => node.textContent.trim() === "I already have an account");
+        if (!button) throw new Error("no join button");
+        button.click();
+      });
+      await waitFor(async () => browser.execute(() => !!document.querySelector("#pair-code")),
+        "pairing code field");
+      await browser.execute(qr => {
+        const field = document.querySelector("#pair-code");
+        field.value = qr;
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+        const button = [...document.querySelectorAll("main button")]
+          .find(node => node.textContent.trim() === "Join");
+        if (!button) throw new Error("no join action");
+        button.click();
+      }, shown.qr);
+      await peer.until(async () => (await peer.call("pair-status", { session: shown.session })).state
+        === "candidate", "desktop candidate");
+      await peer.call("approve", { session: shown.session });
+      await peer.until(async () => (await peer.call("pair-status", { session: shown.session })).state
+        === "ordered", "desktop added");
+      await waitFor(async () => browser.execute(() => {
+        const editor = document.querySelector(".ProseMirror");
+        return editor?.textContent.includes("Existing peer note") ?? false;
+      }), "note after joining", 120_000);
+
+      const first = await peer.call("relative", { window: "main", note: identity.home,
+        paragraph: 0, offset: 2 });
+      await peer.call("select", { window: "main", note: identity.home,
+        anchor: first.hex, head: first.hex, label: "Mac" });
+      const atFirst = await waitFor(async () => {
+        const caret = await remoteCaret();
+        return caret?.label === "Mac" && caret.offset === 2 ? caret : null;
+      }, "remote Mac caret");
+      if (atFirst.drawn !== "Mac" || atFirst.collapsed) failures.push(
+        `remote label: got ${JSON.stringify({ drawn: atFirst.drawn, collapsed: atFirst.collapsed })}`);
+      writeFileSync(path.join(shots, "desktop-presence-caret.png"),
+        Buffer.from(await browser.takeScreenshot(), "base64"));
+
+      const second = await peer.call("relative", { window: "main", note: identity.home,
+        paragraph: 0, offset: 12 });
+      await peer.call("select", { window: "main", note: identity.home,
+        anchor: second.hex, head: second.hex, label: "Mac" });
+      const atSecond = await waitFor(async () => {
+        const caret = await remoteCaret();
+        return caret?.offset === 12 ? caret : null;
+      }, "remote Mac caret moved");
+      if (atSecond.drawn !== "Mac" || atSecond.collapsed) failures.push(
+        `remote label after move: got ${JSON.stringify({ drawn: atSecond.drawn, collapsed: atSecond.collapsed })}`);
+      writeFileSync(path.join(shots, "desktop-presence-moved.png"),
+        Buffer.from(await browser.takeScreenshot(), "base64"));
+
+      await peer.call("clear");
+      await waitFor(async () => (await remoteCaret()) === null, "remote Mac caret cleared");
+      writeFileSync(path.join(shots, "desktop-presence-cleared.png"),
+        Buffer.from(await browser.takeScreenshot(), "base64"));
+      marks.push(["presence caret at", atFirst.offset], ["presence caret moved to", atSecond.offset]);
+    } finally {
+      await peer.quit();
+    }
+  }
   console.log(JSON.stringify({
     sessionId, url, title, heading, shell,
     inlineScriptBlocked: !inline,

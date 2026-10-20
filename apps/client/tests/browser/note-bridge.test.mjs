@@ -7,7 +7,7 @@ import { tauriIpcStub } from "./tauri-ipc-stub.mjs";
 
 function senderHost() {
   window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:crypto.randomUUID()}));
-  window.__bhIpc.handle("note_open", () => ({clientId:window.__bhTestWriterId??2002468231004600,writerToken:Array(32).fill(9),state: [0, 0], generation: 7, sequence: 5 }));
+  window.__bhIpc.handle("note_open", () => ({clientId:window.__bhTestWriterId??2002468231004600,writerToken:Array(32).fill(9),updates: [[0, 0]], generation: 7, sequence: 5 }));
   window.__bhIpc.handle("note_commit", (args) => new Promise((resolve) => {
     (window.__bhPendingAcks ??= []).push({ args, resolve });
   }));
@@ -17,7 +17,7 @@ function senderHost() {
 function receiverHost() {
   window.__bhIpc.handle("note_binding", () => ({note:Array(32).fill(3),surface:'42'}));
   window.__bhIpc.handle("note_open", () => new Promise((resolve) => {
-    window.__bhFinishOpen = () => resolve({clientId:2002468231004601,writerToken:Array(32).fill(9),state: [0, 0], generation: 7, sequence: 5 });
+    window.__bhFinishOpen = () => resolve({clientId:2002468231004601,writerToken:Array(32).fill(9),updates: [[0, 0]], generation: 7, sequence: 5 });
   }));
   window.__bhIpc.handle("note_commit", (args) => ({ requestId: args.requestId }));
   window.__bhIpc.handle("note_close", () => null);
@@ -38,7 +38,7 @@ for (const browserName of browserMatrix) {
         await page.addInitScript(tauriIpcStub);
         await page.addInitScript(() => {
           window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:'42'}));
-          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5}));
+          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:7,sequence:5}));
           window.__bhIpc.handle('note_close', () => null);
         });
         // Only the editor is fault-injected; the actual bundled bridge handles
@@ -53,7 +53,7 @@ for (const browserName of browserMatrix) {
         await page.goto(`${server.origin}/`, {waitUntil:'load'});
         await page.waitForFunction(() => typeof window.__bhNoteDelivery === 'function');
         const result = await page.evaluate(() => {
-          const packet = {generation:7, sequence:6, update:[0,0], resync:true};
+          const packet = {generation:7, sequence:6, update:[], updates:[[0,0]], resync:true};
           const failed = window.__bhNoteDelivery(packet);
           const staleGeneration = window.__bhNoteDelivery({...packet, generation:8});
           const valid = window.__bhNoteDelivery(packet);
@@ -74,7 +74,7 @@ for (const browserName of browserMatrix) {
         await page.addInitScript(tauriIpcStub);
         await page.addInitScript(() => {
           window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
-          window.__bhIpc.handle('note_open',()=>new Promise(resolve=>{window.__bhResolve=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5});}));
+          window.__bhIpc.handle('note_open',()=>new Promise(resolve=>{window.__bhResolve=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:7,sequence:5});}));
           window.__bhIpc.handle('note_close',()=>null);
         });
         await page.route('**/note-editor.js',route=>route.fulfill({contentType:'text/javascript',body:`
@@ -85,7 +85,7 @@ for (const browserName of browserMatrix) {
         `}));
         await page.goto(`${server.origin}/`,{waitUntil:'load'});
         await page.waitForFunction(()=>typeof window.__bhResolve==='function');
-        assert.equal(await page.evaluate(()=>window.__bhNoteDelivery({generation:7,sequence:6,update:[0,0],resync:true})),'buffered');
+        assert.equal(await page.evaluate(()=>window.__bhNoteDelivery({generation:7,sequence:6,update:[],updates:[[0,0]],resync:true})),'buffered');
         await page.evaluate(()=>window.__bhResolve());
         await page.getByText('Note unavailable').waitFor();
         assert.equal(await page.locator('main').getByText('editable').count(),0);
@@ -106,7 +106,7 @@ for (const browserName of browserMatrix) {
           const receive=window.__bhNoteDelivery;
           window.__bhNoteDelivery=packet=>{dispatched++;return receive(packet);};
           // Same expression as native: compare before constructing the payload.
-          const result=(()=>{if(window.__bhNotePage!==old)return 'stale';return window.__bhNoteDelivery?.({generation:7,sequence:6,update:[0,0],resync:true})??'stale'})();
+          const result=(()=>{if(window.__bhNotePage!==old)return 'stale';return window.__bhNoteDelivery?.({generation:7,sequence:6,update:[],updates:[[0,0]],resync:true})??'stale'})();
           return {result,dispatched,current:window.__bhNotePage};
         },old);
         assert.notEqual(result.current,old);
@@ -128,7 +128,7 @@ for (const browserName of browserMatrix) {
             // Three successful native opens whose arrivals overflow the buffer.
             if (opens>=5 && opens<=7) for (let i=1;i<=257;i++)
               window.dispatchEvent(new CustomEvent('bh-note-update',{detail:{generation:opens,sequence:i,update:[0,0]}}));
-            return {clientId:opens,writerToken:Array(32).fill(opens),state:[0,0],generation:opens,sequence:0};
+            return {clientId:opens,writerToken:Array(32).fill(opens),updates:[[0,0]],generation:opens,sequence:0};
           });
           window.__bhIpc.handle('note_close',()=>null);
         });
@@ -161,7 +161,7 @@ for (const browserName of browserMatrix) {
           let calls=0;
           window.__bhIpc.handle('note_open',()=>{
             if (++calls<3) throw 'note changed; retry open';
-            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:9,sequence:0};
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:9,sequence:0};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
@@ -181,7 +181,7 @@ for (const browserName of browserMatrix) {
           let calls=0;
           window.__bhIpc.handle('note_open',()=>{
             if (++calls===1) throw 'note unavailable';
-            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:9,sequence:0};
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:9,sequence:0};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
@@ -207,8 +207,8 @@ for (const browserName of browserMatrix) {
           window.__bhIpc.handle('note_binding',()=>({note:Array(32).fill(3),surface:'42'}));
           let opens=0;
           window.__bhIpc.handle('note_open',()=>{
-            if (++opens===1) return new Promise(resolve=>{window.__bhFirstOpen=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),state:[0,0],generation:7,sequence:5});});
-            return {clientId:2002468231004600,writerToken:Array(32).fill(9),state:window.__bhCommittedState,generation:8,sequence:258};
+            if (++opens===1) return new Promise(resolve=>{window.__bhFirstOpen=()=>resolve({clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[[0,0]],generation:7,sequence:5});});
+            return {clientId:2002468231004600,writerToken:Array(32).fill(9),updates:[window.__bhCommittedState],generation:8,sequence:258};
           });
           window.__bhIpc.handle('note_commit',args=>({requestId:args.requestId}));
           window.__bhIpc.handle('note_close',()=>null);
@@ -242,7 +242,7 @@ for (const browserName of browserMatrix) {
         await view.waitForFunction(() => window.__bhPendingAcks?.length === 1);
         const before = await view.evaluate(() => window.__bhPendingAcks[0].args);
         await view.evaluate((update) => window.dispatchEvent(new CustomEvent('bh-note-update',{
-          detail:{generation:7,sequence:6,resync:true,update}
+          detail:{generation:7,sequence:6,resync:true,update:[],updates:[update]}
         })),remote);
         await view.waitForFunction(() => document.querySelector('.ProseMirror')?.textContent.includes('remote'));
         assert.match(await view.locator('.ProseMirror').textContent(),/local/);
@@ -252,7 +252,7 @@ for (const browserName of browserMatrix) {
         await view.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:'wrong-id'}));
         await view.getByRole('button',{name:'Retry save'}).waitFor({state:'visible'});
         await view.evaluate((update) => window.dispatchEvent(new CustomEvent('bh-note-update',{
-          detail:{generation:7,sequence:7,resync:true,update}
+          detail:{generation:7,sequence:7,resync:true,update:[],updates:[update]}
         })),remote);
         await view.getByRole('button',{name:'Retry save'}).click();
         await view.waitForFunction(() => window.__bhPendingAcks.length === 2);
@@ -264,6 +264,129 @@ for (const browserName of browserMatrix) {
         assert.match(text,/remote/);assert.match(text,/local/);
         assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_commit').length),2);
         await source.close();await view.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("a resync applies native's ordered updates in turn and a reload reopens from them", async () => {
+      const server = await startUiServer();
+      const browser = await launchBrowser(browserName);
+      try {
+        const source = await openPage(browser, server.origin, {extraInit:[senderHost]});
+        await source.locator('.ProseMirror').waitFor();
+        await source.locator('.ProseMirror').click();
+        await source.keyboard.insertText('first');
+        await source.waitForFunction(() => window.__bhPendingAcks?.length === 1);
+        await source.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:window.__bhPendingAcks[0].args.requestId}));
+        await source.keyboard.insertText(' second');
+        await source.waitForFunction(() => window.__bhPendingAcks.length === 2);
+        const updates = await source.evaluate(() => window.__bhPendingAcks.map(ack => ack.args.update));
+        const view = await openPage(browser, server.origin, {extraInit:[() => {
+          window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:crypto.randomUUID()}));
+          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004601,writerToken:Array(32).fill(9),
+            updates:window.__bhReopened ?? [[0,0]],generation:window.__bhReopened ? 8 : 7,sequence:5}));
+          window.__bhIpc.handle('note_commit', args => ({requestId:args.requestId}));
+          window.__bhIpc.handle('note_close', () => null);
+        }]});
+        await view.locator('.ProseMirror').waitFor();
+        // The later update depends on the earlier: they apply in their order.
+        assert.equal(await view.evaluate(updates => window.__bhNoteDelivery(
+          {generation:7,sequence:6,resync:true,update:[],updates}),updates),'accepted');
+        await view.waitForFunction(() => document.querySelector('.ProseMirror')?.textContent === 'first second');
+        // A reload replaces the merged copy with a fresh open of native's order.
+        await view.evaluate(updates => {window.__bhReopened = updates;}, updates);
+        assert.equal(await view.evaluate(updates => window.__bhNoteDelivery(
+          {generation:7,sequence:7,resync:true,reload:true,update:[],updates}),updates),'accepted');
+        await view.waitForFunction(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length === 2);
+        await view.waitForFunction(() => document.querySelector('.ProseMirror')?.textContent === 'first second');
+        assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_close').length), 1);
+        assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_commit').length), 0,
+          'a reload never echoes as local commits');
+        await source.close();await view.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("a reload with unsaved typing saves it first, and a failed drain keeps the merged copy", async () => {
+      const server = await startUiServer();
+      const browser = await launchBrowser(browserName);
+      try {
+        const host = () => {
+          window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:crypto.randomUUID()}));
+          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004601,writerToken:Array(32).fill(9),
+            updates:[[0,0]],generation:7 + window.__bhIpc.calls.filter(c => c.command === 'note_open').length,sequence:5}));
+          window.__bhIpc.handle('note_commit', args => new Promise(resolve => {
+            (window.__bhPendingAcks ??= []).push({args, resolve});
+          }));
+          window.__bhIpc.handle('note_close', () => null);
+        };
+        const opens = page => page.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length);
+        const reload = page => page.evaluate(() => window.__bhNoteDelivery(
+          {generation:8,sequence:6,resync:true,reload:true,update:[],updates:[[0,0]]}));
+        // Unsaved typing is saved by the drain before the note reopens.
+        const view = await openPage(browser, server.origin, {extraInit:[host]});
+        await view.locator('.ProseMirror').waitFor();
+        await view.locator('.ProseMirror').click();
+        await view.keyboard.insertText('unsaved');
+        await view.waitForFunction(() => window.__bhPendingAcks?.length === 1);
+        assert.equal(await reload(view), 'accepted');
+        await view.waitForTimeout(100);
+        assert.equal(await opens(view), 1, 'no reopen before the typing is saved');
+        await view.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:window.__bhPendingAcks[0].args.requestId}));
+        await view.waitForFunction(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length === 2);
+        assert.equal(await view.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_commit').length), 1);
+        await view.close();
+
+        // Typing that cannot be saved keeps the merged copy open and editable.
+        const failing = await openPage(browser, server.origin, {extraInit:[host]});
+        await failing.locator('.ProseMirror').waitFor();
+        await failing.locator('.ProseMirror').click();
+        await failing.keyboard.insertText('kept');
+        await failing.waitForFunction(() => window.__bhPendingAcks?.length === 1);
+        assert.equal(await reload(failing), 'accepted');
+        await failing.evaluate(() => window.__bhPendingAcks[0].resolve({requestId:'wrong-id'}));
+        // The drain retries the same save once; it fails again.
+        await failing.waitForFunction(() => window.__bhPendingAcks.length === 2);
+        await failing.evaluate(() => window.__bhPendingAcks[1].resolve({requestId:'wrong-id'}));
+        await failing.waitForFunction(() => document.querySelector('.ProseMirror')?.getAttribute('contenteditable') === 'true');
+        assert.equal(await opens(failing), 1);
+        assert.match(await failing.locator('.ProseMirror').textContent(), /kept/);
+        await failing.close();
+      } finally {await browser.close();await server.close();}
+    });
+    test("a reload marker that arrives while navigating or under a drain fence is re-armed", async () => {
+      const server = await startUiServer();
+      const browser = await launchBrowser(browserName);
+      try {
+        const page = await openPage(browser, server.origin, {extraInit:[() => {
+          window.__bhIpc.handle('note_binding', () => ({note:Array(32).fill(3),surface:'42'}));
+          window.__bhIpc.handle('note_open', () => ({clientId:2002468231004601,writerToken:Array(32).fill(9),
+            updates:[[0,0]],generation:7 + window.__bhIpc.calls.filter(c => c.command === 'note_open').length,sequence:5}));
+          window.__bhIpc.handle('note_commit', args => ({requestId:args.requestId}));
+          window.__bhIpc.handle('note_close', () => null);
+          window.__bhIpc.handle('note_drained', () => true);
+          // Navigation to the same note waits here, so it is in progress.
+          window.__bhIpc.handle('note_create', () => new Promise(resolve => {window.__bhCreated = () => resolve(Array(32).fill(3));}));
+        }]});
+        await page.locator('.ProseMirror').waitFor();
+        const opens = () => page.evaluate(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length);
+        const reload = generation => page.evaluate(generation => window.__bhNoteDelivery(
+          {generation,sequence:6,resync:true,reload:true,update:[],updates:[[0,0]]}), generation);
+        // While navigating: the marker waits until navigation ends here.
+        await page.evaluate(() => window.__bhMenu('new-note'));
+        await page.waitForFunction(() => typeof window.__bhCreated === 'function');
+        assert.equal(await reload(8), 'accepted');
+        await page.waitForTimeout(50);
+        assert.equal(await opens(), 1);
+        await page.evaluate(() => window.__bhCreated());
+        await page.waitForFunction(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length === 2);
+        // Under a drain fence: the marker waits until native resumes editing.
+        await page.locator('.ProseMirror').waitFor();
+        const surface = await page.evaluate(() => window.__bhNotePage);
+        assert.equal(await page.evaluate(surface => window.__bhDrain({page:surface,fence:'f1',timeoutMs:5000,reason:'close'}), surface), 'accepted');
+        await page.waitForFunction(() => window.__bhIpc.calls.some(c => c.command === 'note_drained'));
+        assert.equal(await reload(9), 'accepted');
+        await page.waitForTimeout(50);
+        assert.equal(await opens(), 2);
+        await page.evaluate(() => window.__bhResumeEditing('f1'));
+        await page.waitForFunction(() => window.__bhIpc.calls.filter(c => c.command === 'note_open').length === 3);
+        await page.close();
       } finally {await browser.close();await server.close();}
     });
     test("mounts only with a binding, buffers and fences updates, and saves only matching commits", async () => {

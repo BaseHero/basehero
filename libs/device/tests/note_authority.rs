@@ -127,7 +127,8 @@ fn authority_requires_anchor_matching_current_capability_and_catalogue_presence(
     assert_eq!(owner.bound_container("w"), Some(id));
     let delta = Owner::core_author(&opened)
         .unwrap()
-        .append_paragraph("hello");
+        .append_paragraph("hello")
+        .unwrap();
     owner
         .commit_leased(
             "w",
@@ -171,7 +172,12 @@ fn reauthorizing_the_same_capability_keeps_windows_but_a_fresh_one_needs_new_loa
         other => panic!("{other:?}"),
     };
     assert!(matches!(
-        owner.commit_queued("w", old, [1; 16], &Note::new().append_paragraph("stale")),
+        owner.commit_queued(
+            "w",
+            old,
+            [1; 16],
+            &Note::new().unwrap().append_paragraph("stale").unwrap()
+        ),
         Err(OwnerError::Unbound)
     ));
     owner.authorize(id, Arc::clone(&fresh), BASE).unwrap();
@@ -182,7 +188,12 @@ fn reauthorizing_the_same_capability_keeps_windows_but_a_fresh_one_needs_new_loa
     ));
     owner.show_note("w", id, note).unwrap();
     assert!(matches!(
-        owner.commit_queued("w", old, [1; 16], &Note::new().append_paragraph("stale")),
+        owner.commit_queued(
+            "w",
+            old,
+            [1; 16],
+            &Note::new().unwrap().append_paragraph("stale").unwrap()
+        ),
         Err(OwnerError::Unbound)
     ));
     let opened = owner.open_leased("w", note).unwrap();
@@ -196,7 +207,8 @@ fn reauthorizing_the_same_capability_keeps_windows_but_a_fresh_one_needs_new_loa
             [2; 16],
             &Owner::core_author(&opened)
                 .unwrap()
-                .append_paragraph("fresh"),
+                .append_paragraph("fresh")
+                .unwrap(),
         )
         .unwrap();
     assert_eq!(frontier(&owner, id, key(note)), 1);
@@ -219,7 +231,10 @@ fn account_lock_after_scope_check_before_writer_refuses_commit() {
             "w",
             opened.generation,
             [8; 16],
-            &Note::new().append_paragraph("not committed"),
+            &Note::new()
+                .unwrap()
+                .append_paragraph("not committed")
+                .unwrap(),
             || {
                 arrived_tx.send(()).unwrap();
                 continue_rx.recv().unwrap();
@@ -254,7 +269,8 @@ fn replacement_serializes_with_commit_even_when_old_arc_is_current() {
             [1; 16],
             &Owner::core_author(&opened)
                 .unwrap()
-                .append_paragraph("first"),
+                .append_paragraph("first")
+                .unwrap(),
             (
                 || {
                     arrived_tx.send(()).unwrap();
@@ -288,7 +304,7 @@ fn replacement_serializes_with_commit_even_when_old_arc_is_current() {
             "w",
             generation,
             [2; 16],
-            &Note::new().append_paragraph("late")
+            &Note::new().unwrap().append_paragraph("late").unwrap()
         ),
         Err(OwnerError::Unbound)
     ));
@@ -316,7 +332,8 @@ fn reverse_order_account_lock_waits_for_note_commit() {
             [9; 16],
             &Owner::core_author(&opened)
                 .unwrap()
-                .append_paragraph("committed before lock"),
+                .append_paragraph("committed before lock")
+                .unwrap(),
             (
                 || {},
                 || {
@@ -431,6 +448,7 @@ fn wrong_account_and_absent_full_key_are_refused_without_affecting_another_accou
                 &Owner::core_author(&opened)
                     .unwrap()
                     .append_paragraph("B unaffected")
+                    .unwrap()
             )
             .unwrap()
             .0
@@ -449,7 +467,7 @@ fn switching_window_to_other_container_before_writer_refuses_old_write() {
     let b_note = owner.create_note(b).unwrap();
     owner.show_note("w", a, a_note).unwrap();
     let a_generation = owner.open_leased("w", a_note).unwrap().generation;
-    let update = Note::new().append_paragraph("old route");
+    let update = Note::new().unwrap().append_paragraph("old route").unwrap();
     let result = owner.commit_with_writer_hook("w", a_generation, [11; 16], &update, || {
         owner.show_note("w", b, b_note).unwrap();
     });
@@ -473,7 +491,7 @@ fn two_windows_share_one_core_note_and_each_receives_the_others_commit() {
     let token = opened.writer.unwrap().token;
     let mut author = Owner::core_author(&opened).unwrap();
     let right = owner.open_leased("note-1", note).unwrap().generation;
-    let delta = author.append_paragraph("from main");
+    let delta = author.append_paragraph("from main").unwrap();
     let (_, targets) = owner
         .commit_leased("main", left, token, [1; 16], &delta)
         .unwrap();
@@ -492,7 +510,7 @@ fn two_windows_share_one_core_note_and_each_receives_the_others_commit() {
             left,
             token,
             [2; 16],
-            &author.append_paragraph("more"),
+            &author.append_paragraph("more").unwrap(),
         )
         .unwrap();
     assert!(targets.is_empty());
@@ -563,7 +581,10 @@ fn opened_note(
     (note, owner.open_leased(window, note).unwrap())
 }
 fn type_into(opened: &bh_device::coordinator::Opened, text: &str) -> Vec<u8> {
-    Owner::core_author(opened).unwrap().append_paragraph(text)
+    Owner::core_author(opened)
+        .unwrap()
+        .append_paragraph(text)
+        .unwrap()
 }
 
 #[test]
@@ -596,14 +617,14 @@ fn drain_fence_finishes_prior_saves_then_refuses_new_loads_and_post_reply_writes
             opened.generation,
             token,
             [1; 16],
-            &author.append_paragraph("before"),
+            &author.append_paragraph("before").unwrap(),
         )
         .unwrap();
     assert_eq!(
         owner.mark_drained("w", fence).unwrap(),
         Some((id, key(note)))
     );
-    let late = author.append_paragraph("after");
+    let late = author.append_paragraph("after").unwrap();
     assert!(
         owner
             .commit_leased("w", opened.generation, token, [2; 16], &late)

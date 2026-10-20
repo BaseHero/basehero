@@ -3,16 +3,22 @@
 mod account_host;
 #[cfg(not(target_os = "macos"))]
 mod account_stub;
+#[cfg(target_os = "android")]
+mod android_account;
 mod lifecycle;
 mod mac_update;
 #[cfg(target_os = "macos")]
 mod native;
 mod note_host;
+mod pairing_host;
 mod passwords;
+mod sync_host;
 // No release-approved policy root, signed bundle or public endpoint is configured.
 // The native bootstrap is deliberately inert until those release inputs exist.
 #[allow(dead_code)]
 mod policy_host;
+#[cfg(target_os = "android")]
+mod qr_scan;
 mod window_layout;
 
 #[cfg(feature = "webdriver")]
@@ -27,6 +33,10 @@ pub fn run() {
     let builder = note_host::builder();
     #[cfg(target_os = "android")]
     let builder = builder.plugin(bh_device_keys::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_account::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(qr_scan::init());
     #[cfg(feature = "webdriver")]
     let builder = webdriver::register(builder);
     let context = tauri::generate_context!();

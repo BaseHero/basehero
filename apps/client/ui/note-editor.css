@@ -2,7 +2,7 @@
 .note-bubble[hidden], .note-linkpop[hidden], .note-refusal[hidden], .note-large[hidden], .note-retry[hidden] { display: none; }
 /* The page: the writing gets the window. */
 .note-pane > section { max-width: 680px; margin: 0 auto; padding: 40px 48px 90px; }
-.note-content { overflow-wrap: anywhere; white-space: pre-wrap; }
+.note-content { position: relative; overflow-wrap: anywhere; white-space: pre-wrap; }
 .note-content .ProseMirror { min-height: 60vh; outline: none; font-size: 16.5px; line-height: 1.66; }
 .note-content .ProseMirror:focus-visible { outline: none; }
 .note-content h1, .note-content h2, .note-content h3 { font-weight: 700; font-stretch: 80%; }
@@ -30,9 +30,21 @@
 /* A window's own selection remains locatable after that window loses focus. */
 .note-content .bh-own-selection { background: var(--select); }
 .note-content .bh-own-cursor { display: inline-block; height: 1em; border-left: 2px solid var(--yellow); margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
-/* Other open windows on this device only; never stored or synced. */
-.note-content .bh-peer-selection { background: #5aa9d366; }
-.note-content .bh-peer-cursor { display: inline-block; height: 1em; border-left: 2px solid #5aa9d3; margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
+/* Other open windows on this device only; never stored or synced. Grey, so
+   they never look like another device's coloured caret. */
+.note-content .bh-peer-selection { background: color-mix(in srgb, var(--text-3) 22%, transparent); }
+.note-content .bh-peer-cursor { display: inline-block; height: 1em; border-left: 2px solid var(--text-3); margin-right: -2px; vertical-align: text-bottom; pointer-events: none; }
+/* Another device's caret: its preset hue, its pairing label above it while the
+   caret moves and for 3 s after, then the label alone as a 6 px colour tab.
+   Drawn over the text, never inside it, so no line ever shifts. The overlay
+   takes no page text selection: a long press on the label must not move the
+   selection out of the editable. */
+.note-content .bh-remote-selection { background: color-mix(in srgb, var(--peer) 22%, transparent); }
+.note-content .bh-remote-carets { position: absolute; left: 0; top: 0; width: 0; height: 0; pointer-events: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.note-content .bh-remote-cursor { position: absolute; height: 1.15em; border-left: 2px solid var(--peer); transform: translateY(-100%); pointer-events: none; }
+.note-content .bh-remote-label { position: absolute; left: -2px; bottom: 100%; margin-bottom: 1px; padding: 3px 5px; background: var(--peer); color: #fff; font: 600 11px/1 var(--mono); letter-spacing: .02em; white-space: nowrap; pointer-events: auto; }
+.note-content .bh-remote-cursor[data-collapsed] .bh-remote-label { width: 6px; height: 6px; padding: 0; font-size: 0; overflow: hidden; }
+.note-content .bh-remote-cursor[data-collapsed] .bh-remote-label:hover { width: auto; height: auto; padding: 3px 5px; font-size: 11px; }
 .note-content .note-placeholder { display: inline-block; padding: 4px 8px; border: 1px solid var(--line); background: var(--panel-2); font: 500 12px var(--mono); }
 
 /* Notices inside the page: paused, refused, read-only. */

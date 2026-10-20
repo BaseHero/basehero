@@ -90,6 +90,134 @@ fn setup(
     owner.show_note("two", id, note).unwrap();
     (owner, id, account, cap, note)
 }
+#[path = "../../storage/tests/support/note_rows.rs"]
+mod note_rows;
+
+#[test]
+fn committed_save_is_acknowledged_when_guest_cannot_be_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, _cap, note) = setup(dir.path());
+    let db = owner.shared_database(id).unwrap();
+    db.lock().unwrap().set_note_cache_budget(16 * 1024);
+    let opened = owner.open_leased("one", note).unwrap();
+    let lease = opened.writer.unwrap();
+    let mut author = Owner::core_author(&opened).unwrap();
+    let update = author
+        .try_append_paragraph("saved without a cache")
+        .unwrap();
+    let (ack, _) = owner
+        .commit_leased("one", opened.generation, lease.token, [1; 16], &update)
+        .unwrap();
+    assert!(!ack.replayed);
+    assert_eq!(ack.request_id, [1; 16]);
+    {
+        let db = db.lock().unwrap();
+        assert_eq!(db.cached_note_count(), 0);
+        assert_eq!(db.pending_note_updates().unwrap()[0].bytes, update);
+    }
+    assert!(
+        owner
+            .commit_leased("one", opened.generation, lease.token, [1; 16], &update)
+            .unwrap()
+            .0
+            .replayed
+    );
+    let reopened = owner.open_leased("one", note).unwrap();
+    assert_eq!(
+        Note::from_ordered(&reopened.state)
+            .unwrap()
+            .state()
+            .unwrap(),
+        author.state().unwrap()
+    );
+}
+
+#[test]
+fn unavailable_local_save_has_no_ack_or_durable_effect_and_exact_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, _cap, note) = setup(dir.path());
+    let opened = owner.open_leased("one", note).unwrap();
+    let lease = opened.writer.unwrap();
+    let mut author = Owner::core_author(&opened).unwrap();
+    let first = author.try_append_paragraph("accepted title").unwrap();
+    owner
+        .commit_leased("one", opened.generation, lease.token, [1; 16], &first)
+        .unwrap();
+    let queued = author
+        .try_append_paragraph("keep this queued payload")
+        .unwrap();
+    let raw = raw_db(dir.path());
+    let before = note_rows::snapshot(&raw);
+    let failed = bh_core::contained::with_fuel(0, || {
+        owner.commit_leased("one", opened.generation, lease.token, [2; 16], &queued)
+    });
+    assert!(matches!(
+        failed,
+        Err(bh_device::OwnerError::NoteUnavailable)
+    ));
+    assert_eq!(note_rows::snapshot(&raw), before);
+    let (ack, _) = owner
+        .commit_leased("one", opened.generation, lease.token, [2; 16], &queued)
+        .unwrap();
+    assert!(!ack.replayed);
+    assert!(
+        owner
+            .commit_leased("one", opened.generation, lease.token, [2; 16], &queued)
+            .unwrap()
+            .0
+            .replayed
+    );
+    let db = owner.shared_database(id).unwrap();
+    let pending = db.lock().unwrap().pending_note_updates().unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].bytes, first);
+    assert_eq!(pending[1].bytes, queued);
+}
+
+#[test]
+fn trapped_local_apply_is_unavailable_not_invalid_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, _cap, note) = setup(dir.path());
+    let opened = owner.open_leased("one", note).unwrap();
+    let lease = opened.writer.unwrap();
+    let raw = raw_db(dir.path());
+    let before = note_rows::snapshot(&raw);
+    // Decoding deeply nested Any arrays traps with ordinary fuel; unlike a
+    // zero-budget test this reaches apply after loading and writer checks.
+    let mut bomb = vec![1, 1];
+    var(lease.client_id, &mut bomb);
+    bomb.extend_from_slice(&[0, 8, 1, 4, b'b', b'o', b'm', b'b', 1]);
+    for _ in 0..100_000 {
+        bomb.extend_from_slice(&[117, 1]);
+    }
+    bomb.extend_from_slice(&[126, 0]);
+    let failed = owner.commit_leased("one", opened.generation, lease.token, [3; 16], &bomb);
+    assert!(
+        matches!(failed, Err(bh_device::OwnerError::NoteUnavailable)),
+        "{:?}",
+        failed.as_ref().err()
+    );
+    assert_eq!(note_rows::snapshot(&raw), before);
+    let healthy = Owner::core_author(&opened)
+        .unwrap()
+        .try_append_paragraph("healthy after trap")
+        .unwrap();
+    owner
+        .commit_leased("one", opened.generation, lease.token, [4; 16], &healthy)
+        .unwrap();
+    assert_eq!(
+        owner
+            .shared_database(id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_note_updates()
+            .unwrap()[0]
+            .bytes,
+        healthy
+    );
+}
+
 #[test]
 fn separate_live_producers_reuse_idle_slot_with_new_token_and_atomic_proof() {
     let dir = tempfile::tempdir().unwrap();
@@ -100,8 +228,8 @@ fn separate_live_producers_reuse_idle_slot_with_new_token_and_atomic_proof() {
     let b = two.writer.unwrap();
     assert_ne!(a.client_id, b.client_id);
     let mut author = Note::with_writer(a.client_id).unwrap();
-    author.apply_update(&one.state).unwrap();
-    let update = author.append_paragraph("safe");
+    author.apply_ordered(&one.state).unwrap();
+    let update = author.append_paragraph("safe").unwrap();
     owner
         .commit_leased("one", one.generation, a.token, [1; 16], &update)
         .unwrap();
@@ -141,12 +269,12 @@ fn separate_live_producers_reuse_idle_slot_with_new_token_and_atomic_proof() {
                 one.generation,
                 a.token,
                 [3; 16],
-                &author.append_paragraph("stale")
+                &author.append_paragraph("stale").unwrap()
             )
             .is_err()
     );
-    let mut random = Note::new();
-    random.apply_update(&reopened.state).unwrap();
+    let mut random = Note::new().unwrap();
+    random.apply_ordered(&reopened.state).unwrap();
     assert!(
         owner
             .commit_leased(
@@ -154,7 +282,7 @@ fn separate_live_producers_reuse_idle_slot_with_new_token_and_atomic_proof() {
                 reopened.generation,
                 c.token,
                 [4; 16],
-                &random.append_paragraph("random")
+                &random.append_paragraph("random").unwrap()
             )
             .is_err()
     );
@@ -173,7 +301,8 @@ fn delete_only_save_uses_deleting_producers_declaration_not_referenced_writer() 
             [1; 16],
             &Owner::core_author(&first)
                 .unwrap()
-                .append_paragraph("delete this"),
+                .append_paragraph("delete this")
+                .unwrap(),
         )
         .unwrap();
     let second = owner.open_leased("two", note).unwrap();
@@ -204,10 +333,10 @@ fn delete_only_save_uses_deleting_producers_declaration_not_referenced_writer() 
         b.client_id
     );
     assert_ne!(a.client_id, b.client_id);
-    let mut durable = Note::new();
-    durable.apply_update(&second.state).unwrap();
+    let mut durable = Note::new().unwrap();
+    durable.apply_ordered(&second.state).unwrap();
     durable.apply_writer_update(&delete, b.client_id).unwrap();
-    assert_eq!(durable.writer_end(b.client_id), Some(0));
+    assert_eq!(durable.writer_end(b.client_id).unwrap(), Some(0));
 }
 fn var(mut n: u64, out: &mut Vec<u8>) {
     while n >= 128 {
@@ -249,7 +378,7 @@ fn pending_prefix_is_kept_unleased_until_its_dependency_arrives() {
             waiting.generation,
             other.token,
             [1; 16],
-            &author.append_paragraph("meanwhile"),
+            &author.append_paragraph("meanwhile").unwrap(),
         )
         .unwrap();
     let slots = db
@@ -273,15 +402,15 @@ fn pending_prefix_is_kept_unleased_until_its_dependency_arrives() {
     let lease = resumed.writer.unwrap();
     assert_eq!(lease.client_id, c);
     let mut author = Owner::core_author(&resumed).unwrap();
-    let next = author.append_paragraph("after");
+    let next = author.append_paragraph("after").unwrap();
     owner
         .commit_leased("one", resumed.generation, lease.token, [2; 16], &next)
         .unwrap();
-    let mut durable = Note::new();
+    let mut durable = Note::new().unwrap();
     durable
-        .apply_update(&owner.open_leased("two", note).unwrap().state)
+        .apply_ordered(&owner.open_leased("two", note).unwrap().state)
         .unwrap();
-    assert_eq!(durable.writer_end(c), Some(8)); // b, element, text, "after"
+    assert_eq!(durable.writer_end(c).unwrap(), Some(8)); // b, element, text, "after"
 }
 #[test]
 fn leased_saves_reach_the_terminal_clock_then_continue_on_a_new_slot() {
@@ -304,9 +433,9 @@ fn leased_saves_reach_the_terminal_clock_then_continue_on_a_new_slot() {
     let mut author = Owner::core_author(&opened).unwrap();
     author.apply_update(&bulk).unwrap();
     // A three-clock paragraph does not fit; it is refused before authoring.
-    let before = author.state();
+    let before = author.state().unwrap();
     assert!(author.try_append_paragraph("a").is_err());
-    assert_eq!(author.state(), before);
+    assert_eq!(author.state().unwrap(), before);
     let penultimate = author.try_append_paragraph("").unwrap(); // to MAX-1
     save(2, &penultimate).unwrap();
     // The next one-clock operation ends exactly at u32::MAX.
@@ -336,7 +465,7 @@ fn leased_saves_reach_the_terminal_clock_then_continue_on_a_new_slot() {
         [(0, true), (1, false)]
     );
     let mut continued = Owner::core_author(&next).unwrap();
-    assert_eq!(continued.writer_end(c), Some(u32::MAX));
+    assert_eq!(continued.writer_end(c).unwrap(), Some(u32::MAX));
     let after = continued.try_append_paragraph("after").unwrap();
     owner
         .commit_leased("one", next.generation, d.token, [4; 16], &after)
@@ -432,7 +561,7 @@ fn capacity_rollover_retires_only_the_callers_live_writer_for_a_fresh_one() {
     assert!(![a.client_id, b.client_id].contains(&f.client_id));
     assert_eq!(slots(), [(0, true), (1, false), (2, false)]);
     let mut author = Owner::core_author(&fresh).unwrap();
-    assert_eq!(author.writer_end(f.client_id), Some(0));
+    assert_eq!(author.writer_end(f.client_id).unwrap(), Some(0));
     let ab = author.try_append_paragraph("ab").unwrap();
     owner
         .commit_leased("one", fresh.generation, f.token, [6; 16], &ab)
@@ -586,11 +715,11 @@ fn revision_change_during_an_attempt_refuses_it_and_identical_retry_uses_the_cur
     let opened = owner.open_leased("one", note).unwrap();
     let lease = opened.writer.unwrap();
     let mut author = Owner::core_author(&opened).unwrap();
-    let first = author.append_paragraph("first");
+    let first = author.append_paragraph("first").unwrap();
     owner
         .commit_leased("one", opened.generation, lease.token, [1; 16], &first)
         .unwrap();
-    let second = author.append_paragraph("retained");
+    let second = author.append_paragraph("retained").unwrap();
     assert!(
         owner
             .commit_leased_with_work_hook(
@@ -630,7 +759,7 @@ fn benign_binding_changes_between_saves_keep_the_live_writer() {
     let save = |request: u8, bytes: &[u8]| {
         owner.commit_leased("one", opened.generation, lease.token, [request; 16], bytes)
     };
-    save(1, &author.append_paragraph("unregistered")).unwrap();
+    save(1, &author.append_paragraph("unregistered").unwrap()).unwrap();
     // Registration lands while the window stays open: verified absent first.
     raw_db(dir.path())
         .execute("UPDATE base_writer_phase SET phase=1", [])
@@ -640,7 +769,7 @@ fn benign_binding_changes_between_saves_keep_the_live_writer() {
         binding: None,
     })));
     owner.install_binding_reader(id, reader.clone());
-    save(2, &author.append_paragraph("registered")).unwrap();
+    save(2, &author.append_paragraph("registered").unwrap()).unwrap();
     // Our own first event is acknowledged, then another binding in this note.
     let slot = owner
         .shared_database(id)
@@ -660,9 +789,9 @@ fn benign_binding_changes_between_saves_keep_the_live_writer() {
         revision: 2,
         binding: Some(own),
     };
-    save(3, &author.append_paragraph("acknowledged")).unwrap();
+    save(3, &author.append_paragraph("acknowledged").unwrap()).unwrap();
     reader.0.lock().unwrap().revision = 3;
-    save(4, &author.append_paragraph("another binding")).unwrap();
+    save(4, &author.append_paragraph("another binding").unwrap()).unwrap();
     let db = owner.shared_database(id).unwrap();
     assert_eq!(db.lock().unwrap().pending_note_updates().unwrap().len(), 4);
 }
@@ -673,7 +802,10 @@ fn conflicting_binding_for_used_writer_pauses_the_note_across_reopens_and_live_w
         let (owner, id, _account, cap, note) = setup(dir.path());
         let one = owner.open_leased("one", note).unwrap();
         let a = one.writer.unwrap();
-        let work = Owner::core_author(&one).unwrap().append_paragraph("work");
+        let work = Owner::core_author(&one)
+            .unwrap()
+            .append_paragraph("work")
+            .unwrap();
         owner
             .commit_leased("one", one.generation, a.token, [1; 16], &work)
             .unwrap();
@@ -714,7 +846,7 @@ fn conflicting_binding_for_used_writer_pauses_the_note_across_reopens_and_live_w
                     two.generation,
                     b.token,
                     [2; 16],
-                    &other.append_paragraph("refused")
+                    &other.append_paragraph("refused").unwrap()
                 )
                 .is_err()
         );
@@ -750,7 +882,7 @@ fn accepted_end_requires_durable_prefix_and_local_save_does_not_advance_it() {
             opened.generation,
             lease.token,
             [1; 16],
-            &author.append_paragraph("hi"),
+            &author.append_paragraph("hi").unwrap(),
         )
         .unwrap();
     let key = NoteKey {
@@ -789,7 +921,7 @@ fn accepted_end_requires_durable_prefix_and_local_save_does_not_advance_it() {
             reuse.generation,
             reuse.writer.unwrap().token,
             [2; 16],
-            &core.append_paragraph("next"),
+            &core.append_paragraph("next").unwrap(),
         )
         .unwrap();
     assert_eq!(reader.0.lock().unwrap().binding.unwrap().accepted_end, 4);
@@ -813,7 +945,7 @@ fn recognized_restore_retires_lineage_without_changing_pending_bytes() {
     let opened = owner.open_leased("one", note).unwrap();
     let lease = opened.writer.unwrap();
     let mut author = Owner::core_author(&opened).unwrap();
-    let bytes = author.append_paragraph("keep original");
+    let bytes = author.append_paragraph("keep original").unwrap();
     owner
         .commit_leased("one", opened.generation, lease.token, [1; 16], &bytes)
         .unwrap();
@@ -830,7 +962,7 @@ fn recognized_restore_retires_lineage_without_changing_pending_bytes() {
                 opened.generation,
                 lease.token,
                 [2; 16],
-                &author.append_paragraph("stale")
+                &author.append_paragraph("stale").unwrap()
             )
             .is_err()
     );
@@ -898,7 +1030,8 @@ fn real_prehost_genesis_first_note_reopens_same_nonce_and_id_with_fresh_token() 
     let lease = opened.writer.unwrap();
     let bytes = Owner::core_author(&opened)
         .unwrap()
-        .append_paragraph("durable before hosting");
+        .append_paragraph("durable before hosting")
+        .unwrap();
     owner
         .commit_leased("one", opened.generation, lease.token, [1; 16], &bytes)
         .unwrap();
@@ -950,12 +1083,18 @@ fn real_prehost_genesis_first_note_reopens_same_nonce_and_id_with_fresh_token() 
         .unwrap()
         .unwrap()
     );
-    assert_eq!(reopened.state, opened_state(&bytes));
+    assert_eq!(
+        Note::from_ordered(&reopened.state)
+            .unwrap()
+            .state()
+            .unwrap(),
+        opened_state(&bytes)
+    );
 }
 fn opened_state(bytes: &[u8]) -> Vec<u8> {
-    let mut n = Note::new();
+    let mut n = Note::new().unwrap();
     n.apply_update(bytes).unwrap();
-    n.state()
+    n.state().unwrap()
 }
 struct Unavailable;
 impl AcceptedBindings for Unavailable {

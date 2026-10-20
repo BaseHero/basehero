@@ -734,6 +734,225 @@ test('an update drain says so, and the view names its selection as relative byte
   await p.close();
 });
 
+async function peerAt(p,id) {return p.evaluate(id=>window.harness.peerAt(id),id);}
+async function macCaret(p,text) {
+  const range=await p.evaluate(text=>window.harness.relativeSelection(text),text);
+  await p.evaluate(([anchor,head])=>window.harness.remote({type:'remote',id:'mac',label:'Mac',colour:0,anchor,head}),[range.anchor,range.head]);
+}
+
+// Test 6a: a remote device's caret is a relative position, so it stays on its
+// words while this window types before it and a remote batch arrives around it.
+test('remote caret stays on text while both type',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await macCaret(p,'fox');
+  await p.waitForFunction(()=>!!window.harness.peerAt('mac'));
+  assert.deepEqual(await peerAt(p,'mac'),{before:'The quick brown fox',selection:'fox',label:'Mac',colour:'#1b5fd9'});
+  // Local typing before the caret: the words it covers do not move under it.
+  await p.locator('.ProseMirror').focus();
+  await p.evaluate(()=>window.harness.caretAtStart());
+  await p.keyboard.type('Today ');
+  await p.waitForFunction(()=>window.harness.peerAt('mac')?.before.startsWith('Today The '));
+  await p.waitForFunction(()=>window.harness.peerAt('mac')?.selection==='fox');
+  // A remote batch inserts before and after those words.
+  await p.evaluate(()=>window.harness.incomingAtText('quick brown',0,'Big '));
+  await p.waitForFunction(()=>window.harness.peerAt('mac')?.before.includes('Big quick brown'));
+  await p.evaluate(()=>window.harness.incomingAtText('fox',3,' very'));
+  await p.waitForFunction(()=>window.harness.peerAt('mac')?.before.endsWith('quick brown fox'));
+  assert.deepEqual(await peerAt(p,'mac'),{before:'Today The Big quick brown fox',selection:'fox',label:'Mac',colour:'#1b5fd9'});
+  await p.close();
+});
+
+// Test 6b: a position naming an item this copy has not received keeps the
+// last caret; the batch carrying that item moves it.
+test('unresolved position keeps last then moves',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await macCaret(p,'fox');
+  await p.waitForFunction(()=>!!window.harness.peerAt('mac'));
+  assert.equal((await peerAt(p,'mac')).selection,'fox');
+  const future=await p.evaluate(()=>window.harness.futureRelative('future words'));
+  await p.evaluate(future=>window.harness.remote({type:'remote',id:'mac',label:'Mac',colour:0,anchor:future.anchor,head:future.head}),future);
+  assert.deepEqual(await peerAt(p,'mac'),{before:'The quick brown fox',selection:'fox',label:'Mac',colour:'#1b5fd9'},'the last caret stays while the item is missing');
+  await p.evaluate(future=>window.harness.incomingBytes(future.update),future);
+  await p.waitForFunction(()=>window.harness.peerAt('mac')?.before.endsWith('future words'));
+  const moved=await peerAt(p,'mac');
+  assert.equal(moved.selection,'');
+  assert.ok(moved.before.endsWith('future words'));
+  await p.close();
+});
+
+// Test 6c: the approved idle state is the same 2 px caret with only its label
+// collapsed to a 6 px colour tab at 3 s. Hovering the tab, or tapping it, shows
+// the label again for another 3 s. Playwright's fake clock drives the timer;
+// every assertion reads geometry, never wall-clock time.
+test('label hides after 3s to a tab',async()=>{
+  const p=await browser.newPage();await p.clock.install();
+  await p.goto(`http://127.0.0.1:${server.address().port}/`);
+  await p.waitForFunction(()=>!!window.harness);
+  await p.evaluate(()=>window.harness.open('sentence'));
+  const range=await p.evaluate(()=>window.harness.relativeSelection('fox'));
+  // The remote message draws synchronously; a locator wait here would advance
+  // the fake clock before the 3 s timer starts.
+  await p.evaluate(([anchor,head])=>window.harness.remote({type:'remote',id:'mac',label:'Mac',colour:0,anchor,head}),[range.anchor,range.head]);
+  const cursor=p.locator('.bh-remote-cursor'),label=p.locator('.bh-remote-label');
+  assert.equal(await label.textContent(),'Mac');
+  const shown=await p.evaluate(()=>window.harness.caretBox('mac'));
+  assert.ok(shown.label.width>6,'the label is full width while the caret moves');
+  assert.equal(shown.cursor.width,2,'the caret is a 2 px line');
+  // Playwright's own calls advance the fake clock by about a millisecond, so
+  // the "before" check aims at 2 s rather than the exact boundary.
+  await p.clock.fastForward(2000);
+  assert.equal(await p.evaluate(()=>window.harness.caretBox('mac').label.width>6),true,'the label is still full before 3 s');
+  await p.clock.fastForward(1000);
+  const idle=await p.evaluate(()=>window.harness.caretBox('mac'));
+  assert.deepEqual({width:idle.label.width,height:idle.label.height},{width:6,height:6},'the label alone is a 6 px tab at 3 s');
+  assert.deepEqual(idle.cursor,shown.cursor,'only the label shrinks: the 2 px caret keeps its size');
+  assert.equal(idle.textLeft,shown.textLeft,'collapsing the label moves no text');
+  assert.equal(await cursor.getAttribute('data-collapsed'),'','the caret is in its idle state');
+  // Hover on the tab shows the name again while the pointer is over it.
+  await label.hover();
+  assert.equal(await p.evaluate(()=>window.harness.caretBox('mac').label.width>6),true,'hovering the tab shows the label');
+  assert.equal(await label.textContent(),'Mac');
+  // A Fold tap shows it for another 3 s, then it collapses again.
+  await label.click();
+  await p.mouse.move(0,0);
+  assert.equal(await cursor.getAttribute('data-collapsed'),null,'a tap leaves the label shown');
+  assert.equal(await p.evaluate(()=>window.harness.caretBox('mac').label.width>6),true,'the tapped label is full width');
+  await p.clock.fastForward(3000);
+  assert.equal(await p.evaluate(()=>window.harness.caretBox('mac').label.width),6,'the tap restarts the 3 s hide');
+  await p.close();
+});
+
+// A window on this same device keeps its integer-position path: the relayed
+// caret draws grey and unlabelled beside another device's coloured one.
+test('same-device window caret draws alongside a remote caret',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await p.evaluate(()=>window.harness.remote({type:'set',id:'window-2',anchor:5,head:9}));
+  assert.equal(await p.locator('.bh-peer-cursor').count(),1);
+  assert.equal(await p.locator('.bh-peer-selection').count(),1);
+  await macCaret(p,'fox');
+  await p.waitForFunction(()=>!!window.harness.peerAt('mac'));
+  assert.equal(await p.locator('.bh-peer-cursor').count(),1,'the remote caret does not replace the window caret');
+  assert.equal(await p.locator('.bh-remote-cursor').count(),1);
+  assert.equal(await p.locator('.bh-remote-label').textContent(),'Mac');
+  await p.evaluate(()=>window.harness.remote({type:'remove',id:'window-2'}));
+  assert.equal(await p.locator('.bh-peer-cursor').count(),0);
+  assert.equal(await p.locator('.bh-remote-cursor').count(),1,'removing the window caret leaves the remote one');
+  await p.close();
+});
+
+// An approved label is at most 24 characters, with an ellipsis when longer.
+test('a long device label shows 24 characters with an ellipsis',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  const long='Pixel 10 Pro Fold folded inner screen';
+  const range=await p.evaluate(()=>window.harness.relativeSelection('fox'));
+  await p.evaluate(([anchor,head,label])=>window.harness.remote({type:'remote',id:'fold',label,colour:1,anchor,head}),[range.anchor,range.head,long]);
+  const shown=await p.locator('.bh-remote-label').textContent();
+  assert.equal(Array.from(shown).length,24);
+  assert.equal(shown,'Pixel 10 Pro Fold folde…');
+  assert.equal(await p.locator('.bh-remote-cursor').getAttribute('data-label'),shown);
+  await p.close();
+});
+
+// Every view update redraws the carets, so it must leave an unchanged label's
+// text alone and measure every peer before writing any marker: a write between
+// measures would make the next peer's coordsAtPos flush the layout it caused.
+test('a redraw keeps an unchanged label node and measures every peer first',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await macCaret(p,'fox');
+  const quick=await p.evaluate(()=>window.harness.relativeSelection('quick'));
+  await p.evaluate(([anchor,head])=>window.harness.remote({type:'remote',id:'fold',label:'Fold',colour:1,anchor,head}),[quick.anchor,quick.head]);
+  await p.waitForFunction(()=>document.querySelectorAll('.bh-remote-cursor').length===2);
+  const drawn=await p.evaluate(()=>{
+    const view=document.querySelector('.ProseMirror').editor.view;
+    const label=document.querySelector('.bh-remote-cursor[data-peer="mac"] .bh-remote-label');
+    const textNode=label.firstChild,order=[];
+    for (const marker of document.querySelectorAll('.bh-remote-cursor')) {
+      const style=marker.style,set=style.setProperty;
+      style.setProperty=function(name,value,priority){if(name==='--peer')order.push('write');return set.call(this,name,value,priority);};
+    }
+    const coords=view.coordsAtPos.bind(view);
+    view.coordsAtPos=(...args)=>{order.push('measure');return coords(...args);};
+    view.dispatch(view.state.tr);
+    return {sameNode:label.firstChild===textNode,text:label.textContent,order};
+  });
+  assert.equal(drawn.text,'Mac');
+  assert.equal(drawn.sameNode,true,'an unchanged label keeps its text node');
+  assert.equal(drawn.order.filter(step=>step==='measure').length,2,'both peers are measured');
+  assert.ok(drawn.order.lastIndexOf('measure')<drawn.order.indexOf('write'),`every peer is measured before any marker is written: ${drawn.order.join(',')}`);
+  await p.close();
+});
+
+// A long press on the label must not start a page text selection, which would
+// take the selection out of the editable and could hide the keyboard. The
+// label inherits it from the overlay it is drawn in.
+test('a remote label takes no page text selection',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await macCaret(p,'fox');
+  await p.waitForFunction(()=>!!window.harness.peerAt('mac'));
+  const style=await p.evaluate(()=>{
+    const label=getComputedStyle(document.querySelector('.bh-remote-label'));
+    const overlay=getComputedStyle(document.querySelector('.bh-remote-carets'));
+    return {label:label.webkitUserSelect,overlay:overlay.webkitUserSelect,standard:label.userSelect};
+  });
+  assert.equal(style.label,'none','the label starts no page text selection');
+  assert.equal(style.overlay,'none','the overlay does not start one either');
+  if (browserName==='chromium') assert.equal(style.standard,'none','the standard property agrees in Chromium');
+  await p.close();
+});
+
+// An Android keyboard edits the note by offsets in the editable's own text.
+// A remote caret drawn inside that text (its "Mac" label) let Gboard's
+// double-space period land inside the label, which ended editing and hid
+// the keyboard. The caret stays drawn while the editable holds only the
+// note's text, before and after typing through it.
+test('a remote caret adds no text to the editable note',async()=>{
+  const p=await page();await p.evaluate(()=>window.harness.open('sentence'));
+  await p.evaluate(()=>window.harness.autoAck());
+  const range=await p.evaluate(()=>window.harness.relativeSelection('The'));
+  await p.evaluate(at=>window.harness.remote({type:'remote',id:'mac',label:'Mac',colour:0,anchor:at,head:at}),range.anchor);
+  await p.locator('.ProseMirror').focus();
+  await p.evaluate(()=>window.harness.caretAtStart());
+  const sentence='The quick brown fox jumps over the lazy dog.';
+  assert.deepEqual(await peerAt(p,'mac'),{before:'',selection:'',label:'Mac',colour:'#1b5fd9'});
+  assert.deepEqual(await p.evaluate(()=>window.harness.editableText()),{all:sentence,before:''});
+  await p.keyboard.type('Hi ');
+  await p.waitForFunction(()=>window.harness.text().includes('Hi '));
+  assert.deepEqual(await p.evaluate(()=>window.harness.editableText()),{all:'Hi '+sentence,before:'Hi '});
+  assert.equal((await peerAt(p,'mac')).label,'Mac','the caret is still drawn');
+  await p.close();
+});
+
+// A caret on an empty line has no text to anchor to. Made by Enter, as a
+// person makes one, it shows on that line on the other device, both ways.
+test('a caret on an empty line shows on that line',async()=>{
+  const cases=[
+    ['middle',async p=>{await p.evaluate(()=>window.harness.caret('dog.'));
+      await p.keyboard.press('Enter');await p.keyboard.press('Enter');await p.keyboard.type('after');},1,3],
+    ['first',async p=>{await p.evaluate(()=>window.harness.caretAtStart());await p.keyboard.press('Enter');},0,2],
+    ['last',async p=>{await p.evaluate(()=>window.harness.caret('dog.'));await p.keyboard.press('Enter');},1,2],
+  ];
+  for (const [where,write,line,blocks] of cases) {
+    const fold=await page();await fold.evaluate(()=>window.harness.open('sentence'));
+    await fold.evaluate(()=>window.harness.autoAck());
+    await fold.locator('.ProseMirror').focus();
+    await write(fold);
+    await fold.waitForFunction(blocks=>window.harness.hostDeltaText().split('\n').length===blocks,blocks);
+    const mac=await page();
+    await mac.evaluate(bytes=>window.harness.open('bytes',{bytes,writers:[{id:7}]}),await fold.evaluate(()=>window.harness.hostBytes()));
+    // Each device puts its own caret on the empty line; the other draws it.
+    for (const [from,to] of [[fold,mac],[mac,fold]]) {
+      assert.equal(await from.locator('.ProseMirror > *').count(),blocks,where);
+      assert.equal(await from.locator('.ProseMirror > *').nth(line).textContent(),'',where);
+      await from.evaluate(line=>{const e=document.querySelector('.ProseMirror').editor;let at=0;
+        e.state.doc.forEach((node,offset,index)=>{if(index===line)at=offset+1;});e.commands.setTextSelection(at);},line);
+      const {anchor,head}=await from.evaluate(()=>window.harness.view());
+      await to.evaluate(([anchor,head])=>window.harness.remote({type:'remote',id:'peer',label:'Peer',colour:0,anchor,head}),[anchor,head]);
+      assert.equal(await to.evaluate(()=>window.harness.peerBlock('peer')),line,`${where} empty line, ${from===fold?'Fold to Mac':'Mac to Fold'}`);
+    }
+    await fold.close();await mac.close();
+  }
+});
+
 test('drain reads the last DOM change into the note before it stops editing',async()=>{
   const p=await page();await p.evaluate(()=>window.harness.open('empty'));
   await p.locator('.ProseMirror').evaluate(el=>{

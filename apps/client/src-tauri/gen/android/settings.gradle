@@ -1,5 +1,7 @@
 include ':app'
 include ':device-keys'
 project(':device-keys').projectDir = new File(settingsDir, '../../../plugins/device-keys/android')
+include ':qr-scan'
+project(':qr-scan').projectDir = new File(settingsDir, '../../../plugins/qr-scan/android')
 
 apply from: 'tauri.settings.gradle'

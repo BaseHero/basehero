@@ -222,7 +222,10 @@ fn unregistered_writing_has_no_ordered_head_or_signed_successor() {
         audience: [0; 32],
         note: [11; 32],
     };
-    let delta = bh_core::note::Note::new().append_paragraph("unregistered local writing");
+    let delta = bh_core::note::Note::new()
+        .unwrap()
+        .append_paragraph("unregistered local writing")
+        .unwrap();
     let mut db = f.db.lock().unwrap();
     db.apply_local_update(key, [12; 16], &delta).unwrap();
     let pending = db.pending_note_updates().unwrap();

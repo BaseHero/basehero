@@ -24,6 +24,23 @@ These bounds cover only work inside these helpers, not the cost of decoding or
 applying updates, nor other yrs APIs. As upstream, the transaction must belong
 to the node's document. They expose no item pointers and no mutation.
 
+`src/structure.rs` adds a third read-only helper, `structure_digest(txn)`: a
+SHA-256 (the added `sha2` dependency) over a canonical stream of the state
+vector, the delete set, any pending update and delete set, and every non-empty
+root and nested branch in item order. Items are hashed as runs of clock units
+(client, first clock, length, and deleted or content kind), so how blocks are
+split or merged, or whether deleted content was collected, does not change the
+digest; nested types add their type and tag, map entries their key and value
+chain. It visits each item, map entry and ID range once, with an explicit stack
+rather than recursion, so its work is bounded by the document's size. It
+exposes no item pointers and changes nothing.
+
+`Cargo.toml` drops upstream's `js` feature from `fastrand`. With it, a
+`wasm32-unknown-unknown` build imports wasm-bindgen's browser random source;
+without it, that target's `fastrand` seed is fixed, so a Wasm build imports
+nothing and draws no ambient randomness. Other targets are unchanged. Callers
+that need distinct client IDs on Wasm must pass them explicitly.
+
 The standalone
 `[workspace]` declaration in Cargo.toml prevents this vendored package becoming
 an implicit workspace member. Its `[lints.rust] warnings = "allow"` matches the

@@ -27,7 +27,7 @@ function heldHost() {
   ipc.handle("note_binding", () => ({ note: Array(32).fill(3), surface: "41", view: window.__bhView }));
   ipc.handle("note_selection", () => []);
   ipc.handle("note_list", () => []);
-  ipc.handle("note_open", () => ({ clientId: 2002468231004600, writerToken: Array(32).fill(9), state: [0, 0], generation: 7, sequence: 0 }));
+  ipc.handle("note_open", () => ({ clientId: 2002468231004600, writerToken: Array(32).fill(9), updates: [[0, 0]], generation: 7, sequence: 0 }));
   ipc.handle("note_commit", (args) => new Promise((resolve, reject) => window.__bhAcks.push({ args, resolve, reject })));
   ipc.handle("note_close", () => null);
   ipc.handle("note_drained", () => window.__bhDrainedReply);
@@ -121,7 +121,7 @@ for (const browserName of browserMatrix) {
         const page = await openPage(browser, server.origin, { extraInit: [heldHost, () => {
           // Native's open was already under way when the drain arrived.
           window.__bhIpc.handle("note_open", () => new Promise((resolve) => {
-            window.__bhOpenGate = () => resolve({ clientId: 2002468231004600, writerToken: Array(32).fill(9), state: [0, 0], generation: 7, sequence: 0 });
+            window.__bhOpenGate = () => resolve({ clientId: 2002468231004600, writerToken: Array(32).fill(9), updates: [[0, 0]], generation: 7, sequence: 0 });
           }));
         }] });
         await page.waitForFunction(() => !!window.__bhOpenGate);
@@ -158,7 +158,7 @@ for (const browserName of browserMatrix) {
       try {
         const page = await openPage(browser, server.origin, { extraInit: [heldHost, () => {
           window.__bhIpc.handle("note_open", () => new Promise((resolve) => {
-            window.__bhOpenGate = () => resolve({ clientId: 2002468231004600, writerToken: Array(32).fill(9), state: [0, 0], generation: 7, sequence: 0 });
+            window.__bhOpenGate = () => resolve({ clientId: 2002468231004600, writerToken: Array(32).fill(9), updates: [[0, 0]], generation: 7, sequence: 0 });
           }));
           window.__bhIpc.handle("note_drained", () => new Promise((resolve) => {
             window.__bhRefuseDrain = () => resolve(false);
@@ -224,7 +224,7 @@ for (const browserName of browserMatrix) {
         const restarted = await openPage(browser, server.origin, { extraInit: [heldHost, [([view, committed]) => {
           window.__bhView = view;
           window.__bhIpc.handle("note_open", async () => ({ clientId: 2002468231004601, writerToken: Array(32).fill(8),
-            state: committed[0], generation: 9, sequence: 0 }));
+            updates: [committed[0]], generation: 9, sequence: 0 }));
         }, [view, committed]]] });
         await restarted.waitForFunction(() => {
           const s = document.querySelector(".ProseMirror")?.editor?.state.selection;

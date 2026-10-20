@@ -23,7 +23,9 @@ with tempfile.TemporaryDirectory(prefix='bh-devicekeys-runner-test.') as tmp:
     shutil.copy2(module / 'run-emulator.sh', target / 'run-emulator.sh')
     lib = root / 'basehero/apps/client/tests/webdriver/lib.sh'
     lib.parent.mkdir(parents=True)
+    (root / 'basehero/apps/client/tests/android').mkdir(parents=True)
     shutil.copy2(client / 'tests/webdriver/lib.sh', lib)
+    shutil.copy2(client / 'tests/android/emulator.sh', root / 'basehero/apps/client/tests/android/emulator.sh')
     apk = target / 'build/outputs/apk/androidTest/debug/bh-device-keys-android-debug-androidTest.apk'
     apk.parent.mkdir(parents=True)
     apk.touch()

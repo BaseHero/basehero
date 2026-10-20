@@ -143,7 +143,7 @@ fn compact(database: &Database, key: NoteKey) -> Result<(), StoreError> {
         }
         job.apply_page(&page)?;
     }
-    if let Some(encoded) = job.finish() {
+    if let Some(encoded) = job.finish()? {
         database
             .lock()
             .expect("container writer lock")

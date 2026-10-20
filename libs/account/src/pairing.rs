@@ -11,6 +11,15 @@ use crate::{AccountId, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, 
 
 const DOMAIN: &[u8; 8] = b"BHPAIR01";
 const PROOF_DOMAIN: &[u8] = b"BaseHero QR proof v1\0";
+const REPLY_DOMAIN: &[u8; 8] = b"BHPRPL01";
+const SHOW_DOMAIN: &[u8] = b"BaseHero pairing show message v1\0";
+const JOIN_DOMAIN: &[u8] = b"BaseHero pairing join message v1\0";
+/// Subkeys of the QR secret under the pairing context: 1 authenticates the
+/// scanner's reply, 2 and 4 seal the showing and the scanning device's relay
+/// messages, 3 is the relay name.
+const SHOW_KEY: u64 = 2;
+const RELAY_NAME: u64 = 3;
+const JOIN_KEY: u64 = 4;
 const VERSION: u16 = 1;
 const QR_LEN: usize = 122;
 const PROOF_LEN: usize = 40;
@@ -71,6 +80,77 @@ impl QrCode {
             session: raw[74..90].try_into().unwrap(),
             secret: Secret::from_slice(&raw[90..]).map_err(|_| PairError::Malformed)?,
         })
+    }
+}
+
+/// The relay's name for one pairing and the keys for each side's relay
+/// messages, all derived from the QR secret. The relay sees only the name, a
+/// keyed hash of the secret it cannot invert, and sealed messages; it never
+/// sees the secret, and none of these is ever logged or persisted.
+pub struct RelayKeys {
+    name: [u8; 32],
+    show: Secret<32>,
+    join: Secret<32>,
+}
+impl RelayKeys {
+    fn of(secret: &Secret<32>) -> Self {
+        Self {
+            name: *crypto::derive_key(secret, DOMAIN, RELAY_NAME).expose(),
+            show: crypto::derive_key(secret, DOMAIN, SHOW_KEY),
+            join: crypto::derive_key(secret, DOMAIN, JOIN_KEY),
+        }
+    }
+    /// The relay object's name: `/v1/pair/<hex of this>`.
+    pub fn name(&self) -> [u8; 32] {
+        self.name
+    }
+    fn seal(
+        &self,
+        key: &Secret<32>,
+        domain: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, PairError> {
+        let ad = [domain, &self.name].concat();
+        let (nonce, ciphertext) =
+            crypto::aead_seal(key, &ad, plaintext).map_err(|_| PairError::Malformed)?;
+        Ok([nonce.as_slice(), &ciphertext].concat())
+    }
+    fn open(
+        &self,
+        key: &Secret<32>,
+        domain: &[u8],
+        sealed: &[u8],
+    ) -> Result<crate::crypto::SecretBytes, PairError> {
+        if sealed.len() < 24 {
+            return Err(PairError::InvalidReply);
+        }
+        let nonce: [u8; 24] = sealed[..24].try_into().expect("fixed nonce");
+        crypto::aead_open(key, &nonce, &[domain, &self.name].concat(), &sealed[24..])
+            .map_err(|_| PairError::InvalidReply)
+    }
+    /// Seal one message from the showing device: nonce (24) then ciphertext.
+    pub fn seal_show(&self, plaintext: &[u8]) -> Result<Vec<u8>, PairError> {
+        self.seal(&self.show, SHOW_DOMAIN, plaintext)
+    }
+    /// Open a message sealed by the showing device of this pairing. It is
+    /// authenticated, not authority: admission is only verified history.
+    pub fn open_show(&self, sealed: &[u8]) -> Result<crate::crypto::SecretBytes, PairError> {
+        self.open(&self.show, SHOW_DOMAIN, sealed)
+    }
+    /// Seal one message from the scanning device, so that the relay sees
+    /// neither its keys nor its label. A reply still carries its own proof.
+    pub fn seal_join(&self, plaintext: &[u8]) -> Result<Vec<u8>, PairError> {
+        self.seal(&self.join, JOIN_DOMAIN, plaintext)
+    }
+    pub fn open_join(&self, sealed: &[u8]) -> Result<crate::crypto::SecretBytes, PairError> {
+        self.open(&self.join, JOIN_DOMAIN, sealed)
+    }
+}
+
+impl QrCode {
+    /// The relay keys of the session this code shows.
+    pub fn relay(&self) -> RelayKeys {
+        RelayKeys::of(&self.secret)
     }
 }
 
@@ -229,6 +309,43 @@ fn transcript(
     Ok(out)
 }
 impl Reply {
+    /// The relay form: domain (8), session (16), the three public keys
+    /// (1280), label length (u16) and label (at most 64), then the proof (40).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 16 + 1280 + 2 + self.label.len() + PROOF_LEN);
+        out.extend_from_slice(REPLY_DOMAIN);
+        out.extend_from_slice(&self.session);
+        out.extend_from_slice(self.keys.signing());
+        out.extend_from_slice(self.keys.control());
+        out.extend_from_slice(self.keys.receiving());
+        out.extend_from_slice(&(self.label.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.label);
+        out.extend_from_slice(&self.proof);
+        out
+    }
+    /// Decoding is not verification; `ShowingSession::receive` checks the proof.
+    pub fn decode(raw: &[u8]) -> Result<Self, PairError> {
+        const FIXED: usize = 8 + 16 + 1280 + 2;
+        if raw.len() < FIXED + PROOF_LEN || &raw[..8] != REPLY_DOMAIN {
+            return Err(PairError::Malformed);
+        }
+        let label_len = u16::from_be_bytes(raw[FIXED - 2..FIXED].try_into().unwrap()) as usize;
+        if label_len > MAX_LABEL || raw.len() != FIXED + label_len + PROOF_LEN {
+            return Err(PairError::Malformed);
+        }
+        let keys = DevicePublicKeys::new(
+            raw[24..56].try_into().unwrap(),
+            raw[56..88].try_into().unwrap(),
+            raw[88..FIXED - 2].try_into().unwrap(),
+        )
+        .map_err(|_| PairError::Malformed)?;
+        Ok(Self {
+            session: raw[8..24].try_into().unwrap(),
+            keys,
+            label: raw[FIXED..FIXED + label_len].to_vec(),
+            proof: raw[FIXED + label_len..].try_into().unwrap(),
+        })
+    }
     pub fn make(qr: &QrCode, keys: DevicePublicKeys, label: &[u8]) -> Result<Self, PairError> {
         let ad = transcript(qr.account, qr.showing, qr.session, &keys, label)?;
         let key = crypto::derive_key(&qr.secret, b"BHPAIR01", 1);
@@ -288,6 +405,14 @@ impl ShowingSession {
             session: self.session,
             secret: Secret::from_slice(secret.expose()).expect("secret length"),
         })
+    }
+    /// The relay keys while the session is live; none once it ended.
+    pub fn relay(&self) -> Result<RelayKeys, PairError> {
+        let state = self.state.lock().expect("session lock poisoned");
+        let State::Live { secret, .. } = &*state else {
+            return Err(PairError::Ended);
+        };
+        Ok(RelayKeys::of(secret))
     }
     pub fn receive(&self, reply: &Reply) -> Result<DevicePublicKeys, PairError> {
         let mut state = self.state.lock().expect("session lock poisoned");

@@ -92,7 +92,7 @@ fn run(path: &Path, shape: &str, updates: usize) {
         visited += page.len();
         job.apply_page(&page).unwrap();
     }
-    let checkpoint = job.finish().unwrap();
+    let checkpoint = job.finish().unwrap().unwrap();
     let compact_time = encode.elapsed();
     let checkpoint_bytes = checkpoint.encoded_bytes();
     let rss_after_checkpoint = rss_bytes();
@@ -118,7 +118,10 @@ fn ten_thousand_offline_edited_notes() {
     let path = dir.path().join("offline.db");
     let mut db = DeviceDatabase::open(&path).unwrap();
     let conn = Connection::open(&path).unwrap();
-    let delta = bh_core::note::Note::new().append_paragraph("offline draft");
+    let delta = bh_core::note::Note::new()
+        .unwrap()
+        .append_paragraph("offline draft")
+        .unwrap();
     let scope = scope();
     let started = Instant::now();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();

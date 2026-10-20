@@ -113,9 +113,9 @@ class MacPackageTests(unittest.TestCase):
         with mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "run", side_effect=RuntimeError("build reached")):
             for root in (private, public):
                 with self.subTest(root=root), mock.patch.object(package, "ROOT", root), self.assertRaisesRegex(ValueError, "source-only export"):
-                    package.build(42, self.root / "out", signing_root=ROOT_SHA1)
+                    package.build(42, self.root / "out", signing_root=ROOT_SHA1, local_only=True)
             with mock.patch.object(package, "ROOT", export), self.assertRaisesRegex(RuntimeError, "build reached"):
-                package.build(42, self.root / "out", signing_root=ROOT_SHA1)
+                package.build(42, self.root / "out", signing_root=ROOT_SHA1, local_only=True)
 
     def test_current_target_bundle_selected_without_old_default_fallback(self):
         export = self.root / "export"
@@ -138,6 +138,7 @@ class MacPackageTests(unittest.TestCase):
                          "assert args[args.index('--target')+1] == 'aarch64-apple-darwin'\n"
                          "assert args[-2:] == ['--', '--locked']\n"
                          "assert os.environ.get('CARGO_BUILD_TARGET') == 'aarch64-apple-darwin'\n"
+                         "assert pathlib.Path(os.environ['BH_SYNC_ENDPOINT']).read_bytes() == pathlib.Path(os.environ['BH_TEST_ENDPOINT']).read_bytes()\n"
                          "app=pathlib.Path(os.environ['CARGO_TARGET_DIR'])/'aarch64-apple-darwin/release/bundle/macos/BaseHero.app'\n"
                          "assert not app.exists(), 'old selected output was not cleared'\n"
                          "(app/'Contents/MacOS').mkdir(parents=True)\n"
@@ -148,12 +149,20 @@ class MacPackageTests(unittest.TestCase):
         codesign.write_text("#!/bin/sh\nexit 0\n")
         codesign.chmod(0o755)
         output = self.root / "out"
-        env = {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+        endpoint = self.root / 'endpoint.json'
+        endpoint.write_text(json.dumps({'edge_url': 'https://edge.invalid', 'hosting_root': '11' * 32,
+                                       'app_root': '22' * 32, 'policy': '', 'policy_signature': '',
+                                       'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
+                                       'build_floor': 1, 'appraisal': 'hardware'}) + '\n')
+        env = {'BH_TEST_ENDPOINT': str(endpoint),"PATH": str(tools) + os.pathsep + os.environ["PATH"],
                "CARGO_TARGET_DIR": str(self.root / "inherited-target"),
                "CARGO_BUILD_TARGET": "x86_64-apple-darwin",
                "BH_TEST_LOG": str(self.root / "cargo.log")}
         with mock.patch.dict(os.environ, env), mock.patch.object(package, "ROOT", export), mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "inspect_macho", return_value=False):
-            package.build(42, output, signing_root=ROOT_SHA1)
+            package.build(42, output, signing_root=ROOT_SHA1, sync_endpoint=endpoint)
+        proof = json.loads((output / 'sync-endpoint-provenance.json').read_text())
+        self.assertEqual(proof['endpoint']['sha256'], hashlib.sha256(endpoint.read_bytes()).hexdigest())
+        self.assertEqual(proof['artifact_sha256'], hashlib.sha256((output / package.NAME).read_bytes()).hexdigest())
         with tarfile.open(output / package.NAME, "r:gz") as archive:
             self.assertEqual(archive.extractfile("BaseHero.app/Contents/MacOS/bh-client").read(), b"CURRENT COMMIT")
             self.assertIn(b"EFF attribution", archive.extractfile("BaseHero.app/Contents/Resources/Licenses/eff_large_wordlist-LICENSE.md").read())
@@ -163,7 +172,7 @@ class MacPackageTests(unittest.TestCase):
         rejected = self.root / "rejected"
         with mock.patch.dict(os.environ, {**env, "BH_TEST_INJECT_WEBDRIVER": "1"}), mock.patch.object(package, "ROOT", export), mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "inspect_macho", return_value=False):
             with self.assertRaises(subprocess.CalledProcessError):
-                package.build(43, rejected, signing_root=ROOT_SHA1)
+                package.build(43, rejected, signing_root=ROOT_SHA1, sync_endpoint=endpoint)
         self.assertFalse((rejected / package.NAME).exists())
         self.assertIn(b"tauri_plugin_webdriver", (current / "Contents" / "MacOS" / "bh-client").read_bytes())
 
@@ -198,8 +207,8 @@ class MacPackageTests(unittest.TestCase):
         codesign.chmod(0o755)
         env = {"PATH": str(tools) + os.pathsep + os.environ["PATH"], "BH_TEST_LOG": str(self.root / "cargo.log")}
         with mock.patch.dict(os.environ, env), mock.patch.object(package, "ROOT", export), mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "inspect_macho", return_value=False):
-            package.build(42, self.root / "demo", demo, ROOT_SHA1)
-            package.build(43, self.root / "production", signing_root=ROOT_SHA1)
+            package.build(42, self.root / "demo", demo, ROOT_SHA1, local_only=True)
+            package.build(43, self.root / "production", signing_root=ROOT_SHA1, local_only=True)
         for output, identifier in (("demo", demo), ("production", "app.basehero.client")):
             with tarfile.open(self.root / output / package.NAME, "r:gz") as archive:
                 info = plistlib.loads(archive.extractfile("BaseHero.app/Contents/Info.plist").read())
@@ -236,8 +245,8 @@ class MacPackageTests(unittest.TestCase):
                 package.certificate_root(bad)
         with mock.patch.dict(os.environ, env), mock.patch.object(package, "ROOT", export), mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "inspect_macho", return_value=False):
             with self.assertRaises(ValueError):
-                package.build(42, self.root / "unrooted", signing_root="")
-            package.build(42, self.root / "out", signing_root=ROOT_SHA1)
+                package.build(42, self.root / "unrooted", signing_root="", local_only=True)
+            package.build(42, self.root / "out", signing_root=ROOT_SHA1, local_only=True)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(len(records), 2, "verify a canonical helper before building the requested identity")
         pin_record, record = records
@@ -270,7 +279,7 @@ class MacPackageTests(unittest.TestCase):
         # identity's helper and Tauri executable both built successfully.
         with mock.patch.object(package, "EXPECTED_HELPER_SHA256", "0" * 64), mock.patch.dict(os.environ, env), mock.patch.object(package, "ROOT", export), mock.patch.object(package.sys, "platform", "darwin"), mock.patch.object(package.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()), mock.patch.object(package, "inspect_macho", return_value=False):
             with self.assertRaisesRegex(ValueError, "Keychain helper.*SHA-256"):
-                package.build(43, self.root / "changed", signing_root=ROOT_SHA1)
+                package.build(43, self.root / "changed", signing_root=ROOT_SHA1, local_only=True)
         self.assertFalse((self.root / "changed" / package.NAME).exists())
 
     def test_eff_wordlist_notice_is_in_packaged_app(self):

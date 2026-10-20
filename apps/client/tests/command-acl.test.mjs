@@ -46,9 +46,10 @@ test("capabilities grant each command once, to its reviewed windows only", async
     assert.ok(want, `unexpected capability ${capability.identifier}`);
     assert.deepEqual(capability.windows, want.windows);
     assert.deepEqual(capability.platforms, want.platforms);
-    // Core grants are only the reviewed ones listed with their capability.
+    // Core and scanner plugin grants are only the reviewed narrow capabilities.
     assert.deepEqual(sorted(capability.permissions),
-      sorted([...want.commands.map((command) => `allow-${command.replaceAll("_", "-")}`), ...(want.core ?? [])]));
+      sorted([...want.commands.map((command) => `allow-${command.replaceAll("_", "-")}`),
+        ...(want.core ?? []), ...(want.plugins ?? [])]));
     for (const command of want.commands) {
       assert.ok(!granted.has(command), `${command} granted twice`);
       granted.set(command, capability.identifier);

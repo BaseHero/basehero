@@ -159,6 +159,182 @@ fn retained_ciphertexts_are_not_overwritten_by_a_pending_retry() {
 }
 
 #[test]
+fn native_sync_proof_uses_ordinary_path() {
+    use bh_account::{
+        Error,
+        device_auth::{self, Context},
+    };
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let context = Context {
+        channel_binding: [41; 32],
+        challenge: [42; 32],
+    };
+    let before_control = h.store.state().sign_calls;
+    let before_content = h.store.state().content_sign_calls;
+    let proof = ready(owner.prove_sync_device(&cap, context)).unwrap();
+    let at =
+        device_auth::verify_at(owner.verified(&cap).unwrap(), context, proof.as_bytes()).unwrap();
+    assert!(at.account() == cap.account_id());
+    assert!(at.device() == cap.device_id());
+    assert_eq!(at.head(), cap.head());
+    assert_eq!(h.store.state().sign_calls, before_control);
+    assert_eq!(h.store.state().content_sign_calls, before_content + 1);
+
+    h.store.state_mut().wrong_content_signature = true;
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Invalid(Error::BadSignature))
+    ));
+    h.store.state_mut().wrong_content_signature = false;
+    h.store.state_mut().content_error = Some(KeyStoreError::AuthenticationCancelled);
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Device(KeyStoreError::AuthenticationCancelled))
+    ));
+    h.store.state_mut().content_error = None;
+    h.store.state_mut().wrong_public = true;
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Device(KeyStoreError::WrongKey))
+    ));
+    assert_eq!(h.store.state().sign_calls, before_control);
+    assert_eq!(h.store.state().content_sign_calls, before_content + 3);
+}
+
+#[test]
+fn prove_at_refuses_future_head_and_inactive_device() {
+    use bh_account::{
+        Error,
+        device_auth::{self, Context},
+        journal::JournaledDevice,
+        platform::DeviceKeyStore,
+    };
+    let context = Context {
+        channel_binding: [41; 32],
+        challenge: [42; 32],
+    };
+    // The first device signs up, then adds a second device at position 4.
+    let h = Harness::new();
+    complete(&h);
+    let joined = Harness::new();
+    let second = ready(
+        joined
+            .store
+            .clone()
+            .create(ControlKeyPolicy::AppEnforcedOwnerConfirmation),
+    )
+    .unwrap();
+    let mut first = h.owner();
+    let cap = activate(&mut first);
+    let request = first.prepare_add_device(&cap, second.keys.clone()).unwrap();
+    let addition = ready(first.sign_control(&cap, &request)).unwrap();
+    first.apply_incoming(&[addition.as_bytes()]).unwrap();
+    let cap = activate(&mut first);
+    let history = h.stored().history;
+    assert_eq!(history.len(), 4);
+
+    // Proofs at each earlier verified head the first device was active at.
+    let views: Vec<_> = (1..=4)
+        .map(|n| {
+            let events: Vec<&[u8]> = history[..n].iter().map(Vec::as_slice).collect();
+            let mut view =
+                bh_account::VerifiedAccount::from_genesis(cap.account_id(), events[0]).unwrap();
+            view.apply_batch(&events[1..]).unwrap();
+            view
+        })
+        .collect();
+    for (n, view) in views.iter().enumerate() {
+        let position = n as u64 + 1;
+        let proof = ready(first.prove_sync_device_at(&cap, position, context)).unwrap();
+        let at = device_auth::verify_at(view, context, proof.as_bytes()).unwrap();
+        assert_eq!(at.head(), view.head());
+        assert!(at.device() == cap.device_id());
+    }
+    for position in [0, 5] {
+        assert!(matches!(
+            ready(first.prove_sync_device_at(&cap, position, context)),
+            Err(OwnerError::Invalid(Error::InvalidCredentials))
+        ));
+    }
+
+    // The second device holds the same history; it was not active before 4.
+    let mut journal = joined.journal();
+    journal
+        .commit_device(&JournaledDevice {
+            handle: second.handle.clone(),
+            keys: second.keys.clone(),
+            policy: second.policy,
+            kind: second.kind,
+        })
+        .unwrap();
+    let events: Vec<&[u8]> = history.iter().map(Vec::as_slice).collect();
+    journal
+        .commit_verified(cap.account_id(), &events, views[3].head(), false)
+        .unwrap();
+    let mut other = joined.owner();
+    let joined_cap = activate(&mut other);
+    let signed = joined.store.state().content_sign_calls;
+    for position in 1..=3 {
+        assert!(matches!(
+            ready(other.prove_sync_device_at(&joined_cap, position, context)),
+            Err(OwnerError::Invalid(Error::NotActive))
+        ));
+    }
+    assert_eq!(
+        joined.store.state().content_sign_calls,
+        signed,
+        "nothing signed"
+    );
+    let proof = ready(other.prove_sync_device_at(&joined_cap, 4, context)).unwrap();
+    let at = device_auth::verify_at(&views[3], context, proof.as_bytes()).unwrap();
+    assert!(at.device() == joined_cap.device_id());
+}
+
+#[test]
+fn late_sync_proof_is_discarded() {
+    use bh_account::device_auth::Context;
+    let h = Harness::new();
+    complete(&h);
+    let mut owner = h.owner();
+    let cap = activate(&mut owner);
+    let context = Context {
+        channel_binding: [41; 32],
+        challenge: [42; 32],
+    };
+    h.store.state_mut().advance_generation_on_load = true;
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Stale)
+    ));
+    assert_eq!(h.store.state().content_sign_calls, 0);
+    h.store.state_mut().advance_generation_on_load = false;
+    let cap = activate(&mut owner);
+    h.store.state_mut().advance_generation_on_sign = true;
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Stale)
+    ));
+    assert_eq!(h.store.state().content_sign_calls, 1);
+    h.store.state_mut().advance_generation_on_sign = false;
+    let before = h.store.state().content_sign_calls;
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::Stale)
+    ));
+    assert_eq!(h.store.state().content_sign_calls, before);
+    let cap = activate(&mut owner);
+    owner.lock().unwrap();
+    assert!(matches!(
+        ready(owner.prove_sync_device(&cap, context)),
+        Err(OwnerError::NotActive)
+    ));
+    assert_eq!(h.store.state().content_sign_calls, before);
+}
+
+#[test]
 fn late_native_content_and_personal_results_are_discarded() {
     let h = Harness::new();
     complete(&h);
@@ -1428,10 +1604,12 @@ fn reconcile_keeps_exact_row_on_forged_successor() {
     let mut owner = h.owner();
     activate(&mut owner);
     *event.last_mut().unwrap() ^= 1;
+    // Unauthenticated bytes are refused without a stop.
     assert!(matches!(
         owner.reconcile_staged_admission(Some(&[event.as_slice()])),
-        Err(OwnerError::Invalid(_))
+        Err(OwnerError::Refused(bh_account::Error::BadSignature))
     ));
+    assert!(!h.stored().stopped);
     assert_eq!(h.stored().head, before.head);
     assert_eq!(h.stored().history, before.history);
     assert_eq!(h.journal().staged_admission().unwrap(), original);
@@ -2003,20 +2181,102 @@ fn uncertain_home_head_does_not_advance_or_bless_bytes() {
     assert!(h.journal().load().unwrap().is_none());
 }
 
+fn test_keys(seed: u8) -> bh_account::DevicePublicKeys {
+    bh_account::DevicePublicKeys::new([seed; 32], [seed + 1; 32], [seed + 2; 1216]).unwrap()
+}
+
+/// Authenticated history contradicting the owner's: it applies one signed
+/// successor, and returns another active-device-signed event at the next
+/// position that extends a different successor of the same head.
+fn fork_successor(owner: &mut Owner, capability: &AccountCapability) -> Vec<u8> {
+    let taken = owner.prepare_add_device(capability, test_keys(81)).unwrap();
+    let taken = ready(owner.sign_control(capability, &taken)).unwrap();
+    let other = owner.prepare_add_device(capability, test_keys(91)).unwrap();
+    let other = ready(owner.sign_control(capability, &other)).unwrap();
+    let mut branch = owner.verified(capability).unwrap().clone();
+    branch.apply(other.as_bytes()).unwrap();
+    let next = branch
+        .add_device(capability.device_id(), test_keys(101))
+        .unwrap();
+    let next = ready(owner.sign_control(capability, &next)).unwrap();
+    owner.apply_incoming(&[taken.as_bytes()]).unwrap();
+    next.as_bytes().to_vec()
+}
+
 #[test]
-fn invalid_incoming_history_persists_stop_with_unchanged_head() {
+fn unauthenticated_or_unsupported_history_is_refused_without_a_stop() {
     let h = Harness::new();
     let _ = complete(&h);
     let mut owner = h.owner();
-    let _capability = activate(&mut owner);
+    let capability = activate(&mut owner);
+    let before = h.stored();
+    let request = owner
+        .prepare_add_device(&capability, test_keys(71))
+        .unwrap();
+    let valid = ready(owner.sign_control(&capability, &request))
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let mut bad_signature = valid.clone();
+    *bad_signature.last_mut().unwrap() ^= 1;
+    // Version and supported version follow the 23-byte domain.
+    let mut newer = valid.clone();
+    newer[23..27].copy_from_slice(&[0, 2, 0, 2]);
+    // The control tag ends the fixed header.
+    let mut unknown_control = valid.clone();
+    unknown_control[23 + 2 + 2 + 8 + 32 + 32 + 32] = 9;
+    // A signed event of this account, but not the next one.
+    let replayed = before.history[1].clone();
+
+    for (bytes, refused) in [
+        (
+            b"not an account event".to_vec(),
+            bh_account::Error::Malformed,
+        ),
+        (bad_signature, bh_account::Error::BadSignature),
+        (replayed, bh_account::Error::WrongPredecessor),
+    ] {
+        assert_eq!(
+            owner.apply_incoming(&[bytes.as_slice()]).err(),
+            Some(OwnerError::Refused(refused))
+        );
+    }
+    for (bytes, unsupported) in [
+        (newer, bh_account::Error::UnsupportedVersion),
+        (unknown_control, bh_account::Error::UnsupportedControl),
+    ] {
+        assert_eq!(
+            owner.apply_incoming(&[bytes.as_slice()]).err(),
+            Some(OwnerError::Unsupported(unsupported))
+        );
+    }
+    // Nothing applied, nothing latched: the session and its writer stay
+    // usable, and the valid successor still applies.
+    let after = h.stored();
+    assert!(!after.stopped);
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.history, before.history, "no unverified bytes stored");
+    assert!(capability.is_current());
+    let head = owner.apply_incoming(&[valid.as_slice()]).unwrap();
+    assert_eq!(head, AccountEvent::decode(&valid).unwrap().head());
+    assert!(capability.is_current());
+}
+
+#[test]
+fn authenticated_fork_persists_stop_with_unchanged_head() {
+    let h = Harness::new();
+    let _ = complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    let fork = fork_successor(&mut owner, &capability);
     let before = h.stored();
 
-    assert!(matches!(
-        owner.apply_incoming(&[b"not an account event"]),
-        Err(OwnerError::Invalid(_))
-    ));
+    assert_eq!(
+        owner.apply_incoming(&[fork.as_slice()]).err(),
+        Some(OwnerError::Invalid(bh_account::Error::Fork))
+    );
     let after = h.stored();
-    assert!(after.stopped, "invalid input must sticky-stop");
+    assert!(after.stopped, "a fork must sticky-stop");
     assert_eq!(after.head, before.head);
     assert_eq!(after.history, before.history, "no unverified bytes stored");
 
@@ -2033,9 +2293,10 @@ fn sticky_stop_survives_restart_and_keeps_remembered_head() {
     let h = Harness::new();
     let _ = complete(&h);
     let mut owner = h.owner();
-    let _ = activate(&mut owner);
+    let capability = activate(&mut owner);
+    let fork = fork_successor(&mut owner, &capability);
     let before = h.stored().head;
-    assert!(owner.apply_incoming(&[b"bad"]).is_err());
+    assert!(owner.apply_incoming(&[fork.as_slice()]).is_err());
 
     drop(owner);
     let mut owner = h.owner();
@@ -2220,9 +2481,11 @@ fn native_key_invalidation_and_integrity_stop_fence_previous_capabilities() {
     complete(&h);
     let mut owner = h.owner();
     let capability = activate(&mut owner);
+    let fork = fork_successor(&mut owner, &capability);
+    assert!(capability.is_current());
     assert!(matches!(
-        owner.apply_incoming(&[b"bad"]),
-        Err(OwnerError::Invalid(_))
+        owner.apply_incoming(&[fork.as_slice()]),
+        Err(OwnerError::Invalid(bh_account::Error::Fork))
     ));
     assert!(
         !capability.is_current(),
@@ -2236,6 +2499,7 @@ fn a_failed_stop_write_still_stops_the_session() {
     let _ = complete(&h);
     let mut owner = h.owner();
     let capability = activate(&mut owner);
+    let fork = fork_successor(&mut owner, &capability);
     // The durable stop write fails after the in-memory stop is set.
     h.raw()
         .execute_batch(
@@ -2244,7 +2508,7 @@ fn a_failed_stop_write_still_stops_the_session() {
         )
         .unwrap();
     assert!(matches!(
-        owner.apply_incoming(&[b"bad"]),
+        owner.apply_incoming(&[fork.as_slice()]),
         Err(OwnerError::Journal(_))
     ));
     assert!(
@@ -2347,4 +2611,133 @@ fn lock_invalidates_the_generation_and_the_capability() {
     ));
     let _ = activate(&mut owner);
     let _ = &h.dir;
+}
+
+#[test]
+fn base_control_signing_uses_the_control_key_for_base_originals_only() {
+    let h = Harness::new();
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    owner.confirm_kit_saved().unwrap();
+    owner.confirm_home_ordered(setup.head).unwrap();
+    let cap = activate(&mut owner);
+    let message = b"bh/original-envelope/v1\0a base copy".to_vec();
+    let expected = *owner
+        .verified(&cap)
+        .unwrap()
+        .active_device(cap.device_id())
+        .unwrap()
+        .control();
+    let before = h.store.state().sign_calls;
+    assert!(matches!(
+        ready(owner.sign_base_control(&cap, &[0; 32], &message)),
+        Err(OwnerError::Device(KeyStoreError::WrongKey))
+    ));
+    assert_eq!(h.store.state().sign_calls, before, "no prompt on wrong key");
+    let signature = ready(owner.sign_base_control(&cap, &expected, &message)).unwrap();
+    let keys = owner
+        .verified(&cap)
+        .unwrap()
+        .active_device(cap.device_id())
+        .unwrap()
+        .clone();
+    bh_account::crypto::verify(keys.control(), &message, &signature).unwrap();
+    assert!(bh_account::crypto::verify(keys.signing(), &message, &signature).is_err());
+    // An account event's bytes are not a base original.
+    let request = owner.prepare_remove_self(&cap).unwrap();
+    assert!(matches!(
+        ready(owner.sign_base_control(&cap, &expected, request.signing_bytes())),
+        Err(OwnerError::Invalid(_))
+    ));
+    // A lock or removal that lands while the prompt is open discards it.
+    h.store.state_mut().advance_generation_on_sign = true;
+    assert!(matches!(
+        ready(owner.sign_base_control(&cap, &expected, &message)),
+        Err(OwnerError::Stale)
+    ));
+}
+
+/// A joining device's own owner, before it has any account: its journaled
+/// scanner identity proves possession at the head the showing device names,
+/// and it commits only original history, verified from the code's anchor,
+/// that admits exactly its keys. It then opens the delivery its addition
+/// carried against that verified history.
+#[test]
+fn joining_device_proves_named_head_and_adopts_only_history_admitting_it() {
+    use bh_account::device_auth::{Context, verify_at};
+    use bh_account::pairing::{Reply, ScannerStatus, ShowingSession, scanner_identity};
+    let showing = Harness::new();
+    let setup = complete(&showing);
+    let joiner = Harness::new();
+    let identity = ready(scanner_identity(
+        &mut joiner.journal(),
+        &mut joiner.store.clone(),
+        ControlKeyPolicy::AppEnforcedOwnerConfirmation,
+    ))
+    .unwrap();
+
+    // The first device approves the joining device's reply and its addition
+    // is ordered.
+    let mut first = showing.owner();
+    let cap = activate(&mut first);
+    let personal = ready(first.open_personal(&cap)).unwrap();
+    let session = ShowingSession::new(setup.anchor, cap.device_id());
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), identity.keys.clone(), b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&first, &cap).unwrap();
+    let added = ready(first.sign_control(&cap, &request)).unwrap();
+    let delivery =
+        ready(first.seal_personal_for_device(&cap, &personal, &identity.keys, &added)).unwrap();
+    let head = first.apply_incoming(&[added.as_bytes()]).unwrap();
+    let history = showing.stored().history;
+    let refs: Vec<&[u8]> = history.iter().map(Vec::as_slice).collect();
+    let view = bh_account::VerifiedAccount::replay(setup.anchor, &refs, head).unwrap();
+
+    // Possession at that head, with the journaled ordinary key.
+    let mut owner = joiner.owner();
+    let context = Context {
+        channel_binding: [3; 32],
+        challenge: [4; 32],
+    };
+    let proof = ready(owner.prove_joining(setup.anchor, head, context)).unwrap();
+    let possession = verify_at(&view, context, proof.as_bytes()).unwrap();
+    assert!(possession.device() == identity.keys.id());
+
+    // History without its addition, from another anchor, or altered: refused,
+    // and nothing is kept.
+    assert!(matches!(
+        owner.adopt_joined(setup.anchor, &refs[..3]),
+        Err(OwnerError::Invalid(_))
+    ));
+    let other = bh_account::AccountId([9; 32]);
+    assert!(owner.adopt_joined(other, &refs).is_err());
+    let mut altered = history.clone();
+    let last = altered[3].len() - 1;
+    altered[3][last] ^= 1;
+    let altered: Vec<&[u8]> = altered.iter().map(Vec::as_slice).collect();
+    assert!(owner.adopt_joined(setup.anchor, &altered).is_err());
+    assert!(joiner.journal().load().unwrap().is_none());
+
+    assert_eq!(owner.adopt_joined(setup.anchor, &refs).unwrap(), head);
+    // Repeating it after a restart keeps what was committed.
+    assert_eq!(owner.adopt_joined(setup.anchor, &refs).unwrap(), head);
+    assert!(owner.adopt_joined(other, &refs).is_err());
+    let joined = activate(&mut owner);
+    assert_eq!(
+        owner.scanner_status().unwrap(),
+        ScannerStatus::ReadyForDelivery
+    );
+    let opened = ready(owner.open_delivered_personal(&joined, &delivery, 4)).unwrap();
+    assert_eq!(opened.public(), personal.public());
+    let mut tampered = delivery.clone();
+    tampered[100] ^= 1;
+    assert!(ready(owner.open_delivered_personal(&joined, &tampered, 4)).is_err());
+    assert!(ready(owner.open_delivered_personal(&joined, &delivery, 3)).is_err());
+    assert_eq!(
+        owner.verified_at(&joined, 3).unwrap().head(),
+        setup.head,
+        "the signup head the own base names"
+    );
+    assert!(ready(owner.prove_joining(other, head, context)).is_err());
 }

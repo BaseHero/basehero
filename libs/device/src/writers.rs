@@ -42,6 +42,31 @@ pub trait AcceptedBindings: Send + Sync {
         client_id: u64,
     ) -> Result<BindingRead, WriterUnavailable>;
 }
+/// The production reader: writer bindings committed with each note's
+/// accepted state by verified incoming batches. Its revision is the last log
+/// position that changed the note's accepted state.
+pub struct StoredBindings;
+impl AcceptedBindings for StoredBindings {
+    fn binding(
+        &self,
+        db: &DeviceDatabase,
+        key: NoteKey,
+        client_id: u64,
+    ) -> Result<BindingRead, WriterUnavailable> {
+        let revision = db.accepted_revision(key).map_err(|_| WriterUnavailable)?;
+        let binding = db
+            .accepted_binding(key, client_id)
+            .map_err(|_| WriterUnavailable)?
+            .map(|b| VerifiedWriterBinding {
+                account: b.account,
+                device: b.device,
+                nonce: b.nonce,
+                client_id: b.client_id,
+                accepted_end: b.accepted_end,
+            });
+        Ok(BindingRead { revision, binding })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterLease {
     pub client_id: u64,
@@ -163,9 +188,11 @@ impl Writers {
 }
 /// The slot's proven next clock under accepted ownership. Capacity for a
 /// further operation is a separate question.
-fn owned_end(note: &Note, slot: &WriterSlot, fence: Fence) -> Option<u32> {
-    let end = note.writer_end(slot.client_id)?;
-    match fence {
+fn owned_end(note: &Note, slot: &WriterSlot, fence: Fence) -> Result<Option<u32>, OwnerError> {
+    let Some(end) = note.writer_end(slot.client_id)? else {
+        return Ok(None);
+    };
+    Ok(match fence {
         Fence::Unregistered => Some(end),
         Fence::Registered(read) => read
             .binding
@@ -177,10 +204,10 @@ fn owned_end(note: &Note, slot: &WriterSlot, fence: Fence) -> Option<u32> {
                     && end >= b.accepted_end
             })
             .then_some(end),
-    }
+    })
 }
-fn reusable(note: &Note, slot: &WriterSlot, fence: Fence) -> bool {
-    !slot.retired && owned_end(note, slot, fence).is_some_and(|end| end < u32::MAX)
+fn reusable(note: &Note, slot: &WriterSlot, fence: Fence) -> Result<bool, OwnerError> {
+    Ok(!slot.retired && owned_end(note, slot, fence)?.is_some_and(|end| end < u32::MAX))
 }
 impl Owner {
     pub fn install_binding_reader(&self, id: ContainerId, reader: Arc<dyn AcceptedBindings>) {
@@ -189,6 +216,36 @@ impl Owner {
             .lock()
             .expect("binding readers")
             .insert(id, reader);
+    }
+    /// Install the production bindings reader for a container whose bases
+    /// sync. Native sync calls this when it starts for the container; until
+    /// then a registered base stays unavailable for writing.
+    pub fn install_stored_bindings(&self, id: ContainerId) {
+        self.install_binding_reader(id, Arc::new(StoredBindings));
+    }
+    /// Record a verified registration of `base` (its genesis receipt, or a
+    /// joined base's bootstrap), pinning `hosting_root` from the base's
+    /// authenticated hosting association (never an invented one) and
+    /// latching its writer phase Registered in the same transaction, and
+    /// install the production bindings reader.
+    pub fn record_registration(
+        &self,
+        id: ContainerId,
+        base: [u8; 32],
+        genesis_receipt: Option<[u8; bh_sync::receipt::RECEIPT_LEN]>,
+        hosting_root: [u8; 32],
+    ) -> Result<(), OwnerError> {
+        let database = self.shared_database(id)?;
+        database
+            .lock()
+            .expect("container writer lock")
+            .record_registration(base, genesis_receipt, hosting_root)
+            .map_err(|e| match e {
+                bh_storage::StoreError::RootConflict => OwnerError::Unavailable,
+                other => OwnerError::Store(other),
+            })?;
+        self.install_stored_bindings(id);
+        Ok(())
     }
     /// Native restore/import integration, never a page operation. Fence live
     /// producers and retain every original pending request and declaration.
@@ -334,10 +391,8 @@ impl Owner {
     /// random replica. Loading a snapshot precedes every authoring operation.
     pub fn core_author(opened: &Opened) -> Result<Note, OwnerError> {
         let lease = opened.writer.ok_or(OwnerError::WriterUnavailable)?;
-        let mut note =
-            Note::with_writer(lease.client_id).map_err(|_| OwnerError::WriterUnavailable)?;
-        note.apply_update(&opened.state)
-            .map_err(|_| OwnerError::WriterUnavailable)?;
+        let mut note = Note::with_writer(lease.client_id)?;
+        note.apply_ordered(&opened.state)?;
         if note.replica_id() != lease.client_id {
             return Err(OwnerError::WriterUnavailable);
         }
@@ -387,12 +442,12 @@ impl Owner {
             // integrates, the same writer continues from its real next clock.
             if occupied.iter().any(|a| a.slot.client_id == slot.client_id)
                 || slot.retired
-                || note.writer_prefix(slot.client_id) == WriterPrefix::Pending
+                || note.writer_prefix(slot.client_id)? == WriterPrefix::Pending
             {
                 continue;
             }
             let fence = self.writers.fence(id, db, key, slot.client_id)?;
-            if reusable(note, slot, fence) {
+            if reusable(note, slot, fence)? {
                 return Ok(ActiveWriter {
                     container: id,
                     generation,
@@ -420,7 +475,7 @@ impl Owner {
             };
             let client_id = d.client_id(scope(key));
             let fence = self.writers.fence(id, db, key, client_id)?;
-            if note.has_writer(client_id)
+            if note.has_writer(client_id)?
                 || db.writer_id_reserved(key, client_id)?
                 || matches!(
                     fence,
@@ -489,7 +544,7 @@ impl Owner {
         let fence =
             self.writers
                 .fence(active.container, db, active.slot.key, active.slot.client_id)?;
-        owned_end(note, &active.slot, fence).ok_or(OwnerError::WriterUnavailable)?;
+        owned_end(note, &active.slot, fence)?.ok_or(OwnerError::WriterUnavailable)?;
         // A newly accepted conflict also stops other live producers. Any later
         // binding change moves the revision this attempt's final fence checks.
         if self
@@ -512,7 +567,7 @@ impl Owner {
         let fence =
             self.writers
                 .fence(active.container, db, active.slot.key, active.slot.client_id)?;
-        if fence != attempt || owned_end(note, &active.slot, fence).is_none() {
+        if fence != attempt || owned_end(note, &active.slot, fence)?.is_none() {
             return Err(OwnerError::WriterUnavailable);
         }
         Ok(())
@@ -569,10 +624,10 @@ mod tests {
                 bytes.extend([2, 10, 2, 0, 2]);
             }
             bytes.push(0);
-            let mut note = Note::new();
+            let mut note = Note::new().unwrap();
             note.apply_update(&bytes).unwrap();
             assert_eq!(
-                note.writer_end(client_id),
+                note.writer_end(client_id).unwrap(),
                 if exhausted { Some(u32::MAX) } else { None }
             );
             let owner = Owner::default();
@@ -615,7 +670,7 @@ mod tests {
             nonce: [6; 32],
         };
         let mut note = Note::with_writer(d.client_id(scope(key))).unwrap();
-        note.append_paragraph("existing");
+        note.append_paragraph("existing").unwrap();
         let owner = Owner::default();
         owner
             .writers
@@ -651,7 +706,7 @@ mod tests {
                     &mut db,
                     other,
                     ([4; 32], [5; 32]),
-                    &Note::new(),
+                    &Note::new().unwrap(),
                     None,
                 )
                 .is_err()
@@ -715,7 +770,7 @@ mod tests {
                 &mut db,
                 key,
                 ([4; 32], [5; 32]),
-                &Note::new(),
+                &Note::new().unwrap(),
                 None,
             )
             .unwrap();

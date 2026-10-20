@@ -83,9 +83,9 @@ fn v9_upgrade_preserves_own_base_and_proofless_work_without_granting_phase() {
         .unwrap();
     drop(db);
     let raw = rusqlite::Connection::open(&path).unwrap();
-    raw.execute_batch("DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; PRAGMA user_version=9;").unwrap();
+    raw.execute_batch("DROP TABLE note_outbox_members; DROP TABLE joined_device; DROP TABLE base_control_outbox; DROP TABLE registration; DROP TABLE sync_alarm; DROP TABLE note_outbox_progress; DROP TABLE writer_binding; DROP TABLE accepted_note_tail; DROP TABLE accepted_note; DROP TABLE log_floor; DROP TABLE log_account_change; DROP TABLE log_event_id; DROP TABLE log_seen; DROP TABLE log_progress; DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; PRAGMA user_version=9;").unwrap();
     let db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 10);
+    assert_eq!(db.data_version(), bh_core::LOCAL_DATA_VERSION);
     assert_eq!(db.own_base().unwrap(), original);
     assert_eq!(db.base_writer_phase([2; 32]).unwrap(), None);
     let pending = db.pending_note_updates().unwrap();

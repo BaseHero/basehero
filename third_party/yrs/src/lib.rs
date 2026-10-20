@@ -620,6 +620,7 @@ mod event;
 mod id_map;
 mod id_set;
 mod store;
+mod structure;
 mod transaction;
 pub mod types;
 mod update;
@@ -679,6 +680,7 @@ pub use crate::sticky_index::IndexedSequence;
 pub use crate::sticky_index::Offset;
 pub use crate::sticky_index::StickyIndex;
 pub use crate::store::Store;
+pub use crate::structure::structure_digest;
 pub use crate::transact::{
     AcquireTransaction, AcquireTransactionMut, AsyncTransact, Transact, TransactionAcqError,
 };

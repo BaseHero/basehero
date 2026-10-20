@@ -35,6 +35,8 @@ function coreHost() {
   ipc.handle("note_list", () => [...notes.values()].sort((a, b) => b.touched - a.touched)
     .map((note) => ({ note: note.id, title: "", touched: note.touched })));
   ipc.handle("note_create", () => make());
+  // A local-only build: its notes stay on this device.
+  ipc.handle("sync_status", () => ({ revision: 1, state: "saved-local", pending: 0, network: "off", home: null, account: "active", confirm: false }));
   ipc.handle("note_show", ({ note }) => {
     if (!notes.has(hex(note))) throw "note unavailable";
     current = note;
@@ -42,8 +44,9 @@ function coreHost() {
   });
   ipc.handle("note_open", async ({ note }) => {
     const stored = notes.get(hex(note));
-    const state = stored.updates.length ? await window.bhMergeUpdates(stored.updates) : [0, 0];
-    return {clientId:window.__bhTestWriterId??2002468231004600,writerToken:Array(32).fill(9),state, generation: ++generation, sequence: 0 };
+    // Like native: the stored updates in order, not one merged state.
+    const updates = stored.updates.length ? stored.updates : [[0, 0]];
+    return {clientId:window.__bhTestWriterId??2002468231004600,writerToken:Array(32).fill(9),updates, generation: ++generation, sequence: 0 };
   });
   ipc.handle("note_commit", ({ update, requestId, generation: from }) => {
     const commit = () => {
@@ -89,8 +92,6 @@ function titledList() {
 
 async function corePage(browser, origin, init = []) {
   const page = await browser.newPage();
-  await page.exposeFunction("bhMergeUpdates", (updates) =>
-    Array.from(Y.mergeUpdates(updates.map((update) => new Uint8Array(update)))));
   await page.exposeFunction("bhTitle", hostTitle);
   await page.addInitScript(tauriIpcStub);
   await page.addInitScript(coreHost);
@@ -390,7 +391,7 @@ for (const browserName of browserMatrix) {
           const receive = window.__bhNoteDelivery;
           window.__bhNoteDelivery = (packet) => { dispatched++; return receive(packet); };
           // Same expression as native: compare before constructing the payload.
-          const outcome = (() => { if (window.__bhNotePage !== token) return "stale"; return window.__bhNoteDelivery?.({ generation: 1, sequence: 9, update: [0, 0], resync: true }) ?? "stale"; })();
+          const outcome = (() => { if (window.__bhNotePage !== token) return "stale"; return window.__bhNoteDelivery?.({ generation: 1, sequence: 9, update: [], updates: [[0, 0]], resync: true }) ?? "stale"; })();
           return { outcome, dispatched };
         }, old);
         assert.deepEqual(result, { outcome: "stale", dispatched: 0 });

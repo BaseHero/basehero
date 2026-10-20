@@ -2,16 +2,22 @@
 //! first-account state machine) compiles and checks on Linux CI. It never
 //! signs, never stores a key and never prints, mails or writes a kit; the
 //! first-run screens report the account service as unavailable on this build.
+//! Android uses its Keystore stores (`android_account`) and only these kit
+//! destinations, which it does not offer.
+use bh_account::recovery::RecoveryCode;
+#[cfg(not(target_os = "android"))]
 use bh_account::{
     crypto::Secret,
     journal::{PendingSetupProtector, ProtectorError},
     platform::{ControlKeyPolicy, DeviceKeyStore, KeyHandle, KeyStoreError, StoredDevice},
-    recovery::RecoveryCode,
 };
 
+#[cfg(not(target_os = "android"))]
+#[cfg_attr(feature = "desktop-fixture", allow(dead_code))]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LoginStore;
 
+#[cfg(not(target_os = "android"))]
 impl DeviceKeyStore for LoginStore {
     async fn create(&mut self, _: ControlKeyPolicy) -> Result<StoredDevice, KeyStoreError> {
         Err(KeyStoreError::Unavailable)
@@ -34,9 +40,12 @@ impl DeviceKeyStore for LoginStore {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+#[cfg_attr(feature = "desktop-fixture", allow(dead_code))]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct KitProtector;
 
+#[cfg(not(target_os = "android"))]
 impl PendingSetupProtector for KitProtector {
     fn seal(&mut self, _: &[u8]) -> Result<Vec<u8>, ProtectorError> {
         Err(ProtectorError::Unavailable)

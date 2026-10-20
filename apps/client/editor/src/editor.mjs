@@ -12,6 +12,16 @@ const TOO_LARGE='This note has reached its size limit, about one million charact
 const PAUSED='Editing is paused until your writing is saved. It picks up again by itself in a moment.';
 const REPLAY_DROPPED='That change wasn’t added because the note changed meanwhile. Try it again.';
 const UNDO_TOO_LARGE='Undo isn’t available this close to the note’s size limit, about one million characters. Delete something first.';
+// Other devices' preset hues; yellow stays this person's own accent.
+const REMOTE_COLOURS=['#1b5fd9','#c2185b','#087a4c','#7a3fd1','#c4520f','#00838f'];
+const LABEL_HIDE_MS=3000;
+const MAX_LABEL=24;
+
+// An open's state is one Yjs update or a list of them, applied in its order:
+// merging the list first can integrate concurrent text in a different order.
+export function applyUpdates(doc, list, origin) {
+  for (const update of [list].flat()) Y.applyUpdate(doc, update, origin);
+}
 
 // A host supplies an already-authorized note, not a base/account/path selector.
 // Contract: open(onUpdate,options)->{state,clientId,unsubscribe} is an atomic
@@ -32,7 +42,7 @@ export async function createNoteEditor(root, host, options={}) {
   if (!opened || typeof opened.unsubscribe!=='function') throw new TypeError('atomic bound note open required');
   let {unsubscribe}=opened;
   let doc=new Y.Doc();
-  try { Y.applyUpdate(doc,opened.state,'initial'); }
+  try { applyUpdates(doc,opened.state,'initial'); }
   catch(error) {unsubscribe();doc.destroy();throw error;}
   let fragment=doc.getXmlFragment(inventory.fragment);
   let mirror;
@@ -76,8 +86,56 @@ export async function createNoteEditor(root, host, options={}) {
   catch(error) {unsubscribe();doc.destroy();throw error;}
   const peerKey=new PluginKey('bhPeerSelections');
   let peerTimer=null;
+  const peerHideTimers=new Map();
+  let peerRefresh=false;
+  // A local edit's PM transaction renders before the Y binding has updated its
+  // type mapping; one follow-up pass resolves the remote carets against the
+  // projected document, and does nothing when nothing changed.
+  const refreshPeers=()=>{
+    if(peerRefresh)return;
+    peerRefresh=true;
+    setTimeout(()=>{
+      peerRefresh=false;
+      if(editor && !closed) editor.view.dispatch(editor.state.tr.setMeta(peerKey,{type:'refresh'}));
+    },0);
+  };
+  const remoteColour=index=>REMOTE_COLOURS[Math.max(0,Math.min(5,Number.isInteger(index)?index:0))];
+  const positionBytes=value=>Array.isArray(value) && value.length>0 && value.length<=96 &&
+    value.every(byte=>Number.isInteger(byte) && byte>=0 && byte<256);
+  // The approved label is at most 24 characters, with an ellipsis when longer.
+  const labelText=value=>{
+    const characters=Array.from(String(value??''));
+    return characters.length>MAX_LABEL?characters.slice(0,MAX_LABEL-1).join('')+'…':characters.join('');
+  };
+  // A remote caret is a Yjs relative position: it resolves against the live
+  // document each time, so typing and remote batches move it with its words.
+  const resolvePeer=(state,bytes)=>{
+    const binding=ySyncPluginKey.getState(state)?.binding;
+    if(!binding || !fragment)return null;
+    try {
+      const decoded=Y.decodeRelativePosition(Uint8Array.from(bytes));
+      // A root position names a type by string. Only this editor's own fragment
+      // may be named: resolving another root would define it in the document.
+      if(!decoded.type && !decoded.item && decoded.tname!==inventory.fragment)return null;
+      const pos=relativePositionToAbsolutePosition(doc,fragment,decoded,binding.mapping);
+      return Number.isInteger(pos)&&pos>=0&&pos<=state.doc.content.size?pos:null;
+    } catch {return null;}
+  };
+  const hasRemote=state=>{
+    for (const peer of peerKey.getState(state)?.values()??[]) if (peer.kind==='remote') return true;
+    return false;
+  };
+  const hidePeerLabel=id=>{
+    clearTimeout(peerHideTimers.get(id));
+    peerHideTimers.set(id,setTimeout(()=>{
+      peerHideTimers.delete(id);
+      if(editor && !closed) editor.view.dispatch(editor.state.tr.setMeta(peerKey,{type:'label',id,visible:false}));
+    },LABEL_HIDE_MS));
+  };
   const receivePeer=event=>{
     if (!editor || closed || !event?.id) return;
+    if (event.type==='remote' || (event.type==='label' && event.visible)) hidePeerLabel(event.id);
+    else if (event.type==='remove') {clearTimeout(peerHideTimers.get(event.id));peerHideTimers.delete(event.id);}
     editor.view.dispatch(editor.state.tr.setMeta(peerKey,event));
   };
   const stopPeers=host.onPeers?.(receivePeer)??(()=>{});
@@ -87,7 +145,10 @@ export async function createNoteEditor(root, host, options={}) {
       peerTimer=null;
       if (!editor || closed) return;
       const {anchor,head}=editor.state.selection;
-      void Promise.resolve(host.selection(anchor,head)).then(peers=>{
+      const binding=ySyncPluginKey.getState(editor.state)?.binding;
+      const anchorRel=binding?relative(anchor,binding):null;
+      const headRel=binding?relative(head,binding):null;
+      void Promise.resolve(host.selection(anchor,head,anchorRel,headRel)).then(peers=>{
         if (Array.isArray(peers)) for (const peer of peers) receivePeer({type:'set',...peer});
       }).catch(()=>{});
     },50);
@@ -141,6 +202,7 @@ export async function createNoteEditor(root, host, options={}) {
   if(options.statusBar)options.statusBar.replaceChildren(status,retryButton);else root.append(status,retryButton);
   const retrySave=()=>{if(!closed && !working){failed=false;setStatus();void (writer.paused?reacquire():flush());}};
   retryButton.addEventListener('click',retrySave);
+  const savedCopy=/Android/i.test(globalThis.navigator?.userAgent??'') ? 'Saved on this device' : 'Saved on this Mac';
   const setStatus=()=>{
     retryButton.hidden=!failed;
     // The pause lifts by itself as saving catches up; say so while it lasts.
@@ -152,11 +214,11 @@ export async function createNoteEditor(root, host, options={}) {
       savingTimer=setTimeout(()=>{savingTimer=null;if(!closed)setStatus();},1000-(Date.now()-savingSince));
     }
     const unsaved=failed || writer.paused || !!rollover;
-    const saving=failed || writer.paused ? 'Not saved' : rollover ? 'Not saved · Editing paused' : hasPending && Date.now()-savingSince>=1000 ? 'Saving…' : 'Saved on this Mac';
+    const saving=failed || writer.paused ? 'Not saved' : rollover ? 'Not saved · Editing paused' : hasPending && Date.now()-savingSince>=1000 ? 'Saving…' : savedCopy;
     const text=held==='update' && !failed ? 'Saving before update…' : !editor
       ? (pendingCount() ? 'Not saved · ' : '')+'Read-only · Update BaseHero to edit' : saving;
     if(status.textContent!==text)status.textContent=text;
-    status.dataset.status=unsaved ? 'failed' : text==='Saved on this Mac' ? 'saved' : !editor ? 'readonly' : 'busy';
+    status.dataset.status=unsaved ? 'failed' : text===savedCopy ? 'saved' : !editor ? 'readonly' : 'busy';
     large.hidden=!(editor && tooLarge);
   };
   function flush() {
@@ -198,7 +260,7 @@ export async function createNoteEditor(root, host, options={}) {
       const next=await host.open(bytes=>receive(bytes),retire?{retire:true}:undefined);
       if(closed){next.unsubscribe();throw Error('closed view');}
       const previous=unsubscribe;unsubscribe=next.unsubscribe;previous();
-      return {clientId:next.clientId,hydrate(){receive(next.state);}};
+      return {clientId:next.clientId,hydrate(){for(const bytes of [next.state].flat())receive(bytes);}};
     });
     if(!closed){
       if(!resumed)failed=true;syncEditable();setStatus();
@@ -318,14 +380,68 @@ export async function createNoteEditor(root, host, options={}) {
     else if(event.key==='Escape'){event.preventDefault();closeLink(true);}
   });
   const outside=event=>{if(!linkPop.hidden && !linkPop.contains(event.target))closeLink(false);};
-  const relayout=()=>{placeBubble();placeLink();};
+  // Android: folding, rotating or the keyboard resizes the page, which can
+  // rewrap a long note or cover the caret. Afterwards show what the person
+  // was looking at: the caret if it was in view, otherwise the text at the
+  // top of the pane, never the caret against their own scrolling.
+  const android=/Android/i.test(navigator.userAgent);
+  let layoutSize=`${innerWidth}x${innerHeight}`,caretSeen=false,reading=null;
+  let pendingRestoration=null;
+  const noteView=()=>{
+    if (!android || !editor || closed) return;
+    const bounds=scroller().getBoundingClientRect();
+    const caret=editor.view.coordsAtPos(editor.state.selection.head);
+    caretSeen=caret.bottom>bounds.top && caret.top<bounds.bottom;
+    // The first block in view, and how far down it the pane's top falls.
+    const blocks=editor.view.dom.children;
+    let low=0,high=blocks.length-1;
+    while (low<high) {const mid=(low+high)>>1;if(blocks[mid].getBoundingClientRect().bottom<=bounds.top)low=mid+1;else high=mid;}
+    const block=blocks[low],rect=block?.getBoundingClientRect();
+    reading=rect?.height?{block,at:(bounds.top-rect.top)/rect.height}:null;
+  };
+  const relayout=()=>{
+    placeBubble();placeLink();
+    if (!android || !editor || closed) return;
+    const size=`${innerWidth}x${innerHeight}`;
+    if (size===layoutSize) {noteView();return;}
+    layoutSize=size;
+    // Keep the pre-reflow anchor through all intermediate resize notifications.
+    // Only the latest two-frame callback may apply it.
+    const task=pendingRestoration??{keep:caretSeen?null:reading,caret:caretSeen,generation:0};
+    if (!task.caret && !task.keep) return;
+    pendingRestoration=task;
+    const generation=++task.generation;
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      if (pendingRestoration!==task || task.generation!==generation || !editor || closed) return;
+      pendingRestoration=null;
+      const area=scroller(),bounds=area.getBoundingClientRect();
+      if (task.keep) {
+        if (!task.keep.block.isConnected) return;
+        const rect=task.keep.block.getBoundingClientRect();
+        area.scrollTop+=rect.top+task.keep.at*rect.height-bounds.top;
+        return;
+      }
+      const caret=editor.view.coordsAtPos(editor.state.selection.head);
+      // Keep a small margin around the cursor box rather than leaving
+      // the selected line flush with the clipping edge.
+      if (caret.top<bounds.top+8 || caret.bottom>bounds.bottom-8)
+        area.scrollTop+=caret.top-bounds.top-bounds.height/2;
+    }));
+  };
+  // Layout itself can emit scroll while WebView rewraps; only input or a
+  // selection update establishes a newer intention than the saved anchor.
+  const onUserIntent=()=>{if(android)pendingRestoration=null;};
+  const onScroll=()=>relayout();
+  const onSelectionIntent=()=>{if(android)pendingRestoration=null;queueMicrotask(noteView);};
   const pointerDown=event=>{if(content.contains(event.target)){pointerSelecting=true;bubble.hidden=true;}};
   const pointerUp=()=>{if(pointerSelecting){pointerSelecting=false;placeBubble();}};
   document.addEventListener('mousedown',outside,true);
   document.addEventListener('mousedown',pointerDown,true);
   window.addEventListener('mouseup',pointerUp,true);
-  window.addEventListener('scroll',relayout,true);
+  window.addEventListener('scroll',onScroll,true);
   window.addEventListener('resize',relayout);
+  if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
+    window.addEventListener(type,onUserIntent,{capture:true,passive:true});
   // The native Edit menu's Undo and Redo arrive as history input events.
   content.addEventListener('beforeinput',event=>{
     if(event.inputType!=='historyUndo' && event.inputType!=='historyRedo')return;
@@ -419,35 +535,122 @@ export async function createNoteEditor(root, host, options={}) {
           if (!message) return previous;
           const next=new Map(previous);
           if (message.type==='remove') next.delete(message.id);
-          else if (message.type==='set' && Number.isSafeInteger(message.anchor) && Number.isSafeInteger(message.head))
-            next.set(message.id,{anchor:message.anchor,head:message.head});
+          else if (message.type==='label') {
+            const held=next.get(message.id);
+            if (held) next.set(message.id,{...held,visible:!!message.visible});
+          } else if (message.type==='set' && Number.isSafeInteger(message.anchor) && Number.isSafeInteger(message.head)) {
+            // Another window on this device: the existing local integer path.
+            next.set(message.id,{kind:'local',anchor:message.anchor,head:message.head});
+          } else if (message.type==='remote' && positionBytes(message.anchor) && positionBytes(message.head)) {
+            const held=next.get(message.id);
+            next.set(message.id,{
+              kind:'remote',
+              anchor:message.anchor,head:message.head,
+              label:labelText(message.label),
+              colour:Number.isInteger(message.colour)?message.colour:0,
+              visible:true,
+              anchorPos:held?.anchorPos,
+              headPos:held?.headPos,
+            });
+          }
           return next;
         },
       },
       props:{decorations(state){
         const decorations=[];
-        for (const [id,{anchor,head}] of peerKey.getState(state)) {
-          const max=state.doc.content.size;
-          const from=Math.max(0,Math.min(anchor,head,max));
-          const to=Math.max(0,Math.min(Math.max(anchor,head),max));
-          if (from!==to) decorations.push(Decoration.inline(from,to,{class:'bh-peer-selection','data-peer':id}));
-          decorations.push(Decoration.widget(Math.max(0,Math.min(head,max)),()=>{
-            const marker=document.createElement('span');marker.className='bh-peer-cursor';
-            marker.setAttribute('aria-hidden','true');marker.dataset.peer=id;return marker;
-          },{side:-1,key:'bh-peer:'+id}));
+        const max=state.doc.content.size;
+        for (const [id,peer] of peerKey.getState(state)) {
+          if (peer.kind==='local') {
+            const from=Math.max(0,Math.min(peer.anchor,peer.head,max));
+            const to=Math.max(0,Math.min(Math.max(peer.anchor,peer.head),max));
+            if (from!==to) decorations.push(Decoration.inline(from,to,{class:'bh-peer-selection','data-peer':id}));
+            decorations.push(Decoration.widget(Math.max(0,Math.min(peer.head,max)),()=>{
+              const marker=document.createElement('span');marker.className='bh-peer-cursor';
+              marker.setAttribute('aria-hidden','true');marker.dataset.peer=id;return marker;
+            },{side:-1,key:'bh-peer:'+id}));
+            continue;
+          }
+          // Resolve on every decoration pass, after the binding has projected
+          // the change: local typing and remote batches move the caret with
+          // its words. A missing item keeps the last place it had.
+          const anchorPos=resolvePeer(state,peer.anchor)??peer.anchorPos;
+          const headPos=resolvePeer(state,peer.head)??peer.headPos;
+          peer.anchorPos=anchorPos;peer.headPos=headPos;
+          if (!Number.isInteger(headPos)) continue;
+          const head=Math.max(0,Math.min(headPos,max));
+          const anchor=Number.isInteger(anchorPos)?Math.max(0,Math.min(anchorPos,max)):head;
+          const colour=remoteColour(peer.colour);
+          if (anchor!==head) decorations.push(Decoration.inline(Math.min(anchor,head),Math.max(anchor,head),
+            {class:'bh-remote-selection','data-peer':id,style:`--peer:${colour}`}));
         }
         return DecorationSet.create(state.doc,decorations);
       }},
-      view:()=>({update(view,previous){
-        if (!view.state.selection.eq(previous.selection) || view.state.doc!==previous.doc) sendSelection();
-        // Incoming, Undo and Redo projections can change the size too.
-        if (view.state.doc!==previous.doc) queueMicrotask(checkSize);
-      }}),
+      view:editorView=>{
+        // Another device's caret and label are drawn over the note, outside
+        // its editable text. An Android keyboard edits that text by offset;
+        // a label inside it let Gboard's edit land in the label, which ended
+        // editing and hid the keyboard.
+        const layer=document.createElement('div');layer.className='bh-remote-carets';layer.setAttribute('aria-hidden','true');
+        const markers=new Map();
+        const draw=()=>{
+          if (!markers.size && !hasRemote(editorView.state)) return;
+          if (!layer.isConnected) {if(!editorView.dom.parentNode)return;editorView.dom.after(layer);}
+          const {doc}=editorView.state,origin=layer.getBoundingClientRect(),shown=new Set();
+          // Measure every peer before writing any marker: a write between two
+          // measurements makes the next coordsAtPos flush the layout it caused.
+          const places=[];
+          for (const [id,peer] of peerKey.getState(editorView.state)) {
+            if (peer.kind!=='remote' || !Number.isInteger(peer.headPos)) continue;
+            const head=Math.max(0,Math.min(peer.headPos,doc.content.size));
+            let at,text;
+            try {
+              at=editorView.coordsAtPos(head,-1);
+              const {node}=editorView.domAtPos(head);text=node.nodeType===1?node:node.parentElement;
+            } catch {continue;}
+            // Sized from the text it stands in, its foot on that text's bottom.
+            places.push({id,peer,left:at.left-origin.left,top:at.bottom-origin.top,fontSize:getComputedStyle(text).fontSize});
+          }
+          for (const {id,peer,left,top,fontSize} of places) {
+            let marker=markers.get(id);
+            if (!marker) {
+              marker=document.createElement('span');marker.className='bh-remote-cursor';marker.dataset.peer=id;
+              const label=document.createElement('span');label.className='bh-remote-label';
+              marker.append(label);
+              // A Fold tap on the collapsed tab shows the label again; the
+              // note keeps focus and its keyboard.
+              marker.addEventListener('mousedown',event=>event.preventDefault());
+              marker.addEventListener('click',event=>{event.preventDefault();receivePeer({type:'label',id,visible:true});});
+              markers.set(id,marker);layer.append(marker);
+            }
+            // Idle keeps the caret and collapses only the label to its tab.
+            marker.toggleAttribute('data-collapsed',!peer.visible);
+            marker.dataset.label=peer.label;
+            // An unchanged name keeps its text node; a new one replaces it.
+            if (marker.firstChild.textContent!==peer.label) marker.firstChild.textContent=peer.label;
+            marker.style.setProperty('--peer',remoteColour(peer.colour));
+            marker.style.fontSize=fontSize;
+            marker.style.left=`${left}px`;marker.style.top=`${top}px`;
+            shown.add(id);
+          }
+          for (const [id,marker] of markers) if (!shown.has(id)) {marker.remove();markers.delete(id);}
+        };
+        // Rewrapping (a fold, a resize) moves the text under a caret.
+        const resized=new ResizeObserver(draw);resized.observe(editorView.dom);
+        return {
+          update(view,previous){
+            if (!view.state.selection.eq(previous.selection) || view.state.doc!==previous.doc) sendSelection();
+            // Incoming, Undo and Redo projections can change the size too.
+            if (view.state.doc!==previous.doc) {queueMicrotask(checkSize);if(hasRemote(view.state))refreshPeers();}
+            draw();
+          },
+          destroy(){resized.disconnect();layer.remove();},
+        };
+      },
     });
     const binding=Extension.create({
       name:'bhNoteBinding',priority:1100,
       addProseMirrorPlugins() {return [
-        ownSelection,otherSelections,
+        ownSelection,
         new Plugin({filterTransaction:tr=>{
           if(!tr.docChanged) return true;
           // Only the binding's own projections of Yjs changes (remote, Undo,
@@ -473,13 +676,15 @@ export async function createNoteEditor(root, host, options={}) {
             else say(REPLAY_DROPPED);
           }))return false;
           say('');return true;
-        }}),ySyncPlugin(fragment),yUndoPlugin(),
+        }}),ySyncPlugin(fragment),otherSelections,yUndoPlugin(),
       ];},
       addKeyboardShortcuts(){return {'Mod-z':()=>history(undo,this.editor),'Mod-Shift-z':()=>history(redo,this.editor),'Mod-y':()=>history(redo,this.editor),'Mod-k':()=>openLink()};},
     });
     editable=!writer.blocked && !tooLarge && !held;
     editor=new Editor({element:content,extensions:[...extensions,binding],content:'',injectCSS:false,editable});
     for(const event of ['selectionUpdate','focus','blur','transaction'])editor.on(event,()=>queueMicrotask(placeBubble));
+    editor.on('selectionUpdate',onSelectionIntent);
+    editor.on('focus',()=>sendSelection());
     // No HTML from a note is ever passed to the editor or DOM.
     checkSize();setStatus();sendSelection();
   }
@@ -564,7 +769,15 @@ export async function createNoteEditor(root, host, options={}) {
       area.getBoundingClientRect().top+area.clientTop;
     return editor.view.coordsAtPos(pos).top-top;
   }
-  const relative=(pos,binding)=>Array.from(Y.encodeRelativePosition(absolutePositionToRelativePosition(pos,fragment,binding.mapping)));
+  // An empty block has no text to anchor to, so y-tiptap names its end. Enter
+  // in that block records in the note that its end moved on to the new block,
+  // and resolving always follows the record: an empty line's caret showed at
+  // the end of the note. Its start is the same place and Enter keeps it.
+  const relative=(pos,binding)=>{
+    const position=absolutePositionToRelativePosition(pos,fragment,binding.mapping);
+    if(position.item===null && binding.prosemirrorView.state.doc.resolve(pos).parent.content.size===0)position.assoc=-1;
+    return Array.from(Y.encodeRelativePosition(position));
+  };
   function view() {
     const binding=editor && !closed && ySyncPluginKey.getState(editor.state)?.binding;
     if(!binding)return null;
@@ -643,10 +856,12 @@ export async function createNoteEditor(root, host, options={}) {
     state() {return {mode:canAuthor()?'editable':'readonly',pending:pendingCount(),saved:!failed&&!writer.paused&&!pendingCount()&&!!editor};},
     close() {
       if(closed)return;
-      closed=true;clearTimeout(savingTimer);changed();stopRestore();clearTimeout(peerTimer);stopPeers();unsubscribe();editor?.destroy();editor=null;
+      closed=true;clearTimeout(savingTimer);changed();stopRestore();clearTimeout(peerTimer);for(const timer of peerHideTimers.values())clearTimeout(timer);peerHideTimers.clear();stopPeers();unsubscribe();editor?.destroy();editor=null;
       pending.close();mirror?.destroy();doc.destroy();doc=null;fragment=null;
       document.removeEventListener('mousedown',outside,true);document.removeEventListener('mousedown',pointerDown,true);
-      window.removeEventListener('mouseup',pointerUp,true);window.removeEventListener('scroll',relayout,true);window.removeEventListener('resize',relayout);
+      window.removeEventListener('mouseup',pointerUp,true);window.removeEventListener('scroll',onScroll,true);window.removeEventListener('resize',relayout);
+      if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
+        window.removeEventListener(type,onUserIntent,true);
       linkInput.value='';bubble.replaceChildren();linkPop.replaceChildren();content.replaceChildren();status.textContent='';
       status.remove();retryButton.remove();root.replaceChildren();
     },

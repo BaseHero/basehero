@@ -361,19 +361,18 @@ pub async fn seal_for_device(
     Ok(frame)
 }
 
-/// Verify the complete signed device-delivery frame against this history before
-/// asking the native key store to open its X-Wing encapsulation. Not a recovery
-/// or first-device bootstrap opener; never fall back to their slots.
-pub async fn open_for_device(
-    state: &VerifiedAccount,
+// The signed frame's checks, shared by public verification and opening: exact
+// framing, a signature by a device active in this history, then the envelope's
+// account, current publication, purpose and recipient. No secret key is used.
+fn checked_delivery<'a>(
+    state: &'a VerifiedAccount,
     frame: &[u8],
-    device: &StoredDevice,
-    store: &mut impl DeviceKeyStore,
-) -> Result<PersonalKey, Error> {
+    recipient: &DevicePublicKeys,
+) -> Result<(DeviceId, Checked<'a>), Error> {
     if frame.len() != DELIVERY_SIZE || &frame[..8] != DELIVERY_PREFIX {
         return Err(Error::Malformed);
     }
-    if state.active_device(device.keys.id())? != &device.keys {
+    if state.active_device(recipient.id())? != recipient {
         return Err(Error::InvalidCredentials);
     }
     let sender = DeviceId(
@@ -387,13 +386,40 @@ pub async fn open_for_device(
         .map_err(|_| Error::Malformed)?;
     crypto::verify(signer.signing(), &frame[..DELIVERY_SIZE - 64], &signature)
         .map_err(|_| Error::BadSignature)?;
-    let envelope = &frame[8..8 + SIZE];
     let checked = checked(
         state,
-        envelope,
+        &frame[8..8 + SIZE],
         SealPurpose::Device,
-        device.keys.receiving(),
+        recipient.receiving(),
     )?;
+    Ok((sender, checked))
+}
+
+/// Check a signed device-delivery frame without opening it: exact framing, a
+/// signature by a device active in `state`, this account, its current personal
+/// publication, the Device purpose, and `recipient` as an active device whose
+/// receiving key the frame names. Returns the signing device. This is what a
+/// verifier holding no secret key can establish; it does not prove the sealed
+/// seed is the personal key, which only opening checks.
+pub fn verify_device_delivery(
+    state: &VerifiedAccount,
+    frame: &[u8],
+    recipient: &DevicePublicKeys,
+) -> Result<DeviceId, Error> {
+    checked_delivery(state, frame, recipient).map(|(sender, _)| sender)
+}
+
+/// Verify the complete signed device-delivery frame against this history before
+/// asking the native key store to open its X-Wing encapsulation. Not a recovery
+/// or first-device bootstrap opener; never fall back to their slots.
+pub async fn open_for_device(
+    state: &VerifiedAccount,
+    frame: &[u8],
+    device: &StoredDevice,
+    store: &mut impl DeviceKeyStore,
+) -> Result<PersonalKey, Error> {
+    let (_, checked) = checked_delivery(state, frame, &device.keys)?;
+    let envelope = &frame[8..8 + SIZE];
     store
         .load_matching(device)
         .await

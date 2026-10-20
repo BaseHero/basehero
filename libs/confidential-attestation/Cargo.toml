@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Local-only labelled synthetic evidence; never enabled in a release build.
+synthetic-attestation = []
+
 [dependencies]
 bh-crypto.workspace = true
 bh-confidential-policy.workspace = true

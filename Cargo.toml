@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["libs/*", "services/*", "apps/client/src-tauri", "apps/client/plugins/device-keys", "tests/system", "tests/crypto-worker"]
+members = ["libs/*", "services/*", "apps/client/src-tauri", "apps/client/plugins/device-keys", "tests/system", "tests/crypto-worker", "tests/sync-client", "tests/host", "tests/local-sync"]
 default-members = ["libs/*", "services/*", "tests/system"]
 exclude = ["third_party/dstack", "third_party/yrs"]
 
@@ -13,6 +13,7 @@ publish = false
 
 [workspace.dependencies]
 bh-account = { path = "libs/account" }
+bh-authz-proto = { path = "libs/authz-proto" }
 # Android's JNI bridge uses the same jni/ndk-context releases already locked by Tauri.
 jni = "=0.21.1"
 ndk-context = "=0.1.1"
@@ -20,6 +21,7 @@ bh-core = { path = "libs/core" }
 bh-device = { path = "libs/device" }
 bh-device-keys = { path = "apps/client/plugins/device-keys" }
 bh-crypto = { path = "libs/crypto" }
+bh-note-engine-artifact = { path = "libs/note-engine/artifact" }
 bh-event = { path = "libs/event" }
 bh-mac-keychain-helper = { path = "libs/mac-keychain-helper" }
 bh-mac-local-auth = { path = "libs/mac-local-auth" }
@@ -36,6 +38,8 @@ bh-provider-policy-store = { path = "libs/provider-policy-store" }
 bh-tls-roots = { path = "libs/tls-roots" }
 bh-storage = { path = "libs/storage" }
 bh-sync = { path = "libs/sync" }
+bh-sync-client = { path = "libs/sync-client" }
+bh-host = { path = "libs/host" }
 brotli = "=8.0.4"
 block2 = "=0.6.2"
 dom_query = "=0.28.0"
@@ -82,6 +86,9 @@ tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs", rev = "91e8aef8fbc3
 tinfoil-ehbp = { git = "https://github.com/tinfoilsh/encrypted-http-body-protocol", rev = "93cc1fa1ad61e19f9a34fb23cb5b5d5635d3edb0", default-features = false, features = ["rustls-no-provider"] }
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+# WebSockets for the authorization service: its device-facing listener and its
+# edge data-socket client, with a caller-supplied rustls configuration.
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 url = "=2.5.8"
 zxcvbn = { version = "=3.1.1", default-features = false }
 futures-util = "=0.3.34"
@@ -93,6 +100,8 @@ sha2 = "=0.10.9"
 aes-gcm = "=0.10.3"
 rand = { version = "=0.9.5", default-features = false, features = ["os_rng", "std_rng"] }
 hex = "=0.4.3"
+# QR matrices only: the client draws its own SVG; no image or SVG features.
+qrcode = { version = "=0.14.1", default-features = false }
 # NRAS ES384 JWT verification using already-locked permissive crypto/encoding crates.
 p384 = { version = "=0.13.1", default-features = false, features = ["ecdsa"] }
 base64 = "=0.22.1"
@@ -102,6 +111,9 @@ ohttp = { version = "=0.7.2", default-features = false, features = ["client", "s
 bhttp = "=0.7.2"
 futures = "=0.3.34"
 yrs = "=0.28.0"
+# The contained note engine's runtime. Its precompiled module is tied to this
+# exact release and configuration, so an upgrade rebuilds it with the app.
+wasmtime = { version = "=49.0.3", default-features = false }
 
 [patch.crates-io]
 yrs = { path = "third_party/yrs" }
@@ -115,6 +127,13 @@ todo = "deny"
 
 [profile.dev]
 debug = "line-tables-only"
+
+# The note engine runs interpreted, so its interpreter is optimized even here.
+[profile.dev.package.pulley-interpreter]
+opt-level = 3
+
+[profile.dev.package.wasmtime]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
@@ -137,3 +156,18 @@ panic = "abort"
 incremental = false
 codegen-units = 1
 rpath = false
+
+# The bundled note engine, built for wasm32-unknown-unknown by
+# bh-note-engine-artifact. It runs interpreted, so it is always optimized,
+# whatever profile builds the app; a panic traps.
+[profile.note-engine]
+inherits = "release"
+opt-level = 3
+debug = false
+strip = true
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1

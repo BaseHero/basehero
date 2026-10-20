@@ -1,0 +1,35 @@
+{
+  "cloudflare": {
+    "account_id": null,
+    "name": null,
+    "route": {"pattern": null, "custom_domain": true},
+    "bucket": null,
+    "receipt_key_binding": "RECEIPT_KEY",
+    "receipt_cert_file": null
+  },
+  "authz": {
+    "backends": [],
+    "image": null,
+    "image_id": null,
+    "archive_sha256": null,
+    "registry_manifest_file": null,
+    "protected_mount": null,
+    "uid": null,
+    "gid": null,
+    "quote_socket": null,
+    "files": {"permit_key": null, "permit_cert": null, "policy": null, "policy_signature": null, "collateral": null},
+    "roughtime": [],
+    "time_config": [1000000000, null, null, null, null]
+  },
+  "endpoint": {
+    "edge_url": null,
+    "hosting_root": null,
+    "app_root": null,
+    "policy": null,
+    "policy_signature": null,
+    "max_lifetime_secs": null,
+    "max_uncertainty_secs": null,
+    "build_floor": null,
+    "appraisal": "hardware"
+  }
+}

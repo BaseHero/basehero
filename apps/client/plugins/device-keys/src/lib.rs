@@ -1,4 +1,4 @@
-//! Private, inactive Android adapter. The app does not depend on or register this crate.
+//! Private Android Keystore adapter, constructed only by the app's native account code.
 //! No command is exposed to JavaScript and no operation touches the WebView.
 
 #[cfg(any(target_os = "android", test))]
@@ -47,6 +47,8 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 mod android;
 #[cfg(any(target_os = "android", test))]
 mod identity;
+#[cfg(any(target_os = "android", test))]
+mod pending;
 #[cfg(target_os = "android")]
 pub use android::{AndroidKeyStore, AndroidPendingSetupProtector};
 

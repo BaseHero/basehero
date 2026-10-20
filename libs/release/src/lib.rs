@@ -7,6 +7,8 @@
 //! Local SQLite compatibility belongs to `bh-core::check_local_data_version` and
 //! `bh-storage::DeviceDatabase::open`, not to release metadata.
 
+#[cfg(feature = "authorization-tools")]
+pub mod authorization;
 pub mod download;
 // Linux builds carry the same exchange so the app's update coordinator tests
 // run real bundle replacement on fixture directories; only macOS wires it.

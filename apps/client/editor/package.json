@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node scripts/patch-yjs.mjs && esbuild src/editor.mjs --bundle --format=esm --platform=browser --target=es2022 --minify --define:localStorage=undefined --define:sessionStorage=undefined --outfile=../ui/note-editor.js",
     "test": "node scripts/patch-yjs.mjs && node --test test/*.test.mjs",
-    "test:unit": "node scripts/patch-yjs.mjs && node --test test/schema.test.mjs test/preflight.test.mjs test/mirror.test.mjs test/pure-delta.test.mjs test/patch-yjs.test.mjs test/non-type.test.mjs test/pm-cache.test.mjs test/save-queue.test.mjs test/writer.test.mjs test/limits.test.mjs",
+    "test:unit": "node scripts/patch-yjs.mjs && node --test test/android-reflow.test.mjs test/schema.test.mjs test/preflight.test.mjs test/mirror.test.mjs test/pure-delta.test.mjs test/patch-yjs.test.mjs test/non-type.test.mjs test/pm-cache.test.mjs test/save-queue.test.mjs test/writer.test.mjs test/limits.test.mjs",
     "test:browser": "node scripts/patch-yjs.mjs && node --test test/browser.test.mjs test/mirror-fallback.test.mjs test/non-type-binding.test.mjs"
   },
   "dependencies": {

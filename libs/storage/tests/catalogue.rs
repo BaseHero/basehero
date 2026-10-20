@@ -55,7 +55,7 @@ fn legacy_local_commit_indexes_created_note_without_loading_document() {
     db.commit_account_verified([4; 32], &[b"genesis"], 1, [5; 32], false)
         .unwrap();
     let initial = db.list_notes(BASE, AUDIENCE, None, 1).unwrap()[0].touched;
-    let delta = Note::new().append_paragraph("saved");
+    let delta = Note::new().unwrap().append_paragraph("saved").unwrap();
     db.commit_working_update(key, 0, [4; 32], [1; 16], &delta)
         .unwrap();
     let saved = db.list_notes(BASE, AUDIENCE, None, 1).unwrap();
@@ -75,7 +75,7 @@ fn legacy_local_commit_indexes_created_note_without_loading_document() {
 fn direct_local_update_indexes_note_in_same_commit() {
     let mut db = DeviceDatabase::open(":memory:").unwrap();
     let key = key([29; 32]);
-    let delta = Note::new().append_paragraph("direct");
+    let delta = Note::new().unwrap().append_paragraph("direct").unwrap();
     db.apply_local_update(key, [2; 16], &delta).unwrap();
     assert!(db.note_exists(key).unwrap());
     assert_eq!(
@@ -93,8 +93,8 @@ fn title_and_touched_share_commit_and_replay_never_reorders() {
         .unwrap();
     let a = key(db.create_note(BASE, AUDIENCE).unwrap());
     let b = key(db.create_note(BASE, AUDIENCE).unwrap());
-    let mut note = Note::new();
-    let delta = note.append_paragraph("one");
+    let mut note = Note::new().unwrap();
+    let delta = note.append_paragraph("one").unwrap();
     assert!(
         !db.commit_working_update_with_title(a, 0, [4; 32], [1; 16], &delta, "one")
             .unwrap()
@@ -150,8 +150,8 @@ fn title_and_touched_share_commit_and_replay_never_reorders() {
         db.list_notes(BASE, AUDIENCE, None, 51),
         Err(StoreError::InvalidNotePage)
     ));
-    let mut second = Note::new();
-    let second_delta = second.append_paragraph("two");
+    let mut second = Note::new().unwrap();
+    let second_delta = second.append_paragraph("two").unwrap();
     db.commit_working_update_with_title(b, 0, [4; 32], [3; 16], &second_delta, "two")
         .unwrap();
     let page = db.list_notes(BASE, AUDIENCE, None, 1).unwrap();

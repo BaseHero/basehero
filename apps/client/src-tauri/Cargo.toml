@@ -15,6 +15,16 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 # Real-app WebDriver tests only; never part of a release build.
 webdriver = ["dep:tauri-plugin-webdriver"]
+# Labelled emulator test-account creation for Android emulator tests only;
+# never part of a release build (scripts/android-release-check.sh).
+emulator-fixture = []
+# Local stack builds only: accept a labelled synthetic attestation from the
+# endpoint's authorization service. Never part of a release build.
+synthetic-attestation = ["bh-host/synthetic-attestation"]
+# Linux desktop WebDriver tests only: a labelled software key store, so a
+# local-stack build can join an account without a platform key store. Never
+# part of a release build.
+desktop-fixture = ["bh-host/test-support"]
 
 [build-dependencies]
 tauri-build.workspace = true
@@ -28,6 +38,8 @@ bh-provider-policy-store.workspace = true
 basehero-models = { path = "../../../libs/models", features = ["near-route"] }
 bh-confidential-attestation.workspace = true
 bh-account.workspace = true
+bh-crypto.workspace = true
+bh-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zxcvbn.workspace = true
@@ -35,10 +47,13 @@ tokio.workspace = true
 tauri-plugin-webdriver = { workspace = true, optional = true }
 
 [dev-dependencies]
+# MockRuntime windows, so command wiring can be exercised without a display.
+tauri = { workspace = true, features = ["test"] }
 rusqlite.workspace = true
 tempfile.workspace = true
 bh-release.workspace = true
-bh-crypto.workspace = true
+# The host's labelled software key store, for tests only.
+bh-host = { workspace = true, features = ["test-support"] }
 flate2.workspace = true
 tar.workspace = true
 plist.workspace = true
@@ -51,7 +66,6 @@ bh-device-keys.workspace = true
 bh-mac-keychain-helper.workspace = true
 bh-mac-local-auth.workspace = true
 bh-release.workspace = true
-bh-crypto.workspace = true
 plist.workspace = true
 url.workspace = true
 bh-mac-lifecycle.workspace = true

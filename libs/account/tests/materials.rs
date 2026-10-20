@@ -5,7 +5,7 @@ use native::open_for_receiver;
 use bh_account::{
     AccountEvent, AccountId, DevicePublicKeys, Error, VerifiedAccount,
     crypto::{KemKey, SigningKey},
-    personal::{PersonalKey, PreparedPublication, SealPurpose, prepare_publication},
+    personal::{self, PersonalKey, PreparedPublication, SealPurpose, prepare_publication},
     recovery::{
         Password, PreparedRecoveryRecord, RecoveryCode, RecoveryKeys, open_record, prepare_record,
     },
@@ -88,6 +88,51 @@ fn initial() -> Fixture {
         published,
     }
 }
+#[test]
+fn initial_objects_require_exact_signed_slots_and_lengths() {
+    let f = initial();
+    let record = f.record.as_bytes();
+    let device = f.publication.device_seal();
+    let recovery = f.publication.recovery_seal();
+    assert_eq!(
+        f.state.verify_initial_objects(record, device, recovery),
+        Ok(())
+    );
+    assert!(
+        f.state
+            .verify_initial_objects(record, recovery, device)
+            .is_err()
+    );
+    let other = initial();
+    assert!(
+        other
+            .state
+            .verify_initial_objects(record, device, recovery)
+            .is_err()
+    );
+    for slot in 0..3 {
+        let mut objects = [record.to_vec(), device.to_vec(), recovery.to_vec()];
+        objects[slot][100] ^= 1;
+        assert!(
+            f.state
+                .verify_initial_objects(&objects[0], &objects[1], &objects[2])
+                .is_err()
+        );
+        objects[slot].clear();
+        assert!(
+            f.state
+                .verify_initial_objects(&objects[0], &objects[1], &objects[2])
+                .is_err()
+        );
+    }
+    let incomplete = VerifiedAccount::from_genesis(f.state.id(), f.genesis.as_bytes()).unwrap();
+    assert!(
+        incomplete
+            .verify_initial_objects(record, device, recovery)
+            .is_err()
+    );
+}
+
 // Independent incoming encoder: does not call SigningRequest or AccountEvent::draft.
 fn incoming(
     state: &VerifiedAccount,
@@ -320,6 +365,105 @@ fn signed_device_delivery_requires_active_sender_recipient_and_current_publicati
         .unwrap();
     assert!(
         native::open_device(&f.state, &object, &second, &receiver2).is_err(),
+        "inactive sender"
+    );
+}
+
+#[test]
+fn device_delivery_verifies_publicly_like_opening_without_secret_keys() {
+    let mut f = initial();
+    let ordinary2 = SigningKey::generate();
+    let control2 = SigningKey::generate();
+    let receiver2 = KemKey::generate();
+    let second =
+        DevicePublicKeys::new(ordinary2.public(), control2.public(), receiver2.public()).unwrap();
+    let predecessor = f.state.clone();
+    let draft = f.state.add_device(f.first.id(), second.clone()).unwrap();
+    let added = draft.finish(f.control.sign(draft.signing_bytes())).unwrap();
+    let object = native::seal_for_device(
+        &f.state,
+        &f.personal,
+        &f.first,
+        &f.ordinary,
+        &second,
+        &added,
+    )
+    .unwrap();
+    // Before the add is applied, the recipient is not a device of the account.
+    assert!(personal::verify_device_delivery(&predecessor, &object, &second).is_err());
+    f.state.apply(added.as_bytes()).unwrap();
+    assert!(personal::verify_device_delivery(&f.state, &object, &second) == Ok(f.first.id()));
+    // Every byte the opener checks before decapsulating is checked here too.
+    for offset in [
+        0,
+        8,
+        10,
+        11,
+        43,
+        75,
+        107,
+        1227,
+        1251,
+        object.len() - 65,
+        object.len() - 1,
+    ] {
+        let mut tampered = object.clone();
+        tampered[offset] ^= 1;
+        assert!(
+            personal::verify_device_delivery(&f.state, &tampered, &second).is_err(),
+            "tampered {offset}"
+        );
+    }
+    for wrong in [
+        &object[..object.len() - 1],
+        &[object.as_slice(), &[0]].concat(),
+    ] {
+        assert!(
+            personal::verify_device_delivery(&f.state, wrong, &second) == Err(Error::Malformed)
+        );
+    }
+    assert!(
+        personal::verify_device_delivery(&f.state, &object, &f.first).is_err(),
+        "another active device is not the recipient"
+    );
+    let resign = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut copy = object.clone();
+        change(&mut copy);
+        let n = copy.len();
+        let signature = f.ordinary.sign(&copy[..n - 64]);
+        copy[n - 64..].copy_from_slice(&signature);
+        copy
+    };
+    for (what, change) in [
+        (
+            "domain",
+            (&|b: &mut Vec<u8>| b[0] ^= 1) as &dyn Fn(&mut Vec<u8>),
+        ),
+        ("first-device purpose", &|b| b[8 + 10] = 1),
+        ("recovery purpose", &|b| b[8 + 10] = 2),
+        ("account", &|b| b[8 + 11] ^= 1),
+        ("personal publication", &|b| b[8 + 43] ^= 1),
+        ("recipient", &|b| b[8 + 75] ^= 1),
+    ] {
+        assert!(
+            personal::verify_device_delivery(&f.state, &resign(change), &second).is_err(),
+            "{what}"
+        );
+    }
+    // A delivery from another account's device, signed validly, is refused.
+    let foreign = initial();
+    assert!(personal::verify_device_delivery(&foreign.state, &object, &second).is_err());
+    let draft = f.state.remove_self(f.first.id()).unwrap();
+    f.state
+        .apply(
+            draft
+                .finish(f.control.sign(draft.signing_bytes()))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(
+        personal::verify_device_delivery(&f.state, &object, &second).is_err(),
         "inactive sender"
     );
 }

@@ -6,7 +6,7 @@
 //! plan and durably commit before releasing bytes or an acknowledgement.
 
 use crate::log::{BodyObject, Input, hash, referenced_body};
-use crate::{BaseId, Commitment, Digest, Error, Head, OpaqueEvent, VERSION};
+use crate::{BaseId, Commitment, Digest, Error, Head, OpaqueEvent, Route, VERSION};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccessError {
@@ -289,7 +289,14 @@ pub fn plan_consumption(
                     stage: None,
                 });
             }
-            let committed = Commitment::order(state.base, state.head, event)
+            // This approval lane has no control appends: only a genesis is a
+            // control.
+            let route = if state.head == Head::EMPTY {
+                Route::Control
+            } else {
+                Route::Content
+            };
+            let committed = Commitment::order(state.base, state.head, event, route)
                 .map_err(|_| AccessError::History)?;
             next.head = committed.head();
             Ok(Consumption {

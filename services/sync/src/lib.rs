@@ -460,8 +460,10 @@ fn validate(
         }
         prior.head()
     };
-    let canonical =
-        Commitment::order(state.base, previous, &event).map_err(|_| Refusal::Unavailable)?;
+    // Canonical for the route it was stored under; the route itself is checked
+    // by whoever applies the event.
+    let canonical = Commitment::order(state.base, previous, &event, commitment.route())
+        .map_err(|_| Refusal::Unavailable)?;
     if commitment != canonical
         || (position == state.head.position && commitment.head() != state.head)
     {

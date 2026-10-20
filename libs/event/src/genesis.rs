@@ -7,7 +7,7 @@ use crate::codec::{
 use crate::history::{History, Outcome};
 use bh_account::{AccountId, DeviceId, Head as AccountHead, VerifiedAccount};
 use bh_crypto::{Secret, random};
-use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent};
+use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent, Route, receipt::RECEIPT_LEN};
 
 pub struct GenesisSigningRequest(EventSigningRequest);
 impl GenesisSigningRequest {
@@ -61,6 +61,7 @@ pub fn prepare_genesis(
             class: CLASS_CONTROL,
             padded: 0,
             commitment: [0; 32],
+            seen_receipt: [0; RECEIPT_LEN],
         },
         Payload {
             kind: GENESIS,
@@ -93,17 +94,28 @@ pub fn verify_genesis(
     remembered_floor: u16,
 ) -> Result<VerifiedGenesis, Outcome> {
     let base = BaseId::from_genesis(descriptor);
-    let mut history = History::with_account(creator, base, remembered_floor)
+    let mut history = History::anchored(creator, base, None, remembered_floor)
         .map_err(|_| Outcome::IntegrityStop)?;
-    let ordered =
-        Commitment::order(base, Head::EMPTY, descriptor).map_err(|_| Outcome::IntegrityStop)?;
-    history.prepare(&ordered, descriptor, Some(body), metadata, None)?;
+    let ordered = Commitment::order(base, Head::EMPTY, descriptor, Route::Control)
+        .map_err(|_| Outcome::IntegrityStop)?;
+    judge_genesis(&mut history, &ordered, descriptor, body, metadata)
+}
+
+/// Judge an ordered genesis with History's checks and return its IDs.
+pub(crate) fn judge_genesis(
+    history: &mut History,
+    ordered: &Commitment,
+    descriptor: &OpaqueEvent,
+    body: &[u8],
+    metadata: &Secret<32>,
+) -> Result<VerifiedGenesis, Outcome> {
+    history.prepare(ordered, descriptor, Some(body), metadata, None)?;
     // The checked binding and body are read again solely to return their IDs;
     // no independent validation path may accept a genesis History rejects.
-    let signed = history.inspect(&ordered, descriptor, metadata)?;
+    let signed = history.inspect(ordered, descriptor, metadata)?;
     let payload = open_body(&signed, body, metadata, None).map_err(|_| Outcome::IntegrityStop)?;
     Ok(VerifiedGenesis {
-        base,
+        base: ordered.base(),
         creator: signed.account,
         device: signed.device,
         account_head: signed.account_head,

@@ -62,6 +62,15 @@ impl<S: PolicyStore> ClientHello<S> {
     pub fn accept_proof(self, frame: &[u8]) -> Result<ProofChecked<S>, Error> {
         self.accept_proof_with(frame, attestation::verify_evidence)
     }
+    /// Local-only: accept the labelled synthetic quote of a server running with
+    /// synthetic attestation, never hardware evidence. Policy delivery, key and
+    /// nonce binding, the signed policy's build and machine lists and every later
+    /// check are unchanged. Absent unless the `synthetic-attestation` feature,
+    /// which no release build enables, is on.
+    #[cfg(feature = "synthetic-attestation")]
+    pub fn accept_synthetic_proof(self, frame: &[u8]) -> Result<ProofChecked<S>, Error> {
+        self.accept_proof_with(frame, attestation::synthetic::verify_evidence)
+    }
     // Private injection boundary for synthetic full-assembly unit tests only.
     fn accept_proof_with(
         self,

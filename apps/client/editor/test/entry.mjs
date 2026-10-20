@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import {createNoteEditor} from '/note-editor.js';
-let view,doc,listener,jobs=[],boldUpdate,opens=0,writers=[],openOptions=[],autoAck=false;
+let view,doc,listener,jobs=[],boldUpdate,opens=0,writers=[],openOptions=[],autoAck=false,peersCb=null;
 const NATIVE=2002468231004600, LAST=2**32-1;
 const varUint=(n,out)=>{while(n>=128){out.push(n%128+128);n=Math.floor(n/128);}out.push(n);return out;};
 function element(name,text,attrs={}) {
@@ -32,6 +32,9 @@ function initial(kind,options={}) {
   if(kind==='lines') fragment.insert(0,Array.from({length:options.count??300},(_,i)=>
     element('paragraph',`line ${i} `+'words to wrap across a narrower window '.repeat(i%3+1))));
   if(kind==='rich') fragment.insert(0,[element('paragraph','intro'),element('heading','headline',{level:2})]);
+  if(kind==='sentence') fragment.insert(0,[element('paragraph','The quick brown fox jumps over the lazy dog.')]);
+  // Another device's copy of a note: exactly the host bytes it was given.
+  if(kind==='bytes') Y.applyUpdate(doc,Uint8Array.from(options.bytes));
   if(kind==='spaces'||kind==='spacesUnknown') fragment.insert(0,[element('paragraph','a  b')]);
   if(kind==='spacesUnknown') fragment.insert(1,[element('futureWidget','private',{payload:'keep'})]);
   if(kind==='racing') fragment.insert(0,[element('paragraph','before')]);
@@ -45,7 +48,7 @@ window.harness={
   // Each native open hands out the next writer; `room` makes it a reused
   // writer whose earlier clocks are already durable (one GC run).
   async open(kind,options={}) {
-    view?.close();jobs=[];listener=null;opens=0;openOptions=[];if(kind!=='existing')initial(kind,options);
+    view?.close();jobs=[];listener=null;opens=0;openOptions=[];peersCb=null;if(kind!=='existing')initial(kind,options);
     writers=options.writers??[{id:NATIVE}];
     view=await createNoteEditor(document.querySelector('#root'),{
       open:async (callback,requested)=>{
@@ -65,6 +68,7 @@ window.harness={
         if(autoAck){Y.applyUpdate(doc,bytes);return Promise.resolve({requestId:id});}
         return new Promise((resolve,reject)=>jobs.push({bytes,id,resolve,reject}));
       },
+      onPeers(callback){peersCb=callback;return ()=>{peersCb=null;};},
     },options.view?{view:options.view}:undefined);
     return {...view.state(),writes:jobs.length};
   },
@@ -110,6 +114,8 @@ window.harness={
     editor.state.doc.descendants((node,pos)=>{if(at<0&&node.isText&&node.text.includes(text))at=pos+node.text.indexOf(text)+text.length;});
     editor.commands.setTextSelection(at);
   },
+  // The start of the first paragraph's text, as a caret.
+  caretAtStart(){document.querySelector('.ProseMirror').editor.commands.setTextSelection(1);},
   heading:()=>document.querySelector('.ProseMirror h2').textContent,
   // Clocks one supported edit actually used, against the bound checked first.
   measure(cost){
@@ -147,6 +153,90 @@ window.harness={
   resume(){view.resume();},
   hold(reason){view.hold(reason);},
   view(){return view.view();},
+  // A remote device's message, exactly as the native peer path delivers it.
+  remote(message){if(!peersCb)throw Error('no peer listener');peersCb(message);return true;},
+  // The production encoder for a selection covering `text`.
+  relativeSelection(text){
+    this.select(text);
+    const {anchor,head}=this.view();
+    return {anchor,head};
+  },
+  // The text position a remote caret is drawn over: the point in the middle
+  // of its 2 px line, as the reader sees it.
+  peerPoint(id){
+    const cursor=document.querySelector(`.bh-remote-cursor[data-peer="${id}"]`);
+    if(!cursor)return null;
+    const box=cursor.getBoundingClientRect();
+    return {cursor,at:document.caretRangeFromPoint(box.left+1,box.top+box.height/2)};
+  },
+  // Where a remote caret actually renders: text before the caret and the
+  // words its selection covers.
+  peerAt(id){
+    const root=document.querySelector('.ProseMirror'),drawn=this.peerPoint(id);
+    if(!root || !drawn?.at)return null;
+    const {cursor,at}=drawn;
+    const before=document.createRange();before.setStart(root,0);before.setEnd(at.startContainer,at.startOffset);
+    const covered=root.querySelector(`.bh-remote-selection[data-peer="${id}"]`);
+    return {before:before.toString(),selection:covered?.textContent??'',label:cursor.querySelector('.bh-remote-label')?.textContent??'',colour:cursor.style.getPropertyValue('--peer')};
+  },
+  // The note's block (top-level index) a remote caret is drawn on.
+  peerBlock(id){
+    const root=document.querySelector('.ProseMirror'),at=this.peerPoint(id)?.at;
+    return at?[...root.children].findIndex(block=>block.contains(at.startContainer)):null;
+  },
+  // The geometry a remote caret actually renders: the caret's own box, its
+  // label's box, and where the text after it starts on the line. The text
+  // position proves a collapsed label does not move the line under it.
+  caretBox(id='mac'){
+    const root=document.querySelector('.ProseMirror'),drawn=this.peerPoint(id);
+    if(!root || !drawn?.at)return null;
+    const {cursor,at}=drawn;
+    const label=cursor.querySelector('.bh-remote-label');
+    const box=element=>{const {width,height}=element.getBoundingClientRect();return {width:Math.round(width*100)/100,height:Math.round(height*100)/100};};
+    const after=document.createRange();after.setStart(at.startContainer,at.startOffset);after.setEnd(root,root.childNodes.length);
+    return {cursor:box(cursor),label:box(label),textLeft:Math.round(after.getBoundingClientRect().left)};
+  },
+  // The note text an Android keyboard reads: the editable's own text, and
+  // the text before this window's caret.
+  editableText(){
+    const root=document.querySelector('.ProseMirror'),selection=getSelection();
+    const before=document.createRange();before.setStart(root,0);before.setEnd(selection.focusNode,selection.focusOffset);
+    return {all:root.textContent,before:before.toString()};
+  },
+  // A peer's batch insertion into a paragraph's text, delivered as an update.
+  incomingText(index,offset,text){
+    const before=Y.encodeStateVector(doc);
+    doc.getXmlFragment('default').get(index).get(0).insert(offset,text);
+    listener(Y.encodeStateAsUpdate(doc,before));
+  },
+  // A peer's insertion at an offset around text this copy already has.
+  incomingAtText(match,offset,text){
+    const before=Y.encodeStateVector(doc);
+    const frag=doc.getXmlFragment('default');
+    for(let index=0;index<frag.length;index++){
+      const inner=frag.get(index)?.get?.(0);
+      const value=inner?.toString?.()??'';
+      if(!value.includes(match))continue;
+      inner.insert(value.indexOf(match)+offset,text);
+      listener(Y.encodeStateAsUpdate(doc,before));
+      return index;
+    }
+    throw Error('text not found: '+match);
+  },
+  incomingBytes(bytes){listener(Uint8Array.from(bytes));return view.state();},
+  // Relative positions that name an item this copy has not received yet,
+  // plus the update that carries it: a remote device's newest paragraph.
+  futureRelative(text){
+    const peer=new Y.Doc();peer.clientID=424242;
+    Y.applyUpdate(peer,Y.encodeStateAsUpdate(doc));
+    const fragment=peer.getXmlFragment('default');
+    fragment.insert(fragment.length,[element('paragraph',text)]);
+    const inner=fragment.get(fragment.length-1).get(0);
+    const relative=Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(inner,text.length));
+    const update=Y.encodeStateAsUpdate(peer,Y.encodeStateVector(doc));
+    peer.destroy();
+    return {anchor:Array.from(relative),head:Array.from(relative),update:Array.from(update)};
+  },
   editable:()=>document.querySelector('.ProseMirror')?.getAttribute('contenteditable'),
   selection(){const e=document.querySelector('.ProseMirror').editor;return [e.state.selection.anchor,e.state.selection.head];},
   scroller:()=>document.scrollingElement.scrollTop,

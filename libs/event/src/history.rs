@@ -1,21 +1,26 @@
-use crate::codec::{
-    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Error, GENESIS, NOTE, OpenPayload,
-    apply_note, key_id, open_binding, open_body,
-};
-use bh_account::{
-    AccountEvent, AccountId, Error as AccountError, Head as AccountHead, VerifiedAccount,
-};
+use crate::codec::{Binding, Error, NOTE_PREFIX, OpenPayload, apply_note};
+use crate::control::{Judged, SignedContext, judge, verify_signed};
+use crate::writer::DeviceWriterDeclaration;
+use bh_account::{AccountId, Head as AccountHead, VerifiedAccount};
 use bh_core::note::{Note, NoteError};
-use bh_crypto::{Secret, SecretBytes, verify};
+use bh_crypto::{Secret, SecretBytes};
 use bh_sync::{BaseId, Commitment, Digest, Head, OpaqueEvent, referenced_body};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// These results establish only historical verification, never a currently
 /// authorised service operation. A caller must stop after `IntegrityStop`.
+///
+/// An invalid submission under a known protocol (a forged or malformed
+/// original, a false claim about what its author had seen, an absent or
+/// invalid receipt, an inactive author) is `Rejected`: ordered, with no
+/// effect, and verification continues. Only evidence against independently
+/// verified history stops: a verified hosting receipt contradicting it,
+/// changed bytes under an established commitment, or an invalid genesis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Accepted,
     ContentRejected,
+    Rejected,
     IntegrityStop,
     UnsupportedPause,
     UnavailablePause,
@@ -88,6 +93,9 @@ impl Transition {
 pub enum ConsumeError {
     StaleState,
     WrongTarget,
+    /// The note engine trapped or hit a local limit: nothing was judged, and
+    /// the working Note is discarded.
+    Unavailable,
 }
 
 // No public constructor or deserializer: only prepare() can produce this owned
@@ -102,6 +110,7 @@ pub struct PreparedEvent {
     digest: Digest,
     event_id: [u8; 32],
     version: u16,
+    author: Option<([u8; 32], [u8; 32])>,
     kind: PreparedKind,
 }
 impl PreparedEvent {
@@ -109,8 +118,20 @@ impl PreparedEvent {
     pub fn note_id(&self) -> Option<[u8; 32]> {
         match &self.kind {
             PreparedKind::Note { id, .. } => Some(*id),
-            PreparedKind::Control { .. } => None,
+            PreparedKind::Control { .. } | PreparedKind::Rejected => None,
         }
+    }
+    /// The producing writer a note event declares, unchecked against its
+    /// author; None for controls.
+    pub fn writer(&self) -> Option<DeviceWriterDeclaration> {
+        match &self.kind {
+            PreparedKind::Note { writer, .. } => Some(*writer),
+            PreparedKind::Control { .. } | PreparedKind::Rejected => None,
+        }
+    }
+    /// An invalid submission: consuming it advances history with no effect.
+    pub fn is_rejected(&self) -> bool {
+        matches!(self.kind, PreparedKind::Rejected)
     }
 }
 /// An authenticated, consumed event. Its private construction binds all bytes
@@ -125,10 +146,22 @@ pub struct AppliedEvent {
     kind: AppliedKind,
     head: Head,
     floor: u16,
+    judged_floor: u16,
+    author: Option<([u8; 32], [u8; 32])>,
+    writer: Option<DeviceWriterDeclaration>,
+    seen: Seen,
+    metadata_id: Option<[u8; 32]>,
+    epoch_id: Option<[u8; 32]>,
+    hosting_root: Option<[u8; 32]>,
+    account_change: Option<Vec<u8>>,
 }
-/// Only an accepted note exposes an applied delta. A rejected content event
-/// advances the common history but must not change the Note.
+/// Authenticated history classification. A rejected content event advances
+/// the common history but must not change the Note.
 pub enum AppliedKind {
+    /// With `History::consume`, the delta passed that history's Note judgment.
+    /// With `History::consume_unapplied`, this is only an authenticated
+    /// candidate: the device Owner must judge and commit it before it is
+    /// accepted content or may retire pending work.
     NoteAccepted {
         note_id: [u8; 32],
         delta: SecretBytes,
@@ -137,6 +170,8 @@ pub enum AppliedKind {
         note_id: [u8; 32],
     },
     Control,
+    /// An invalid submission: it holds its position and nothing else.
+    Rejected,
 }
 impl std::fmt::Debug for AppliedEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,9 +201,13 @@ impl AppliedEvent {
     pub fn kind(&self) -> &AppliedKind {
         &self.kind
     }
+    /// This history's classification, not necessarily final content acceptance.
+    /// In particular, `consume_unapplied` returns `Accepted` for authenticated
+    /// Note candidates whose content still awaits the Owner's judgment/commit.
     pub fn outcome(&self) -> Outcome {
         match self.kind {
             AppliedKind::NoteRejected { .. } => Outcome::ContentRejected,
+            AppliedKind::Rejected => Outcome::Rejected,
             _ => Outcome::Accepted,
         }
     }
@@ -178,17 +217,61 @@ impl AppliedEvent {
     pub fn floor(&self) -> u16 {
         self.floor
     }
+    /// The version floor this event was judged under. Above the floor before
+    /// it, the floor rose at the previous position.
+    pub fn judged_floor(&self) -> u16 {
+        self.judged_floor
+    }
+    /// What verified history had applied once this event was: the record an
+    /// author's claim to have seen this position is checked against.
+    pub fn seen(&self) -> Seen {
+        self.seen
+    }
+    /// Everything judging the next event needs, once this one is applied.
+    /// None only before a genesis has named the metadata root.
+    pub fn continuation(&self) -> Option<Continuation> {
+        Some(Continuation {
+            seen: self.seen,
+            metadata_id: self.metadata_id?,
+            epoch_id: self.epoch_id,
+            floor: self.floor,
+        })
+    }
+    /// The pinned hosting root this event's receipt was judged under; None
+    /// only for a genesis verified without one.
+    pub fn hosting_root(&self) -> Option<[u8; 32]> {
+        self.hosting_root
+    }
+    /// The exact verified account event an accepted account control applied
+    /// to the account projection.
+    pub fn account_change(&self) -> Option<&[u8]> {
+        self.account_change.as_deref()
+    }
+    /// The verified signer: its account and active device. None for a
+    /// rejected submission, whose signer is not established.
+    pub fn author(&self) -> Option<([u8; 32], [u8; 32])> {
+        self.author
+    }
+    /// The writer a note event declares, rejected or not. Only its decoding
+    /// is checked here: whether it binds [`Self::author`] is the note
+    /// owner's rule. None for controls.
+    pub fn writer(&self) -> Option<DeviceWriterDeclaration> {
+        self.writer
+    }
 }
 enum PreparedKind {
     Note {
         id: [u8; 32],
+        writer: DeviceWriterDeclaration,
         payload: OpenPayload,
     },
     Control {
         account: Arc<VerifiedAccount>,
         metadata_id: Option<[u8; 32]>,
         epoch_id: Option<[u8; 32]>,
+        change: Option<Vec<u8>>,
     },
+    Rejected,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Prestate {
@@ -199,16 +282,48 @@ struct Prestate {
     metadata_id: Option<[u8; 32]>,
     epoch_id: Option<[u8; 32]>,
     floor: u16,
-    entries: usize,
+    position: u64,
     ids: usize,
     stopped: bool,
 }
 
+/// What verified history had applied at one position: its head, the digest
+/// of the newest control event and the account head. An author's claim to
+/// have seen that position is checked against exactly this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub head: Head,
+    pub control: [u8; 32],
+    pub account: AccountHead,
+}
+
+/// A durable verified continuation: what judging the next event needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    pub seen: Seen,
+    pub metadata_id: [u8; 32],
+    pub epoch_id: Option<[u8; 32]>,
+    pub floor: u16,
+}
+
+/// A local store could not answer. Nothing is judged; the device waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupError;
+
+/// Durable verified history below a resumed continuation, read by point
+/// lookups so that resuming neither replays nor loads the whole log.
+/// Implementations must not take a lock a caller of `prepare` may hold.
+pub trait HistoryLookup: Send + Sync {
+    /// What was seen at `position` (from 1), if verified history has it.
+    fn seen(&self, position: u64) -> Result<Option<Seen>, LookupError>;
+    /// The digest of the first ordered event that used this ID, if any.
+    fn event_digest(&self, event_id: [u8; 32]) -> Result<Option<Digest>, LookupError>;
+}
+
 #[derive(Clone)]
-struct Seen {
-    head: Head,
-    control: [u8; 32],
-    account: AccountHead,
+struct Durable {
+    last: Seen,
+    lookup: Arc<dyn HistoryLookup>,
 }
 
 /// In-memory candidate. The device store must atomically persist exact originals,
@@ -219,31 +334,53 @@ pub struct History {
     // Notes and transactional clones share this immutable verified snapshot.
     // An account-changing control prepares a separate owned successor.
     account: Arc<VerifiedAccount>,
+    // Verified history below `entries` when resumed: looked up, never loaded.
+    durable: Option<Durable>,
+    // Positions after the durable continuation (from 1 without one).
     entries: Vec<Seen>,
     ids: BTreeMap<[u8; 32], Digest>,
     metadata_id: Option<[u8; 32]>,
     epoch_id: Option<[u8; 32]>,
     floor: u16,
     stopped: bool,
+    // Pinned hosting root that certifies receipt keys. Only base genesis
+    // verification runs without one; it never reaches a later event.
+    hosting_root: Option<[u8; 32]>,
 }
 impl History {
     /// `base` and `account_id` must come from local creation or an independent
-    /// introduction, never from the untrusted log being checked.
+    /// introduction, never from the untrusted log being checked. `hosting_root`
+    /// is the independently pinned key that certifies receipt keys for this base.
     pub fn new(
         account_id: AccountId,
         account_genesis: &[u8],
         base: BaseId,
+        hosting_root: [u8; 32],
         remembered_floor: u16,
     ) -> Result<Self, Error> {
         let account = VerifiedAccount::from_genesis(account_id, account_genesis)
             .map_err(|_| Error::Invalid)?;
-        Self::with_account(&account, base, remembered_floor)
+        Self::with_account(&account, base, hosting_root, remembered_floor)
     }
     /// Start at the creator's independently verified account head named by a
     /// base genesis, including heads after account setup or device changes.
+    /// Every event after genesis must carry a receipt for its author's observed
+    /// head that verifies under `hosting_root`.
     pub fn with_account(
         account: &VerifiedAccount,
         base: BaseId,
+        hosting_root: [u8; 32],
+        remembered_floor: u16,
+    ) -> Result<Self, Error> {
+        Self::anchored(account, base, Some(hosting_root), remembered_floor)
+    }
+    /// Genesis verification needs no receipt, so it needs no hosting root; any
+    /// later event pauses as unavailable. A missing local root is this
+    /// device's configuration, not evidence about the log.
+    pub(crate) fn anchored(
+        account: &VerifiedAccount,
+        base: BaseId,
+        hosting_root: Option<[u8; 32]>,
         remembered_floor: u16,
     ) -> Result<Self, Error> {
         if remembered_floor == 0 || account.is_stopped() {
@@ -252,16 +389,125 @@ impl History {
         Ok(Self {
             base,
             account: Arc::new(account.clone()),
+            durable: None,
             entries: vec![],
             ids: BTreeMap::new(),
             metadata_id: None,
             epoch_id: None,
             floor: remembered_floor,
             stopped: false,
+            hosting_root,
         })
     }
+    /// Continue from a durable verified continuation without replaying the
+    /// log. `anchor` is the creator's account at the head the base genesis
+    /// names, as for [`History::with_account`]; `account_changes` are the
+    /// exact verified account events base-log controls applied after it, in
+    /// position order. Earlier positions and event IDs are read through
+    /// `lookup`. `hosting_root` must be the root pinned when this base was
+    /// registered, taken from its authenticated hosting association; the
+    /// store owner refuses any other. Local state that does not reproduce
+    /// the continuation is `UnavailablePause`: nothing is judged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume<C, A>(
+        anchor: &VerifiedAccount,
+        base: BaseId,
+        hosting_root: [u8; 32],
+        continuation: Continuation,
+        account_changes: C,
+        lookup: Arc<dyn HistoryLookup>,
+        remembered_floor: u16,
+    ) -> Result<Self, Outcome>
+    where
+        C: IntoIterator<Item = A>,
+        A: AsRef<[u8]>,
+    {
+        let unavailable = Outcome::UnavailablePause;
+        if continuation.seen.head.position == 0
+            || continuation.floor == 0
+            || remembered_floor == 0
+            || anchor.is_stopped()
+        {
+            return Err(unavailable);
+        }
+        let mut account = anchor.clone();
+        for change in account_changes {
+            account.apply(change.as_ref()).map_err(|_| unavailable)?;
+        }
+        if account.head() != continuation.seen.account
+            || lookup.seen(continuation.seen.head.position) != Ok(Some(continuation.seen))
+        {
+            return Err(unavailable);
+        }
+        Ok(Self {
+            base,
+            account: Arc::new(account),
+            durable: Some(Durable {
+                last: continuation.seen,
+                lookup,
+            }),
+            entries: vec![],
+            ids: BTreeMap::new(),
+            metadata_id: Some(continuation.metadata_id),
+            epoch_id: continuation.epoch_id,
+            floor: continuation.floor.max(remembered_floor),
+            stopped: false,
+            hosting_root: Some(hosting_root),
+        })
+    }
+    fn durable_position(&self) -> u64 {
+        self.durable.as_ref().map_or(0, |d| d.last.head.position)
+    }
+    fn position(&self) -> u64 {
+        self.durable_position() + self.entries.len() as u64
+    }
+    fn last_seen(&self) -> Option<Seen> {
+        self.entries
+            .last()
+            .copied()
+            .or_else(|| self.durable.as_ref().map(|d| d.last))
+    }
+    fn last_control(&self) -> [u8; 32] {
+        self.last_seen().map_or([0; 32], |s| s.control)
+    }
+    /// What was seen at a position: in memory after the continuation, or
+    /// looked up below it. A store that cannot answer, or answers for
+    /// another position, makes this device wait.
+    fn seen_at(&self, position: u64) -> Result<Option<Seen>, Outcome> {
+        let below = self.durable_position();
+        if position == 0 {
+            return Ok(None);
+        }
+        if position > below {
+            return Ok(usize::try_from(position - below - 1)
+                .ok()
+                .and_then(|index| self.entries.get(index))
+                .copied());
+        }
+        let durable = self
+            .durable
+            .as_ref()
+            .expect("positions below a continuation");
+        match durable.lookup.seen(position) {
+            Ok(Some(seen)) if seen.head.position == position => Ok(Some(seen)),
+            _ => Err(Outcome::UnavailablePause),
+        }
+    }
+    fn id_used(&self, event_id: [u8; 32]) -> Result<bool, Outcome> {
+        if self.ids.contains_key(&event_id) {
+            return Ok(true);
+        }
+        match &self.durable {
+            Some(durable) => durable
+                .lookup
+                .event_digest(event_id)
+                .map(|digest| digest.is_some())
+                .map_err(|_| Outcome::UnavailablePause),
+            None => Ok(false),
+        }
+    }
     pub fn head(&self) -> Head {
-        self.entries.last().map_or(Head::EMPTY, |s| s.head)
+        self.last_seen().map_or(Head::EMPTY, |s| s.head)
     }
     pub fn floor(&self) -> u16 {
         self.floor
@@ -280,11 +526,17 @@ impl History {
     /// Rebuild only the verified history, not Note projections, from independently
     /// anchored introductions/roots and exact stored originals in log order.
     /// Malformed framing or any verification failure refuses the entire replay.
+    ///
+    /// `floor_rises` are `(position, floor)`: events after `position` were
+    /// judged under at least `floor`, so each event is judged under the floor
+    /// in force when it was ordered, never a later one.
+    #[allow(clippy::too_many_arguments)]
     pub fn replay<I, D, B>(
         account_id: AccountId,
         account_genesis: &[u8],
         base: BaseId,
-        remembered_floor: u16,
+        hosting_root: [u8; 32],
+        floor_rises: &[(u64, u16)],
         metadata: &Secret<32>,
         content: Option<&Secret<32>>,
         records: I,
@@ -296,14 +548,23 @@ impl History {
     {
         let account = VerifiedAccount::from_genesis(account_id, account_genesis)
             .map_err(|_| Outcome::IntegrityStop)?;
-        Self::replay_with_account(&account, base, remembered_floor, metadata, content, records)
+        Self::replay_with_account(
+            &account,
+            base,
+            hosting_root,
+            floor_rises,
+            metadata,
+            content,
+            records,
+        )
     }
     /// Replay originals anchored to the creator's verified account projection
     /// at the genesis head; later account changes arrive in the base log.
     pub fn replay_with_account<I, D, B>(
         account: &VerifiedAccount,
         base: BaseId,
-        remembered_floor: u16,
+        hosting_root: [u8; 32],
+        floor_rises: &[(u64, u16)],
         metadata: &Secret<32>,
         content: Option<&Secret<32>>,
         records: I,
@@ -313,9 +574,18 @@ impl History {
         D: AsRef<[u8]>,
         B: AsRef<[u8]>,
     {
-        let mut history = Self::with_account(account, base, remembered_floor)
+        let mut history = Self::with_account(account, base, hosting_root, 1)
             .map_err(|_| Outcome::IntegrityStop)?;
+        let rise = |history: &mut Self| {
+            let position = history.position();
+            for &(after, floor) in floor_rises {
+                if after <= position {
+                    history.floor = history.floor.max(floor);
+                }
+            }
+        };
         for (ordered, descriptor, body) in records {
+            rise(&mut history);
             let descriptor =
                 OpaqueEvent::decode(descriptor.as_ref()).map_err(|_| Outcome::IntegrityStop)?;
             let prepared = history.prepare(
@@ -330,6 +600,7 @@ impl History {
             // advance the common chain, account controls or version floor.
             history.advance(&prepared);
         }
+        rise(&mut history);
         Ok(history)
     }
     pub fn is_stopped(&self) -> bool {
@@ -342,12 +613,12 @@ impl History {
         Prestate {
             base: self.base,
             head: self.head(),
-            control: self.entries.last().map_or([0; 32], |s| s.control),
+            control: self.last_control(),
             account: self.account.head(),
             metadata_id: self.metadata_id,
             epoch_id: self.epoch_id,
             floor: self.floor,
-            entries: self.entries.len(),
+            position: self.position(),
             ids: self.ids.len(),
             stopped: self.stopped,
         }
@@ -355,6 +626,8 @@ impl History {
 
     /// Verify descriptor, original signature, author-seen heads and account
     /// authority without fetching/opening a note body. This does not advance.
+    /// An invalid submission is `Err(Rejected)`; [`History::prepare`] turns it
+    /// into an event that advances history with no effect.
     pub fn inspect(
         &self,
         ordered: &Commitment,
@@ -364,97 +637,21 @@ impl History {
         if self.stopped {
             return Err(Outcome::IntegrityStop);
         }
-        let genesis = self.entries.is_empty();
+        // The order must continue verified history and commit these bytes.
         if ordered.verify_next(self.base, self.head()).is_err()
             || ordered.verify_body(event).is_err()
-            || self.ids.contains_key(&event.id().0)
         {
             return Err(Outcome::IntegrityStop);
         }
-        let (signed, signature) = match open_binding(
-            event,
-            metadata,
-            if genesis { [0; 32] } else { self.base.0 },
-            genesis,
-        ) {
-            Ok(v) => v,
-            Err(Error::Unsupported) => return Err(Outcome::UnsupportedPause),
-            Err(Error::Unavailable) => return Err(Outcome::UnavailablePause),
-            Err(Error::Invalid) => return Err(Outcome::IntegrityStop),
-        };
-        if signed.audience != [0; 32] || signed.account != self.account.id() {
-            return Err(Outcome::IntegrityStop);
-        }
-        // AEAD success alone cannot authenticate a substituted metadata root.
-        // Genesis introduces M; every later original, including content, must
-        // use precisely that committed root. S's epoch remains class-specific.
-        let metadata_key_id = key_id(metadata);
-        if !genesis && self.metadata_id != Some(metadata_key_id) {
-            return Err(Outcome::IntegrityStop);
-        }
-        if !genesis && signed.class == CLASS_CONTENT && Some(signed.epoch) != self.epoch_id {
-            return Err(Outcome::IntegrityStop);
-        }
-        if signed.class == CLASS_CONTROL && signed.epoch != metadata_key_id {
-            return Err(Outcome::IntegrityStop);
-        }
-        if genesis {
-            if signed.class != CLASS_CONTROL
-                || signed.seen != Head::EMPTY
-                || signed.seen_control != [0; 32]
-                || signed.account_head != self.account.head()
-            {
-                return Err(Outcome::IntegrityStop);
-            }
-        } else {
-            if signed.seen.position == 0 {
-                return Err(Outcome::IntegrityStop);
-            }
-            let Ok(index) = usize::try_from(signed.seen.position - 1) else {
-                return Err(Outcome::IntegrityStop);
-            };
-            let Some(seen) = self.entries.get(index) else {
-                return Err(Outcome::IntegrityStop);
-            };
-            if seen.head != signed.seen
-                || seen.control != signed.seen_control
-                || seen.account != signed.account_head
-            {
-                return Err(Outcome::IntegrityStop);
-            }
-            if signed.class == CLASS_CONTROL
-                && signed.seen_control != self.entries.last().expect("nonempty history").control
-            {
-                return Err(Outcome::IntegrityStop);
-            }
-        }
-        let device = match self.account.active_device(signed.device) {
-            Ok(v) => v,
-            Err(_) => return Err(Outcome::IntegrityStop),
-        };
-        let key = if genesis || signed.class == CLASS_CONTENT {
-            device.signing()
-        } else {
-            device.control()
-        };
-        let mut signed_bytes = b"bh/original-envelope/v1\0".to_vec();
-        signed_bytes.extend(signed.encode_for_verify());
-        if verify(key, &signed_bytes, &signature).is_err()
-            || signed.highest < signed.version
-            || signed.version < self.floor
-        {
-            return Err(Outcome::IntegrityStop);
-        }
-        if signed.version != 1 {
-            return Err(Outcome::UnsupportedPause);
-        }
-        Ok(signed)
+        verify_signed(self, ordered.route(), event, metadata)
     }
 
     /// Fully verify one ordered original and body without advancing the
-    /// checkpoint or modifying a Note. Invalid history latches an integrity
-    /// stop; missing input and unsupported semantics do not. This grants no
-    /// current/unlock authority.
+    /// checkpoint or modifying a Note. Evidence against verified history
+    /// latches an integrity stop; missing input and unsupported semantics do
+    /// not. An invalid submission is prepared as rejected
+    /// ([`PreparedEvent::is_rejected`]): consuming it advances history with
+    /// no effect. This grants no current/unlock authority.
     pub fn prepare(
         &mut self,
         ordered: &Commitment,
@@ -463,11 +660,36 @@ impl History {
         metadata: &Secret<32>,
         content: Option<&Secret<32>>,
     ) -> Result<PreparedEvent, Outcome> {
-        let result = self.prepare_checked(ordered, event, body, metadata, content);
+        let result = match self.prepare_checked(ordered, event, body, metadata, content) {
+            Err(Outcome::Rejected) => Ok(self.rejected(ordered, event, body)),
+            other => other,
+        };
         if matches!(result, Err(Outcome::IntegrityStop)) {
             self.stopped = true;
         }
         result
+    }
+
+    /// An ordered invalid submission: its position and bytes, nothing else.
+    fn rejected(
+        &self,
+        ordered: &Commitment,
+        event: &OpaqueEvent,
+        body: Option<&[u8]>,
+    ) -> PreparedEvent {
+        PreparedEvent {
+            before: self.prestate(),
+            ordered: *ordered,
+            descriptor: event.encode(),
+            body: body.map(<[u8]>::to_vec).unwrap_or_default(),
+            body_commitment: referenced_body(event).unwrap_or(Digest([0; 32])),
+            head: ordered.head(),
+            digest: ordered.event_digest(),
+            event_id: event.id().0,
+            version: 0,
+            author: None,
+            kind: PreparedKind::Rejected,
+        }
     }
 
     fn prepare_checked(
@@ -480,94 +702,30 @@ impl History {
     ) -> Result<PreparedEvent, Outcome> {
         let signed = self.inspect(ordered, event, metadata)?;
         let body = body.ok_or(Outcome::UnavailablePause)?;
-        if signed.class == CLASS_CONTENT && content.is_some_and(|root| key_id(root) != signed.epoch)
-        {
-            return Err(Outcome::IntegrityStop);
-        }
-        let payload = open_body(&signed, body, metadata, content).map_err(|e| match e {
-            Error::Unavailable => Outcome::UnavailablePause,
-            Error::Unsupported => Outcome::UnsupportedPause,
-            Error::Invalid => Outcome::IntegrityStop,
-        })?;
-        let mut next_account = None;
-        let mut next_metadata = self.metadata_id;
-        let mut next_epoch = self.epoch_id;
-        match (signed.class, payload.kind) {
-            (CLASS_CONTROL, GENESIS) if self.entries.is_empty() => {
-                let data = payload.data();
-                if data.len() != 168
-                    || data[..32] != signed.account.0
-                    || data[32..40] != signed.account_head.position.to_be_bytes()
-                    || data[40..72] != signed.account_head.hash
-                    || data[72..104] != [0; 32]
-                    || data[136..168] != signed.epoch
-                {
-                    return Err(Outcome::IntegrityStop);
-                }
-                next_metadata = Some(signed.epoch);
-                next_epoch = Some(data[104..136].try_into().expect("length checked"));
-            }
-            (CLASS_CONTROL, ACCOUNT_CHANGE) if !self.entries.is_empty() => {
-                let data = payload.data();
-                // Independent allowlist; expanding the account parser cannot make
-                // private recovery/seal records forwardable under metadata M.
-                const TAG: usize = b"BaseHero account event\0".len() + 2 + 2 + 8 + 32 + 32 + 32;
-                let Some(tag) = data.get(TAG) else {
-                    return Err(Outcome::IntegrityStop);
-                };
-                if !matches!(tag, 1 | 2) {
-                    return Err(Outcome::UnsupportedPause);
-                }
-                let parsed = match AccountEvent::decode(data) {
-                    Ok(event) => event,
-                    Err(AccountError::UnsupportedVersion | AccountError::UnsupportedControl) => {
-                        return Err(Outcome::UnsupportedPause);
-                    }
-                    Err(_) => return Err(Outcome::IntegrityStop),
-                };
-                if signed.account_head != self.account.head() {
-                    return Err(Outcome::IntegrityStop);
-                }
-                // Only a control that changes account authority needs an owned
+        let kind = match judge(self, &signed, event, body, metadata, content)? {
+            Judged::Note {
+                id,
+                writer,
+                payload,
+            } => PreparedKind::Note {
+                id,
+                writer,
+                payload,
+            },
+            Judged::Control {
+                account,
+                change,
+                metadata_id,
+                epoch_id,
+            } => PreparedKind::Control {
+                // Only a control that changes account authority owns a
                 // candidate; note verification and genesis share the snapshot.
-                let mut account = Arc::clone(&self.account);
-                match Arc::make_mut(&mut account).apply(parsed.as_bytes()) {
-                    Ok(()) => next_account = Some(account),
-                    Err(AccountError::Unavailable) => return Err(Outcome::UnavailablePause),
-                    Err(AccountError::UnsupportedVersion | AccountError::UnsupportedControl) => {
-                        return Err(Outcome::UnsupportedPause);
-                    }
-                    Err(_) => return Err(Outcome::IntegrityStop),
-                }
-                if data[TAG] == 2 {
-                    next_epoch = None;
-                }
-            }
-            (CLASS_CONTENT, NOTE) if !self.entries.is_empty() => {
-                let data = payload.data();
-                let id: [u8; 32] = data
-                    .get(..32)
-                    .ok_or(Outcome::IntegrityStop)?
-                    .try_into()
-                    .expect("length checked");
-                return Ok(PreparedEvent {
-                    before: self.prestate(),
-                    ordered: *ordered,
-                    descriptor: event.encode(),
-                    body: body.to_vec(),
-                    body_commitment: referenced_body(event).expect("inspected descriptor"),
-                    head: ordered.head(),
-                    digest: ordered.event_digest(),
-                    event_id: event.id().0,
-                    version: signed.version,
-                    kind: PreparedKind::Note { id, payload },
-                });
-            }
-            (CLASS_CONTROL, GENESIS)
-            | (CLASS_CONTENT, GENESIS | ACCOUNT_CHANGE)
-            | (CLASS_CONTROL, NOTE) => return Err(Outcome::IntegrityStop),
-            _ => return Err(Outcome::UnsupportedPause),
-        }
+                account: account.unwrap_or_else(|| Arc::clone(&self.account)),
+                metadata_id,
+                epoch_id,
+                change,
+            },
+        };
         Ok(PreparedEvent {
             before: self.prestate(),
             ordered: *ordered,
@@ -578,11 +736,8 @@ impl History {
             digest: ordered.event_digest(),
             event_id: event.id().0,
             version: signed.version,
-            kind: PreparedKind::Control {
-                account: next_account.unwrap_or_else(|| Arc::clone(&self.account)),
-                metadata_id: next_metadata,
-                epoch_id: next_epoch,
-            },
+            author: Some((signed.account.0, signed.device.0)),
+            kind,
         })
     }
 
@@ -601,7 +756,7 @@ impl History {
                 target,
             });
         }
-        if matches!(&prepared.kind, PreparedKind::Control { .. }) != target.is_none()
+        if prepared.note_id().is_none() != target.is_none()
             || target
                 .as_ref()
                 .is_some_and(|t| Some(t.id) != prepared.note_id())
@@ -613,9 +768,10 @@ impl History {
         }
         let (kind, note) = match &prepared.kind {
             PreparedKind::Control { .. } => (AppliedKind::Control, None),
-            PreparedKind::Note { id, payload } => {
+            PreparedKind::Rejected => (AppliedKind::Rejected, None),
+            PreparedKind::Note { id, payload, .. } => {
                 let mut note = target.expect("target checked").note;
-                let delta = &payload.data()[32..];
+                let delta = &payload.data()[NOTE_PREFIX..];
                 match note.apply_update(delta) {
                     Ok(()) => (
                         AppliedKind::NoteAccepted {
@@ -635,6 +791,12 @@ impl History {
                             Some(WorkingNote::Poisoned),
                         )
                     }
+                    Err(NoteError::Unavailable) => {
+                        return Err(MaterializeError {
+                            reason: ConsumeError::Unavailable,
+                            target: None,
+                        });
+                    }
                 }
             }
         };
@@ -643,13 +805,14 @@ impl History {
                 account,
                 metadata_id,
                 epoch_id,
+                ..
             } => (
                 Some(Arc::clone(account)),
                 *metadata_id,
                 *epoch_id,
                 prepared.digest.0,
             ),
-            PreparedKind::Note { .. } => (
+            PreparedKind::Note { .. } | PreparedKind::Rejected => (
                 None,
                 self.metadata_id,
                 self.epoch_id,
@@ -663,6 +826,11 @@ impl History {
                 .as_ref()
                 .map_or_else(|| self.account.head(), |a| a.head()),
         };
+        let writer = prepared.writer();
+        let account_change = match &prepared.kind {
+            PreparedKind::Control { change, .. } => change.clone(),
+            _ => None,
+        };
         let applied = AppliedEvent {
             ordered: prepared.ordered,
             ordered_bytes: prepared.ordered.encode(),
@@ -672,6 +840,14 @@ impl History {
             kind,
             head: prepared.head,
             floor: self.floor.max(prepared.version),
+            judged_floor: prepared.before.floor,
+            author: prepared.author,
+            writer,
+            seen,
+            metadata_id,
+            epoch_id,
+            hosting_root: self.hosting_root,
+            account_change,
         };
         Ok(Materialized {
             transition: Transition {
@@ -705,7 +881,10 @@ impl History {
         self.metadata_id = transition.metadata_id;
         self.epoch_id = transition.epoch_id;
         self.entries.push(transition.seen);
-        self.ids.insert(transition.event_id, transition.digest);
+        // A rejected replay of an ordered ID keeps the first one's digest.
+        self.ids
+            .entry(transition.event_id)
+            .or_insert(transition.digest);
         self.floor = transition.applied.floor;
         Ok(transition.applied)
     }
@@ -721,8 +900,7 @@ impl History {
         if self.prestate() != prepared.before || self.stopped {
             return Err(ConsumeError::StaleState);
         }
-        let is_control = matches!(&prepared.kind, PreparedKind::Control { .. });
-        if is_control != target.is_none()
+        if prepared.note_id().is_none() != target.is_none()
             || target
                 .as_ref()
                 .is_some_and(|t| Some(t.id) != prepared.note_id())
@@ -731,44 +909,92 @@ impl History {
         }
         let kind = match &prepared.kind {
             PreparedKind::Control { .. } => AppliedKind::Control,
-            PreparedKind::Note { id, payload } => {
+            PreparedKind::Rejected => AppliedKind::Rejected,
+            PreparedKind::Note { id, payload, .. } => {
                 let target = target.expect("target checked");
-                match apply_note(target.note, &payload.data()[32..]) {
+                match apply_note(target.note, &payload.data()[NOTE_PREFIX..]) {
                     Ok(candidate) => {
                         // Take direct ownership of the copied delta in its wiped
                         // allocation; the decrypted padded payload remains guarded.
-                        let delta = SecretBytes::from_vec(payload.data()[32..].to_vec());
+                        let delta = SecretBytes::from_vec(payload.data()[NOTE_PREFIX..].to_vec());
                         *target.note = candidate;
                         AppliedKind::NoteAccepted {
                             note_id: *id,
                             delta,
                         }
                     }
-                    Err(()) => AppliedKind::NoteRejected { note_id: *id },
+                    Err(NoteError::Unavailable) => return Err(ConsumeError::Unavailable),
+                    Err(_) => AppliedKind::NoteRejected { note_id: *id },
                 }
             }
         };
         self.advance(&prepared);
-        Ok(AppliedEvent {
+        Ok(self.advanced(prepared, kind))
+    }
+
+    /// Consume against the exact verified predecessor without applying any
+    /// Note or running its engine. `NoteAccepted` carries an authenticated
+    /// candidate, not a content verdict: decoding and integration belong to
+    /// the note owner, independently of verified log progress.
+    pub fn consume_unapplied(
+        &mut self,
+        prepared: PreparedEvent,
+    ) -> Result<AppliedEvent, ConsumeError> {
+        if self.prestate() != prepared.before || self.stopped {
+            return Err(ConsumeError::StaleState);
+        }
+        let kind = match &prepared.kind {
+            PreparedKind::Control { .. } => AppliedKind::Control,
+            PreparedKind::Rejected => AppliedKind::Rejected,
+            PreparedKind::Note { id, payload, .. } => {
+                let delta = &payload.data()[NOTE_PREFIX..];
+                AppliedKind::NoteAccepted {
+                    note_id: *id,
+                    delta: SecretBytes::from_vec(delta.to_vec()),
+                }
+            }
+        };
+        self.advance(&prepared);
+        Ok(self.advanced(prepared, kind))
+    }
+
+    /// The applied event for a prepared event this History just advanced by.
+    fn advanced(&self, prepared: PreparedEvent, kind: AppliedKind) -> AppliedEvent {
+        let writer = prepared.writer();
+        let judged_floor = prepared.before.floor;
+        let account_change = match prepared.kind {
+            PreparedKind::Control { change, .. } => change,
+            _ => None,
+        };
+        AppliedEvent {
             ordered: prepared.ordered,
             ordered_bytes: prepared.ordered.encode(),
+            author: prepared.author,
+            writer,
             descriptor: prepared.descriptor,
             body: prepared.body,
             body_commitment: prepared.body_commitment,
             kind,
             head: self.head(),
             floor: self.floor,
-        })
+            judged_floor,
+            seen: self.last_seen().expect("just advanced"),
+            metadata_id: self.metadata_id,
+            epoch_id: self.epoch_id,
+            hosting_root: self.hosting_root,
+            account_change,
+        }
     }
 
     // Replay calls this only after prepare; it advances the same common history
     // as consume, without needing or changing any Note projection.
     fn advance(&mut self, prepared: &PreparedEvent) {
-        let previous_control = self.entries.last().map_or([0; 32], |p| p.control);
+        let previous_control = self.last_control();
         let is_control = if let PreparedKind::Control {
             account,
             metadata_id,
             epoch_id,
+            ..
         } = &prepared.kind
         {
             self.account = Arc::clone(account);
@@ -787,7 +1013,7 @@ impl History {
             },
             account: self.account.head(),
         });
-        self.ids.insert(prepared.event_id, prepared.digest);
+        self.ids.entry(prepared.event_id).or_insert(prepared.digest);
         self.floor = self.floor.max(prepared.version);
     }
 
@@ -813,6 +1039,9 @@ impl History {
         };
         match self.consume(prepared, target) {
             Ok(applied) => applied.outcome(),
+            // Local engine failure says nothing about the signed event. Leave
+            // the verifier retryable, distinct from wrong-target compatibility.
+            Err(ConsumeError::Unavailable) => Outcome::UnavailablePause,
             Err(_) => {
                 self.stopped = true;
                 Outcome::IntegrityStop
@@ -821,16 +1050,69 @@ impl History {
     }
 }
 
+/// History knows every verified position: below a resumed continuation by
+/// lookup, after it in memory.
+impl SignedContext for History {
+    fn base(&self) -> BaseId {
+        self.base
+    }
+    fn genesis(&self) -> bool {
+        self.position() == 0
+    }
+    fn account(&self) -> &VerifiedAccount {
+        &self.account
+    }
+    fn metadata_id(&self) -> Option<[u8; 32]> {
+        self.metadata_id
+    }
+    fn epoch_id(&self) -> Option<[u8; 32]> {
+        self.epoch_id
+    }
+    fn floor(&self) -> u16 {
+        self.floor
+    }
+    fn hosting_root(&self) -> Option<[u8; 32]> {
+        self.hosting_root
+    }
+    fn last_control(&self) -> [u8; 32] {
+        History::last_control(self)
+    }
+    fn id_used(&self, event_id: [u8; 32]) -> Result<bool, Outcome> {
+        History::id_used(self, event_id)
+    }
+    fn known_head(&self, position: u64) -> Result<Option<Head>, Outcome> {
+        Ok(self.seen_at(position)?.map(|seen| seen.head))
+    }
+    fn saw(&self, claim: Seen) -> Result<bool, Outcome> {
+        Ok(self.seen_at(claim.head.position)? == Some(claim))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{Payload, seal};
+    use crate::codec::{
+        ACCOUNT_CHANGE, CLASS_CONTENT, CLASS_CONTROL, GENESIS, NOTE, Payload, key_id, seal,
+    };
+    use bh_account::AccountEvent;
     use bh_account::{DevicePublicKeys, RecoveryPublicKeys};
     use bh_crypto::{KemKey, SigningKey};
-    use bh_sync::EventId;
+    use bh_sync::receipt;
+    use bh_sync::{EventId, Route};
 
-    #[test]
-    fn notes_reuse_account_state_and_candidate_controls_are_isolated() {
+    struct Fixture {
+        signing: SigningKey,
+        control: SigningKey,
+        device: bh_account::DeviceId,
+        account_id: AccountId,
+        account_genesis: AccountEvent,
+        account: VerifiedAccount,
+        metadata: Secret<32>,
+        content: Secret<32>,
+        genesis: crate::Encoded,
+    }
+
+    fn fixture() -> Fixture {
         let signing = SigningKey::generate();
         let control = SigningKey::generate();
         let receiving = KemKey::generate();
@@ -874,6 +1156,7 @@ mod tests {
                 class: CLASS_CONTROL,
                 padded: 0,
                 commitment: [0; 32],
+                seen_receipt: [0; bh_sync::receipt::RECEIPT_LEN],
             },
             Payload {
                 kind: GENESIS,
@@ -884,9 +1167,51 @@ mod tests {
             None,
         )
         .unwrap();
+        Fixture {
+            signing,
+            control,
+            device,
+            account_id,
+            account_genesis,
+            account,
+            metadata,
+            content,
+            genesis,
+        }
+    }
+
+    #[test]
+    fn notes_reuse_account_state_and_candidate_controls_are_isolated() {
+        let Fixture {
+            signing,
+            control,
+            device,
+            account_id,
+            account_genesis,
+            account,
+            metadata,
+            content,
+            genesis,
+        } = fixture();
+        let metadata_id = key_id(&metadata);
         let base = BaseId::from_genesis(&genesis.descriptor);
-        let mut history = History::new(account_id, account_genesis.as_bytes(), base, 1).unwrap();
-        let genesis_order = Commitment::order(base, Head::EMPTY, &genesis.descriptor).unwrap();
+        let root = SigningKey::generate();
+        let receipt_key = SigningKey::generate();
+        let certificate = receipt::verify_certificate(
+            &root.public(),
+            &receipt::certify(&root, receipt_key.public()),
+        )
+        .unwrap();
+        let mut history = History::new(
+            account_id,
+            account_genesis.as_bytes(),
+            base,
+            root.public(),
+            1,
+        )
+        .unwrap();
+        let genesis_order =
+            Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
         let prepared = history
             .prepare(
                 &genesis_order,
@@ -907,8 +1232,8 @@ mod tests {
         );
 
         let binding = |history: &History, class| Binding {
-            version: 1,
-            highest: 1,
+            version: 2,
+            highest: 2,
             mode: 0,
             base: base.0,
             audience: [0; 32],
@@ -922,13 +1247,24 @@ mod tests {
             device,
             account_head: history.account_head(),
             seen: history.head(),
-            seen_control: history.entries.last().unwrap().control,
+            seen_control: history.last_control(),
             class,
             padded: 0,
             commitment: [0; 32],
+            seen_receipt: receipt::sign(&certificate, &receipt_key, base, history.head()).unwrap(),
         };
-        let mut note_data = vec![7; 32];
-        note_data.extend(Note::new().append_paragraph("unchanged account"));
+        let note_data = crate::note_payload(
+            [7; 32],
+            DeviceWriterDeclaration {
+                account: account_id.0,
+                device: device.0,
+                nonce: [1; 32],
+            },
+            &Note::new()
+                .unwrap()
+                .append_paragraph("unchanged account")
+                .unwrap(),
+        );
         let note = seal(
             binding(&history, CLASS_CONTENT),
             Payload {
@@ -940,7 +1276,8 @@ mod tests {
             Some(&content),
         )
         .unwrap();
-        let ordered = Commitment::order(base, history.head(), &note.descriptor).unwrap();
+        let ordered =
+            Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
         let account_head = history.account_head();
         let prepared = history
             .prepare(
@@ -986,7 +1323,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let ordered = Commitment::order(base, candidate.head(), &changed.descriptor).unwrap();
+        let ordered =
+            Commitment::order(base, candidate.head(), &changed.descriptor, Route::Control).unwrap();
         let prepared = candidate
             .prepare(
                 &ordered,
@@ -1007,5 +1345,90 @@ mod tests {
             history.account.active_device(device).unwrap() as *const _,
             account_device
         );
+    }
+
+    #[test]
+    fn rootless_history_pauses_on_any_event_after_genesis() {
+        let f = fixture();
+        let base = BaseId::from_genesis(&f.genesis.descriptor);
+        let mut history = History::anchored(&f.account, base, None, 1).unwrap();
+        let genesis_order =
+            Commitment::order(base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+        let prepared = history
+            .prepare(
+                &genesis_order,
+                &f.genesis.descriptor,
+                Some(&f.genesis.body),
+                &f.metadata,
+                None,
+            )
+            .unwrap();
+        history.advance(&prepared);
+        let root = SigningKey::generate();
+        let receipt_key = SigningKey::generate();
+        let certificate = receipt::verify_certificate(
+            &root.public(),
+            &receipt::certify(&root, receipt_key.public()),
+        )
+        .unwrap();
+        let data = crate::note_payload(
+            [7; 32],
+            DeviceWriterDeclaration {
+                account: f.account_id.0,
+                device: f.device.0,
+                nonce: [1; 32],
+            },
+            &Note::new()
+                .unwrap()
+                .append_paragraph("past genesis")
+                .unwrap(),
+        );
+        let note = seal(
+            Binding {
+                version: 2,
+                highest: 2,
+                mode: 0,
+                base: base.0,
+                audience: [0; 32],
+                epoch: key_id(&f.content),
+                event_id: EventId(bh_crypto::random()),
+                account: f.account_id,
+                device: f.device,
+                account_head: history.account_head(),
+                seen: history.head(),
+                seen_control: history.last_control(),
+                class: CLASS_CONTENT,
+                padded: 0,
+                commitment: [0; 32],
+                seen_receipt: receipt::sign(&certificate, &receipt_key, base, history.head())
+                    .unwrap(),
+            },
+            Payload {
+                kind: NOTE,
+                data: &data,
+            },
+            &f.signing,
+            &f.metadata,
+            Some(&f.content),
+        )
+        .unwrap();
+        let ordered =
+            Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
+        // Without a pinned root this device cannot check the receipt: that is
+        // missing local configuration, not evidence against the log.
+        assert_eq!(
+            history
+                .prepare(
+                    &ordered,
+                    &note.descriptor,
+                    Some(&note.body),
+                    &f.metadata,
+                    Some(&f.content),
+                )
+                .err(),
+            Some(Outcome::UnavailablePause)
+        );
+        assert!(!history.is_stopped());
+        let _ = f.control;
     }
 }

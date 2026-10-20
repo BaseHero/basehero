@@ -4,7 +4,7 @@ use bh_core::note::Note;
 use bh_crypto::{Secret, SigningKey};
 use bh_event::{Binding, CLASS_CONTENT, Encoded, NOTE, Payload, key_id, seal};
 use bh_storage::{DeviceDatabase, NoteKey, PackagePreparation, StoreError};
-use bh_sync::{BaseId, Commitment, EventId, Head};
+use bh_sync::{BaseId, Commitment, EventId, Head, Route};
 use rusqlite::Connection;
 
 fn key() -> NoteKey {
@@ -22,8 +22,8 @@ fn package(id: EventId, delta: &[u8]) -> Encoded {
     data.extend(delta);
     seal(
         Binding {
-            version: 1,
-            highest: 1,
+            version: 2,
+            highest: 2,
             mode: 0,
             base: key().base,
             audience: key().audience,
@@ -40,6 +40,8 @@ fn package(id: EventId, delta: &[u8]) -> Encoded {
             class: CLASS_CONTENT,
             padded: 0,
             commitment: [0; 32],
+            // Packaging only: the outbox never verifies the receipt.
+            seen_receipt: [0; bh_sync::receipt::RECEIPT_LEN],
         },
         Payload {
             kind: NOTE,
@@ -63,8 +65,8 @@ fn sealed(
 }
 fn setup(path: &std::path::Path) -> (DeviceDatabase, i64, Vec<u8>) {
     let mut db = DeviceDatabase::open(path).unwrap();
-    let mut note = Note::new();
-    let delta = note.append_paragraph("test-only note");
+    let mut note = Note::new().unwrap();
+    let delta = note.append_paragraph("test-only note").unwrap();
     let id = db
         .apply_local_update(key(), [8; 16], &delta)
         .unwrap()
@@ -147,11 +149,20 @@ fn packaged_exact_bytes_survive_reopen_and_duplicate_ack() {
             hash: bh_sync::Digest([9; 32]),
         },
         &first.descriptor,
+        Route::Content,
     )
     .unwrap();
     assert!(db.acknowledge_note_update(update, &ordered).unwrap());
     assert!(!db.acknowledge_note_update(update, &ordered).unwrap());
-    assert!(db.pending_note_updates().unwrap().is_empty());
+    // An ordered Ack records the position; only the verified echo of an
+    // accepted package retires its local work.
+    assert_eq!(db.pending_note_updates().unwrap().len(), 1);
+    let progress = db.package_progress(update).unwrap().unwrap();
+    assert_eq!(progress.position, Some(2));
+    assert_eq!(
+        progress.outcome,
+        Some(bh_storage::sync_state::PackageOutcome::Acked)
+    );
     drop(db);
     let mut db = DeviceDatabase::open(&path).unwrap();
     assert!(!db.acknowledge_note_update(update, &ordered).unwrap());
@@ -205,6 +216,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
             hash: bh_sync::Digest([9; 32]),
         },
         &first.descriptor,
+        Route::Content,
     )
     .unwrap();
     assert!(matches!(
@@ -227,6 +239,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
             hash: bh_sync::Digest([9; 32]),
         },
         &other.descriptor,
+        Route::Content,
     )
     .unwrap();
     assert!(matches!(
@@ -241,6 +254,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
             hash: bh_sync::Digest([9; 32]),
         },
         &first.descriptor,
+        Route::Content,
     )
     .unwrap();
     assert!(db.acknowledge_note_update(update, &ack).unwrap());
@@ -251,6 +265,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
             hash: bh_sync::Digest([9; 32]),
         },
         &first.descriptor,
+        Route::Content,
     )
     .unwrap();
     assert!(matches!(
@@ -345,10 +360,11 @@ fn failed_ack_commit_retains_pending_and_retries_exact_record() {
             hash: bh_sync::Digest([9; 32]),
         },
         &first.descriptor,
+        Route::Content,
     )
     .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("CREATE TRIGGER fail_ack BEFORE DELETE ON pending_note_work BEGIN SELECT RAISE(ABORT, 'fail'); END;").unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_ack BEFORE INSERT ON note_outbox_progress BEGIN SELECT RAISE(ABORT, 'fail'); END;").unwrap();
     assert!(db.acknowledge_note_update(update, &ack).is_err());
     assert_eq!(db.pending_note_updates().unwrap().len(), 1);
     let stored: Option<Vec<u8>> = conn
@@ -361,4 +377,93 @@ fn failed_ack_commit_retains_pending_and_retries_exact_record() {
     assert!(stored.is_none());
     conn.execute_batch("DROP TRIGGER fail_ack").unwrap();
     assert!(db.acknowledge_note_update(update, &ack).unwrap());
+}
+
+/// The publisher's view: each note's oldest pending update with no Ack and
+/// no outcome, in commit order of those heads, and none for a note whose
+/// earlier package was refused, rejected or conflicted.
+#[test]
+fn outbox_heads_one_per_note_in_order_and_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = DeviceDatabase::open(dir.path().join("heads.db")).unwrap();
+    let other = NoteKey {
+        note: [9; 32],
+        ..key()
+    };
+    let third = NoteKey {
+        note: [10; 32],
+        ..key()
+    };
+    let mut ids = Vec::new();
+    for (n, key) in [key(), other, key(), other, third].into_iter().enumerate() {
+        let mut note = Note::new().unwrap();
+        let delta = note.append_paragraph(&format!("update {n}")).unwrap();
+        ids.push((
+            key,
+            db.apply_local_update(key, [n as u8; 16], &delta)
+                .unwrap()
+                .update_id,
+        ));
+    }
+    let heads = |db: &DeviceDatabase, after| {
+        db.outbox_heads(after, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.key.note, h.update_id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        heads(&db, 0),
+        vec![
+            (key().note, ids[0].1),
+            (other.note, ids[1].1),
+            (third.note, ids[4].1)
+        ]
+    );
+    assert_eq!(heads(&db, ids[0].1), heads(&db, 0)[1..]);
+    assert_eq!(db.outbox_heads(0, 1).unwrap().len(), 1);
+    let summary = db.outbox_summary().unwrap();
+    assert_eq!((summary.unacknowledged, summary.not_accepted_notes), (5, 0));
+
+    // An Ack moves the note's head to its next update.
+    let stored = db
+        .package_note_update(ids[0].1, |id, pending| sealed(id, &pending.bytes))
+        .unwrap();
+    let ack = Commitment::order(
+        BaseId(key().base),
+        Head {
+            position: 1,
+            hash: bh_sync::Digest([9; 32]),
+        },
+        &stored.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    assert!(db.acknowledge_note_update(ids[0].1, &ack).unwrap());
+    assert_eq!(
+        heads(&db, 0),
+        vec![
+            (other.note, ids[1].1),
+            (key().note, ids[2].1),
+            (third.note, ids[4].1)
+        ]
+    );
+    assert_eq!(db.outbox_summary().unwrap().unacknowledged, 4);
+
+    // A refused package holds its note back; the others carry on.
+    db.package_note_update(ids[1].1, |id, pending| sealed(id, &pending.bytes))
+        .unwrap();
+    let raw = Connection::open(dir.path().join("heads.db")).unwrap();
+    raw.execute(
+        "INSERT INTO note_outbox_progress(update_id,staged,outcome,refusal) VALUES (?1,1,3,2)
+         ON CONFLICT(update_id) DO UPDATE SET outcome=3,refusal=2",
+        [ids[1].1],
+    )
+    .unwrap();
+    assert_eq!(
+        heads(&db, 0),
+        vec![(key().note, ids[2].1), (third.note, ids[4].1)]
+    );
+    let summary = db.outbox_summary().unwrap();
+    assert_eq!((summary.unacknowledged, summary.not_accepted_notes), (3, 1));
 }

@@ -1,6 +1,7 @@
 // Bundled bridge only. The page cannot supply its account, base, audience or
 // window identity; the native session supplies the note ID, and native IPC
 // derives the actual calling WebView. No web storage or remote content.
+import { pairingButton, syncLine } from './pairing.js';
 const invoke = window.__TAURI_INTERNALS__?.invoke;
 if (invoke) {
   let boundNote = false, retryOpen, currentPage, currentNote, editor, closeLoad = () => {};
@@ -113,10 +114,10 @@ if (invoke) {
       accepted = await invoke(saved ? 'note_drained' : 'note_drain_failed',
         saved ? {surface: page, fence, view: held?.view() ?? null} : {surface: page, fence});
     } catch { /* native refuses the drain at its own deadline */ }
-    if (!accepted && drainFence === fence) {drainFence = null; drainedEditor?.resume();}
+    if (!accepted && drainFence === fence) {drainFence = null; drainedEditor?.resume();rearmReload();}
   }
   window.__bhResumeEditing = fence => {
-    if (fence === drainFence) {drainFence = null; drainedEditor?.resume();}
+    if (fence === drainFence) {drainFence = null; drainedEditor?.resume();rearmReload();}
     return 'accepted';
   };
   const rebind = async () => {
@@ -152,16 +153,53 @@ if (invoke) {
       // through native binding, never synthesize an empty editing document.
       retryOpen=rebind;
       unavailable();
-    } finally {navigating=false;}
+    } finally {navigating=false;rearmReload();}
+  }
+  // Native rebuilt this note from its accepted state, with a structure the
+  // open copy cannot reach by merging. Reopen it after the same safe drain
+  // as navigating; writing that cannot save yet keeps the merged copy open.
+  // A marker that arrives while navigating or under a drain fence waits for
+  // that to end; opening a note fresh satisfies it.
+  let reloadWanted = false;
+  function rearmReload() {
+    if (reloadWanted && !navigating && !drainFence) setTimeout(() => void reloadNote(), 0);
+  }
+  async function reloadNote() {
+    if (!editor) return;
+    if (navigating || drainFence) {reloadWanted=true;return;}
+    reloadWanted=false;
+    navigating=true;
+    let disposed=false;
+    try {
+      if (!await editor.drain(Date.now() + 10000, 'close')) {
+        if (!drainFence) editor.resume();
+        return;
+      }
+      if (drainFence) return;
+      editor.close();editor=null;disposed=true;
+      await closeLoad();
+      const binding=await invoke('note_binding');
+      if (!binding) throw Error('note unavailable');
+      await openNote(binding);
+    } catch {
+      if (!disposed) {if (!drainFence) editor?.resume();return;}
+      retryOpen=rebind;
+      unavailable();
+    } finally {navigating=false;rearmReload();}
   }
   const newNote = () => navigate(()=>invoke('note_create'),'Untitled');
   const newWindow = async () => {
     try {await invoke('note_new_window',{note:currentNote});say('');}
     catch {say('New window unavailable. Try again.');}
   };
+  // Adding a device needs this account's cloud sync; shown only once native
+  // says it has one, never in a local-only build.
+  const addDevice = pairingButton(invoke,icon('M3.5 1.5h6v13h-6z','M6 12.5h1','M12.5 5v5M10 7.5h5'));
+  addDevice.hidden = true;
   tools.append(
     iconButton('New note',['⌘N','Ctrl+N'],icon('M8 2.5H2.5v11h11V8','M6.5 9.5l.5-2.5 6-6 2 2-6 6z'),newNote),
-    iconButton('New window',['⌥⌘N','Ctrl+Alt+N'],icon('M1.5 4.5h10v9h-10z','M4.5 4.5v-3h10v9h-3'),newWindow));
+    iconButton('New window',['⌥⌘N','Ctrl+Alt+N'],icon('M1.5 4.5h10v9h-10z','M4.5 4.5v-3h10v9h-3'),newWindow),
+    addDevice);
   // The same actions from the native menu (File, View) and their shortcuts.
   const actions = {sidebar:()=>setSidebar(!sidebarVisible()), 'new-note':newNote, 'new-window':newWindow};
   window.__bhMenu = action => {
@@ -197,7 +235,11 @@ if (invoke) {
   const footer = document.querySelector('footer');
   const footerLocal = document.createElement('span');footerLocal.className='local';
   const cloud = document.createElement('span');cloud.className='cloud';
-  cloud.append(icon('M4.5 12.5h7a3 3 0 00.4-6A4 4 0 004.4 6 3.3 3.3 0 004.5 12.5z','M2 2l12 12'),'Cloud sync not connected');
+  // The network's view of this account, apart from the editor's local save.
+  const line = syncLine(cloud, invoke, view => {
+    addDevice.hidden = !(view.network === 'on' && view.account === 'active');
+  });
+  cloud.append(icon('M4.5 12.5h7a3 3 0 00.4-6A4 4 0 004.4 6 3.3 3.3 0 004.5 12.5z'), ...line.nodes);
   let preference;
   function mountWorkspace() {
     if (!workspace) {
@@ -217,20 +259,26 @@ if (invoke) {
     main.className='note-workspace';
   }
   const openNote = async binding => {
+    reloadWanted = false;
     boundNote = Boolean(binding);
     if (binding) {
       const {note, surface, view} = binding;
       // Each in-place navigation rotates the token too. Already-posted evals
       // compare against this getter before constructing any plaintext payload.
       currentPage=surface;currentNote=note;
+      // Status posts reach this page from now on. Ask for the one native
+      // published before, which no post brought here; the newer of the two
+      // stays, and nothing from an earlier page.
+      line.follow();
+      invoke('sync_status',{surface}).then(status=>{if(currentPage===surface) line.render(status);},()=>{});
       const { createNoteEditor } = await import('./note-editor.js');
       const main = document.querySelector('main');
       let release = () => {}, activeGeneration, activeWriterToken, peerListener = () => {};
       window.__bhNotePeers = message => peerListener(message);
       const host = {
         onPeers(callback) {peerListener=callback;return ()=>{peerListener=()=>{};};},
-        async selection(anchor,head) {
-          return invoke('note_selection',{generation:activeGeneration,surface,anchor,head});
+        async selection(anchor,head,anchorRel,headRel) {
+          return invoke('note_selection',{generation:activeGeneration,surface,anchor,head,anchorRel,headRel});
         },
         async open(onUpdate, options) {
           // A capacity rollover, after the editor drained, names this view's
@@ -242,23 +290,32 @@ if (invoke) {
           let generation, sequence = 0, closed = false;
           const waiting = [];
           let waitingBytes=0, waitingOverflow=false;
+          // A delta is one update; a resync is the native note as ordered
+          // updates, applied in turn: merging them into one could integrate
+          // concurrent text in a different order.
+          const updatesOf = packet => packet.resync ? packet.updates : [packet.update];
           const receive = packet => {
-            if (!packet || !Array.isArray(packet.update) || closed) return 'stale';
+            if (!packet || closed) return 'stale';
+            const updates = updatesOf(packet);
+            if (!Array.isArray(updates) || !updates.every(Array.isArray)) return 'stale';
+            const size = updates.reduce((total, update) => total + update.length, 0);
             if (generation === undefined) {
-              if (waitingOverflow || waiting.length >= 256 || waitingBytes + packet.update.length > 256 * 1024) {
+              if (waitingOverflow || waiting.length >= 256 || waitingBytes + size > 256 * 1024) {
                 // A fresh native open below obtains all committed bytes.
                 waitingOverflow=true;waiting.length=0;waitingBytes=0;
                 return 'failed';
               }
-              waiting.push(packet);waitingBytes+=packet.update.length;
+              waiting.push(packet);waitingBytes+=size;
               return 'buffered';
             }
             if (packet.generation !== generation || packet.sequence <= sequence) return 'stale';
             try {
               // Both deltas and resyncs merge into the same live document.
-              onUpdate(new Uint8Array(packet.update));
+              for (const update of updates) onUpdate(new Uint8Array(update));
               sequence = packet.sequence;
               refreshSoon();
+              // Native rebuilt the note in an order merging cannot reach.
+              if (packet.reload) setTimeout(() => void reloadNote(), 0);
               return 'accepted';
             } catch { return 'failed'; }
           };
@@ -317,7 +374,8 @@ if (invoke) {
             if (receive(packet) === 'failed') throw new Error('note update failed during open');
           }
           waiting.length = 0;waitingBytes=0;
-          return {state:new Uint8Array(opened.state), clientId:opened.clientId, unsubscribe:release};
+          // The note's updates in native's integration order, applied in turn.
+          return {state:opened.updates.map(update=>new Uint8Array(update)), clientId:opened.clientId, unsubscribe:release};
         },
         async commit(update, requestId) {
           // A resolved matching requestId is the *only* source of Saved.

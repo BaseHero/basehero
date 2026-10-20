@@ -1,7 +1,7 @@
 //! Two short-lived read-only SQLite connections per file container. Rebuild a
 //! note in keyset pages without holding the writer or a long read snapshot.
 use crate::{NoteEntry, NoteKey, StoreError, catalogue};
-use bh_core::note::Note;
+use bh_core::note::{Note, OrderedState};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::{
     fs::File,
@@ -197,7 +197,7 @@ impl ReadPool {
     ) -> Result<ReadResult, StoreError> {
         let loaded = self.load_note_with_progress(key, progress)?;
         Ok(ReadResult {
-            state: loaded.note.state(),
+            state: loaded.note.state()?,
             frontier: loaded.frontier,
             rows: loaded.rows,
             bytes: loaded.bytes,
@@ -209,8 +209,44 @@ impl ReadPool {
     pub fn load_note_with_progress(
         &self,
         key: NoteKey,
-        mut progress: impl FnMut(),
+        progress: impl FnMut(),
     ) -> Result<LoadedNote, StoreError> {
+        let mut note = Note::new()?;
+        let (frontier, rows, bytes) = self.scan(key, true, progress, |update| {
+            note.apply_update(&update).map_err(StoreError::from)
+        })?;
+        Ok(LoadedNote {
+            note,
+            frontier,
+            rows,
+            bytes,
+        })
+    }
+    /// The checkpoint's ordered updates followed by every later row, in the
+    /// order a loaded note integrates them, and the frontier they reach.
+    /// Only bytes are read; it is not a replay pass.
+    pub fn note_ordered(&self, key: NoteKey) -> Result<(OrderedState, i64), StoreError> {
+        let mut ordered = OrderedState::default();
+        let (frontier, _, _) = self.scan(
+            key,
+            false,
+            || {},
+            |update| {
+                ordered.push(update);
+                Ok(())
+            },
+        )?;
+        Ok((ordered, frontier))
+    }
+    /// Feed the checkpoint's segments, then each later row, to `apply` in
+    /// order. Rows are read in bounded pages, each under its own lease.
+    fn scan(
+        &self,
+        key: NoteKey,
+        replay: bool,
+        mut progress: impl FnMut(),
+        mut apply: impl FnMut(Vec<u8>) -> Result<(), StoreError>,
+    ) -> Result<(i64, usize, usize), StoreError> {
         let (covered, encoded, target) = {
             let conn = self.lease()?;
             let (covered,encoded): (i64,Vec<u8>)=conn.query_row(
@@ -228,14 +264,14 @@ impl ReadPool {
             )?;
             (covered, encoded, target.unwrap_or(covered))
         };
-        let mut note = Note::new();
-        if !encoded.is_empty() {
-            note.apply_update(&encoded)
-                .map_err(|_| StoreError::InvalidUpdate)?;
+        let mut bytes = encoded.len();
+        let checkpoint = OrderedState::decode(&encoded).map_err(|_| StoreError::InvalidUpdate)?;
+        drop(encoded);
+        for segment in checkpoint.into_segments() {
+            apply(segment)?;
         }
         let mut after = covered;
         let mut count = 0;
-        let mut bytes = encoded.len();
         while after < target {
             let page = {
                 let conn = self.lease()?;
@@ -268,20 +304,16 @@ impl ReadPool {
                 return Err(StoreError::InvalidUpdate);
             }
             for (id, delta) in page {
-                note.apply_update(&delta)
-                    .map_err(|_| StoreError::InvalidUpdate)?;
-                self.replayed_rows.fetch_add(1, Ordering::Relaxed);
+                bytes += delta.len();
+                apply(delta)?;
+                if replay {
+                    self.replayed_rows.fetch_add(1, Ordering::Relaxed);
+                }
                 after = id;
                 count += 1;
-                bytes += delta.len();
             }
             progress();
         }
-        Ok(LoadedNote {
-            note,
-            frontier: target,
-            rows: count,
-            bytes,
-        })
+        Ok((target, count, bytes))
     }
 }

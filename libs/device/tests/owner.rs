@@ -2,7 +2,7 @@ use bh_account::{
     AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount,
     crypto::{KemKey, SigningKey},
 };
-use bh_core::note::Note;
+use bh_core::note::{Note, OrderedState};
 use bh_device::{
     ContainerId, Owner, OwnerError,
     coordinator::{AuthoritySource, Scope},
@@ -154,7 +154,7 @@ fn duplicate_anchor_and_tampered_registry_cannot_create_note_authority() {
             "one",
             old.generation,
             [3; 16],
-            &Note::new().append_paragraph("old"),
+            &Note::new().unwrap().append_paragraph("old").unwrap(),
             |_| {}
         ),
         Err(OwnerError::Unbound)
@@ -204,7 +204,7 @@ fn setup_container_promotes_in_place_only_after_exact_verified_history() {
             "one",
             opened.generation,
             [1; 16],
-            &Note::new().append_paragraph("persisted"),
+            &Note::new().unwrap().append_paragraph("persisted").unwrap(),
         )
         .unwrap();
     let (different, _) = test_only_verified();
@@ -213,7 +213,7 @@ fn setup_container_promotes_in_place_only_after_exact_verified_history() {
         Err(OwnerError::AnchorMismatch)
     ));
     assert_eq!(
-        owner.open("one", [4; 32]).unwrap().state,
+        full(&owner.open("one", [4; 32]).unwrap().state),
         DeviceDatabase::open(dir.path().join("setup.db"))
             .unwrap()
             .note_state(scope(proof.id().0, 1).key)
@@ -398,20 +398,25 @@ fn delivery_callback_cannot_hold_writer_or_owner_and_containers_progress_indepen
     let opened = owner.open("one", [4; 32]).unwrap();
     owner.open("listener", [4; 32]).unwrap();
     let other = owner.open("other", [4; 32]).unwrap();
-    let update = Note::new().append_paragraph("editable");
+    let update = Note::new().unwrap().append_paragraph("editable").unwrap();
     let second = Arc::clone(&owner);
     owner
         .commit("one", opened.generation, [1; 16], &update, |_| {
             let next = Arc::clone(&second);
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                tx.send(next.commit(
-                    "other",
-                    other.generation,
-                    [2; 16],
-                    &Note::new().append_paragraph("independent"),
-                    |_| {},
-                ))
+                tx.send(
+                    next.commit(
+                        "other",
+                        other.generation,
+                        [2; 16],
+                        &Note::new()
+                            .unwrap()
+                            .append_paragraph("independent")
+                            .unwrap(),
+                        |_| {},
+                    ),
+                )
                 .unwrap();
             });
             assert!(
@@ -446,7 +451,7 @@ fn two_authorized_windows_fan_out_once_only_after_disk_commit_and_reopen() {
     let left = owner.open("left", [4; 32]).unwrap();
     let right = owner.open("right", [4; 32]).unwrap();
     owner.open("elsewhere", [4; 32]).unwrap();
-    let first = Note::new().append_paragraph("from left");
+    let first = Note::new().unwrap().append_paragraph("from left").unwrap();
     let (ack, targets) = owner
         .commit_queued("left", left.generation, [1; 16], &first)
         .unwrap();
@@ -471,7 +476,7 @@ fn two_authorized_windows_fan_out_once_only_after_disk_commit_and_reopen() {
     assert!(retry.replayed);
     assert!(targets.is_empty());
     assert!(owner.drain_surface("right", &mut |_| panic!("retry duplicated update")));
-    let second = Note::new().append_paragraph("from right");
+    let second = Note::new().unwrap().append_paragraph("from right").unwrap();
     let (_, targets) = owner
         .commit_queued("right", right.generation, [2; 16], &second)
         .unwrap();
@@ -484,8 +489,8 @@ fn two_authorized_windows_fan_out_once_only_after_disk_commit_and_reopen() {
         .unwrap()
         .note_state(scope(proof.id().0, 1).key)
         .unwrap();
-    assert_eq!(owner.open("left", [4; 32]).unwrap().state, after);
-    assert_eq!(owner.open("right", [4; 32]).unwrap().state, after);
+    assert_eq!(full(&owner.open("left", [4; 32]).unwrap().state), after);
+    assert_eq!(full(&owner.open("right", [4; 32]).unwrap().state), after);
     assert_eq!(
         DeviceDatabase::open(&path)
             .unwrap()
@@ -519,7 +524,7 @@ fn navigation_during_exclusive_work_discards_uncommitted_note_and_request() {
             "writer",
             open.generation,
             [23; 16],
-            &Note::new().append_paragraph("unsaved"),
+            &Note::new().unwrap().append_paragraph("unsaved").unwrap(),
             || {
                 ready_tx.send(()).unwrap();
                 resume_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -561,7 +566,7 @@ fn three_same_note_open_races_return_retryable_instead_of_replaying_under_guard(
     owner.bind("view", id).unwrap();
     let writer = owner.open("writer", [4; 32]).unwrap();
     let racing = owner.open_with_snapshot_hook("view", [4; 32], |attempt| {
-        let update = Note::new().append_paragraph("arrival");
+        let update = Note::new().unwrap().append_paragraph("arrival").unwrap();
         owner
             .commit(
                 "writer",
@@ -578,7 +583,7 @@ fn three_same_note_open_races_return_retryable_instead_of_replaying_under_guard(
     );
     let reopened = owner.open("view", [4; 32]).unwrap();
     assert_eq!(
-        reopened.state,
+        full(&reopened.state),
         DeviceDatabase::open(&path)
             .unwrap()
             .note_state(scope(proof.id().0, 1).key)
@@ -615,7 +620,10 @@ fn paused_same_container_note_work_does_not_block_other_base_or_publish_dirty_no
     let (committed_tx, committed_rx) = mpsc::channel();
     let copy = Arc::clone(&owner);
     let a_writer = thread::spawn(move || {
-        let changed = Note::new().append_paragraph("a committed");
+        let changed = Note::new()
+            .unwrap()
+            .append_paragraph("a committed")
+            .unwrap();
         let result = copy.commit_with_work_hook(
             "a",
             a.generation,
@@ -642,7 +650,7 @@ fn paused_same_container_note_work_does_not_block_other_base_or_publish_dirty_no
                 "b",
                 b.generation,
                 [52; 16],
-                &Note::new().append_paragraph("b typed"),
+                &Note::new().unwrap().append_paragraph("b typed").unwrap(),
                 |_| {},
             ))
             .unwrap()
@@ -677,7 +685,7 @@ fn paused_same_container_note_work_does_not_block_other_base_or_publish_dirty_no
         1
     );
     assert_eq!(
-        owner.open("a", [4; 32]).unwrap().state,
+        full(&owner.open("a", [4; 32]).unwrap().state),
         reopened.note_state(scope(proof.id().0, 1).key).unwrap()
     );
 }
@@ -691,7 +699,7 @@ fn cold_open_seeds_first_save_and_checkpoint_without_replaying_legacy_rows() {
     let db = anchored(&path, &proof, &signed);
     let replay = db.read_pool().unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let old = Note::new().append_paragraph("old");
+    let old = Note::new().unwrap().append_paragraph("old").unwrap();
     for n in 0..256u16 {
         conn.execute(
             "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
@@ -716,7 +724,7 @@ fn cold_open_seeds_first_save_and_checkpoint_without_replaying_legacy_rows() {
     // for first save or checkpoint) would now fail, while the owned Note is sound.
     conn.execute("UPDATE note_updates SET delta=x'ff' WHERE id=2", [])
         .unwrap();
-    let new = Note::new().append_paragraph("new");
+    let new = Note::new().unwrap().append_paragraph("new").unwrap();
     owner
         .commit_queued("writer", opened.generation, [255; 16], &new)
         .unwrap();
@@ -751,6 +759,168 @@ fn cold_open_seeds_first_save_and_checkpoint_without_replaying_legacy_rows() {
     );
 }
 
+/// Yjs updates in log order; the third names a left origin in the first and
+/// a right origin in the second that are not adjacent.
+const K2: [&[u8]; 4] = [
+    &[
+        1, 3, 2, 0, 7, 1, 7, 100, 101, 102, 97, 117, 108, 116, 3, 9, 112, 97, 114, 97, 103, 114,
+        97, 112, 104, 7, 0, 2, 0, 6, 4, 0, 2, 1, 5, 104, 101, 108, 108, 111, 0,
+    ],
+    &[1, 1, 1, 0, 132, 2, 6, 2, 72, 76, 0],
+    &[1, 1, 50, 0, 196, 2, 4, 1, 1, 4, 97, 98, 99, 100, 0],
+    &[1, 1, 107, 0, 132, 2, 6, 6, 32, 119, 111, 114, 108, 100, 0],
+];
+
+fn insert_rows(conn: &rusqlite::Connection, key: NoteKey, rows: &[&[u8]]) {
+    for (n, delta) in rows.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO note_updates(base,audience,note,request,delta) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                key.base,
+                key.audience,
+                key.note,
+                [(n as u16).to_be_bytes().as_slice(), &[0; 14]].concat(),
+                delta
+            ],
+        )
+        .unwrap();
+    }
+}
+/// The published checkpoint, once the background job has covered `rows`.
+fn wait_for_checkpoint(conn: &rusqlite::Connection, key: NoteKey, rows: usize) -> OrderedState {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let checkpoint: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT local_frontier,encoded_yjs FROM note_checkpoints WHERE base=?1",
+                [key.base.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((covered, encoded)) = checkpoint
+            && covered >= rows as i64
+        {
+            return OrderedState::decode(&encoded).unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background checkpoint did not publish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn open_and_its_checkpoint_keep_the_integrated_structure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ordered.db");
+    let (proof, signed) = test_only_verified();
+    let key = scope(proof.id().0, 1).key;
+    let db = anchored(&path, &proof, &signed);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // Enough rows that a checkpoint is due at open.
+    let old = Note::new().unwrap().append_paragraph("old").unwrap();
+    let rows: Vec<&[u8]> = K2.iter().copied().chain([old.as_slice(); 256]).collect();
+    insert_rows(&conn, key, &rows);
+    let mut live = Note::new().unwrap();
+    for delta in &rows {
+        live.apply_update(delta).unwrap();
+    }
+    let owner = Owner::default();
+    let id = owner
+        .register(db, Some(&proof), issuer(proof.id().0, 1, "writer"))
+        .unwrap();
+    owner.bind("writer", id).unwrap();
+    let opened = owner.open("writer", key.note).unwrap();
+    // One full state reopens differently, so the view gets the stored order
+    // and the background checkpoint does the compaction.
+    assert_eq!(opened.state.segments().len(), rows.len());
+    let view = Note::from_ordered(&opened.state).unwrap();
+    assert_eq!(view.digest().unwrap(), live.digest().unwrap());
+    assert!(
+        view.title_preview()
+            .unwrap()
+            .starts_with("helloH worldabcdL")
+    );
+    let published = wait_for_checkpoint(&conn, key, rows.len());
+    assert!(published.segments().len() < rows.len());
+    assert_eq!(
+        Note::from_ordered(&published).unwrap().digest().unwrap(),
+        live.digest().unwrap()
+    );
+    drop(owner);
+    let owner = Owner::default();
+    let id = owner
+        .register(
+            DeviceDatabase::open(&path).unwrap(),
+            Some(&proof),
+            issuer(proof.id().0, 1, "writer"),
+        )
+        .unwrap();
+    owner.bind("writer", id).unwrap();
+    let reopened = owner.open("writer", key.note).unwrap();
+    assert_eq!(reopened.state, published);
+    assert_eq!(
+        Note::from_ordered(&reopened.state)
+            .unwrap()
+            .digest()
+            .unwrap(),
+        live.digest().unwrap()
+    );
+}
+
+#[test]
+fn opening_a_hostile_million_position_note_rebuilds_at_most_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.db");
+    let (proof, signed) = test_only_verified();
+    let key = scope(proof.id().0, 1).key;
+    let db = anchored(&path, &proof, &signed);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // K2, then about a million positions as one update, then 256 saves.
+    let mut author = Note::with_writer(9).unwrap();
+    let line = "x".repeat(98);
+    for _ in 0..9_990 {
+        author.append_paragraph(&line).unwrap();
+    }
+    let big = author.state().unwrap();
+    let saves: Vec<Vec<u8>> = (0..256)
+        .map(|n| author.append_paragraph(&format!("save {n}")).unwrap())
+        .collect();
+    let rows: Vec<&[u8]> = K2
+        .iter()
+        .copied()
+        .chain([big.as_slice()])
+        .chain(saves.iter().map(Vec::as_slice))
+        .collect();
+    insert_rows(&conn, key, &rows);
+    let mut live = Note::new().unwrap();
+    for delta in &rows {
+        live.apply_update(delta).unwrap();
+    }
+    assert!(live.document_positions().unwrap() >= 1_000_000);
+    let owner = Owner::default();
+    let id = owner
+        .register(db, Some(&proof), issuer(proof.id().0, 1, "writer"))
+        .unwrap();
+    owner.bind("writer", id).unwrap();
+    // Background compaction runs on its own workers, not this thread.
+    let before = bh_core::note::verification_rebuilds();
+    let opened = owner.open("writer", key.note).unwrap();
+    let rebuilds = bh_core::note::verification_rebuilds() - before;
+    assert!(rebuilds <= 1, "{rebuilds} rebuilds on open");
+    assert_eq!(
+        Note::from_ordered(&opened.state).unwrap().digest().unwrap(),
+        live.digest().unwrap()
+    );
+    let published = wait_for_checkpoint(&conn, key, rows.len());
+    assert_eq!(
+        Note::from_ordered(&published).unwrap().digest().unwrap(),
+        live.digest().unwrap()
+    );
+}
+
 #[test]
 fn stale_retry_cannot_erase_new_generation_after_validation() {
     let dir = tempfile::tempdir().unwrap();
@@ -771,7 +941,7 @@ fn stale_retry_cannot_erase_new_generation_after_validation() {
     owner.bind("reader", id).unwrap();
     let writer = owner.open("writer", [4; 32]).unwrap();
     owner.open("reader", [4; 32]).unwrap();
-    let delta = Note::new().append_paragraph("first");
+    let delta = Note::new().unwrap().append_paragraph("first").unwrap();
     owner
         .commit_queued("writer", writer.generation, [1; 16], &delta)
         .unwrap();
@@ -794,7 +964,7 @@ fn stale_retry_cannot_erase_new_generation_after_validation() {
             "writer",
             writer.generation,
             [2; 16],
-            &Note::new().append_paragraph("new"),
+            &Note::new().unwrap().append_paragraph("new").unwrap(),
         )
         .unwrap();
     go.send(()).unwrap();
@@ -857,7 +1027,7 @@ fn concurrent_note_work_reuses_one_slot_until_last_user_finishes() {
                 "reader",
                 opened.generation,
                 [7; 16],
-                &Note::new().append_paragraph("one"),
+                &Note::new().unwrap().append_paragraph("one").unwrap(),
                 || {
                     ready.send(()).unwrap();
                     resume.recv().unwrap();
@@ -877,7 +1047,7 @@ fn concurrent_note_work_reuses_one_slot_until_last_user_finishes() {
                 "reader",
                 opened.generation,
                 [8; 16],
-                &Note::new().append_paragraph("two"),
+                &Note::new().unwrap().append_paragraph("two").unwrap(),
             )
             .unwrap()
     });
@@ -920,7 +1090,10 @@ fn one_unacked_native_delivery_bounds_hundreds_of_pending_updates() {
     owner.open("reader", [4; 32]).unwrap();
     // One large repeated update exceeds the 256-KiB byte budget well
     // before 64 rows: a rows-only queue mutant must fail this test.
-    let delta = Note::new().append_paragraph(&"x".repeat(8192));
+    let delta = Note::new()
+        .unwrap()
+        .append_paragraph(&"x".repeat(8192))
+        .unwrap();
     owner
         .commit_queued("writer", writer.generation, [1; 16], &delta)
         .unwrap();
@@ -994,8 +1167,8 @@ fn realistic_legacy_owner_open_and_two_saves() {
         let db = anchored(&path, &proof, &signed);
         let replay = db.read_pool().unwrap();
         let key = scope(proof.id().0, 1).key;
-        let mut source = Note::new();
-        let first = source.append_paragraph(&"x".repeat(1024 * 1024));
+        let mut source = Note::new().unwrap();
+        let first = source.append_paragraph(&"x".repeat(1024 * 1024)).unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let insert = |n: usize, delta: Vec<u8>| {
@@ -1004,7 +1177,7 @@ fn realistic_legacy_owner_open_and_two_saves() {
         };
         insert(0, first);
         for n in 0..count {
-            insert(n + 1, source.append_paragraph("a"));
+            insert(n + 1, source.append_paragraph("a").unwrap());
         }
         conn.execute_batch("COMMIT").unwrap();
         drop(source);
@@ -1025,7 +1198,7 @@ fn realistic_legacy_owner_open_and_two_saves() {
                 "writer",
                 opened.generation,
                 [1; 16],
-                &Note::new().append_paragraph("first"),
+                &Note::new().unwrap().append_paragraph("first").unwrap(),
             )
             .unwrap();
         let first_time = started.elapsed();
@@ -1035,7 +1208,7 @@ fn realistic_legacy_owner_open_and_two_saves() {
                 "writer",
                 opened.generation,
                 [2; 16],
-                &Note::new().append_paragraph("second"),
+                &Note::new().unwrap().append_paragraph("second").unwrap(),
             )
             .unwrap();
         let second_time = started.elapsed();
@@ -1047,9 +1220,9 @@ fn realistic_legacy_owner_open_and_two_saves() {
         eprintln!(
             "owner_legacy_updates={count} open={open_time:?} first_save={first_time:?} second_save={second_time:?} replayed_rows={} state_bytes={} rss_before={before_rss} rss_after={after_rss} rss_delta={} cache_budget_estimate={} containers=1",
             replay.replayed_rows(),
-            opened.state.len(),
+            opened.state.encode().len(),
             after_rss.saturating_sub(before_rss),
-            3 * opened.state.len() + 4096
+            3 * opened.state.encode().len() + 4096
         );
     }
 }
@@ -1079,7 +1252,7 @@ fn failed_background_compaction_retries_on_next_open() {
                 "writer",
                 opened.generation,
                 request,
-                &Note::new().append_paragraph("offline"),
+                &Note::new().unwrap().append_paragraph("offline").unwrap(),
             )
             .unwrap();
     }
@@ -1156,7 +1329,7 @@ fn failed_resnapshot_stays_bounded_and_later_merges_all_committed_updates() {
                 "writer",
                 writer.generation,
                 [n; 16],
-                &Note::new().append_paragraph("committed"),
+                &Note::new().unwrap().append_paragraph("committed").unwrap(),
             )
             .unwrap();
     }
@@ -1179,37 +1352,45 @@ fn failed_resnapshot_stays_bounded_and_later_merges_all_committed_updates() {
                 "writer",
                 writer.generation,
                 [n; 16],
-                &Note::new().append_paragraph("after failure"),
+                &Note::new()
+                    .unwrap()
+                    .append_paragraph("after failure")
+                    .unwrap(),
             )
             .unwrap();
     }
     let read_pool = DeviceDatabase::open(&path).unwrap().read_pool().unwrap();
     assert!(
         !owner.drain_surface_with_snapshot("reader", &mut |d| seen.push(d), |key| {
-            let read = read_pool.note_state(key)?;
-            Ok((read.state, 0))
+            let (state, _) = read_pool.note_ordered(key)?;
+            Ok((state, 0))
         }),
         "snapshot below the marker's covered row cannot claim its sequence"
     );
     assert!(owner.queued_delivery_budget("reader").0 <= 64);
     assert!(
         owner.drain_surface_with_snapshot("reader", &mut |d| seen.push(d), |key| {
-            let read = read_pool.note_state(key)?;
-            Ok((read.state, read.frontier))
+            read_pool.note_ordered(key)
         })
     );
     assert!(seen.iter().any(|d| d.resync));
-    let mut merged = Note::new();
+    let mut merged = Note::new().unwrap();
     for d in seen {
-        merged.apply_update(&d.update).unwrap();
+        // A resync carries the note's ordered updates, a delta one update.
+        for update in if d.resync { d.segments } else { vec![d.update] } {
+            merged.apply_update(&update).unwrap();
+        }
     }
-    assert_eq!(merged.state(), owner.open("reader", [4; 32]).unwrap().state);
+    assert_eq!(
+        merged.state().unwrap(),
+        full(&owner.open("reader", [4; 32]).unwrap().state)
+    );
     owner
         .commit_queued(
             "writer",
             writer.generation,
             [99; 16],
-            &Note::new().append_paragraph("fenced"),
+            &Note::new().unwrap().append_paragraph("fenced").unwrap(),
         )
         .unwrap();
     owner.invalidate("reader");
@@ -1247,7 +1428,7 @@ fn failed_resnapshot_during_reopen_does_not_wedge_new_generation() {
                 "writer",
                 writer.generation,
                 [n; 16],
-                &Note::new().append_paragraph("overflow"),
+                &Note::new().unwrap().append_paragraph("overflow").unwrap(),
             )
             .unwrap();
     }
@@ -1266,7 +1447,10 @@ fn failed_resnapshot_during_reopen_does_not_wedge_new_generation() {
             "writer",
             writer.generation,
             [99; 16],
-            &Note::new().append_paragraph("new generation"),
+            &Note::new()
+                .unwrap()
+                .append_paragraph("new generation")
+                .unwrap(),
         )
         .unwrap();
     let mut delivered = Vec::new();
@@ -1310,7 +1494,7 @@ fn overflow_resync_is_ordered_and_does_not_block_same_container_writes() {
             "writer",
             opened.generation,
             [1; 16],
-            &Note::new().append_paragraph("first"),
+            &Note::new().unwrap().append_paragraph("first").unwrap(),
             |d| {
                 if results.lock().unwrap().is_empty() {
                     started_tx.send(()).unwrap();
@@ -1328,7 +1512,7 @@ fn overflow_resync_is_ordered_and_does_not_block_same_container_writes() {
                 "writer",
                 opened.generation,
                 [index; 16],
-                &Note::new().append_paragraph("later"),
+                &Note::new().unwrap().append_paragraph("later").unwrap(),
                 |_| {},
             )
             .unwrap();
@@ -1340,11 +1524,25 @@ fn overflow_resync_is_ordered_and_does_not_block_same_container_writes() {
         deliveries.iter().any(|item| item.resync),
         "overflow must replace dropped deltas with a full merge snapshot"
     );
-    let mut merged = Note::new();
+    let mut merged = Note::new().unwrap();
     for d in deliveries.iter() {
-        merged.apply_update(&d.update).unwrap();
+        for update in if d.resync {
+            &d.segments[..]
+        } else {
+            std::slice::from_ref(&d.update)
+        } {
+            merged.apply_update(update).unwrap();
+        }
     }
     // A stale earlier update is harmless: the Yjs merge, not editor recreation,
     // retains the in-flight local edits and resolves dependencies.
-    assert_eq!(merged.state(), owner.open("reader", [4; 32]).unwrap().state);
+    assert_eq!(
+        merged.state().unwrap(),
+        full(&owner.open("reader", [4; 32]).unwrap().state)
+    );
+}
+
+/// The full state a view reaches after applying an open's ordered updates.
+fn full(state: &OrderedState) -> Vec<u8> {
+    Note::from_ordered(state).unwrap().state().unwrap()
 }

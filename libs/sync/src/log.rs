@@ -2,7 +2,11 @@ use std::fmt;
 
 /// Fixed framing version; it never negotiates an inner signature's version.
 pub const VERSION: u16 = 1;
-pub const PADDED_SIZES: [usize; 4] = [1024, 4096, 16384, 65536];
+/// Padded event envelope sizes. Envelopes are stored inline with ordering, so
+/// they stay at most 64 KiB.
+pub const ENVELOPE_SIZES: [usize; 4] = [1024, 4096, 16384, 65536];
+/// Padded detached body sizes. Bodies are stored as separate objects.
+pub const BODY_SIZES: [usize; 7] = [1024, 4096, 16384, 65536, 262144, 1048576, 4194304];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Digest(pub [u8; 32]);
@@ -59,7 +63,7 @@ impl fmt::Debug for OpaqueEvent {
 }
 impl OpaqueEvent {
     pub fn new(id: EventId, envelope: Vec<u8>) -> Result<Self, Error> {
-        if !PADDED_SIZES.contains(&envelope.len()) {
+        if !ENVELOPE_SIZES.contains(&envelope.len()) {
             return Err(Error::Size);
         }
         Ok(Self { id, envelope })
@@ -86,7 +90,7 @@ impl OpaqueEvent {
         input.version()?;
         let id = EventId(input.array()?);
         let len = u32::from_be_bytes(input.array()?) as usize;
-        if !PADDED_SIZES.contains(&len) {
+        if !ENVELOPE_SIZES.contains(&len) {
             return Err(Error::Size);
         }
         if input.0.len() != len {
@@ -117,7 +121,7 @@ impl fmt::Debug for BodyObject {
 }
 impl BodyObject {
     pub fn new(bytes: Vec<u8>) -> Result<Self, Error> {
-        if !PADDED_SIZES.contains(&bytes.len()) {
+        if !BODY_SIZES.contains(&bytes.len()) {
             return Err(Error::Size);
         }
         Ok(Self { bytes })
@@ -147,22 +151,41 @@ pub fn referenced_body(event: &OpaqueEvent) -> Result<Digest, Error> {
     Ok(Digest(first))
 }
 
-/// Common body-free record. It exposes no content kind, epoch, author or audience.
-/// An untrusted sequencer can construct this: callers MUST also verify the
-/// original encrypted author binding and controls before applying a body.
+/// Which permit the sequencer ordered an event under: a membership or key
+/// change, or content. It is committed in the chain, so a device can refuse an
+/// event whose sealed class differs. A genesis is always a control.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum Route {
+    Content = 0,
+    Control = 1,
+}
+
+/// Common body-free record. It exposes no content kind, epoch, author or audience
+/// beyond its route. An untrusted sequencer can construct this: callers MUST also
+/// verify the original encrypted author binding and controls before applying a body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Commitment {
     base: BaseId,
     previous: Head,
     event_id: EventId,
     event_digest: Digest,
+    route: Route,
     head: Head,
 }
 impl Commitment {
-    pub fn order(base: BaseId, previous: Head, event: &OpaqueEvent) -> Result<Self, Error> {
+    pub const LEN: usize = 179;
+    pub fn order(
+        base: BaseId,
+        previous: Head,
+        event: &OpaqueEvent,
+        route: Route,
+    ) -> Result<Self, Error> {
         let position = previous.position.checked_add(1).ok_or(Error::Exhausted)?;
         if previous.position == 0
-            && (previous != Head::EMPTY || BaseId::from_genesis(event) != base)
+            && (previous != Head::EMPTY
+                || BaseId::from_genesis(event) != base
+                || route != Route::Control)
         {
             return Err(Error::GenesisMismatch);
         }
@@ -171,6 +194,7 @@ impl Commitment {
             previous,
             event_id: event.id(),
             event_digest: event.digest(),
+            route,
             head: Head {
                 position,
                 hash: Digest([0; 32]),
@@ -185,11 +209,17 @@ impl Commitment {
     pub fn head(&self) -> Head {
         self.head
     }
+    pub fn previous(&self) -> Head {
+        self.previous
+    }
     pub fn event_id(&self) -> EventId {
         self.event_id
     }
     pub fn event_digest(&self) -> Digest {
         self.event_digest
+    }
+    pub fn route(&self) -> Route {
+        self.route
     }
     pub fn verify_next(&self, base: BaseId, previous: Head) -> Result<Head, Error> {
         if self.base != base
@@ -199,7 +229,11 @@ impl Commitment {
         {
             return Err(Error::HistoryMismatch);
         }
-        if previous.position == 0 && (previous != Head::EMPTY || self.event_digest.0 != base.0) {
+        if previous.position == 0
+            && (previous != Head::EMPTY
+                || self.event_digest.0 != base.0
+                || self.route != Route::Control)
+        {
             return Err(Error::GenesisMismatch);
         }
         Ok(self.head)
@@ -214,13 +248,14 @@ impl Commitment {
         Ok(())
     }
     fn prefix(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(146);
+        let mut out = Vec::with_capacity(Self::LEN);
         out.extend(VERSION.to_be_bytes());
         out.extend(self.base.0);
         out.extend(self.previous.position.to_be_bytes());
         out.extend(self.previous.hash.0);
         out.extend(self.event_id.0);
         out.extend(self.event_digest.0);
+        out.push(self.route as u8);
         out.extend(self.head.position.to_be_bytes());
         out
     }
@@ -243,6 +278,11 @@ impl Commitment {
             },
             event_id: EventId(input.array()?),
             event_digest: Digest(input.array()?),
+            route: match input.array::<1>()? {
+                [0] => Route::Content,
+                [1] => Route::Control,
+                _ => return Err(Error::Encoding),
+            },
             head: Head {
                 position: u64::from_be_bytes(input.array()?),
                 hash: Digest(input.array()?),

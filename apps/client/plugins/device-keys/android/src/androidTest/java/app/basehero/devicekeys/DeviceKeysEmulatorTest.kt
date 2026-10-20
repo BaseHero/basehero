@@ -123,17 +123,43 @@ class DeviceKeysEmulatorTest {
         assertFalse(File(activity.filesDir, "device-keys-v1").exists())
         assertFalse(File(activity.cacheDir, "device-keys-v1").exists())
         val input = byteArrayOf(1, 2, 3, 4)
+        val kit = handle()
         val seal = ticket()
-        DeviceKeysBridge.sealPending(activity, input, seal)
+        DeviceKeysBridge.sealPending(activity, kit, input, seal)
         assertArrayEquals(byteArrayOf(0, 0, 0, 0), input)
         val blob = result(seal).bytes!!
+        val reuse = ticket()
+        DeviceKeysBridge.sealPending(activity, kit, byteArrayOf(5), reuse)
+        assertEquals("sealing replaced an existing pending key", DeviceKeysBridge.FAILURE, result(reuse).code)
         val open = ticket()
-        DeviceKeysBridge.openPending(activity, blob, open)
+        DeviceKeysBridge.openPending(activity, kit, blob, open)
         assertArrayEquals(byteArrayOf(1, 2, 3, 4), result(open).bytes)
-        blob[blob.lastIndex] = (blob.last().toInt() xor 1).toByte()
+        val home = handle()
+        val reseal = ticket()
+        DeviceKeysBridge.sealPending(activity, home, byteArrayOf(6, 7), reseal)
+        val homeBlob = result(reseal).bytes!!
+        val crossed = ticket()
+        DeviceKeysBridge.openPending(activity, home, blob, crossed)
+        assertEquals("one setup key opened another's blob", DeviceKeysBridge.FAILURE, result(crossed).code)
+        val tampered = blob.clone().apply { this[lastIndex] = (last().toInt() xor 1).toByte() }
         val tamper = ticket()
-        DeviceKeysBridge.openPending(activity, blob, tamper)
+        DeviceKeysBridge.openPending(activity, kit, tampered, tamper)
         assertEquals(DeviceKeysBridge.FAILURE, result(tamper).code)
+        repeat(2) { // retirement is idempotent
+            val retire = ticket()
+            DeviceKeysBridge.retirePending(activity, kit, retire)
+            assertEquals(DeviceKeysBridge.OK, result(retire).code)
+        }
+        assertFalse(store().containsAlias("app.basehero.device-keys.v1.pending.$kit"))
+        val retired = ticket()
+        DeviceKeysBridge.openPending(activity, kit, blob, retired)
+        assertEquals("a retired key reopened its blob", DeviceKeysBridge.UNAVAILABLE, result(retired).code)
+        val kept = ticket()
+        DeviceKeysBridge.openPending(activity, home, homeBlob, kept)
+        assertArrayEquals(byteArrayOf(6, 7), result(kept).bytes)
+        val cleanup = ticket()
+        DeviceKeysBridge.retirePending(activity, home, cleanup)
+        assertEquals(DeviceKeysBridge.OK, result(cleanup).code)
     }
 
     @Test fun cancelledCreationLeavesNothing() {
