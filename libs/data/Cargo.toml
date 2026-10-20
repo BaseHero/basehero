@@ -1,0 +1,28 @@
+[package]
+name = "bh-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+testkit = []
+
+[dependencies]
+bh-crypto.workspace = true
+jsonschema.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_jcs.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The integration tests use the replica harness.
+bh-data = { path = ".", features = ["testkit"] }
+rusqlite = { workspace = true, features = ["trace"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

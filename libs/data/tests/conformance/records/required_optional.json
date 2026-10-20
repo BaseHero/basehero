@@ -1,0 +1,34 @@
+{
+  "description": "required optional",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "integer"
+      },
+      "optional": {
+        "type": "string",
+        "maxLength": 3
+      }
+    },
+    "required": [
+      "id"
+    ]
+  },
+  "valid": [
+    {
+      "id": 1
+    },
+    {
+      "id": 2,
+      "optional": "yes"
+    }
+  ],
+  "invalid": [
+    {},
+    {
+      "id": 1,
+      "optional": "long"
+    }
+  ]
+}

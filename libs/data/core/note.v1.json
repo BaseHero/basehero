@@ -1,0 +1,26 @@
+{
+  "format": "bh-type/1",
+  "local": "00000000000000000000000000000000",
+  "app": "0000000000000000000000000000000000000000000000000000000000000000",
+  "kind": "record",
+  "name": "Note",
+  "description": "A note with a core-managed rich-text body. The body is not an editable JSON field.",
+  "builtin": "Note",
+  "extends": null,
+  "uses": [],
+  "schema": {
+    "type": "object",
+    "properties": {"title": {"type": "string", "maxLength": 200}},
+    "required": ["title"]
+  },
+  "fields": {
+    "/title": {"meaning": "first non-empty paragraph or heading of the body, derived by the core", "kind": "string", "write": "derived"}
+  },
+  "actions": [],
+  "indexes": [{"name": "recent", "keys": ["$changed"]}],
+  "unique": [],
+  "search": {"title": "/title", "text": [], "builtin_body": true},
+  "queries": [],
+  "evolution": {"previous": null, "migration": "", "migration_ops": [], "examples": {"valid": [{"title": "A note"}], "invalid": [{"title": 123}]}},
+  "rationale": ["The body stays in the core-managed rich-text store; title is its derived projection."]
+}

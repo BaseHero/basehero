@@ -226,6 +226,7 @@ fn echo(
             metadata_id: [0; 32],
             epoch_id: None,
             notes: Vec::new(),
+            steps: Vec::new(),
             own: vec![OwnOutcome {
                 update_id,
                 ordered,

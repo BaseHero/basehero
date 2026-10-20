@@ -1,0 +1,22 @@
+{
+  "description": "union bounded",
+  "schema": {
+    "anyOf": [
+      {
+        "type": "string",
+        "maxLength": 4
+      },
+      {
+        "type": "integer"
+      }
+    ]
+  },
+  "valid": [
+    "yes",
+    3
+  ],
+  "invalid": [
+    true,
+    "lengthy"
+  ]
+}

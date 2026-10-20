@@ -161,6 +161,36 @@ fn snapshot(conn: &Connection) -> BTreeMap<String, Vec<Vec<Value>>> {
         })
         .collect()
 }
+fn preserved(
+    before: &BTreeMap<String, Vec<Vec<Value>>>,
+    after: &BTreeMap<String, Vec<Vec<Value>>>,
+) {
+    for (table, rows) in before {
+        assert_eq!(after.get(table), Some(rows), "{table} bytes retained");
+    }
+}
+/// A step may add only the tables its own layout defines; row equality above
+/// already rules out new rows in tables that existed before.
+fn only_layout_tables_added(
+    before: &BTreeMap<String, Vec<Vec<Value>>>,
+    after: &BTreeMap<String, Vec<Vec<Value>>>,
+) {
+    for table in after.keys() {
+        if before.contains_key(table) {
+            continue;
+        }
+        assert!(
+            table == "note_outbox_members"
+                || table == "note_projection_repair"
+                || table == "typed_outbox"
+                || table == "typed_alarm"
+                || table == "sqlite_sequence"
+                || table.starts_with("data_"),
+            "upgrade added an unexpected table {table}"
+        );
+    }
+}
+
 #[test]
 fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
     let dir = tempfile::tempdir().unwrap();
@@ -168,8 +198,9 @@ fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
     let raw = legacy(&path);
     let before = snapshot(&raw);
     let mut db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 12);
-    assert_eq!(snapshot(&raw), before);
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
+    preserved(&before, &snapshot(&raw));
+    only_layout_tables_added(&before, &snapshot(&raw));
     assert_eq!(
         raw.query_row("SELECT count(*) FROM note_outbox_members", [], |r| r
             .get::<_, i64>(0))
@@ -198,7 +229,7 @@ fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
     assert_eq!(db.package_progress(5).unwrap().unwrap().outcome, None);
     drop(db);
     let mut db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 12);
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     assert_eq!(db.package_pending_count(6).unwrap(), 2);
     let after = snapshot(&raw);
     for table in [
@@ -356,8 +387,9 @@ fn failed_v12_version_write_rolls_back_table_index_and_data_then_retries() {
         0
     );
     initialize(&mut raw).unwrap();
-    assert_eq!(version(&raw).unwrap(), 12);
-    assert_eq!(snapshot(&raw), before);
+    assert_eq!(version(&raw).unwrap(), LOCAL_DATA_VERSION);
+    preserved(&before, &snapshot(&raw));
+    only_layout_tables_added(&before, &snapshot(&raw));
 }
 #[test]
 fn package_and_members_are_atomic_and_overlapping_candidates_cannot_both_win() {

@@ -73,6 +73,15 @@ impl DeviceDatabase {
             "INSERT INTO base_writer_phase(base,phase) VALUES (?1,0)",
             [record.base],
         )?;
+        // The own base's ordinary audience exists before its first Note, so an
+        // empty base lists as complete-empty rather than unknown.
+        crate::data::seed_scope_coverage(
+            &tx,
+            bh_data::Scope {
+                base: record.base,
+                audience: [0; 32],
+            },
+        )?;
         tx.commit()?;
         Ok(record.clone())
     }

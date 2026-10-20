@@ -1,0 +1,49 @@
+{
+  "actions": [],
+  "app": "0404040404040404040404040404040404040404040404040404040404040404",
+  "description": "Synthetic workspace context, not a production project schema.",
+  "evolution": {
+    "examples": {
+      "valid": [],
+      "invalid": []
+    },
+    "migration": "",
+    "migration_ops": [],
+    "previous": null
+  },
+  "extends": null,
+  "fields": {
+    "/name": {
+      "kind": "string",
+      "meaning": "Context label",
+      "write": "direct"
+    }
+  },
+  "format": "bh-type/1",
+  "indexes": [],
+  "kind": "record",
+  "local": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+  "name": "Project",
+  "queries": [],
+  "rationale": [
+    "Groups selections by a named context without defining an access boundary."
+  ],
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "maxLength": 120
+      }
+    },
+    "required": [
+      "name"
+    ]
+  },
+  "search": {
+    "title": "/name",
+    "text": []
+  },
+  "unique": [],
+  "uses": []
+}

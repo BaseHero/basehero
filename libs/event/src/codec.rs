@@ -7,7 +7,21 @@ use bh_sync::{BODY_SIZES, EventId, Head, OpaqueEvent, receipt::RECEIPT_LEN, refe
 
 pub const CLASS_CONTENT: u8 = 0;
 pub const CLASS_CONTROL: u8 = 1;
+/// The Note-core content kind. A future Note-core change must use a new NOTE
+/// writer-declaration version, never another outer content kind: a reader
+/// retains an unknown content kind without applying it, so changed Note
+/// semantics sent under a new kind would never reach the readers that already
+/// exist.
 pub const NOTE: u16 = 1;
+/// Typed data owned by the shared record layer. The event layer keeps its
+/// bytes opaque.
+///
+/// A future typed-data change must use a new inner payload version or
+/// operation kind inside this outer kind, never another outer content kind,
+/// for the same reason as the Note core: a reader retains an unknown content
+/// kind without applying it, so its changes would never reach the readers
+/// that already exist.
+pub const TYPED_DATA: u16 = 0x0002;
 /// A note payload starts with its 32-byte ID and the producing writer's
 /// 99-byte declaration; the Yjs update follows.
 pub const NOTE_PREFIX: usize = 32 + 99;
@@ -25,10 +39,11 @@ pub fn note_payload(
     data
 }
 
-/// A note event by this device, for its ordinary key to sign outside this
-/// library.
-pub struct NoteSigningRequest(EventSigningRequest);
-impl NoteSigningRequest {
+/// A content event by this device, for its ordinary key to sign outside this
+/// library. Notes and typed data are sealed the same way; only their content
+/// kind and payload differ.
+pub struct ContentSigningRequest(EventSigningRequest);
+impl ContentSigningRequest {
     pub fn signing_bytes(&self) -> &[u8] {
         self.0.signing_bytes()
     }
@@ -49,42 +64,41 @@ pub struct NoteDraft<'a> {
     pub update: &'a [u8],
 }
 
-/// Prepare the note event carrying `note_payload(note, writer, update)` in
-/// the content epoch of `content`. `seen` is what the
-/// author's verified history of the base had applied at its head and
-/// `receipt` the hosting receipt for that head, which the caller must have
-/// verified: sealing cannot check it. `base_account` is the base's copy of
-/// the account; the writer must be this account's `device`, active there.
-#[allow(clippy::too_many_arguments)] // One note event's exact signed fields.
-pub fn prepare_note(
+/// One local typed payload to seal: its event id and the exact bytes this
+/// layer carries without parsing.
+pub struct TypedDraft<'a> {
+    pub event_id: EventId,
+    pub payload: &'a [u8],
+}
+
+/// Prepare a content event carrying `kind` and `data` in the content epoch of
+/// `content`, bound to the same seen head, account copy and receipt as a note
+/// event. `seen` is what the author's verified history of the base had
+/// applied at its head and `receipt` the hosting receipt for that head, which
+/// the caller must have verified: sealing cannot check it. `base_account` is
+/// the base's copy of the account; `device` must be this account's and active
+/// there.
+#[allow(clippy::too_many_arguments)] // One content event's exact signed fields.
+fn content_request(
     base: bh_sync::BaseId,
     base_account: &bh_account::VerifiedAccount,
     device: DeviceId,
     seen: crate::Seen,
     receipt: [u8; RECEIPT_LEN],
-    draft: NoteDraft<'_>,
+    event_id: EventId,
+    kind: u16,
+    data: &[u8],
     metadata: &Secret<32>,
     content: &Secret<32>,
-) -> Result<NoteSigningRequest, Error> {
-    let NoteDraft {
-        event_id,
-        note,
-        writer,
-        update,
-    } = draft;
-    if seen.head.position == 0
-        || seen.account != base_account.head()
-        || writer.account != base_account.id().0
-        || writer.device != device.0
-    {
+) -> Result<ContentSigningRequest, Error> {
+    if seen.head.position == 0 || seen.account != base_account.head() {
         return Err(Error::Invalid);
     }
     let expected = *base_account
         .active_device(device)
         .map_err(|_| Error::Invalid)?
         .signing();
-    let data = note_payload(note, writer, update);
-    Ok(NoteSigningRequest(prepare_seal(
+    Ok(ContentSigningRequest(prepare_seal(
         Binding {
             version: 2,
             highest: 2,
@@ -103,14 +117,76 @@ pub fn prepare_note(
             commitment: [0; 32],
             seen_receipt: receipt,
         },
-        Payload {
-            kind: NOTE,
-            data: &data,
-        },
+        Payload { kind, data },
         expected,
         metadata,
         Some(content),
     )?))
+}
+
+/// Prepare the note event carrying `note_payload(note, writer, update)`. The
+/// writer must be this account's `device`, active in the base's copy.
+#[allow(clippy::too_many_arguments)] // One note event's exact signed fields.
+pub fn prepare_note(
+    base: bh_sync::BaseId,
+    base_account: &bh_account::VerifiedAccount,
+    device: DeviceId,
+    seen: crate::Seen,
+    receipt: [u8; RECEIPT_LEN],
+    draft: NoteDraft<'_>,
+    metadata: &Secret<32>,
+    content: &Secret<32>,
+) -> Result<ContentSigningRequest, Error> {
+    let NoteDraft {
+        event_id,
+        note,
+        writer,
+        update,
+    } = draft;
+    if writer.account != base_account.id().0 || writer.device != device.0 {
+        return Err(Error::Invalid);
+    }
+    let data = note_payload(note, writer, update);
+    content_request(
+        base,
+        base_account,
+        device,
+        seen,
+        receipt,
+        event_id,
+        NOTE,
+        &data,
+        metadata,
+        content,
+    )
+}
+
+/// Prepare the typed-data event carrying `draft.payload` exactly as given.
+/// This layer neither parses nor signs any meaning into those bytes.
+#[allow(clippy::too_many_arguments)] // One content event's exact signed fields.
+pub fn prepare_typed(
+    base: bh_sync::BaseId,
+    base_account: &bh_account::VerifiedAccount,
+    device: DeviceId,
+    seen: crate::Seen,
+    receipt: [u8; RECEIPT_LEN],
+    draft: TypedDraft<'_>,
+    metadata: &Secret<32>,
+    content: &Secret<32>,
+) -> Result<ContentSigningRequest, Error> {
+    let TypedDraft { event_id, payload } = draft;
+    content_request(
+        base,
+        base_account,
+        device,
+        seen,
+        receipt,
+        event_id,
+        TYPED_DATA,
+        payload,
+        metadata,
+        content,
+    )
 }
 pub const GENESIS: u16 = 0x0100;
 pub const ACCOUNT_CHANGE: u16 = 0x0101;

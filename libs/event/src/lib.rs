@@ -8,9 +8,9 @@ mod history;
 pub mod presence;
 pub mod writer;
 pub use codec::{
-    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, Error, GENESIS, NOTE,
-    NOTE_PREFIX, NoteDraft, NoteSigningRequest, Payload, key_id, note_payload, prepare_note, seal,
-    sealed_epoch,
+    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, ContentSigningRequest, Encoded, Error,
+    GENESIS, NOTE, NOTE_PREFIX, NoteDraft, Payload, TYPED_DATA, TypedDraft, key_id, note_payload,
+    prepare_note, prepare_typed, seal, sealed_epoch,
 };
 pub use control::{
     ControlChange, ControlEffect, ControlSigningRequest, ControlSpine, ControlState,

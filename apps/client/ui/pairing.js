@@ -189,6 +189,7 @@ export const cloudText = {
     : v.pending ? `Saved on this device · ${v.pending} not yet synced` : 'Saved on this device',
   syncing: v => v.pending ? `Syncing ${v.pending} ${v.pending === 1 ? 'note' : 'notes'}` : 'Syncing',
   synced: () => 'Synced',
+  'update-needed': () => 'Some content needs an app update',
   'waiting-network': () => 'Saved on this device · Waiting for network',
   'waiting-authorization': v => v.confirm ? 'Waiting for your confirmation' : 'Waiting for authorization',
   'history-missing': () => 'Waiting for missing history',

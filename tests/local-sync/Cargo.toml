@@ -17,6 +17,7 @@ bh-account.workspace = true
 bh-authz-proto.workspace = true
 bh-core.workspace = true
 bh-crypto.workspace = true
+bh-data = { workspace = true, features = ["testkit"] }
 bh-device.workspace = true
 bh-host = { workspace = true, features = ["test-support"] }
 bh-storage.workspace = true

@@ -70,6 +70,11 @@ pub(crate) fn insert(
             .map(|(a, d, n)| [a.as_slice(), d.as_slice(), n.as_slice()].concat());
         tx.execute("INSERT INTO held_note_event(base,audience,note,position,commitment,author,writer,delta,own_update) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key.base.as_slice(), key.audience.as_slice(), key.note.as_slice(), event.ordered.head().position as i64, event.ordered.encode(), author, writer, event.delta, event.own_update])?;
     }
+    if !events.is_empty() {
+        // This Note cannot show this content yet: ordered decisions about it
+        // wait and Note listings stay incomplete until the hold is released.
+        crate::data::mark_note_gap(tx, crate::data::note_scope(key), key.note)?;
+    }
     Ok(())
 }
 
@@ -195,8 +200,18 @@ impl DeviceDatabase {
         for outcome in own {
             super::sync_state::record_own(&tx, note.key.base, outcome)?;
         }
+        let created = crate::data::note_projection_missing(&tx, note.key)?;
         let committed = super::sync_state::commit_note(&tx, note)?;
         tx.execute("DELETE FROM held_note_event WHERE base=?1 AND audience=?2 AND note=?3 AND position<=?4",params![note.key.base.as_slice(),note.key.audience.as_slice(),note.key.note.as_slice(),through as i64])?;
+        // The commit above projected the Note while these rows still existed,
+        // so the record's gap is re-asserted now that they are gone. A created
+        // projection or a closed gap is the dependency parked work waits for:
+        // replay just that record's queue rather than the whole scope's.
+        let scope = crate::data::note_scope(note.key);
+        let closed = crate::data::refresh_note_gap(&tx, scope, note.key.note)?;
+        if created || closed {
+            crate::data::replay_parked_for(&tx, scope, note.key.note)?;
+        }
         tx.commit()?;
         self.forget_note(note.key);
         Ok(committed)

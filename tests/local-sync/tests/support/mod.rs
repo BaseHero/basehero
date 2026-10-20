@@ -75,6 +75,7 @@ impl Stack {
             .as_millis();
         let dir = runs().join(format!("{name}-{stamp}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("stack")).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
         let stack = Self {
             endpoint: dir.join("stack/endpoint.json"),
             dir,
@@ -94,13 +95,18 @@ impl Stack {
             .open(self.dir.join("stack.log"))
             .unwrap();
         let status = Command::new("bash")
-            .arg("scripts/local-stack.sh")
+            .args(["--noprofile", "--norc", "scripts/local-stack.sh"])
             .args(args)
             .current_dir(checkout())
             .env("LOCAL_STACK_DIR", self.stack_dir())
             .env("CARGO_TARGET_DIR", target())
             .env("LOCAL_STACK_BIND", "127.0.0.1")
             .env("LOCAL_STACK_PREBUILT", "1")
+            .env("HOME", self.dir.join("home"))
+            .env("GH_CONFIG_DIR", self.dir.join("home/gh"))
+            .env("XDG_CONFIG_HOME", self.dir.join("home/xdg"))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .stdout(out.try_clone().unwrap())
             .stderr(out)
             .status()
@@ -144,6 +150,11 @@ impl Stack {
         let request = json!({"op": op, "log": log_id, "args": args});
         let output = Command::new("node")
             .arg("tests/local-sync/storage-fixture.mjs")
+            .env("HOME", self.dir.join("home"))
+            .env("GH_CONFIG_DIR", self.dir.join("home/gh"))
+            .env("XDG_CONFIG_HOME", self.dir.join("home/xdg"))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .arg(self.stack_dir())
             .arg(request.to_string())
             .current_dir(checkout())
@@ -169,11 +180,17 @@ impl Stack {
 impl Drop for Stack {
     fn drop(&mut self) {
         let _ = Command::new("bash")
-            .arg("scripts/local-stack.sh")
+            .args(["--noprofile", "--norc", "scripts/local-stack.sh"])
             .arg("down")
             .current_dir(checkout())
             .env("LOCAL_STACK_DIR", self.stack_dir())
             .env("CARGO_TARGET_DIR", target())
+            .env("LOCAL_STACK_BIND", "127.0.0.1")
+            .env("HOME", self.dir.join("home"))
+            .env("GH_CONFIG_DIR", self.dir.join("home/gh"))
+            .env("XDG_CONFIG_HOME", self.dir.join("home/xdg"))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .status();
     }
 }
@@ -210,6 +227,11 @@ impl Device {
             .arg(&dir)
             .arg(&endpoint)
             .arg(if gated { "gated" } else { "plain" })
+            .env("HOME", run.join("home"))
+            .env("GH_CONFIG_DIR", run.join("home/gh"))
+            .env("XDG_CONFIG_HOME", run.join("home/xdg"))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -483,6 +505,14 @@ pub struct Package {
     pub pending: bool,
 }
 
+#[derive(Debug)]
+pub struct TypedPackage {
+    pub event: Option<String>,
+    pub position: Option<i64>,
+    pub outcome: Option<i64>,
+    pub pending: bool,
+}
+
 impl Db {
     fn open(dir: &Path) -> Self {
         let file = std::fs::read_dir(dir.join("accounts"))
@@ -498,6 +528,38 @@ impl Db {
             )
             .unwrap(),
         )
+    }
+    /// Replicated accepted state and clocks in this read-only container.
+    pub fn state_digest(&self, scope: bh_data::Scope) -> [u8; 32] {
+        bh_data::testkit::state_digest(&self.0, scope).unwrap()
+    }
+    /// A typed mutation's durable package and its accepted log position.
+    pub fn typed(&self, mutation: &str) -> Option<TypedPackage> {
+        let bytes: Vec<u8> = (0..16)
+            .map(|i| u8::from_str_radix(&mutation[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        self.0
+            .query_row(
+                "SELECT lower(hex(event_id)),ordered_position,outcome,
+                EXISTS(SELECT 1 FROM data_pending p WHERE p.mutation=t.mutation)
+             FROM typed_outbox t WHERE mutation=?1",
+                [bytes],
+                |r| {
+                    Ok(TypedPackage {
+                        event: r.get(0)?,
+                        position: r.get(1)?,
+                        outcome: r.get(2)?,
+                        pending: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .unwrap()
+    }
+    pub fn typed_count(&self) -> i64 {
+        self.0
+            .query_row("SELECT count(*) FROM typed_outbox", [], |r| r.get(0))
+            .unwrap()
     }
     /// Local updates not yet accepted from their verified echo.
     pub fn pending(&self) -> i64 {

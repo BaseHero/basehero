@@ -24,6 +24,8 @@ nix develop --offline .#cryptoWorker --command bash -euc '
 '
 cargo build --locked --offline -p bh-local-sync-tests --features synthetic-attestation --tests --examples
 printf 'Local sync runs: %s\n' "$BH_LOCAL_SYNC_RUNS"
-cargo test --locked --offline -p bh-local-sync-tests --features synthetic-attestation \
-  --test checkpoint -- --ignored "$@"
-printf 'Local sync checkpoint passed: %s\n' "$BH_LOCAL_SYNC_RUNS"
+for test in checkpoint typed; do
+  cargo test --locked --offline -p bh-local-sync-tests --features synthetic-attestation \
+    --test "$test" -- --ignored "$@"
+done
+printf 'Local sync tests passed: %s\n' "$BH_LOCAL_SYNC_RUNS"

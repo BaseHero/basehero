@@ -12,14 +12,24 @@
 
 pub mod account;
 mod catalogue;
+mod data;
 pub mod held_notes;
 pub mod joined;
 pub mod note_writers;
 pub mod own_base;
+pub mod retained;
 mod runs;
 pub mod sync_state;
+pub mod typed_outbox;
 pub use catalogue::{MAX_NOTE_PAGE, MAX_NOTE_TITLE, NoteEntry};
+pub use data::NoteBodyText;
+#[cfg(feature = "testkit")]
+pub use data::testkit;
 mod view_records;
+pub use typed_outbox::{
+    OutboxCandidate, OutboxOrder, QueuedTyped, StoredTypedPackage, SubmitTypedError, TypedEcho,
+    TypedHead, TypedPackageCandidate, TypedPackagePreparation, TypedPackageProgress,
+};
 pub use view_records::ViewRecord;
 mod local_reads;
 mod read_pool;
@@ -39,6 +49,7 @@ use bh_core::{
     LOCAL_DATA_VERSION, check_local_data_version,
     note::{Note, OrderedState},
 };
+use bh_data::text;
 use bh_sync::{BodyObject, Commitment, EventId, OpaqueEvent, referenced_body};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
@@ -73,6 +84,8 @@ pub struct DeviceDatabase {
 // and cache entry. The shared compiled module is not per-note. This is a cache
 // policy, NOT measured RSS or a process-memory cap (working Notes are excluded).
 const NOTE_CACHE_OVERHEAD: usize = 256 * 1024;
+const INLINE_WAL_FRAMES: u32 = 4_000;
+const QUIET_WAL_FRAMES: u64 = 256;
 fn cache_weight(note: &Note) -> Result<usize, bh_core::note::NoteError> {
     Ok(note.memory_bytes()?.saturating_add(NOTE_CACHE_OVERHEAD))
 }
@@ -96,6 +109,8 @@ pub struct NoteKey {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("local database file unavailable")]
+    Io(#[from] std::io::Error),
     #[error("local SQLite transaction failed")]
     Database(#[from] rusqlite::Error),
     #[error("invalid note update")]
@@ -154,6 +169,8 @@ pub enum StoreError {
     RootConflict,
     #[error("publishing is stopped by a local alarm")]
     PublishingStopped,
+    #[error("typed record storage failed: {0}")]
+    Data(#[from] bh_data::DataError),
 }
 
 impl From<bh_core::note::NoteError> for StoreError {
@@ -276,6 +293,15 @@ impl DeviceDatabase {
         ensure_supported(version(&connection)?)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
+        // Autocheckpoint threshold for bursts with no quiet maintenance
+        // (including in-memory and test-support writers): roughly 16 MiB at
+        // the default page size. It triggers a checkpoint; it does not bound
+        // an active WAL, which readers can keep from resetting.
+        // journal_size_limit below only trims the file retained after a reset.
+        connection.pragma_update(None, "wal_autocheckpoint", INLINE_WAL_FRAMES)?;
+        let page_size: i64 = connection.pragma_query_value(None, "page_size", |r| r.get(0))?;
+        let quiet_wal_limit = 32 + QUIET_WAL_FRAMES as i64 * (page_size + 24);
+        connection.pragma_update(None, "journal_size_limit", quiet_wal_limit)?;
         connection.pragma_update(None, "foreign_keys", true)?;
 
         initialize(&mut connection)?;
@@ -293,11 +319,165 @@ impl DeviceDatabase {
         })
     }
 
+    /// Checkpoint on a quiet maintenance turn, never waiting for readers.
+    /// The writer guard must span this call; FULL commit sync remains unchanged.
+    pub fn checkpoint_wal_if_needed(&self) -> Result<i64, StoreError> {
+        let Some(path) = self.connection.path() else {
+            return Ok(0);
+        };
+        if path.is_empty() {
+            return Ok(0);
+        }
+        let page_size: i64 = self
+            .connection
+            .pragma_query_value(None, "page_size", |r| r.get(0))?;
+        let wal = format!("{path}-wal");
+        let bytes = match std::fs::metadata(wal) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        let frames = bytes.saturating_sub(32) / (page_size as u64 + 24);
+        if frames <= QUIET_WAL_FRAMES {
+            return Ok(0);
+        }
+        let (_busy, _log, checkpointed): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        Ok(checkpointed.max(0))
+    }
+
     pub fn data_version(&self) -> u32 {
         self.data_version
     }
     pub fn read_pool(&self) -> Option<Arc<ReadPool>> {
         self.readers.clone()
+    }
+    /// Scoped typed-data host access. Only this database owns the writer.
+    pub fn with_data_read<R>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<R, bh_data::DataError>,
+    ) -> Result<R, bh_data::DataError> {
+        read(&self.connection)
+    }
+    pub fn with_data_write<R>(
+        &mut self,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R, bh_data::DataError>,
+    ) -> Result<R, bh_data::DataError> {
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|e| bh_data::DataError::Sql(e.to_string()))?;
+        let result = write(&tx)?;
+        tx.commit()
+            .map_err(|e| bh_data::DataError::Sql(e.to_string()))?;
+        Ok(result)
+    }
+    /// Probe only durable derived-work markers; opening an idle container does
+    /// not scan typed records or replay history.
+    pub fn derived_pending(&self) -> Result<bool, StoreError> {
+        self.with_data_read(|conn| {
+            Ok(bh_data::index::has_pending(conn)?
+                || bh_data::text::reprojection_pending(conn)?
+                || bh_data::mutation::apply::replay_pending(conn)?)
+        })
+        .map_err(StoreError::Data)
+    }
+
+    /// Advance one index or rebuild batch, committing before the next guarded
+    /// section. A newly ready unique index queues a replay pass over its scope's
+    /// parked work atomically with readiness; [`Self::derived_replay_step`]
+    /// runs that pass in bounded pages, so readiness itself replays nothing.
+    pub fn derived_index_step(&mut self, vm_steps: u64) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        let next = bh_data::index::next_pending(&tx).map_err(StoreError::Data)?;
+        if next == Some(bh_data::index::TEXT_REBUILD_WORK) {
+            if bh_data::index::clearing_pending(&tx).map_err(StoreError::Data)? {
+                bh_data::index::clear_step_bounded(&tx, 32, vm_steps).map_err(StoreError::Data)?;
+            } else {
+                bh_data::text::rebuild_step_bounded(&tx, 32, vm_steps).map_err(StoreError::Data)?;
+            }
+        } else if let Some(ix) = next {
+            let state = bh_data::index::state(&tx, ix).map_err(StoreError::Data)?;
+            if state.state == "clearing" {
+                bh_data::index::clear_step_bounded(&tx, 32, vm_steps).map_err(StoreError::Data)?;
+            } else {
+                let progress = bh_data::index::backfill_step_bounded(
+                    &tx,
+                    ix,
+                    bh_data::index::BACKFILL_BATCH,
+                    vm_steps,
+                )
+                .map_err(StoreError::Data)?;
+                // Only a unique index can release parked work (uniqueness
+                // waits), so other indexes becoming ready queue no pass.
+                if state.state == "building" && state.unique && progress.ready {
+                    bh_data::mutation::apply::schedule_replay(&tx, state.scope)
+                        .map_err(StoreError::Data)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One bounded page of a queued parked-work replay pass in its own writer
+    /// transaction: the page's verdicts, the own typed packages they decide
+    /// and the pass's cursor commit together, so a crash repeats or skips no
+    /// row and settles no package twice.
+    pub fn derived_replay_step(&mut self, vm_steps: u64) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        data::replay_page(&tx, vm_steps)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One bounded search-mapping batch in its own writer transaction.
+    pub fn derived_reproject_step(&mut self, vm_steps: u64) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        if bh_data::text::reprojection_pending(&tx).map_err(StoreError::Data)? {
+            bh_data::text::reproject_step(&tx, &bh_data::catalogue::Shipped, 500, vm_steps)
+                .map_err(StoreError::Data)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Canonical Note text for search extraction. File containers have this
+    /// read source; an in-memory one does not. Take it under the DB guard,
+    /// release the guard, then call [`NoteBodyText::next_batch`]: decoding
+    /// needs no writer and must not hold the guard.
+    pub fn note_body_source(&self) -> Option<NoteBodyText> {
+        self.readers.clone().map(NoteBodyText::for_pool)
+    }
+    /// One bounded repair turn: each missing projection is re-derived from its
+    /// catalogue title in its own short transaction, so no Note is decoded. A
+    /// caller may run this while holding the DB guard.
+    pub fn repair_projections(&mut self, max_repairs: usize) -> Result<usize, StoreError> {
+        data::repair_step(&mut self.connection, max_repairs)
+    }
+    /// Store one batch decoded by [`NoteBodyText::next_batch`] in one short
+    /// transaction. Callers take the source from [`Self::note_body_source`]
+    /// under the DB guard, release the guard while decoding, then reacquire it
+    /// only for this call. A job whose revision moved while it was decoded
+    /// stores nothing and stays queued at its new revision. Returns how many
+    /// jobs were attempted and how many were stored; the work limit can leave
+    /// later jobs of the batch for a later turn.
+    pub fn store_body_batch(
+        &mut self,
+        batch: &[text::DecodedJob],
+        max_vm_steps: u64,
+    ) -> Result<text::ExtractOutcome, StoreError> {
+        if batch.is_empty() {
+            return Ok(text::ExtractOutcome::default());
+        }
+        let tx = self.connection.transaction()?;
+        let outcome =
+            text::store_batch_bounded(&tx, batch, max_vm_steps).map_err(StoreError::Data)?;
+        tx.commit()?;
+        Ok(outcome)
     }
     /// Per-container budget; only durably committed Notes are retained here.
     pub fn set_note_cache_budget(&mut self, bytes: usize) {
@@ -562,6 +742,47 @@ impl DeviceDatabase {
         title: Option<&str>,
         writer: Option<&note_writers::WriterSlot>,
     ) -> Result<LocalCommit, StoreError> {
+        self.commit_working_update_mode(key, frontier, anchor, request, bytes, title, writer, true)
+    }
+    /// Measurement-only baseline for the paired commit comparison: the same
+    /// atomic save without the derived projection.
+    #[cfg(feature = "testkit")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_working_update_with_title_baseline(
+        &mut self,
+        key: NoteKey,
+        frontier: i64,
+        anchor: [u8; 32],
+        request: [u8; 16],
+        bytes: &[u8],
+        title: &str,
+    ) -> Result<LocalCommit, StoreError> {
+        if title.chars().count() > MAX_NOTE_TITLE {
+            return Err(StoreError::InvalidNoteTitle);
+        }
+        self.commit_working_update_mode(
+            key,
+            frontier,
+            anchor,
+            request,
+            bytes,
+            Some(title),
+            None,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn commit_working_update_mode(
+        &mut self,
+        key: NoteKey,
+        frontier: i64,
+        anchor: [u8; 32],
+        request: [u8; 16],
+        bytes: &[u8],
+        title: Option<&str>,
+        writer: Option<&note_writers::WriterSlot>,
+        project: bool,
+    ) -> Result<LocalCommit, StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -621,6 +842,15 @@ impl DeviceDatabase {
             note_writers::link(&tx, id, writer)?;
         }
         catalogue::touch(&tx, key, title)?;
+        if project {
+            // An untitled save still changed the body, so the projection follows
+            // the catalogue title it already has.
+            let title = match title {
+                Some(title) => title.to_owned(),
+                None => data::catalogued_title(&tx, key)?,
+            };
+            data::project_note(&tx, key, &title)?;
+        }
         tx.commit()?;
         Ok(LocalCommit {
             update_id: id,
@@ -680,6 +910,8 @@ impl DeviceDatabase {
             ],
         )?;
         catalogue::touch(&tx, key, None)?;
+        let title = data::catalogued_title(&tx, key)?;
+        data::project_note(&tx, key, &title)?;
         tx.commit()?;
         if let Some(entry) = self.notes.get_mut(&key) {
             entry.frontier = id;
@@ -999,6 +1231,7 @@ const MIGRATIONS: &[(u32, u32, Migration)] = &[
     (9, 10, note_writers::migrate),
     (10, 11, sync_state::migrate),
     (11, 12, runs::migrate),
+    (12, 13, data::migrate),
 ];
 
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {
@@ -1224,6 +1457,8 @@ fn migrate_v8_to_v9(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod note_cost_tests;
 #[cfg(test)]
 mod outbox_cost_tests;
 #[cfg(test)]

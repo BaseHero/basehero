@@ -12,6 +12,15 @@ use bh_account::{
 };
 use bh_core::note::Note;
 use bh_crypto::{KemKey, Secret, SigningKey};
+use bh_data::{
+    Actor, AppId, MutationId, Position, RecordId, RevisionId, Scope, TypeId,
+    catalogue::Shipped,
+    mutation::{
+        ops::{FieldChange, Operation},
+        pending::LocalSaved,
+    },
+    store::{coverage::Coverage, records::RecordRow},
+};
 use bh_device::{
     ContainerId, Owner, OwnerError, SealRefusal,
     coordinator::Delivery,
@@ -19,11 +28,16 @@ use bh_device::{
     own_base::create_or_open,
 };
 use bh_event::{
-    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, History, NOTE, Payload, key_id,
-    note_payload, seal,
+    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, History, NOTE, Payload,
+    TYPED_DATA, key_id, note_payload, seal,
     writer::{DeviceWriterDeclaration, WriterScope},
 };
-use bh_storage::{NoteKey, StoreError, sync_state::SyncAlarm};
+use bh_storage::{
+    NoteKey, StoreError,
+    retained::RetainedContent,
+    sync_state::{PackageOutcome, SyncAlarm},
+    typed_outbox::TypedPackagePreparation,
+};
 use bh_sync::{
     BaseId, BodyObject, Commitment, Digest, EventId, Head, OpaqueEvent, Route,
     receipt::{self, CertifiedReceiptKey, RECEIPT_LEN},
@@ -38,6 +52,68 @@ mod protector;
 mod store;
 
 type Account = AccountOwner<DeviceJournal, store::FakeStore, protector::PlainProtector>;
+
+/// The Note specialisation these tests bind a Note to: a shipped fixture
+/// definition extending the core Note, with an optional `/mood` string.
+struct JournalEntry;
+impl JournalEntry {
+    fn bytes() -> &'static [u8] {
+        include_bytes!("../../data/tests/fixtures/types/JournalEntry.json")
+    }
+    fn app() -> AppId {
+        AppId([2; 32])
+    }
+    fn type_id() -> TypeId {
+        bh_data::definition::parse(Self::bytes()).unwrap().type_id
+    }
+    fn revision() -> RevisionId {
+        RevisionId::of(Self::bytes())
+    }
+    fn bind(note: [u8; 32]) -> Operation {
+        Operation::BindNote {
+            note: RecordId(note),
+            type_id: Self::type_id(),
+            revision: Self::revision(),
+            doc: serde_json::json!({ "date": 1_700_000_000_000_i64 }),
+        }
+    }
+    fn edit(note: [u8; 32], mood: &str) -> Operation {
+        Operation::Edit {
+            record: RecordId(note),
+            revision: Self::revision(),
+            changes: vec![FieldChange {
+                path: bh_data::FieldPath::parse("/mood").unwrap(),
+                value: Some(serde_json::json!(mood)),
+            }],
+        }
+    }
+}
+
+/// A non-Note record type, with the value type it uses, for typed work that
+/// must keep applying beside a Note this build cannot show.
+struct Recipe;
+impl Recipe {
+    fn address() -> &'static [u8] {
+        include_bytes!("../../data/tests/fixtures/types/Address.json")
+    }
+    fn bytes() -> &'static [u8] {
+        include_bytes!("../../data/tests/fixtures/types/Recipe.json")
+    }
+    fn type_id() -> TypeId {
+        bh_data::definition::parse(Self::bytes()).unwrap().type_id
+    }
+    fn revision() -> RevisionId {
+        RevisionId::of(Self::bytes())
+    }
+    fn create(record: [u8; 32], name: &str) -> Operation {
+        Operation::Create {
+            record: RecordId(record),
+            type_id: Self::type_id(),
+            revision: Self::revision(),
+            doc: serde_json::json!({ "name": name }),
+        }
+    }
+}
 
 #[test]
 fn incoming_log_id_is_the_permit_log_id_and_storage_codes_match_the_wire() {
@@ -108,8 +184,10 @@ struct Fixture {
 impl Fixture {
     /// Sign up, create the own base, register it and apply its genesis.
     fn new() -> Self {
+        Self::with_owner(Owner::without_maintenance())
+    }
+    fn with_owner(owner: Owner) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let owner = Owner::default();
         let id = owner.create_container(dir.path()).unwrap();
         let db = owner.shared_database(id).unwrap();
         let generation = AccountGeneration::new();
@@ -371,6 +449,248 @@ impl Fixture {
             update,
         )
     }
+    /// A content event of any class-content kind, signed by this device.
+    fn content_event(&self, kind: u16, data: &[u8]) -> Encoded {
+        let binding = self.binding(
+            EventId(bh_crypto::random()),
+            self.cap.device_id(),
+            CLASS_CONTENT,
+            self.hosting.receipt(self.base, self.history.head()),
+        );
+        let state = self.store.state();
+        self.seal_binding(binding, kind, data, state.ordinary.as_ref().unwrap())
+    }
+    /// A note event for `note` by writer `nonce`, with its declaration and
+    /// update authored by the same writer.
+    fn note_event(&self, note: [u8; 32], nonce: [u8; 32]) -> Encoded {
+        let writer = self.writer(nonce);
+        self.remote(note, nonce, &seed(self.client(note, writer)))
+    }
+    /// A note payload whose writer declaration this build cannot read: the
+    /// declaration version is 2, and the Yjs update is otherwise valid.
+    fn unsupported_declaration(&self, note: [u8; 32], nonce: [u8; 32]) -> Vec<u8> {
+        let writer = self.writer(nonce);
+        let mut payload = note_payload(note, writer, &seed(self.client(note, writer)));
+        payload[33] = 2;
+        payload
+    }
+    /// The signed author of every event this fixture seals.
+    fn actor(&self) -> Actor {
+        Actor::Device {
+            account: self.cap.account_id().0,
+            device: self.cap.device_id().0,
+        }
+    }
+    fn base_scope(&self) -> Scope {
+        Scope {
+            base: self.base.0,
+            audience: [0; 32],
+        }
+    }
+    /// One typed operation's payload, as a publisher hands it to the envelope.
+    fn typed_bytes(op: &Operation) -> Vec<u8> {
+        bh_data::payload::encode(MutationId::random(), op).unwrap()
+    }
+    /// A typed-data content event carrying `op`.
+    fn typed(&self, op: &Operation) -> Encoded {
+        self.content_event(TYPED_DATA, &Self::typed_bytes(op))
+    }
+    /// Seed the accepted typed state a build with host admission would have
+    /// ordered earlier in the log: an app, a Note specialisation and its
+    /// activation at typed positions 1-3. Only typed events advance the typed
+    /// position, so a test's first typed event must sit at a log position
+    /// above 3; Note and control events do not consume those positions.
+    fn seed_note_specialisation(&self) {
+        self.seed_types(&[JournalEntry::bytes()]);
+    }
+    /// Seed the app's active state and these type definitions, as a build with
+    /// host admission would have ordered them before the log's first typed
+    /// event: DefineApp at 1, each definition at 2.., activation last.
+    fn seed_types(&self, defs: &[&[u8]]) {
+        let raw = self.raw();
+        let actor = self.actor();
+        let last = defs.len() as u64 + 2;
+        let mut ops = vec![(
+            1,
+            Operation::DefineApp {
+                app: JournalEntry::app(),
+                name: "Journal".into(),
+            },
+        )];
+        for (index, bytes) in defs.iter().enumerate() {
+            ops.push((
+                index as u64 + 2,
+                Operation::DefineType {
+                    bytes: bytes.to_vec(),
+                },
+            ));
+        }
+        ops.push((
+            last,
+            Operation::SetAppState {
+                app: JournalEntry::app(),
+                active: true,
+            },
+        ));
+        for (position, op) in ops {
+            let tx = raw.unchecked_transaction().unwrap();
+            let outcome = bh_data::testkit::apply_payload(
+                &tx,
+                &Shipped,
+                self.base_scope(),
+                Position(position),
+                &actor,
+                &bh_data::testkit::assumed_payload(
+                    &tx,
+                    &Shipped,
+                    self.base_scope(),
+                    &actor,
+                    MutationId::random(),
+                    &op,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                matches!(outcome, bh_data::mutation::apply::Outcome::Accepted { .. }),
+                "seeded definition rejected: {outcome:?}"
+            );
+            tx.commit().unwrap();
+        }
+    }
+    /// Save a typed operation as this device's pending work, as a local write
+    /// would, and return the exact bytes to publish for it.
+    fn submit_typed(&self, op: Operation) -> LocalSaved {
+        let raw = self.raw();
+        let tx = raw.unchecked_transaction().unwrap();
+        let saved =
+            bh_data::testkit::submit(&tx, &Shipped, self.base_scope(), &self.actor(), op).unwrap();
+        tx.commit().unwrap();
+        saved
+    }
+    /// Save and seal the exact local typed package for an incoming echo.
+    fn own_typed_package(&self, op: Operation) -> (Encoded, i64, MutationId) {
+        let db = self.owner.shared_database(self.id).unwrap();
+        let mut db = db.lock().unwrap();
+        let queued = db
+            .submit_typed(
+                &Shipped,
+                self.base_scope(),
+                &self.actor(),
+                op,
+                &bh_data::testkit::AssumedAdmission,
+            )
+            .unwrap();
+        let candidate = match db.prepare_typed_package(queued.package).unwrap() {
+            TypedPackagePreparation::Candidate(candidate) => candidate,
+            TypedPackagePreparation::Existing(_) => panic!("new package already sealed"),
+        };
+        let binding = self.binding(
+            candidate.event_id,
+            self.cap.device_id(),
+            CLASS_CONTENT,
+            self.hosting.receipt(self.base, self.history.head()),
+        );
+        let encoded = self.seal_binding(
+            binding,
+            TYPED_DATA,
+            &candidate.payload,
+            self.store.state().ordinary.as_ref().unwrap(),
+        );
+        db.publish_typed_package(
+            candidate,
+            encoded.descriptor.clone(),
+            BodyObject::new(encoded.body.clone()).unwrap(),
+        )
+        .unwrap();
+        (encoded, queued.package, queued.saved.mutation)
+    }
+    fn typed_package_outcome(&self, package: i64) -> Option<PackageOutcome> {
+        self.owner
+            .shared_database(self.id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .typed_package_progress(package)
+            .unwrap()
+            .unwrap()
+            .outcome
+    }
+    fn typed_record(&self, note: [u8; 32]) -> Option<RecordRow> {
+        let raw = self.raw();
+        let sid = bh_data::store::records::lookup_scope(&raw, self.base_scope()).unwrap()?;
+        bh_data::store::records::get(&raw, sid, RecordId(note)).unwrap()
+    }
+    fn typed_coverage(&self) -> Option<Coverage> {
+        let raw = self.raw();
+        let sid = bh_data::store::records::lookup_scope(&raw, self.base_scope()).unwrap()?;
+        Some(bh_data::store::coverage::get(&raw, sid).unwrap())
+    }
+    /// The Note gaps this replica records for its ordinary scope.
+    fn note_gaps(&self) -> i64 {
+        let raw = self.raw();
+        let Some(sid) = bh_data::store::records::lookup_scope(&raw, self.base_scope()).unwrap()
+        else {
+            return 0;
+        };
+        raw.query_row(
+            "SELECT count(*) FROM data_note_gap WHERE scope=?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+    /// One page of a typed listing, through the shared query contract.
+    fn page(&self, select: bh_data::query::TypeSelect) -> bh_data::query::Page {
+        let raw = self.raw();
+        let scope = self.base_scope();
+        bh_data::query::run(
+            &raw,
+            scope,
+            &[scope],
+            &Shipped,
+            &bh_data::query::Query {
+                select,
+                filter: None,
+                sort: vec![],
+                fields: vec![],
+                follow: vec![],
+                text: None,
+                limit: 50,
+                after: None,
+            },
+            bh_data::query::Budget::INTERACTIVE,
+        )
+        .unwrap_or_else(|e| panic!("query failed: {e:?}"))
+    }
+    fn parked(&self) -> i64 {
+        self.raw()
+            .query_row("SELECT count(*) FROM data_parked", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn parked_rows(&self) -> Vec<(i64, String, Vec<u8>)> {
+        self.raw()
+            .prepare("SELECT position,affects,payload FROM data_parked ORDER BY position")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn pending_typed(&self) -> i64 {
+        self.raw()
+            .query_row("SELECT count(*) FROM data_pending", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn retained(&self) -> Vec<RetainedContent> {
+        self.owner
+            .shared_database(self.id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_content(self.base.0, [0; 32], None, 256)
+            .unwrap()
+    }
     /// Order and verify these events after `history`'s head, as a puller does.
     fn batch_from(&self, history: &mut History, events: &[&Encoded]) -> VerifiedBatch {
         let mut applied = Vec::new();
@@ -512,6 +832,26 @@ impl Fixture {
             "note_checkpoints",
             "notes",
             "note_counter",
+            "data_scope",
+            "data_app",
+            "data_app_at",
+            "data_type",
+            "data_type_at",
+            "data_definition",
+            "data_ordered",
+            "data_coverage",
+            "data_record",
+            "data_field_clock",
+            "data_history",
+            "data_pending",
+            "data_parked",
+            "data_retained",
+            "data_note_gap",
+            "data_index_entry",
+            "data_unique",
+            "data_ref",
+            "data_text_state",
+            "data_text_job",
         ]
         .iter()
         .map(|table| {
@@ -1240,6 +1580,61 @@ fn remote_edit_applies_and_fans_out() {
     assert!(f.owner.has_note(f.id, fresh).unwrap());
     let listed = f.owner.list_notes(f.id, None, 10).unwrap();
     assert!(listed.iter().any(|e| e.note == fresh && e.title == "hello"));
+    let catalogue = f
+        .owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .list_notes(f.base.0, [0; 32], None, 10)
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|e| e.note).collect::<Vec<_>>(),
+        catalogue.iter().map(|e| e.note).collect::<Vec<_>>(),
+        "incoming ordinary Note changes preserve catalogue order"
+    );
+}
+
+#[test]
+fn plain_note_list_matches_catalogue_after_local_and_incoming_commits() {
+    let mut f = Fixture::new();
+    let (local, _) = f.own_work();
+    let first_remote = [70; 32];
+    let incoming = f.note_event(first_remote, [1; 32]);
+    assert_eq!(f.apply(&[&incoming]).len(), 1);
+    let (next_local, _) = f.own_work();
+    let second_remote = [71; 32];
+    let incoming = f.note_event(second_remote, [2; 32]);
+    assert_eq!(f.apply(&[&incoming]).len(), 1);
+    let writer = f.writer([1; 32]);
+    let client = f.client(first_remote, writer);
+    let incoming = f.remote(
+        first_remote,
+        [1; 32],
+        &item(client, 7, (client, 6), None, "more"),
+    );
+    assert_eq!(
+        f.apply(&[&incoming]),
+        vec![(f.key(first_remote), NoteOutcome::Accepted)]
+    );
+    let old = f
+        .owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .list_notes(f.base.0, [0; 32], None, 50)
+        .unwrap();
+    let new = f.owner.list_notes_page(f.id, None, 50).unwrap();
+    assert_eq!(new.completeness, bh_data::query::Completeness::Complete);
+    assert_eq!(
+        new.rows.iter().map(|r| r.note).collect::<Vec<_>>(),
+        old.iter().map(|r| r.note).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        new.rows.iter().map(|r| r.note).collect::<Vec<_>>(),
+        vec![first_remote, second_remote, next_local, local]
+    );
 }
 
 #[test]
@@ -2136,8 +2531,117 @@ fn a_history_pinned_to_another_root_is_unavailable() {
     assert_eq!(f.dump(), before, "no progress");
 }
 
+/// Generous bound on waiting for a worker report; it only stops a hung test.
+const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits out the maintenance setup scheduled itself (registration, genesis):
+/// a turn decides whether it continues before reporting, so an idle
+/// container after a report has nothing queued, deferred or running.
+fn settle_setup_maintenance(f: &Fixture, turns: &std::sync::mpsc::Receiver<(ContainerId, usize)>) {
+    while !f.owner.maintenance_idle(f.id) {
+        let (id, _) = turns.recv_timeout(HANG).expect("setup maintenance");
+        assert_eq!(id, f.id);
+    }
+    while turns.try_recv().is_ok() {}
+}
+
+#[test]
+fn typed_only_saves_schedule_a_quiet_checkpoint() {
+    let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let (completed, turns) = std::sync::mpsc::channel();
+    let now = {
+        let clock = Arc::clone(&clock);
+        move || *clock.lock().unwrap()
+    };
+    let f = Fixture::with_owner(Owner::notifying_maintenance_with_clock(
+        completed,
+        now,
+        std::time::Duration::from_millis(750),
+    ));
+    settle_setup_maintenance(&f, &turns);
+    let before = f.owner.maintenance_stats(f.id).unwrap().len();
+    assert!(before < 64, "the diagnostics ring still counts new turns");
+    let records = f.owner.records(f.id).unwrap();
+    let db = f.owner.shared_database(f.id).unwrap();
+    db.lock()
+        .unwrap()
+        .with_data_read(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    for n in 0..100u8 {
+        records
+            .submit(Operation::DefineApp {
+                app: AppId([n; 32]),
+                name: format!("App {n}"),
+            })
+            .unwrap();
+    }
+    // The burst's turn waits for a quiet period the test clock has not
+    // reached, so nothing ran during the burst.
+    assert!(
+        !f.owner.maintenance_idle(f.id),
+        "typed saves must schedule quiet maintenance"
+    );
+    assert!(turns.try_recv().is_err());
+    assert_eq!(f.owner.maintenance_stats(f.id).unwrap().len(), before);
+    *clock.lock().unwrap() += std::time::Duration::from_millis(751);
+    f.owner.wake_maintenance();
+    let (id, _) = turns.recv_timeout(HANG).expect("the post-burst turn");
+    assert_eq!(id, f.id);
+    let stats = f.owner.maintenance_stats(f.id).unwrap();
+    assert_eq!(stats.len(), before + 1, "exactly the post-burst turn ran");
+    assert!(
+        stats[before].checkpoint_frames > 0,
+        "typed saves must checkpoint in a quiet turn, below the inline cap: {:?}",
+        stats[before]
+    );
+}
+
+#[test]
+fn a_records_handle_kept_after_owner_drop_holds_no_workers() {
+    let (completed, turns) = std::sync::mpsc::channel();
+    let f = Fixture::with_owner(Owner::notifying_maintenance(completed));
+    let records = f.owner.records(f.id).unwrap();
+    let (dir, owner, id) = {
+        let f = f;
+        let Fixture { dir, owner, id, .. } = f;
+        (dir, owner, id)
+    };
+    drop(owner);
+    // Dropping the Owner joined its workers: the scheduler and both workers
+    // held the only senders, so the report channel closes once they exit.
+    loop {
+        match turns.recv_timeout(HANG) {
+            Ok((turn, _)) => assert_eq!(turn, id),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("a records handle kept the Owner's workers alive")
+            }
+        }
+    }
+    // The handle still saves; with no scheduler left it schedules nothing.
+    records
+        .submit(Operation::DefineApp {
+            app: AppId([3; 32]),
+            name: "After".into(),
+        })
+        .unwrap();
+    drop(records);
+    // Nothing holds the container now: an ordinary Owner opens the same file.
+    let path = std::fs::read_dir(dir.path().join("accounts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+        .unwrap();
+    bh_storage::DeviceDatabase::open(&path).expect("container released after the handle");
+}
+
 #[test]
 fn stop_is_sticky_and_keeps_state() {
+    // The fixture excludes unrelated body extraction between exact snapshots.
     let mut f = Fixture::new();
     let note = [7; 32];
     let s = f.client(note, f.writer([1; 32]));
@@ -2481,6 +2985,42 @@ fn native_note_seal_is_accepted_as_this_devices_package() {
     assert!(f.alarms().is_empty());
 }
 
+#[test]
+fn note_seal_checks_base_and_anchor_before_missing_declaration() {
+    let mut f = Fixture::new();
+    let (_, id) = f.own_work();
+    let db = f.owner.shared_database(f.id).unwrap();
+    let bh_storage::PackagePreparation::Candidate(mut candidate) =
+        db.lock().unwrap().prepare_note_package(id).unwrap()
+    else {
+        panic!("already packaged")
+    };
+    candidate.pending.writer = None;
+    candidate.pending.key.base = [3; 32];
+    let seal = |candidate: &bh_storage::PackageCandidate, anchor: &bh_account::VerifiedAccount| {
+        f.owner
+            .prepare_note_seal(
+                f.id,
+                anchor,
+                f.hosting.root.public(),
+                &f.metadata,
+                &f.content,
+                candidate,
+            )
+            .map(|_| ())
+    };
+    assert!(matches!(
+        seal(&candidate, &f.anchor),
+        Err(OwnerError::Unbound)
+    ));
+    candidate.pending.key.base = f.base.0;
+    let other = Fixture::new();
+    assert!(matches!(
+        seal(&candidate, &other.anchor),
+        Err(OwnerError::AnchorMismatch)
+    ));
+}
+
 /// Sealing cannot check the receipt it signs, so the producer does: a seen
 /// receipt that does not verify under the pinned root for the stored head,
 /// a closed epoch, or another hosting root seals nothing.
@@ -2631,4 +3171,910 @@ fn an_incoming_commit_rechecks_the_authority_it_was_read_under() {
         .unwrap();
     assert_eq!(outcomes, vec![(f.key(note), NoteOutcome::Accepted)]);
     assert_eq!(f.progress().position, position + 1);
+}
+
+/// A content kind this build does not know is kept exactly where it was
+/// ordered: the notes around it apply, verified progress advances, and the
+/// scope's typed coverage stays incomplete while the bytes are held.
+#[test]
+fn unsupported_typed_version_requires_newer_build_for_its_base() {
+    let mut f = Fixture::new();
+    let mut bytes = Fixture::typed_bytes(&JournalEntry::bind([21; 32]));
+    bytes[..2].copy_from_slice(&2u16.to_be_bytes());
+    let event = f.content_event(TYPED_DATA, &bytes);
+    assert!(f.apply(&[&event]).is_empty());
+    assert_eq!(f.parked(), 1);
+    let db = f.owner.shared_database(f.id).unwrap();
+    assert!(!db.lock().unwrap().needs_newer_build([91; 32]).unwrap());
+    assert!(db.lock().unwrap().needs_newer_build(f.base.0).unwrap());
+}
+
+#[test]
+fn retained_unknown_content_keeps_its_bytes_and_notes_apply() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([21; 32], [22; 32]);
+    let create_a = f.note_event(a, [1; 32]);
+    let unknown = f.content_event(0xf123, b"unknown content kind");
+    let create_b = f.note_event(b, [2; 32]);
+    let outcomes = f.apply(&[&create_a, &unknown, &create_b]);
+    assert_eq!(
+        outcomes,
+        vec![
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(b), NoteOutcome::Accepted)
+        ]
+    );
+    assert_eq!(f.progress().position, 4);
+    let retained = f.retained();
+    assert_eq!(retained.len(), 1);
+    let row = &retained[0];
+    assert_eq!(row.position, Position(3));
+    assert_eq!(row.kind, 0xf123);
+    assert_eq!(row.payload, b"unknown content kind");
+    assert_eq!(row.note, None);
+    assert_eq!(row.audience, [0; 32]);
+    assert_eq!(
+        row.author,
+        Some((f.cap.account_id().0, f.cap.device_id().0))
+    );
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(4)));
+    assert!(
+        coverage.complete,
+        "the typed log is complete; unknown content is not a typed gap"
+    );
+    assert_eq!(f.accepted(a).title_preview().unwrap(), "hello");
+    // A newer build is needed, and only that line says so.
+    let db = f.owner.shared_database(f.id).unwrap();
+    assert!(db.lock().unwrap().needs_newer_build(f.base.0).unwrap());
+    // Unknown outer content is not a Note gap: Note listings stay complete.
+    assert_eq!(f.note_gaps(), 0);
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Family(TypeId::core("note")))
+            .completeness,
+        bh_data::query::Completeness::Complete
+    );
+
+    // Unknown content is not a blanket stop: typed work still applies here.
+    let bind = f.typed(&JournalEntry::bind(a)); // position 5
+    assert!(f.apply(&[&bind]).is_empty());
+    let record = f.typed_record(a).unwrap();
+    assert_eq!(record.type_id, JournalEntry::type_id());
+    assert_eq!(record.accepted.unwrap()["date"], 1_700_000_000_000_i64);
+    assert!(f.typed_coverage().unwrap().complete);
+
+    // Reopen: the exact bytes and the honest incomplete coverage survive.
+    let raw = f.raw();
+    let path = std::path::PathBuf::from(raw.path().unwrap());
+    drop(raw);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let rows: Vec<(i64, i64, Vec<u8>)> = raw
+        .prepare("SELECT position,kind,payload FROM data_retained ORDER BY position")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![(3, 0xf123, b"unknown content kind".to_vec())]);
+    let sid = bh_data::store::records::lookup_scope(&raw, f.base_scope())
+        .unwrap()
+        .unwrap();
+    let coverage = bh_data::store::coverage::get(&raw, sid).unwrap();
+    assert_eq!(coverage.through, Some(Position(5)));
+    assert!(coverage.complete);
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM data_note_gap", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "unknown outer content names no Note"
+    );
+}
+
+/// A Note is created, bound to its specialisation and extended by typed
+/// operations interleaved with another Note's update. Every effect lands in
+/// log order: the binding sees the Note created before it, and the extension
+/// edit sees both.
+#[test]
+fn typed_note_binding_and_extension_apply_in_log_order() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([31; 32], [32; 32]);
+    let wa = f.writer([1; 32]);
+    let wb = f.writer([2; 32]);
+    let create_a = f.remote(a, [1; 32], &seed(f.client(a, wa))); // position 2
+    let create_b = f.remote(b, [2; 32], &seed(f.client(b, wb))); // position 3
+    let bind = f.typed(&JournalEntry::bind(a)); // position 4
+    let update_b = f.remote(b, [3; 32], &seed(f.client(b, f.writer([3; 32])))); // position 5
+    let edit = f.typed(&JournalEntry::edit(a, "glad")); // position 6
+    let outcomes = f.apply(&[&create_a, &create_b, &bind, &update_b, &edit]);
+    assert_eq!(
+        outcomes,
+        vec![
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(b), NoteOutcome::Accepted),
+            (f.key(b), NoteOutcome::Accepted),
+        ]
+    );
+    let record = f.typed_record(a).unwrap();
+    assert_eq!(record.type_id, JournalEntry::type_id());
+    assert_eq!(record.revision, JournalEntry::revision());
+    let accepted = record.accepted.unwrap();
+    assert_eq!(accepted["date"], 1_700_000_000_000_i64);
+    assert_eq!(accepted["mood"], "glad");
+    // The other Note is untouched by typed work and keeps its own update.
+    assert_eq!(f.typed_record(b).unwrap().type_id, TypeId::core("note"));
+    assert_eq!(f.accepted(a).title_preview().unwrap(), "hello");
+    assert_eq!(f.parked(), 0);
+    assert!(f.typed_coverage().unwrap().complete);
+}
+
+/// A typed binding ordered before its Note creates parks, then applies at its
+/// own position once the Note's projection arrives: in the same batch, and in
+/// a later one.
+#[test]
+fn a_binding_before_its_note_parks_then_applies_at_its_position() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([41; 32], [42; 32]);
+    let wb = f.writer([2; 32]);
+    // Non-typed events first, so the typed operations sit above the fixture's
+    // seeded typed positions.
+    let create_b = f.remote(b, [1; 32], &seed(f.client(b, wb)));
+    let update_b = f.remote(b, [2; 32], &seed(f.client(b, f.writer([3; 32]))));
+    let bind = f.typed(&JournalEntry::bind(a));
+    assert_eq!(f.apply(&[&create_b, &update_b, &bind]).len(), 2);
+
+    // The binding waits for its Note, under that record only.
+    assert_eq!(f.parked(), 1);
+    let parked = f.parked_rows();
+    assert_eq!(parked[0].0, 4);
+    assert_eq!(parked[0].1, format!("r:{}", hex(&a)));
+    assert!(f.typed_record(a).is_none());
+
+    // The Note's projection arrives in the next batch and unblocks it.
+    let wa = f.writer([1; 32]);
+    let create_a = f.remote(a, [1; 32], &seed(f.client(a, wa)));
+    let outcomes = f.apply(&[&create_a]);
+    assert_eq!(outcomes, vec![(f.key(a), NoteOutcome::Accepted)]);
+    assert_eq!(f.parked(), 0, "the parked binding replayed in order");
+    let record = f.typed_record(a).unwrap();
+    assert_eq!(record.type_id, JournalEntry::type_id());
+    assert_eq!(record.accepted.unwrap()["date"], 1_700_000_000_000_i64);
+}
+
+/// The same relation inside one batch: the Note's projection is created at
+/// its first accepted position, so a binding ordered after it applies, and a
+/// binding ordered before it waits.
+#[test]
+fn a_batch_applies_a_binding_after_its_note_and_parks_one_before_it() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([51; 32], [52; 32]);
+    let create_a = f.note_event(a, [1; 32]); // position 2
+    let update_a = f.note_event(a, [2; 32]); // position 3
+    let bind_b = f.typed(&JournalEntry::bind(b)); // position 4: before b exists
+    let create_b = f.note_event(b, [3; 32]); // position 5
+    let bind_a = f.typed(&JournalEntry::bind(a)); // position 6: after a exists
+    let outcomes = f.apply(&[&create_a, &update_a, &bind_b, &create_b, &bind_a]);
+    assert_eq!(
+        outcomes,
+        vec![
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(b), NoteOutcome::Accepted),
+        ]
+    );
+    // Both bindings applied: the early one from the batch's dependency replay,
+    // the later one directly, each at its own position.
+    assert_eq!(f.typed_record(a).unwrap().type_id, JournalEntry::type_id());
+    assert_eq!(f.typed_record(b).unwrap().type_id, JournalEntry::type_id());
+    assert_eq!(f.parked(), 0);
+}
+
+/// An unreadable Note declaration waits for its own Note only: later events
+/// for that Note are kept behind it in order, other Notes carry on, and the
+/// Note never appears empty or partly updated.
+#[test]
+fn an_unreadable_note_declaration_waits_for_its_own_note_only() {
+    let mut f = Fixture::new();
+    f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+    let (a, b, c) = ([61; 32], [62; 32], [63; 32]);
+    let create_b = f.note_event(b, [1; 32]); // 2
+    let create_a = f.note_event(a, [2; 32]); // 3
+    let bad_a = f.content_event(NOTE, &f.unsupported_declaration(a, [3; 32])); // 4
+    let bad_c = f.content_event(NOTE, &f.unsupported_declaration(c, [4; 32])); // 5
+    let later_a = f.note_event(a, [5; 32]); // 6
+    let later_c = f.note_event(c, [6; 32]); // 7
+    let later_b = f.note_event(b, [7; 32]); // 8
+    let outcomes = f.apply(&[
+        &create_b, &create_a, &bad_a, &bad_c, &later_a, &later_c, &later_b,
+    ]);
+    assert_eq!(
+        outcomes,
+        vec![
+            (f.key(b), NoteOutcome::Accepted),
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(a), NoteOutcome::Waiting),
+            (f.key(c), NoteOutcome::Waiting),
+            (f.key(b), NoteOutcome::Accepted),
+        ]
+    );
+    assert_eq!(f.progress().position, 8);
+    let retained = f.retained();
+    let positions: Vec<u64> = retained.iter().map(|r| r.position.0).collect();
+    assert_eq!(positions, vec![4, 5, 6, 7]);
+    assert!(retained.iter().all(|r| r.kind == NOTE));
+    assert_eq!(retained[0].payload, f.unsupported_declaration(a, [3; 32]));
+    assert_eq!(retained[1].payload, f.unsupported_declaration(c, [4; 32]));
+    assert_eq!(retained[0].note, Some(a));
+    assert_eq!(retained[1].note, Some(c));
+    // The later events are kept exactly as their authors sealed them.
+    assert_eq!(
+        retained[2].payload,
+        note_payload(a, f.writer([5; 32]), &seed(f.client(a, f.writer([5; 32]))))
+    );
+    assert_eq!(
+        retained[3].payload,
+        note_payload(c, f.writer([6; 32]), &seed(f.client(c, f.writer([6; 32]))))
+    );
+    // A keeps the content it had before the wait; C never appears at all.
+    assert_eq!(f.accepted(a).title_preview().unwrap(), "hello");
+    assert!(f.owner.show_note("c", f.id, c).is_err());
+    assert!(f.typed_record(c).is_none());
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(8)));
+    assert!(coverage.complete, "the typed log is complete through 8");
+    // Each Note with unreadable content is a gap in that record, and only the
+    // Note family reads incomplete.
+    assert_eq!(f.note_gaps(), 2);
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Family(TypeId::core("note")))
+            .completeness,
+        bh_data::query::Completeness::Incomplete(vec![bh_data::query::Gap::NoteUnavailable])
+    );
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Exact(Recipe::type_id()))
+            .completeness,
+        bh_data::query::Completeness::Complete
+    );
+    // Unrelated typed work still applies, with nothing parked.
+    let soup = f.typed(&Recipe::create([200; 32], "Soup")); // 9
+    assert!(f.apply(&[&soup]).is_empty());
+    assert_eq!(
+        f.typed_record([200; 32]).unwrap().type_id,
+        Recipe::type_id()
+    );
+    assert_eq!(f.parked(), 0);
+    // A typed change to the gapped Note waits for that record, undecided.
+    let edit = f.typed(&Operation::Edit {
+        record: RecordId(c),
+        revision: bh_data::catalogue::baseline_note().1,
+        changes: vec![FieldChange {
+            path: bh_data::FieldPath::parse("/mood").unwrap(),
+            value: Some(serde_json::json!("waiting")),
+        }],
+    }); // 10
+    assert!(f.apply(&[&edit]).is_empty());
+    let parked = f.parked_rows();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].0, 10);
+    assert_eq!(parked[0].1, format!("r:{}", hex(&c)));
+    // Nothing here is retried on a timer: only a newer build can read it.
+    let (retried, _) = f.owner.retry_held(f.id, f.key(a)).unwrap();
+    assert!(retried.is_empty());
+    assert_eq!(f.accepted(a).title_preview().unwrap(), "hello");
+    assert_eq!(
+        f.retained(),
+        retained,
+        "reopen-equivalent state is unchanged"
+    );
+}
+
+/// A malformed typed payload, an unsupported inner version and content the
+/// rules refuse each take their own outcome; none of them stops Notes, and an
+/// unsupported version waits under its declared `affects` only.
+#[test]
+fn malformed_unsupported_and_invalid_typed_payloads_take_their_own_outcomes() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([71; 32], [72; 32]);
+    let create_a = f.note_event(a, [1; 32]); // 2
+    let create_b = f.note_event(b, [2; 32]); // 3
+    // Version 1 with a header that parses but is not a payload header.
+    let malformed = f.content_event(TYPED_DATA, &[0, 1, 0, 0, 0, 2, b'{', b'}']); // 4
+    // A well-formed edit whose version bytes are from the future: the
+    // header's `affects` still names the record it would change.
+    let mut bytes = Fixture::typed_bytes(&JournalEntry::edit(a, "glad"));
+    bytes[0] = 0xff;
+    bytes[1] = 0xff;
+    let unsupported = f.content_event(TYPED_DATA, &bytes); // 5
+    // A well-formed edit the rules refuse: /mood is not a core Note field.
+    // It names another record, so the unreadable version above does not
+    // queue it behind that record's wait.
+    let invalid = f.typed(&Operation::Edit {
+        record: RecordId(b),
+        revision: bh_data::catalogue::baseline_note().1,
+        changes: vec![FieldChange {
+            path: bh_data::FieldPath::parse("/mood").unwrap(),
+            value: Some(serde_json::json!("cross")),
+        }],
+    }); // 6
+    let later_a = f.note_event(a, [3; 32]); // 7
+    let bind_b = f.typed(&JournalEntry::bind(b)); // 8: another record applies
+    let bind_a = f.typed(&JournalEntry::bind(a)); // 9: queued behind the wait
+    let outcomes = f.apply(&[
+        &create_a,
+        &create_b,
+        &malformed,
+        &unsupported,
+        &invalid,
+        &later_a,
+        &bind_b,
+        &bind_a,
+    ]);
+    assert_eq!(
+        outcomes,
+        vec![
+            (f.key(a), NoteOutcome::Accepted),
+            (f.key(b), NoteOutcome::Accepted),
+            (f.key(a), NoteOutcome::Accepted),
+        ],
+        "typed outcomes never become Note outcomes"
+    );
+    // The refused edit left the Note alone: only the later binding changed it.
+    let projection = f.typed_record(b).unwrap();
+    assert_eq!(projection.type_id, JournalEntry::type_id());
+    let accepted = projection.accepted.unwrap();
+    assert!(accepted.get("mood").is_none(), "{accepted}");
+    assert_eq!(accepted["date"], 1_700_000_000_000_i64);
+    // The unreadable version waits under its own record only, and the binding
+    // of that record queues behind it.
+    let parked = f.parked_rows();
+    assert_eq!(parked.len(), 2);
+    assert_eq!(parked[0].0, 5);
+    assert_eq!(parked[0].1, format!("r:{}", hex(&a)));
+    assert_eq!(parked[0].2, bytes);
+    assert_eq!(parked[1].0, 9);
+    assert_eq!(parked[1].1, format!("r:{}", hex(&a)));
+    assert_eq!(f.accepted(a).title_preview().unwrap(), "hello");
+    assert_eq!(f.progress().position, 9);
+}
+
+/// This replica's own typed work is retired by its exact ordered echo, once;
+/// a second delivery of the same payload changes nothing more.
+#[test]
+fn own_typed_echo_retires_local_work_exactly_once() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let a = [81; 32];
+    let create_a = f.note_event(a, [1; 32]); // 2
+    let filler = f.note_event([82; 32], [2; 32]); // 3
+    assert_eq!(f.apply(&[&create_a, &filler]).len(), 2);
+    let saved = f.submit_typed(JournalEntry::bind(a));
+    assert_eq!(f.pending_typed(), 1);
+    let echo = f.content_event(TYPED_DATA, &saved.payload); // 4
+    assert!(f.apply(&[&echo]).is_empty());
+    assert_eq!(f.pending_typed(), 0, "the exact echo retired the work");
+    let record = f.typed_record(a).unwrap();
+    assert_eq!(record.type_id, JournalEntry::type_id());
+    assert_eq!(
+        record.accepted.clone().unwrap()["date"],
+        1_700_000_000_000_i64
+    );
+    // A duplicate delivery of the same bytes is idempotent.
+    let again = f.content_event(TYPED_DATA, &saved.payload); // 5
+    assert!(f.apply(&[&again]).is_empty());
+    assert_eq!(f.pending_typed(), 0);
+    assert_eq!(f.typed_record(a).unwrap().accepted, record.accepted);
+    assert_eq!(f.parked(), 0);
+}
+
+/// A missing Note projection parks this device's exact edit, which a
+/// later Note projection and replay settle in the same incoming transaction.
+#[test]
+fn parked_own_typed_edit_settles_after_later_projection() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let record = [131; 32];
+    let creation = f.note_event(record, [9; 32]);
+    let filler = f.note_event([180; 32], [20; 32]);
+    assert_eq!(f.apply(&[&creation, &filler]).len(), 2);
+    let binding = f.typed(&JournalEntry::bind(record));
+    assert!(f.apply(&[&binding]).is_empty());
+    let (edit, package, mutation) = f.own_typed_package(JournalEntry::edit(record, "bright"));
+    let raw = f.raw();
+    let tx = raw.unchecked_transaction().unwrap();
+    // Simulate a missing local Note projection while keeping the signed
+    // ordered history and the saved pending edit intact.
+    tx.execute(
+        "DELETE FROM data_record WHERE record=?1",
+        [record.as_slice()],
+    )
+    .unwrap();
+    bh_data::note::mark_unavailable(&tx, f.base_scope(), RecordId(record)).unwrap();
+    tx.commit().unwrap();
+    let rebound = f.typed(&JournalEntry::bind(record));
+    assert!(f.apply(&[&rebound]).is_empty());
+    assert!(f.apply(&[&edit]).is_empty());
+    assert_eq!(f.parked(), 2);
+    assert_eq!(f.pending_typed(), 1);
+    let waiting = f
+        .owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .typed_package_progress(package)
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.outcome, None);
+    assert_eq!(waiting.payload_position, Some(6));
+    let next = f.note_event(record, [10; 32]);
+    assert_eq!(f.apply(&[&next]).len(), 1);
+    assert_eq!(f.parked(), 0);
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Accepted)
+    );
+    let remaining: i64 = f
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM data_pending WHERE mutation=?1",
+            [mutation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        f.typed_record(record).unwrap().accepted.unwrap()["mood"],
+        "bright"
+    );
+    let settled = f
+        .owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .typed_package_progress(package)
+        .unwrap()
+        .unwrap();
+    assert!(f.apply(&[&edit]).is_empty());
+    assert_eq!(
+        f.owner
+            .shared_database(f.id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .typed_package_progress(package)
+            .unwrap()
+            .unwrap(),
+        settled
+    );
+}
+
+#[test]
+fn parked_own_typed_edit_rejected_on_replay_stays_visible() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let record = [132; 32];
+    let first = f.note_event(record, [9; 32]);
+    let filler = f.note_event([181; 32], [20; 32]);
+    assert_eq!(f.apply(&[&first, &filler]).len(), 2);
+    let binding = f.typed(&JournalEntry::bind(record));
+    assert!(f.apply(&[&binding]).is_empty());
+    let (edit, package, mutation) = f.own_typed_package(JournalEntry::edit(record, "bright"));
+    let raw = f.raw();
+    let tx = raw.unchecked_transaction().unwrap();
+    tx.execute(
+        "DELETE FROM data_record WHERE record=?1",
+        [record.as_slice()],
+    )
+    .unwrap();
+    bh_data::note::mark_unavailable(&tx, f.base_scope(), RecordId(record)).unwrap();
+    tx.commit().unwrap();
+    let phantom = f.note_event([183; 32], [24; 32]);
+    let extra = Commitment::order(
+        f.base,
+        f.history.head(),
+        &phantom.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    let wrong_ack =
+        Commitment::order(f.base, extra.head(), &edit.descriptor, Route::Content).unwrap();
+    f.owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .acknowledge_typed_package(package, &wrong_ack)
+        .unwrap();
+    assert!(f.apply(&[&edit]).is_empty());
+    assert_eq!(f.parked(), 1);
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Acked)
+    );
+    assert!(f.alarms().contains(&SyncAlarm::TypedAckMismatch {
+        package,
+        position: 5
+    }));
+    let next = f.note_event(record, [10; 32]);
+    assert_eq!(f.apply(&[&next]).len(), 1);
+    assert_eq!(f.parked(), 0);
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Rejected)
+    );
+    let state: String = f
+        .raw()
+        .query_row(
+            "SELECT state FROM data_pending WHERE mutation=?1",
+            [mutation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "rejected");
+}
+
+#[test]
+fn releasing_held_note_settles_parked_own_typed_package() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (note, _) = f.own_work();
+    let filler_a = f.note_event([183; 32], [21; 32]);
+    let filler_b = f.note_event([184; 32], [22; 32]);
+    assert_eq!(f.apply(&[&filler_a, &filler_b]).len(), 2);
+    let (echo, package, mutation) = f.own_typed_package(JournalEntry::bind(note));
+    let raw = f.raw();
+    raw.execute("DELETE FROM data_record WHERE record=?1", [note.as_slice()])
+        .unwrap();
+    let creation = f.note_event(note, [23; 32]);
+    let batch = f.batch(&[&creation]);
+    let waiting =
+        bh_core::contained::with_fuel(0, || f.owner.apply_remote_batch(f.id, batch)).unwrap();
+    assert_eq!(waiting, vec![(f.key(note), NoteOutcome::Waiting)]);
+    assert!(f.apply(&[&echo]).is_empty());
+    assert_eq!(f.parked(), 1);
+    assert_ne!(f.typed_package_outcome(package), Some(PackageOutcome::Held));
+    let (released, _) = f.owner.retry_held(f.id, f.key(note)).unwrap();
+    assert_eq!(released, vec![(f.key(note), NoteOutcome::Accepted)]);
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Accepted)
+    );
+    let remaining: i64 = f
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM data_pending WHERE mutation=?1",
+            [mutation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn incoming_typed_echo_alarms_a_mismatched_ack() {
+    let mut f = Fixture::new();
+    f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+    let fillers: Vec<_> = (0..3)
+        .map(|i| f.note_event([i + 185; 32], [i + 30; 32]))
+        .collect();
+    assert_eq!(f.apply(&[&fillers[0], &fillers[1], &fillers[2]]).len(), 3);
+    let (echo, package, _) = f.own_typed_package(Recipe::create([140; 32], "Soup"));
+    let phantom = f.note_event([190; 32], [35; 32]);
+    let extra = Commitment::order(
+        f.base,
+        f.history.head(),
+        &phantom.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    let wrong_ack =
+        Commitment::order(f.base, extra.head(), &echo.descriptor, Route::Content).unwrap();
+    f.owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .acknowledge_typed_package(package, &wrong_ack)
+        .unwrap();
+    assert!(f.apply(&[&echo]).is_empty());
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Accepted)
+    );
+    assert!(f.alarms().contains(&SyncAlarm::TypedAckMismatch {
+        package,
+        position: 5
+    }));
+}
+
+#[test]
+fn incoming_own_key_conflict_stops_typed_publishing() {
+    let mut f = Fixture::new();
+    f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+    let fillers: Vec<_> = (0..3)
+        .map(|i| f.note_event([i + 195; 32], [i + 40; 32]))
+        .collect();
+    assert_eq!(f.apply(&[&fillers[0], &fillers[1], &fillers[2]]).len(), 3);
+    let (own, package, _) = f.own_typed_package(Recipe::create([141; 32], "Soup"));
+    let binding = f.binding(
+        own.descriptor.id(),
+        f.cap.device_id(),
+        CLASS_CONTENT,
+        f.hosting.receipt(f.base, f.history.head()),
+    );
+    let conflict = f.seal_binding(
+        binding,
+        TYPED_DATA,
+        &Fixture::typed_bytes(&Recipe::create([142; 32], "Stew")),
+        f.store.state().ordinary.as_ref().unwrap(),
+    );
+    assert!(f.apply(&[&conflict]).is_empty());
+    assert_eq!(
+        f.typed_package_outcome(package),
+        Some(PackageOutcome::Conflicted)
+    );
+    assert!(
+        f.alarms()
+            .contains(&SyncAlarm::TypedPublishingStopped { package })
+    );
+}
+
+/// A failure part-way through a batch leaves progress, the notes, the typed
+/// operations and any retained content exactly as they were.
+#[test]
+fn a_failed_batch_leaves_typed_and_retained_state_unchanged() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (a, b) = ([91; 32], [92; 32]);
+    let wa = f.writer([1; 32]);
+    let create_a = f.remote(a, [1; 32], &seed(f.client(a, wa))); // 2
+    let create_b = f.remote(b, [2; 32], &seed(f.client(b, f.writer([2; 32])))); // 3
+    let bind = f.typed(&JournalEntry::bind(a)); // 4
+    let unknown = f.content_event(0xf123, b"unknown content kind"); // 5
+    let before = f.dump();
+    let before_progress = f.progress();
+    let mut calls = Vec::new();
+    let mut history = f.history.clone();
+    let batch = f.batch_from(&mut history, &[&create_a, &create_b, &bind, &unknown]);
+    let failed = f.owner.apply_remote_batch_with_hook(f.id, batch, |index| {
+        calls.push(index);
+        // Steps are Note a, Note b, the typed binding, then the retained
+        // content: failing before the last one proves the typed writes roll
+        // back with the rest of the batch.
+        if index == 3 {
+            Err(StoreError::InvalidUpdate)
+        } else {
+            Ok(())
+        }
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        calls,
+        vec![0, 1, 2, 3],
+        "failed after the typed operation wrote"
+    );
+    assert_eq!(f.dump(), before, "no table changed");
+    assert_eq!(f.progress(), before_progress);
+    // The same verified batch applies in full on retry.
+    assert_eq!(f.apply(&[&create_a, &create_b, &bind, &unknown]).len(), 2);
+    assert_eq!(f.typed_record(a).unwrap().type_id, JournalEntry::type_id());
+    assert_eq!(f.retained().len(), 1);
+}
+
+/// Coverage states that the typed log is applied through the committed
+/// position. A Note this replica cannot show is a gap in that record, not in
+/// the scope: unrelated typed work and listings continue, and releasing the
+/// hold closes the gap.
+#[test]
+fn coverage_tracks_the_typed_log_and_a_note_gap_stays_in_its_record() {
+    let mut f = Fixture::new();
+    f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+    let (a, b) = ([101; 32], [102; 32]);
+    let create_a = f.note_event(a, [1; 32]); // 2
+    assert_eq!(f.apply(&[&create_a]).len(), 1);
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(2)));
+    assert!(coverage.complete);
+    assert_eq!(f.note_gaps(), 0);
+
+    // A Note the engine cannot judge is a gap in that record at the committed
+    // position, and only the Note family reads incomplete.
+    let hold = f.note_event(b, [2; 32]); // 3
+    let batch = f.batch(&[&hold]);
+    let waiting =
+        bh_core::contained::with_fuel(0, || f.owner.apply_remote_batch(f.id, batch)).unwrap();
+    assert!(waiting.iter().all(|(_, o)| *o == NoteOutcome::Waiting));
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(3)));
+    assert!(coverage.complete);
+    assert_eq!(f.note_gaps(), 1);
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Family(TypeId::core("note")))
+            .completeness,
+        bh_data::query::Completeness::Incomplete(vec![bh_data::query::Gap::NoteUnavailable])
+    );
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Exact(Recipe::type_id()))
+            .completeness,
+        bh_data::query::Completeness::Complete,
+        "an unrelated type is complete while a Note is held"
+    );
+
+    // Unrelated typed work applies and parks nothing. (The seeded definitions
+    // hold typed positions 1-4, so this sits at log position 5.)
+    let filler = f.note_event([103; 32], [3; 32]); // 4
+    assert_eq!(f.apply(&[&filler]).len(), 1);
+    let soup = f.typed(&Recipe::create([201; 32], "Soup")); // 5
+    assert!(f.apply(&[&soup]).is_empty());
+    assert_eq!(
+        f.typed_record([201; 32]).unwrap().type_id,
+        Recipe::type_id()
+    );
+    assert_eq!(f.parked(), 0);
+
+    // Releasing the held row closes the record's gap over the proven position.
+    let (released, _) = f.owner.retry_held(f.id, f.key(b)).unwrap();
+    assert_eq!(released, vec![(f.key(b), NoteOutcome::Accepted)]);
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(5)));
+    assert!(coverage.complete);
+    assert_eq!(f.note_gaps(), 0);
+    assert_eq!(
+        f.page(bh_data::query::TypeSelect::Family(TypeId::core("note")))
+            .completeness,
+        bh_data::query::Completeness::Complete
+    );
+
+    // Unknown outer content asks for a newer build but is no gap anywhere, and
+    // no batch closes it: only a newer build's replay deletes the row.
+    let unknown = f.content_event(0xf123, b"unknown content kind"); // 6
+    f.apply(&[&unknown]);
+    assert!(f.typed_coverage().unwrap().complete);
+    assert_eq!(f.note_gaps(), 0);
+    let db = f.owner.shared_database(f.id).unwrap();
+    assert!(db.lock().unwrap().needs_newer_build(f.base.0).unwrap());
+}
+
+/// A joined container bootstrapping from genesis is fully informed at every
+/// position it applies, so its typed work applies rather than parking; and
+/// activation only marks it usable.
+#[test]
+fn typed_work_applies_during_a_joined_bootstrap() {
+    let mut f = Fixture::new();
+    f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+    // This container is also the joined one, before its bootstrap ended.
+    let account = f.cap.account_id().0;
+    f.raw()
+        .execute(
+            "INSERT INTO joined_device(id,account,hint,delivery,added_at,activated)
+             VALUES(1,?1,zeroblob(1),zeroblob(1),2,0)",
+            [account.as_slice()],
+        )
+        .unwrap();
+    // Typed events must sit above the fixture's seeded typed positions 1-4.
+    let first = f.note_event([111; 32], [1; 32]); // 2
+    let second = f.note_event([112; 32], [2; 32]); // 3
+    let third = f.note_event([113; 32], [3; 32]); // 4
+    assert_eq!(f.apply(&[&first, &second, &third]).len(), 3);
+    let create = f.typed(&Recipe::create([210; 32], "Bootstrap soup")); // 5
+    assert!(f.apply(&[&create]).is_empty());
+    assert_eq!(f.parked(), 0, "a bootstrap does not park typed work");
+    assert_eq!(
+        f.typed_record([210; 32]).unwrap().type_id,
+        Recipe::type_id()
+    );
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(5)));
+    assert!(coverage.complete);
+
+    f.owner
+        .shared_database(f.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .activate_joined()
+        .unwrap();
+    let coverage = f.typed_coverage().unwrap();
+    assert_eq!(coverage.through, Some(Position(5)));
+    assert!(coverage.complete);
+    assert_eq!(f.parked(), 0);
+}
+
+#[test]
+fn typed_creation_before_a_held_notes_first_event_keeps_its_verdict() {
+    let note = [123; 32];
+    let mut held = Fixture::new();
+    let mut normal = Fixture::new();
+    for f in [&mut held, &mut normal] {
+        f.seed_types(&[Recipe::address(), Recipe::bytes()]);
+        // Typed positions seeded through 4; the next typed event is position 6.
+        for n in 124..128 {
+            let filler = f.note_event([n; 32], [1; 32]);
+            f.apply(&[&filler]);
+        }
+    }
+    let create_held = held.typed(&Recipe::create(note, "Soup"));
+    let note_held = held.note_event(note, [2; 32]);
+    let batch = held.batch(&[&create_held, &note_held]);
+    let outcomes =
+        bh_core::contained::with_fuel(0, || held.owner.apply_remote_batch(held.id, batch)).unwrap();
+    assert_eq!(outcomes, vec![(held.key(note), NoteOutcome::Waiting)]);
+    let create_normal = normal.typed(&Recipe::create(note, "Soup"));
+    let note_normal = normal.note_event(note, [2; 32]);
+    normal.apply(&[&create_normal, &note_normal]);
+    assert_eq!(
+        held.parked(),
+        0,
+        "the earlier creation must not see a later hold"
+    );
+    assert_eq!(
+        held.typed_record(note).unwrap().accepted,
+        Some(serde_json::json!({"name": "Soup"}))
+    );
+    let (released, _) = held.owner.retry_held(held.id, held.key(note)).unwrap();
+    assert_eq!(released, vec![(held.key(note), NoteOutcome::Accepted)]);
+    assert_eq!(
+        held.typed_record(note).unwrap().accepted,
+        normal.typed_record(note).unwrap().accepted
+    );
+}
+
+/// Releasing a held Note creates its projection and closes its record's gap,
+/// which are the dependencies its parked typed work waits for: the release
+/// replays that record's queue rather than the whole scope's.
+#[test]
+fn releasing_a_held_note_replays_work_parked_on_its_projection() {
+    let mut f = Fixture::new();
+    f.seed_note_specialisation();
+    let (c, filler) = ([121; 32], [122; 32]);
+    let create_c = f.note_event(c, [1; 32]); // 2
+    let filler_event = f.note_event(filler, [2; 32]); // 3
+    let bind_c = f.typed(&JournalEntry::bind(c)); // 4, parked: c is not projected
+    let edit_c = f.typed(&Operation::Edit {
+        record: RecordId(c),
+        revision: JournalEntry::revision(),
+        changes: vec![FieldChange {
+            path: bh_data::FieldPath::parse("/mood").unwrap(),
+            value: Some(serde_json::json!("waiting")),
+        }],
+    }); // 5, parked behind the same gap
+    let batch = f.batch(&[&create_c, &filler_event, &bind_c, &edit_c]);
+    let waiting =
+        bh_core::contained::with_fuel(0, || f.owner.apply_remote_batch(f.id, batch)).unwrap();
+    assert!(waiting.iter().all(|(_, o)| *o == NoteOutcome::Waiting));
+    assert!(f.typed_record(c).is_none());
+    assert_eq!(f.parked(), 2);
+    let parked = f.parked_rows();
+    assert!(
+        parked
+            .iter()
+            .all(|(_, affects, _)| affects == &format!("r:{}", hex(&c)))
+    );
+
+    // Releasing another Note's hold does not touch this record's queue.
+    let (first, _) = f.owner.retry_held(f.id, f.key(filler)).unwrap();
+    assert_eq!(first, vec![(f.key(filler), NoteOutcome::Accepted)]);
+    assert_eq!(f.note_gaps(), 1);
+    assert_eq!(f.parked(), 2);
+
+    // Releasing this one replays its queue: the binding applies at its
+    // position, and the edit behind it applies, leaving nothing parked.
+    let (released, _) = f.owner.retry_held(f.id, f.key(c)).unwrap();
+    assert_eq!(released, vec![(f.key(c), NoteOutcome::Accepted)]);
+    let row = f.typed_record(c).unwrap();
+    assert_eq!(row.type_id, JournalEntry::type_id());
+    assert_eq!(row.accepted.unwrap()["mood"], "waiting");
+    assert_eq!(f.parked(), 0);
+    assert_eq!(f.note_gaps(), 0);
+    assert!(f.typed_coverage().unwrap().complete);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

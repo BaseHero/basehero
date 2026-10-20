@@ -1,0 +1,30 @@
+{
+  "description": "annotations do not validate",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "link": {
+        "type": "string",
+        "maxLength": 50,
+        "format": "uri",
+        "default": "https://example.com",
+        "examples": [
+          "https://example.com"
+        ],
+        "description": "a link",
+        "readOnly": true
+      }
+    }
+  },
+  "valid": [
+    {
+      "link": "not a uri"
+    },
+    {}
+  ],
+  "invalid": [
+    {
+      "link": 2
+    }
+  ]
+}

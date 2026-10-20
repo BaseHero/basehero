@@ -132,6 +132,24 @@ impl ReadPool {
         }
         Ok(bytes)
     }
+    /// Run one short typed-data query without holding the writer guard.
+    pub fn read_data<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, bh_data::DataError>,
+    ) -> Result<T, bh_data::DataError> {
+        let conn = self
+            .lease()
+            .map_err(|e| bh_data::DataError::Sql(e.to_string()))?;
+        read(&conn)
+    }
+    /// Run one short read-only operation without the writer guard.
+    pub(crate) fn with_connection<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let conn = self.lease()?;
+        read(&conn)
+    }
     fn lease(&self) -> Result<Lease<'_>, StoreError> {
         let mut idle = self.idle.lock().expect("read pool lock");
         loop {

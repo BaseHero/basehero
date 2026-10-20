@@ -8,8 +8,8 @@
 //! same control they reach the same verdict and effect.
 use crate::codec::{
     ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, Error, EventSigningRequest,
-    GENESIS, NOTE, NOTE_PREFIX, OpenPayload, Payload, body_committed, body_named, key_id,
-    open_binding, open_body, prepare_seal,
+    GENESIS, NOTE, NOTE_PREFIX, OpenPayload, Payload, TYPED_DATA, body_committed, body_named,
+    key_id, open_binding, open_body, prepare_seal,
 };
 use crate::genesis::{VerifiedGenesis, judge_genesis};
 use crate::history::{History, Outcome, Seen};
@@ -196,6 +196,12 @@ pub(crate) enum Judged {
         writer: DeviceWriterDeclaration,
         payload: OpenPayload,
     },
+    /// Typed data this build carries but does not parse.
+    Typed { payload: OpenPayload },
+    /// A class-content kind this build does not know.
+    UnknownContent { kind: u16, payload: OpenPayload },
+    /// A note event whose writer declaration this build cannot read.
+    NoteUnsupported { id: [u8; 32], payload: OpenPayload },
     Control {
         /// The account after an account change; None when unchanged.
         account: Option<Arc<VerifiedAccount>>,
@@ -286,10 +292,12 @@ pub(crate) fn judge(
             let id: [u8; 32] = data[..32].try_into().expect("length checked");
             let writer = match DeviceWriterDeclaration::decode(&data[32..NOTE_PREFIX]) {
                 Ok(writer) => writer,
+                // A declaration only a newer version reads names the note it
+                // is for, so that note alone waits; the exact bytes are kept.
                 Err(
                     WriterDecodeError::UnsupportedVersion(_)
                     | WriterDecodeError::UnsupportedAuthor(_),
-                ) => return Err(Outcome::UnsupportedPause),
+                ) => return Ok(Judged::NoteUnsupported { id, payload }),
                 Err(_) => return Err(invalid),
             };
             Ok(Judged::Note {
@@ -298,9 +306,16 @@ pub(crate) fn judge(
                 payload,
             })
         }
+        (CLASS_CONTENT, TYPED_DATA) if !genesis => Ok(Judged::Typed { payload }),
+        // Known kinds in the wrong class stay the author's invalid submission.
         (CLASS_CONTROL, GENESIS)
         | (CLASS_CONTENT, GENESIS | ACCOUNT_CHANGE)
-        | (CLASS_CONTROL, NOTE) => Err(invalid),
+        | (CLASS_CONTROL, NOTE | TYPED_DATA) => Err(invalid),
+        // Any other class-content kind is content this build retains without
+        // applying: its exact bytes are kept, history continues past it, and
+        // the scope it could affect reports incomplete until a newer build
+        // replays it. It never changes control state.
+        (CLASS_CONTENT, kind) if !genesis => Ok(Judged::UnknownContent { kind, payload }),
         _ => Err(Outcome::UnsupportedPause),
     }
 }

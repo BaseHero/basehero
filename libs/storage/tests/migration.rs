@@ -5,6 +5,9 @@ use bh_core::LOCAL_DATA_VERSION;
 use bh_storage::{DeviceDatabase, OpenError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
+#[path = "support/legacy.rs"]
+mod legacy;
+
 fn version(connection: &Connection) -> u32 {
     connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -171,6 +174,7 @@ fn failed_v8_to_v9_rolls_back_projection_and_preserves_pending_work() {
     conn.execute("INSERT INTO pending_note_work(update_id) VALUES (1)", [])
         .unwrap();
     conn.execute_batch("DROP TABLE note_outbox_members; DROP TABLE joined_device; DROP TABLE base_control_outbox; DROP TABLE registration; DROP TABLE sync_alarm; DROP TABLE note_outbox_progress; DROP TABLE writer_binding; DROP TABLE accepted_note_tail; DROP TABLE accepted_note; DROP TABLE log_floor; DROP TABLE log_account_change; DROP TABLE log_event_id; DROP TABLE log_seen; DROP TABLE log_progress; DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; PRAGMA user_version=8; CREATE TABLE own_base(bogus INTEGER);").unwrap();
+    legacy::drop_data_tables(&conn);
     drop(conn);
     assert!(DeviceDatabase::open(&path).is_err());
     let conn = Connection::open(&path).unwrap();
@@ -506,6 +510,7 @@ fn v3_to_v4_preserves_pending_notes_and_account_journal() {
         "DROP TABLE note_outbox_members; DROP TABLE joined_device; DROP TABLE base_control_outbox; DROP TABLE registration; DROP TABLE sync_alarm; DROP TABLE note_outbox_progress; DROP TABLE writer_binding; DROP TABLE accepted_note_tail; DROP TABLE accepted_note; DROP TABLE log_floor; DROP TABLE log_account_change; DROP TABLE log_event_id; DROP TABLE log_seen; DROP TABLE log_progress; DROP TABLE note_update_writer; DROP TABLE note_writer_slots; DROP TABLE base_writer_phase; DROP TABLE account_initial_bootstrap; DROP TABLE own_base; DROP TABLE account_devices; DROP TABLE account_key_use; DROP TABLE account_projection; DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE pending_scope_backfill; DROP TABLE pending_scope; DROP TABLE note_checkpoints; DROP INDEX IF EXISTS note_updates_audience_id; DROP TABLE account_staged_admission; DROP TABLE note_outbox; PRAGMA user_version=3",
     )
     .unwrap();
+    legacy::drop_data_tables(&conn);
     drop(conn);
     let db = DeviceDatabase::open(&path).unwrap();
     assert_eq!(db.pending_note_updates().unwrap().len(), 1);
@@ -527,6 +532,7 @@ fn failed_v4_migration_rolls_back_marker_and_keeps_v3_rows() {
         "DROP TABLE view_records; DROP TABLE notes; DROP TABLE note_counter; DROP TABLE note_outbox; PRAGMA user_version=3; CREATE TABLE note_outbox (bogus INTEGER)",
     )
     .unwrap();
+    legacy::drop_data_tables(&conn);
     drop(conn);
     assert!(DeviceDatabase::open(&path).is_err());
     let conn = Connection::open(&path).unwrap();

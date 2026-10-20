@@ -19,8 +19,17 @@ use bh_account::{
 use bh_authz::proto::account_log_id;
 use bh_core::note::Note;
 use bh_crypto::{KemKey, Secret, SigningKey};
+use bh_data::{
+    Actor, DataError, MutationId, Position, Scope,
+    admission::{Confirmation, HostAdmission},
+    catalogue::Shipped,
+    mutation::ops::Operation,
+};
 use bh_device::{ContainerId, Owner, own_base::create_or_open};
-use bh_storage::{DeviceDatabase, NoteKey, PackagePreparation, StoredNotePackage};
+use bh_storage::{
+    DeviceDatabase, NoteKey, PackagePreparation, StoredNotePackage, TypedPackagePreparation,
+    TypedPackageProgress,
+};
 use bh_sync::{
     BaseId,
     permit::{LogId, LogKind},
@@ -518,6 +527,15 @@ impl Signer for TestSigner {
     }
 }
 
+/// A host that confirms this device's own rule changes: test-only admission,
+/// never compiled into a product path.
+pub struct Confirmed;
+impl HostAdmission for Confirmed {
+    fn confirms(&self, request: &Confirmation, _at: Option<Position>) -> Result<bool, DataError> {
+        Ok(matches!(request.actor, Actor::Device { .. }))
+    }
+}
+
 /// One open note this device writes to.
 pub struct Writer {
     pub note: [u8; 32],
@@ -542,6 +560,7 @@ pub struct Device {
     pub signer: Arc<TestSigner>,
     pub account_log: LogId,
     pub originals: Vec<Vec<u8>>,
+    fixture_join: bool,
     windows: Mutex<u32>,
     /// The label and colour presence uses when this device's client starts.
     presence: Mutex<Option<(String, u8)>>,
@@ -550,8 +569,16 @@ pub struct Device {
 impl Device {
     /// Sign up and create the own base, as signup leaves a device.
     pub fn new() -> Self {
+        Self::new_with_maintenance(true)
+    }
+
+    pub fn new_with_maintenance(enabled: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let owner = Arc::new(Owner::default());
+        let owner = Arc::new(if enabled {
+            Owner::default()
+        } else {
+            Owner::without_maintenance()
+        });
         let id = owner.create_container(dir.path()).unwrap();
         let db = owner.shared_database(id).unwrap();
         let generation = AccountGeneration::new();
@@ -640,6 +667,7 @@ impl Device {
                 id: account_log_id(&genesis).unwrap(),
             },
             originals: record.history,
+            fixture_join: false,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
         }
@@ -657,8 +685,16 @@ impl Device {
     /// copy, as the joining bootstrap will deliver them. The base itself
     /// knows of this device only once `first` copies the addition into it.
     pub fn join(first: &Device, hosted: &Hosted) -> Self {
+        Self::join_with_maintenance(first, hosted, true)
+    }
+
+    pub fn join_with_maintenance(first: &Device, hosted: &Hosted, enabled: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let owner = Arc::new(Owner::default());
+        let owner = Arc::new(if enabled {
+            Owner::default()
+        } else {
+            Owner::without_maintenance()
+        });
         let id = owner.create_container(dir.path()).unwrap();
         let db = owner.shared_database(id).unwrap();
         let generation = AccountGeneration::new();
@@ -759,6 +795,7 @@ impl Device {
             signer,
             account_log: first.account_log,
             originals: history,
+            fixture_join: true,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
         }
@@ -846,6 +883,7 @@ impl Device {
                 id: account_log_id(&genesis).unwrap(),
             },
             originals: record.history,
+            fixture_join: false,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
         }
@@ -1159,6 +1197,62 @@ impl Device {
             .unwrap()
     }
 
+    /// Save one typed mutation in this base's ordinary scope and queue it for
+    /// publishing, through the same submit path a host uses.
+    pub fn typed_submit(&self, op: Operation) -> (MutationId, i64) {
+        self.typed_submit_scoped([0; 32], op)
+    }
+    pub fn typed_submit_scoped(&self, audience: [u8; 32], op: Operation) -> (MutationId, i64) {
+        let scope = Scope {
+            base: self.base.0,
+            audience,
+        };
+        if audience != [0; 32] {
+            let mut raw = self.raw();
+            let tx = raw.transaction().unwrap();
+            let sid = bh_data::store::records::scope_id(&tx, scope, &Shipped).unwrap();
+            tx.execute("INSERT INTO data_coverage(scope,through,complete) VALUES(?1,0,1) ON CONFLICT(scope) DO UPDATE SET complete=1", [sid]).unwrap();
+            tx.commit().unwrap();
+        }
+        let db = self.owner.shared_database(self.id).unwrap();
+        let mut db = db.lock().unwrap();
+        let actor = Actor::Device {
+            account: self.signer.account.0,
+            device: self.signer.device.0,
+        };
+        let queued = db
+            .submit_typed(&Shipped, scope, &actor, op, &Confirmed)
+            .unwrap();
+        (queued.saved.mutation, queued.package)
+    }
+    /// This typed work's sealed package, if it has one.
+    pub fn typed_package(&self, package: i64) -> Option<bh_storage::StoredTypedPackage> {
+        let db = self.owner.shared_database(self.id).unwrap();
+        let db = db.lock().unwrap();
+        match db.prepare_typed_package(package) {
+            Ok(TypedPackagePreparation::Existing(stored)) => Some(stored),
+            _ => None,
+        }
+    }
+    pub fn typed_progress(&self, package: i64) -> Option<TypedPackageProgress> {
+        let db = self.owner.shared_database(self.id).unwrap();
+        let db = db.lock().unwrap();
+        db.typed_package_progress(package).unwrap()
+    }
+    /// The position this typed package's verified Ack recorded.
+    pub fn typed_acked(&self, package: i64) -> Option<u64> {
+        self.typed_progress(package)?.payload_position
+    }
+    /// `bh-data`'s own state for a saved typed mutation, if it is still saved.
+    pub fn typed_state(&self, mutation: MutationId) -> Option<String> {
+        let raw = self.raw();
+        raw.query_row(
+            "SELECT state FROM data_pending WHERE mutation=?1",
+            [mutation.0.as_slice()],
+            |r| r.get(0),
+        )
+        .ok()
+    }
     /// This update's sealed package, if it has one.
     pub fn package(&self, update_id: i64) -> Option<StoredNotePackage> {
         let db = self.owner.shared_database(self.id).unwrap();
@@ -1247,6 +1341,23 @@ impl Device {
             .find(|path| path.extension().is_some_and(|ext| ext == "lock"))
             .unwrap();
         let seeds = self.signer.seeds.clone();
+        // The Device::join fixture provisions a second identity without
+        // pairing's delivered-personal-key row. Rebuild its test signer from
+        // its saved native seeds and base roots after opening the database.
+        let fixture = if self.fixture_join {
+            Some((
+                self.signer.anchor.clone(),
+                self.signer.current.lock().unwrap().clone(),
+                self.signer.account,
+                self.signer.device,
+                self.signer.genesis.clone(),
+                self.signer.roots(),
+            ))
+        } else {
+            None
+        };
+        let account_log = self.account_log;
+        let originals = self.originals;
         let dir = self.dir;
         drop(self.owner);
         drop(self.signer);
@@ -1265,13 +1376,66 @@ impl Device {
             .unwrap()
             .1
             .unwrap();
-        let device = Self::joined(dir, owner, id, AccountGeneration::new(), seeds);
-        device
-            .owner
-            .anchor(id, &device.signer.current.lock().unwrap())
-            .unwrap();
-        device.authorize().unwrap();
-        device
+        if let Some((anchor, current, account, identity, genesis, (metadata, content))) = fixture {
+            let generation = AccountGeneration::new();
+            let db = owner.shared_database(id).unwrap();
+            let signer = Arc::new(TestSigner {
+                ordinary: SigningKey::from_seed(&seeds.ordinary),
+                seeds,
+                anchor,
+                current: Mutex::new(current.clone()),
+                account,
+                device: identity,
+                genesis,
+                metadata,
+                content,
+                content_override: Mutex::default(),
+                database: db,
+                generation,
+                base: BaseId(self.base.0),
+                wrong_base: AtomicBool::new(false),
+                owner_lock_held: AtomicBool::new(false),
+                home_ordered: Mutex::default(),
+                stale_confirms: AtomicUsize::new(0),
+                refuse_confirm: AtomicBool::new(false),
+                confirm_attempts: AtomicUsize::new(0),
+                tamper: Mutex::default(),
+                no_home_obligation: AtomicBool::new(false),
+                approve_controls: AtomicBool::new(true),
+                approvals: Approvals::default(),
+                control_requests: AtomicUsize::new(0),
+                control_signatures: AtomicUsize::new(0),
+                applied: Mutex::default(),
+                apply_attempts: AtomicUsize::new(0),
+                sign_hold: Mutex::default(),
+                signed: AtomicUsize::new(0),
+                sign_time: Mutex::default(),
+                sign_asked: Mutex::default(),
+            });
+            let device = Self {
+                dir,
+                owner,
+                id,
+                base: self.base,
+                signer,
+                account_log,
+                originals,
+                fixture_join: true,
+                windows: Mutex::new(0),
+                presence: Mutex::new(None),
+            };
+            device.owner.anchor(id, &current).unwrap();
+            device.authorize().unwrap();
+            device
+        } else {
+            let device = Self::joined(dir, owner, id, AccountGeneration::new(), seeds);
+            device
+                .owner
+                .anchor(id, &device.signer.current.lock().unwrap())
+                .unwrap();
+            device.authorize().unwrap();
+            device
+        }
     }
 
     /// A new, empty note and a typist for it.

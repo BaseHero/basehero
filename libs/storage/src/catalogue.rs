@@ -1,6 +1,6 @@
 //! Local ordinary-note menu projection. Rows are untrusted indexing data, not
 //! base membership, note authority, or an authenticated incoming event.
-use crate::{DeviceDatabase, NoteKey, StoreError};
+use crate::{DeviceDatabase, NoteKey, StoreError, data};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 pub const MAX_NOTE_PAGE: usize = 50;
@@ -160,5 +160,14 @@ fn insert_empty(
     }
     let note = bh_crypto::random::<32>();
     tx.execute("INSERT INTO notes(base,audience,note,touched,title) VALUES (?1,?2,?3,(SELECT value FROM note_counter WHERE id=1),'')", params![base.as_slice(),audience.as_slice(),note.as_slice()])?;
+    data::project_note(
+        tx,
+        NoteKey {
+            base,
+            audience,
+            note,
+        },
+        "",
+    )?;
     Ok(note)
 }

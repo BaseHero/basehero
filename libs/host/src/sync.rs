@@ -672,6 +672,7 @@ pub fn state_name(status: SyncStatus) -> &'static str {
         SyncStatus::SavedLocal { .. } => "saved-local",
         SyncStatus::Syncing { .. } => "syncing",
         SyncStatus::Synced => "synced",
+        SyncStatus::UpdateNeeded => "update-needed",
         SyncStatus::WaitingNetwork => "waiting-network",
         SyncStatus::WaitingAuthorization => "waiting-authorization",
         SyncStatus::HistoryMissing => "history-missing",
@@ -958,7 +959,7 @@ pub struct SyncHost(Arc<SyncInner>);
 
 impl SyncHost {
     pub fn new(configured: Configured, owner: Arc<bh_device::Owner>) -> Self {
-        Self(Arc::new(SyncInner {
+        let host = Self(Arc::new(SyncInner {
             configured,
             owner,
             connector: None,
@@ -967,7 +968,17 @@ impl SyncHost {
             starts: Default::default(),
             local: Mutex::default(),
             views: Mutex::default(),
-        }))
+        }));
+        host.install_records_wake();
+        host
+    }
+    fn install_records_wake(&self) {
+        let weak = Arc::downgrade(&self.0);
+        self.0.owner.set_records_wake(Arc::new(move |id| {
+            if let Some(inner) = weak.upgrade() {
+                Self(inner).wake(id);
+            }
+        }));
     }
     /// As `new`, over another transport to the same edge routes.
     #[cfg(any(test, feature = "test-support"))]
@@ -981,7 +992,9 @@ impl SyncHost {
         let mut inner = Arc::try_unwrap(host.0).ok().expect("new host");
         inner.connector = Some(connector);
         inner.relay = Some(relay);
-        Self(Arc::new(inner))
+        let host = Self(Arc::new(inner));
+        host.install_records_wake();
+        host
     }
 
     /// The edge and roots this build syncs with, if any.

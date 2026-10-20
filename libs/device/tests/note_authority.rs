@@ -7,6 +7,10 @@ use bh_account::{
     storage::DeviceJournal,
 };
 use bh_core::note::Note;
+use bh_data::{
+    RecordId, Scope,
+    query::{Completeness, Gap},
+};
 use bh_device::{ContainerId, Owner, OwnerError};
 use bh_storage::{NoteKey, ViewRecord};
 use std::{
@@ -23,6 +27,8 @@ mod protector;
 mod store;
 use protector::PlainProtector;
 use store::FakeStore;
+#[path = "../../storage/tests/support/legacy.rs"]
+mod legacy;
 
 type Account = AccountOwner<DeviceJournal, FakeStore, PlainProtector>;
 fn ready<F: Future>(future: F) -> F::Output {
@@ -45,6 +51,10 @@ fn add_account(
     path: &std::path::Path,
 ) -> (ContainerId, Account, Arc<AccountCapability>) {
     let id = owner.create_container(path).unwrap();
+    let (account, capability) = initialize_account(owner, id);
+    (id, account, capability)
+}
+fn initialize_account(owner: &Owner, id: ContainerId) -> (Account, Arc<AccountCapability>) {
     let db = owner.shared_database(id).unwrap();
     let generation = AccountGeneration::new();
     let mut account = Account::new(
@@ -84,7 +94,7 @@ fn add_account(
             || capability.is_current(),
         )
         .unwrap();
-    (id, account, capability)
+    (account, capability)
 }
 // Synthetic native argument; the app supplies its verified OwnBase id.
 const BASE: [u8; 32] = [71; 32];
@@ -365,6 +375,200 @@ fn reverse_order_account_lock_waits_for_note_commit() {
     locker.unwrap().join().unwrap();
     assert!(!cap.is_current());
     assert_eq!(frontier(&owner, id, key(note)), 1);
+}
+
+#[test]
+fn note_list_complete_immediately_after_v13_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = dir.path().join("accounts");
+    std::fs::create_dir(&accounts).unwrap();
+    let path = accounts.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sqlite");
+    let conn = legacy::v12(&path);
+    for (note, touched, title) in [(1u8, 3, "one"), (2, 2, "two"), (3, 1, "three")] {
+        conn.execute(
+            "INSERT INTO notes(base,audience,note,touched,title) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                BASE.as_slice(),
+                [0u8; 32].as_slice(),
+                [note; 32].as_slice(),
+                touched,
+                title
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE note_counter SET value=3 WHERE id=1", [])
+        .unwrap();
+    drop(conn);
+    let owner = Owner::default();
+    let opened = owner.open_containers(dir.path()).unwrap();
+    let id = opened.into_iter().next().unwrap().1.unwrap();
+    let (_account, cap) = initialize_account(&owner, id);
+    owner.authorize(id, cap, BASE).unwrap();
+    let page = owner.list_notes_page(id, None, 50).unwrap();
+    assert_eq!(page.completeness, Completeness::Complete);
+    assert_eq!(
+        page.rows
+            .iter()
+            .map(|r| (r.note[0], r.title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "one"), (2, "two"), (3, "three")]
+    );
+}
+
+#[test]
+fn note_list_empty_base_is_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap) = setup(dir.path());
+    owner.authorize(id, cap, BASE).unwrap();
+    let page = owner.list_notes_page(id, None, 50).unwrap();
+    assert!(page.rows.is_empty());
+    assert_eq!(page.completeness, Completeness::Complete);
+}
+
+#[test]
+fn note_list_plain_note_order_matches_catalogue_after_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap) = setup(dir.path());
+    owner.authorize(id, cap, BASE).unwrap();
+    let first = owner.create_note(id).unwrap();
+    let second = owner.create_note(id).unwrap();
+    let third = owner.create_note(id).unwrap();
+    let delta = Note::new().unwrap().append_paragraph("edited").unwrap();
+    owner
+        .shared_database(id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply_local_update(key(first), [8; 16], &delta)
+        .unwrap();
+    let old = owner
+        .shared_database(id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .list_notes(BASE, [0; 32], None, 50)
+        .unwrap();
+    let new = owner.list_notes_page(id, None, 50).unwrap();
+    assert_eq!(
+        new.rows.iter().map(|r| r.note).collect::<Vec<_>>(),
+        old.iter().map(|r| r.note).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        new.rows.iter().map(|r| r.note).collect::<Vec<_>>(),
+        vec![first, third, second]
+    );
+}
+
+#[test]
+fn note_list_paging_ties_and_new_commit_between_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap) = setup(dir.path());
+    owner.authorize(id, cap, BASE).unwrap();
+    let created: Vec<_> = (0..55).map(|_| owner.create_note(id).unwrap()).collect();
+    // Fixture for a future import/rebuild that gives multiple records the same
+    // recency key. Update the matching derived index, not canonical Note data.
+    owner.shared_database(id).unwrap().lock().unwrap().with_data_write(|tx| {
+        tx.execute("UPDATE data_record SET changed=1 WHERE scope=(SELECT id FROM data_scope WHERE base=?1 AND audience=?2)",
+            rusqlite::params![BASE.as_slice(), [0u8;32].as_slice()]).unwrap();
+        tx.execute("UPDATE data_index_entry SET k1=1 WHERE ix IN (SELECT id FROM data_index WHERE name='recent')", []).unwrap();
+        Ok(())
+    }).unwrap();
+    let first = owner.list_notes_page(id, None, 50).unwrap();
+    assert_eq!(first.rows.len(), 50);
+    assert_eq!(first.completeness, Completeness::Complete);
+    let new = owner.create_note(id).unwrap();
+    let last = first.rows.last().unwrap();
+    let second = owner
+        .list_notes_page(id, Some((last.touched, last.note)), 50)
+        .unwrap();
+    let ids: Vec<_> = first
+        .rows
+        .iter()
+        .chain(&second.rows)
+        .map(|row| row.note)
+        .collect();
+    let mut expected = created;
+    expected.sort_by(|a, b| b.cmp(a));
+    assert_eq!(
+        ids, expected,
+        "a tie crossing the page boundary has no gaps or duplicates"
+    );
+    assert!(
+        !ids.contains(&new),
+        "a concurrent newer Note belongs to a refreshed first page"
+    );
+    assert_eq!(second.completeness, Completeness::Complete);
+    assert!(
+        owner
+            .list_notes_page(id, Some((-1, last.note)), 50)
+            .is_err(),
+        "invalid native sort keys must not bypass the query cursor checks"
+    );
+}
+
+#[test]
+fn note_list_held_gap_is_incomplete_without_a_phantom_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap) = setup(dir.path());
+    owner.authorize(id, cap, BASE).unwrap();
+    let note = owner.create_note(id).unwrap();
+    owner
+        .shared_database(id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .with_data_write(|tx| {
+            let scope = Scope {
+                base: BASE,
+                audience: [0; 32],
+            };
+            bh_data::note::remove_projection(tx, scope, RecordId(note))?;
+            bh_data::note::mark_unavailable(tx, scope, RecordId(note))
+        })
+        .unwrap();
+    let catalogue = owner
+        .shared_database(id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .list_notes(BASE, [0; 32], None, 50)
+        .unwrap();
+    assert_eq!(
+        catalogue.iter().map(|r| r.note).collect::<Vec<_>>(),
+        vec![note]
+    );
+    let page = owner.list_notes_page(id, None, 50).unwrap();
+    assert!(
+        page.rows.is_empty(),
+        "the missing projection must not appear"
+    );
+    assert_eq!(
+        page.completeness,
+        Completeness::Incomplete(vec![Gap::NoteUnavailable])
+    );
+}
+
+#[test]
+fn note_list_uses_read_pool_while_writer_guard_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap) = setup(dir.path());
+    owner.authorize(id, cap, BASE).unwrap();
+    let note = owner.create_note(id).unwrap();
+    let writer = owner.shared_database(id).unwrap();
+    let held = writer.lock().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        sender
+            .send(owner.list_notes_page(id, None, 50).unwrap().rows[0].note)
+            .unwrap();
+    });
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(60)).unwrap(),
+        note
+    );
+    drop(held);
+    thread.join().unwrap();
 }
 
 #[test]

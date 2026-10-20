@@ -5,6 +5,9 @@ use bh_core::LOCAL_DATA_VERSION;
 use bh_storage::{DeviceDatabase, NoteKey, note_writers::WriterSlot};
 use rusqlite::{Connection, types::Value};
 
+#[path = "support/legacy.rs"]
+mod legacy;
+
 const V11_TABLES: [&str; 14] = [
     "held_note_event",
     "log_progress",
@@ -109,6 +112,7 @@ fn write_v10(path: &std::path::Path) -> NoteKey {
     for table in V11_TABLES {
         raw.execute_batch(&format!("DROP TABLE {table};")).unwrap();
     }
+    legacy::drop_data_tables(&raw);
     raw.pragma_update(None, "user_version", 10u32).unwrap();
     key
 }

@@ -39,7 +39,18 @@ fn setup(
     Arc<AccountCapability>,
     [u8; 32],
 ) {
-    let owner = Owner::default();
+    setup_with(path, Owner::default())
+}
+fn setup_with(
+    path: &std::path::Path,
+    owner: Owner,
+) -> (
+    Owner,
+    ContainerId,
+    Account,
+    Arc<AccountCapability>,
+    [u8; 32],
+) {
     let id = owner.create_container(path).unwrap();
     let db = owner.shared_database(id).unwrap();
     let generation = AccountGeneration::new();
@@ -135,7 +146,9 @@ fn committed_save_is_acknowledged_when_guest_cannot_be_retained() {
 #[test]
 fn unavailable_local_save_has_no_ack_or_durable_effect_and_exact_retry_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let (owner, id, _account, _cap, note) = setup(dir.path());
+    // The whole-store snapshot below must see only this commit's effect, not
+    // background body extraction for the setup Note.
+    let (owner, id, _account, _cap, note) = setup_with(dir.path(), Owner::without_maintenance());
     let opened = owner.open_leased("one", note).unwrap();
     let lease = opened.writer.unwrap();
     let mut author = Owner::core_author(&opened).unwrap();
@@ -177,7 +190,9 @@ fn unavailable_local_save_has_no_ack_or_durable_effect_and_exact_retry_succeeds(
 #[test]
 fn trapped_local_apply_is_unavailable_not_invalid_update() {
     let dir = tempfile::tempdir().unwrap();
-    let (owner, id, _account, _cap, note) = setup(dir.path());
+    // The whole-store snapshot below must see only this commit's effect, not
+    // background body extraction for the setup Note.
+    let (owner, id, _account, _cap, note) = setup_with(dir.path(), Owner::without_maintenance());
     let opened = owner.open_leased("one", note).unwrap();
     let lease = opened.writer.unwrap();
     let raw = raw_db(dir.path());
@@ -624,7 +639,7 @@ fn capacity_rollover_retires_only_the_callers_live_writer_for_a_fresh_one() {
 #[test]
 fn leased_save_titles_its_note_in_the_same_commit_without_list_document_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let (owner, id, _account, _cap, note) = setup(dir.path());
+    let (owner, id, _account, _cap, note) = setup_with(dir.path(), Owner::without_maintenance());
     let db = owner.shared_database(id).unwrap();
     let pool = db.lock().unwrap().read_pool().unwrap();
     let listed = || {

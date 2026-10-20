@@ -20,6 +20,7 @@ bh-confidential-attestation.workspace = true
 bh-confidential-policy.workspace = true
 bh-core.workspace = true
 bh-crypto.workspace = true
+bh-data = { workspace = true, features = ["testkit"] }
 bh-device.workspace = true
 bh-event.workspace = true
 bh-storage.workspace = true

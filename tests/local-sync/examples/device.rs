@@ -15,6 +15,7 @@ use bh_account::{
     crypto::{KemKey, Secret, SigningKey},
     platform::{ControlKeyPolicy, DeviceKeyStore, KeyHandle, KeyStoreError, StoredDevice},
 };
+use bh_data::{MutationId, RecordId, mutation::ops::Operation, query::Query};
 use bh_device::ContainerId;
 use bh_host::{
     accounts::{AccountOperation, HostKeyStore, Screen, SharedAccountHost, fresh_test_host},
@@ -1041,6 +1042,89 @@ impl Device {
             "accepted_digest": hex(&accepted_note.digest().map_err(|e| format!("{e:?}"))?),
         }))
     }
+    /// Native records boundary: the handle fixes authority and scope; signing
+    /// happens after the approval request, outside its Owner/database locks.
+    async fn records(&self, request: &Value) -> Result<Value, String> {
+        let id = self.id()?;
+        let records = self.owner.records(id).map_err(|e| format!("{e:?}"))?;
+        let record = || -> Result<RecordId, String> {
+            serde_json::from_value(request["record"].clone()).map_err(|e| e.to_string())
+        };
+        let operation = || -> Result<Operation, String> {
+            serde_json::from_value(request["operation"].clone()).map_err(|e| e.to_string())
+        };
+        let saved = |saved: bh_data::mutation::pending::LocalSaved| json!({"mutation": saved.mutation, "content_rev": saved.content_rev, "skipped": saved.skipped});
+        match request["op"].as_str().unwrap_or("") {
+            "records-query" => {
+                let query: Query =
+                    serde_json::from_value(request["query"].clone()).map_err(|e| e.to_string())?;
+                ok(serde_json::to_value(
+                    records
+                        .session()
+                        .query(records.scope(), &query)
+                        .map_err(|e| format!("{e:?}"))?,
+                )
+                .unwrap())
+            }
+            "records-submit" => ok(saved(
+                records.submit(operation()?).map_err(|e| format!("{e:?}"))?,
+            )),
+            "records-approve" => {
+                let op = operation()?;
+                let approval = match &op {
+                    Operation::DefineType { bytes } => {
+                        let proposal = records
+                            .prepare_change(bytes)
+                            .map_err(|e| format!("{e:?}"))?;
+                        records
+                            .approval_request(&proposal)
+                            .map_err(|e| format!("{e:?}"))?
+                    }
+                    _ => records
+                        .approval_request_operation(op)
+                        .map_err(|e| format!("{e:?}"))?,
+                };
+                let signer = self.sync.signer(id).ok_or("no native signer")?;
+                let signature = signer
+                    .sign_event(approval.message().to_vec())
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                ok(saved(
+                    records
+                        .approve(approval, signature)
+                        .map_err(|e| format!("{e:?}"))?,
+                ))
+            }
+            "records-undo" => {
+                let target: MutationId = serde_json::from_value(request["mutation"].clone())
+                    .map_err(|e| e.to_string())?;
+                ok(saved(records.undo(target).map_err(|e| format!("{e:?}"))?))
+            }
+            "records-get" => {
+                let row = records
+                    .session()
+                    .get(records.scope(), record()?)
+                    .map_err(|e| format!("{e:?}"))?;
+                ok(match row {
+                    Some(row) => json!({"record":row.record,"type_id":row.type_id,
+                        "revision":row.revision,"accepted":row.accepted,"doc":row.doc,
+                        "view":row.view(),"pending":row.pending,"changed_at":row.changed_at.map(|p| p.0)}),
+                    None => Value::Null,
+                })
+            }
+            "records-history" => {
+                let entries = records
+                    .session()
+                    .history(records.scope(), record()?, None, 100)
+                    .map_err(|e| format!("{e:?}"))?;
+                ok(json!({"entries": entries.iter().map(|entry| json!({
+                    "position": entry.position.0, "mutation": entry.mutation,
+                    "actor": entry.actor, "path": entry.path, "old": entry.old, "new": entry.new
+                })).collect::<Vec<_>>() }))
+            }
+            _ => Err("unknown records command".into()),
+        }
+    }
     fn status(&self) -> Value {
         json!({
             "view": self.seen.last.lock().unwrap().clone(),
@@ -1515,6 +1599,8 @@ async fn handle(device: &mut Device, request: &Value) -> Result<Value, String> {
         // One caller-controlled keystroke per call; no driver timer.
         "type" => device.edit_text(&text("window"), arg_note(request)?, &text("text"), true),
         "note" => device.note(&text("window"), arg_note(request)?),
+        "records-query" | "records-submit" | "records-approve" | "records-undo" | "records-get"
+        | "records-history" => device.records(request).await,
         // A Yjs v1 relative position at a paragraph offset in the working
         // note, as the editor's own encoder produces for a selection.
         "relative" => {

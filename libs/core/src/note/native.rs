@@ -22,6 +22,31 @@ pub struct Note {
     coverage: yrs::IdSet,
 }
 
+/// One separator between visible body text, never a leading or doubled one.
+fn boundary(out: &mut String, mark: char) {
+    if !out.is_empty() && !out.ends_with(mark) {
+        out.push(mark);
+    }
+}
+
+fn is_block(tag: &str) -> bool {
+    matches!(
+        tag,
+        "paragraph" | "heading" | "listItem" | "taskItem" | "blockquote" | "codeBlock" | "tableRow"
+    )
+}
+
+fn truncate_utf8(mut out: String, max_bytes: usize) -> String {
+    if out.len() > max_bytes {
+        let mut end = max_bytes;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out
+}
+
 /// Whether these updates, applied in order to a new note, give this digest.
 fn reproduces<'a>(segments: impl Iterator<Item = &'a [u8]>, target: [u8; 32]) -> bool {
     count_rebuilds(1);
@@ -394,6 +419,64 @@ impl Note {
             }
         }
         String::new()
+    }
+
+    /// Plain literal text of the current body in document order, at most
+    /// `max_bytes` UTF-8 bytes: text items' visible characters, one newline for
+    /// each hard break and block boundary, never marks, attributes or embeds.
+    /// Read-only and bounded: at most `max_bytes` scalars and about
+    /// `4 * max_bytes` source items are visited. A shorter prefix is returned
+    /// when a budget is exhausted, never a fabricated or malformed string.
+    pub fn body_text(&self, max_bytes: usize) -> String {
+        const DEPTH: usize = 16;
+        let txn = self.doc.transact();
+        let Some(root) = txn.get_xml_fragment(FRAGMENT) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        if max_bytes == 0 {
+            return out;
+        }
+        let mut chars_left = max_bytes;
+        let mut items = max_bytes.saturating_mul(4).saturating_add(4_096);
+        let mut bytes = items;
+        let mut stack = vec![(String::new(), root.source_children(&txn))];
+        while let Some((_, cursor)) = stack.last_mut() {
+            let next = cursor.next(&mut items);
+            match next {
+                Ok(Some(XmlOut::Text(text))) => {
+                    if chars_left == 0 {
+                        break;
+                    }
+                    let Ok(prefix) = text.plain_prefix(&txn, &mut items, &mut bytes, chars_left)
+                    else {
+                        break;
+                    };
+                    chars_left -= prefix.chars().count();
+                    out.push_str(&prefix);
+                }
+                Ok(Some(XmlOut::Element(el))) => {
+                    let tag = el.tag();
+                    if tag.as_ref() == "hardBreak" {
+                        boundary(&mut out, '\n');
+                    } else if stack.len() < DEPTH {
+                        stack.push((tag.to_string(), el.source_children(&txn)));
+                    }
+                }
+                Ok(Some(XmlOut::Fragment(_))) => {}
+                Ok(None) => {
+                    let (tag, _) = stack.pop().expect("open cursor");
+                    if is_block(&tag) {
+                        boundary(&mut out, '\n');
+                    }
+                }
+                Err(()) => break,
+            }
+            if out.len() >= max_bytes {
+                break;
+            }
+        }
+        truncate_utf8(out, max_bytes)
     }
 
     /// The editor's ProseMirror `nodeSize` for this note: UTF-16 units of text,

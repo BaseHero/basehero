@@ -170,6 +170,18 @@ pub extern "C" fn title_preview() -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn body_text(ptr: *mut u8, len: usize) -> i32 {
+    let bytes = input(ptr, len);
+    let Ok(max_bytes) = <[u8; 8]>::try_from(bytes.as_ref()) else {
+        return MISUSE;
+    };
+    let Ok(max_bytes) = usize::try_from(u64::from_le_bytes(max_bytes)) else {
+        return MISUSE;
+    };
+    with_note(|note| ok(note.body_text(max_bytes).into_bytes()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn document_positions() -> i32 {
     with_note(|note| ok((note.document_positions() as u64).to_le_bytes().to_vec()))
 }

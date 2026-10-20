@@ -21,6 +21,10 @@ pub enum SyncStatus {
     /// change waits to be copied, and verified progress has reached every
     /// head known to exist.
     Synced,
+    /// Synced, but this base holds content only a newer build can apply (an
+    /// unknown content kind, or a Note declaration this build cannot read).
+    /// Nothing is paused; the person is told to update.
+    UpdateNeeded,
     WaitingNetwork,
     /// Connected, but current authority does not permit the work now: the
     /// service refuses or cannot check it, the base's epoch is closed, or a
@@ -36,8 +40,8 @@ pub enum SyncStatus {
     /// This device's own key signed other bytes under one of its event ids
     /// (a clone or a local fault): it publishes nothing until resolved.
     PublishingStopped,
-    /// Notes with work the hosted log ordered but did not accept (refused,
-    /// rejected or conflicted). It stays on this device.
+    /// Notes or typed items with work the hosted log ordered but did not
+    /// accept (refused, rejected or conflicted). It stays on this device.
     NotAccepted {
         notes: u64,
     },
@@ -81,19 +85,23 @@ pub(crate) struct Inputs {
 /// `None` when local state cannot be read; the status then stays as it was.
 pub(crate) fn derive(owner: &Owner, container: ContainerId, inputs: Inputs) -> Option<SyncStatus> {
     let database = owner.shared_database(container).ok()?;
-    let (progress, summary, publishing_stopped, held_notes) = {
+    let (progress, summary, publishing_stopped, held_notes, newer_build) = {
         let db = database.lock().expect("container writer lock");
-        let progress = db
-            .own_base()
-            .ok()
-            .flatten()
+        let own = db.own_base().ok().flatten();
+        let progress = own
+            .as_ref()
             .and_then(|record| db.log_progress(LogKind::Base as u8, record.base).ok())
             .flatten();
+        let newer_build = match own.as_ref() {
+            Some(record) => db.needs_newer_build(record.base).ok()?,
+            None => false,
+        };
         (
             progress,
             db.outbox_summary().ok()?,
             db.publishing_stopped().ok()?,
             db.has_held_notes().ok()?,
+            newer_build,
         )
     };
     if progress.is_some_and(|p| p.stopped.is_some()) || inputs.condition == Condition::Stopped {
@@ -105,8 +113,10 @@ pub(crate) fn derive(owner: &Owner, container: ContainerId, inputs: Inputs) -> O
     if inputs.condition == Condition::Unsupported || inputs.held == Held::Unsupported {
         return Some(SyncStatus::Unsupported);
     }
-    let pending = summary.unaccepted_notes;
-    let not_accepted = summary.not_accepted_notes + inputs.alarms;
+    // Typed work counts like note work: a base is never Synced with unsent or
+    // unaccepted typed mutations.
+    let pending = summary.unaccepted_notes + summary.unaccepted_typed;
+    let not_accepted = summary.not_accepted_notes + summary.not_accepted_typed + inputs.alarms;
     if not_accepted > 0 {
         return Some(SyncStatus::NotAccepted {
             notes: not_accepted,
@@ -120,13 +130,56 @@ pub(crate) fn derive(owner: &Owner, container: ContainerId, inputs: Inputs) -> O
     }
     let caught_up = progress.is_some_and(|p| inputs.tail_known && p.position >= inputs.latest);
     let synced = pending == 0 && !inputs.unsettled && caught_up && !held_notes;
-    Some(match inputs.condition {
+    Some(settled(inputs.condition, pending, synced, newer_build))
+}
+
+/// The quiet status, once nothing higher-priority applies. A newer build is
+/// needed only where `Synced` would otherwise be shown: every state that
+/// already has something to say keeps saying it.
+fn settled(condition: Condition, pending: u64, synced: bool, newer_build: bool) -> SyncStatus {
+    match condition {
         Condition::Authorization => SyncStatus::WaitingAuthorization,
         Condition::Network => SyncStatus::WaitingNetwork,
         Condition::Starting | Condition::Held => SyncStatus::SavedLocal { pending },
+        _ if synced && newer_build => SyncStatus::UpdateNeeded,
         _ if synced => SyncStatus::Synced,
         Condition::Working => SyncStatus::Syncing { pending },
         Condition::Unsupported => SyncStatus::Unsupported,
         Condition::Stopped => SyncStatus::Stopped,
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Condition, SyncStatus, settled};
+
+    #[test]
+    fn a_newer_build_is_needed_only_where_synced_would_show() {
+        assert_eq!(
+            settled(Condition::Working, 0, true, true),
+            SyncStatus::UpdateNeeded
+        );
+        assert_eq!(
+            settled(Condition::Working, 0, true, false),
+            SyncStatus::Synced
+        );
+        // Work still to publish, an unreachable service or an approval each
+        // keep their own line: none is hidden behind the update notice.
+        assert_eq!(
+            settled(Condition::Working, 2, false, true),
+            SyncStatus::Syncing { pending: 2 }
+        );
+        assert_eq!(
+            settled(Condition::Network, 0, true, true),
+            SyncStatus::WaitingNetwork
+        );
+        assert_eq!(
+            settled(Condition::Authorization, 0, true, true),
+            SyncStatus::WaitingAuthorization
+        );
+        assert_eq!(
+            settled(Condition::Starting, 0, false, true),
+            SyncStatus::SavedLocal { pending: 0 }
+        );
+    }
 }

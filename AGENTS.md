@@ -37,6 +37,7 @@ From this directory, in `nix develop` or with README prerequisites installed:
 - Android libraries: `nix develop .#android --command bash scripts/check.sh android`.
 - Android crypto/release link proof (separate from fast default checks):
   `nix develop .#android --command bash scripts/check.sh android-crypto`.
+- Android emulator bh-data unit and integration tests (opt-in): `nix develop .#androidEmulator --command bash scripts/check.sh data-android-emulator`. To also run examples from `bh-data-consumers`, set `DATA_ANDROID_EXAMPLES='scale -- --records 100000 --out /data/local/tmp/bh-data/out'` and `DATA_ANDROID_OUTPUT_DIR=/path/to/new/local/output` on that command (the local directory must not exist). Example names before `--` share the arguments after it; examples run only after all test binaries pass, and the emulator's `out` directory is pulled to the local directory. For examples in another package, set `DATA_ANDROID_EXAMPLE_PACKAGE`. No example workload is run by default.
 - Inactive Android device-key plugin (not a client dependency):
   `nix develop .#android --command bash scripts/check.sh android-device-keys`
   checks the target crate and standalone Android library module. This is source

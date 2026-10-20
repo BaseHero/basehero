@@ -2,26 +2,41 @@
 //! state, apart from this device's pending local work. A note's accepted
 //! state is the log-order integration of its accepted events; its working
 //! state is accepted plus pending local updates in local order. Incoming
-//! rules read accepted state only. One batch's decisions, its progress and
-//! the working notes' remote deltas commit in one SQLite transaction, and
-//! deliveries go to windows only after that commit.
+//! rules read accepted state only. One batch's decisions, its progress, its
+//! typed operations, its retained content and the working notes' remote
+//! deltas commit in one SQLite transaction, and deliveries go to windows only
+//! after that commit.
+//!
+//! A batch's effects run in log order, so a typed operation sees a Note whose
+//! first accepted event is earlier and not one whose is later. Content this
+//! build cannot apply is kept exactly, at its position, and never stops
+//! unrelated work: a content kind it does not know, and a note event whose
+//! writer declaration it cannot read. The latter waits only for its own Note:
+//! later events for that Note are kept behind it in order, so the Note never
+//! moves past an event this build cannot read. The scope's typed log stays
+//! complete through the committed position; a Note this replica cannot show is
+//! a gap in that record, which makes ordered work on it wait and a Note-family
+//! listing incomplete while everything else carries on.
 use crate::{
     ContainerId, ORDINARY_AUDIENCE, Owner, OwnerError, SyncFence, load_working_note,
     sync_fence::Recheck,
 };
 use bh_account::VerifiedAccount;
 use bh_core::note::{IncomingError, IncomingRefusal, Note, NoteError};
+use bh_data::{Actor, Position, Scope};
 use bh_event::{
-    AppliedEvent, AppliedKind, Continuation, History, HistoryLookup, LookupError, Seen,
+    AppliedEvent, AppliedKind, Continuation, History, HistoryLookup, LookupError, NOTE, Seen,
+    note_payload,
     writer::{DeviceWriterDeclaration, WriterScope},
 };
 use bh_storage::held_notes::HeldEvent;
 use bh_storage::{
     DeviceDatabase, NoteKey, StoreError,
     note_writers::BaseWriterPhase,
+    retained::RetainedContent,
     sync_state::{
-        AcceptedBinding, AcceptedNote, IncomingCommit, IncomingNote, OwnOutcome, PackageOutcome,
-        SeenRow, VerifiedRecord,
+        AcceptedBinding, AcceptedNote, IncomingCommit, IncomingNote, IncomingStep, OwnOutcome,
+        PackageOutcome, SeenRow, TypedPayload, VerifiedRecord,
     },
 };
 pub use bh_sync::permit::{LogId, LogKind};
@@ -588,8 +603,9 @@ impl Owner {
         self.apply_remote_batch_inner(id, Some(fence), batch, |_| Ok(()))
     }
 
-    /// Test seam: `between(i)` runs inside the transaction before note `i`'s
-    /// writes; an error there must leave every table unchanged.
+    /// Test seam: `between(i)` runs inside the transaction before step `i`'s
+    /// writes (in log order: a note, a typed operation or retained content);
+    /// an error there must leave every table unchanged.
     #[doc(hidden)]
     pub fn apply_remote_batch_with_hook(
         &self,
@@ -644,13 +660,19 @@ impl Owner {
         };
         let database = self.shared_database(id)?;
         // Exclusive ownership of exactly this batch's notes, in a fixed order;
-        // other notes and containers carry on.
+        // other notes and containers carry on. A Note this batch keeps behind
+        // unreadable content takes its lock too, so a concurrent release of
+        // that Note's held events never interleaves with it.
         let mut notes: Vec<[u8; 32]> = events
             .iter()
             .filter_map(|e| match e.kind() {
                 AppliedKind::NoteAccepted { note_id, .. }
-                | AppliedKind::NoteRejected { note_id } => Some(*note_id),
-                AppliedKind::Control | AppliedKind::Rejected => None,
+                | AppliedKind::NoteRejected { note_id }
+                | AppliedKind::NoteUnsupported { note_id, .. } => Some(*note_id),
+                AppliedKind::Control
+                | AppliedKind::Rejected
+                | AppliedKind::Typed { .. }
+                | AppliedKind::UnknownContent { .. } => None,
             })
             .collect();
         notes.sort_unstable();
@@ -699,6 +721,13 @@ impl Owner {
         // Classify event identity exactly once in global log order, before any
         // note engine runs. A later duplicate cannot settle a held own package.
         let mut groups: BTreeMap<[u8; 32], Vec<(usize, HeldEvent)>> = BTreeMap::new();
+        // The position of the first note event this build cannot read, per
+        // Note: later events for that Note wait behind it.
+        let mut blockers: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        // Content kept exactly at its position: an unknown kind, an unreadable
+        // declaration, and any note event waiting behind either.
+        let mut retained = Vec::new();
+        let mut typed = Vec::new();
         let mut settled = HashSet::new();
         let mut own_outcomes = Vec::new();
         for (index, event) in events.iter().enumerate() {
@@ -707,13 +736,24 @@ impl Owner {
                     Some((*note_id, Some(delta.expose().to_vec())))
                 }
                 AppliedKind::NoteRejected { note_id } => Some((*note_id, None)),
-                AppliedKind::Control | AppliedKind::Rejected => None,
+                AppliedKind::Control
+                | AppliedKind::Rejected
+                | AppliedKind::Typed { .. }
+                | AppliedKind::UnknownContent { .. }
+                | AppliedKind::NoteUnsupported { .. } => None,
+            };
+            let unsupported = match event.kind() {
+                AppliedKind::NoteUnsupported { note_id, .. } => Some(*note_id),
+                _ => None,
             };
             let own = own_event(
                 &database,
                 base,
                 event,
-                candidate.as_ref().map(|(n, _)| key(*n)),
+                candidate
+                    .as_ref()
+                    .map(|(n, _)| key(*n))
+                    .or_else(|| unsupported.map(key)),
                 &settled,
             )?;
             let mut own_update = None;
@@ -723,6 +763,14 @@ impl Owner {
                     settled.insert(update_id);
                     if candidate.is_some() {
                         own_update = Some(update_id);
+                    } else if unsupported.is_some() {
+                        // Retained exactly, so this package is not decided yet.
+                        own_outcomes.push(OwnOutcome {
+                            update_id,
+                            ordered: event.commitment(),
+                            outcome: PackageOutcome::Held,
+                            publishing_stopped: false,
+                        });
                     } else {
                         own_outcomes.push(OwnOutcome {
                             update_id,
@@ -742,12 +790,62 @@ impl Owner {
                     });
                 }
             }
+            let author = event.author();
+            let position = event.head().position;
+            let ordered = event.commitment();
+            match event.kind() {
+                AppliedKind::NoteUnsupported { note_id, payload } => {
+                    blockers
+                        .entry(*note_id)
+                        .and_modify(|first| *first = (*first).min(position))
+                        .or_insert(position);
+                    retained.push(RetainedContent {
+                        log_kind: log_code(log),
+                        log_id: base,
+                        audience: ORDINARY_AUDIENCE,
+                        position: Position(position),
+                        kind: NOTE,
+                        note: Some(*note_id),
+                        author,
+                        payload: payload.expose().to_vec(),
+                    });
+                }
+                AppliedKind::UnknownContent { kind, payload } => retained.push(RetainedContent {
+                    log_kind: log_code(log),
+                    log_id: base,
+                    audience: ORDINARY_AUDIENCE,
+                    position: Position(position),
+                    kind: *kind,
+                    note: None,
+                    author,
+                    payload: payload.expose().to_vec(),
+                }),
+                AppliedKind::Typed { payload } => typed.push((
+                    position,
+                    Box::new(TypedPayload {
+                        scope: Scope {
+                            base,
+                            audience: ORDINARY_AUDIENCE,
+                        },
+                        position: Position(position),
+                        actor: Actor::Device {
+                            account: author.ok_or(StoreError::CorruptSyncState)?.0,
+                            device: author.ok_or(StoreError::CorruptSyncState)?.1,
+                        },
+                        payload: payload.expose().to_vec(),
+                        ordered,
+                        descriptor: event.descriptor_bytes().to_vec(),
+                        body: event.body_bytes().to_vec(),
+                    }),
+                )),
+                _ => {}
+            }
             if let Some((note, delta)) = candidate {
                 groups.entry(note).or_default().push((
                     index,
                     HeldEvent {
-                        ordered: event.commitment(),
-                        author: event.author(),
+                        ordered,
+                        author,
                         writer: event.writer().map(|w| (w.account, w.device, w.nonce)),
                         delta,
                         own_update,
@@ -765,16 +863,106 @@ impl Owner {
             metadata_id: continuation.metadata_id,
             epoch_id: continuation.epoch_id,
             notes: Vec::new(),
+            steps: Vec::new(),
             own: own_outcomes,
             held: Vec::new(),
         };
         let mut outcomes = Vec::new();
         let mut reloads = Vec::new();
         let mut prepared_bytes = 0;
+        let mut steps: Vec<(u64, IncomingStep)> = typed
+            .into_iter()
+            .map(|(position, typed)| (position, IncomingStep::Typed(typed)))
+            .collect();
+        steps.extend(
+            retained
+                .into_iter()
+                .map(|row| (row.position.0, IncomingStep::Retained(row))),
+        );
         // Only this note's working engine is retained, never one per batch
         // entry. Global outcomes are reassembled by their original position.
         for (note, candidates) in groups {
             let key = key(note);
+            let already_retained = database
+                .lock()
+                .expect("container writer lock")
+                .note_has_retained(key)?;
+            // This batch's first unreadable declaration for the Note, or every
+            // candidate when an earlier batch already retained one.
+            let cut = if already_retained {
+                0
+            } else {
+                match blockers.get(&note) {
+                    Some(position) => candidates
+                        .iter()
+                        .position(|(_, c)| c.ordered.head().position >= *position)
+                        .unwrap_or(candidates.len()),
+                    None => candidates.len(),
+                }
+            };
+            let (prefix, suffix) = candidates.split_at(cut);
+            // Later events for the Note wait behind what this build cannot
+            // read, in position order: it never moves past them, and no event
+            // is lost.
+            for (index, candidate) in suffix {
+                let kept = candidate.writer.zip(candidate.delta.as_deref());
+                match kept {
+                    Some((writer, delta)) => {
+                        let payload = note_payload(
+                            note,
+                            DeviceWriterDeclaration {
+                                account: writer.0,
+                                device: writer.1,
+                                nonce: writer.2,
+                            },
+                            delta,
+                        );
+                        steps.push((
+                            candidate.ordered.head().position,
+                            IncomingStep::Retained(RetainedContent {
+                                log_kind: log_code(log),
+                                log_id: base,
+                                audience: ORDINARY_AUDIENCE,
+                                position: Position(candidate.ordered.head().position),
+                                kind: NOTE,
+                                note: Some(note),
+                                author: candidate.author,
+                                payload,
+                            }),
+                        ));
+                        if let Some(update_id) = candidate.own_update {
+                            commit.own.push(OwnOutcome {
+                                update_id,
+                                ordered: candidate.ordered,
+                                outcome: PackageOutcome::Held,
+                                publishing_stopped: false,
+                            });
+                        }
+                        outcomes.push((*index, key, NoteOutcome::Waiting));
+                    }
+                    // A note event this layer already refused was no update at
+                    // all: there are no bytes to keep, and its verdict does not
+                    // depend on the unreadable declaration before it.
+                    None => {
+                        if let Some(update_id) = candidate.own_update {
+                            commit.own.push(OwnOutcome {
+                                update_id,
+                                ordered: candidate.ordered,
+                                outcome: PackageOutcome::Refused(RefusalReason::Undecodable.code()),
+                                publishing_stopped: false,
+                            });
+                        }
+                        outcomes.push((
+                            *index,
+                            key,
+                            NoteOutcome::Refused(RefusalReason::Undecodable),
+                        ));
+                    }
+                }
+            }
+            if prefix.is_empty() {
+                continue;
+            }
             let already_held = database
                 .lock()
                 .expect("container writer lock")
@@ -785,7 +973,7 @@ impl Owner {
                 judge_note(
                     &database,
                     key,
-                    &candidates,
+                    prefix,
                     PREPARED_BYTES.saturating_sub(prepared_bytes),
                 )
             };
@@ -795,18 +983,22 @@ impl Owner {
                     if prepared.rebuild_working.is_some() {
                         reloads.push(key);
                     }
-                    outcomes.extend(
-                        candidates
-                            .iter()
-                            .zip(verdicts)
-                            .map(|((i, _), o)| (*i, key, o)),
-                    );
+                    // Its existence shows at the position of its first accepted
+                    // candidate; the title of the whole group commits with it.
+                    let at = prefix
+                        .iter()
+                        .zip(&verdicts)
+                        .find(|(_, verdict)| **verdict == NoteOutcome::Accepted)
+                        .map(|((_, candidate), _)| candidate.ordered.head().position)
+                        .unwrap_or(prefix[0].1.ordered.head().position);
+                    outcomes.extend(prefix.iter().zip(verdicts).map(|((i, _), o)| (*i, key, o)));
                     commit.own.extend(own);
+                    steps.push((at, IncomingStep::Note(commit.notes.len())));
                     commit.notes.push(prepared);
                 }
                 Err(OwnerError::NoteUnavailable) => {
                     let mut held = Vec::new();
-                    for (index, candidate) in candidates {
+                    for (index, candidate) in prefix {
                         if let Some(update_id) = candidate.own_update {
                             commit.own.push(OwnOutcome {
                                 update_id,
@@ -815,14 +1007,22 @@ impl Owner {
                                 publishing_stopped: false,
                             });
                         }
-                        outcomes.push((index, key, NoteOutcome::Waiting));
-                        held.push(candidate);
+                        outcomes.push((*index, key, NoteOutcome::Waiting));
+                        held.push(candidate.clone());
                     }
+                    // The gap begins at this Note's first held position, not
+                    // at the start of the batch ahead of earlier typed work.
+                    steps.push((
+                        prefix[0].1.ordered.head().position,
+                        IncomingStep::Hold(commit.held.len()),
+                    ));
                     commit.held.push((key, held));
                 }
                 Err(e) => return Err(e),
             }
         }
+        steps.sort_unstable_by_key(|(position, _)| *position);
+        commit.steps = steps.into_iter().map(|(_, step)| step).collect();
         outcomes.sort_unstable_by_key(|(i, _, _)| *i);
         let outcomes = outcomes.into_iter().map(|(_, key, o)| (key, o)).collect();
         commit
@@ -866,6 +1066,8 @@ impl Owner {
         for note in &committed {
             self.compaction.schedule(id, note.key, &database);
         }
+        self.compaction.schedule_maintenance(id, &database);
+        self.compaction.schedule_derived_if_pending(id, &database);
         Ok((outcomes, windows))
     }
 
@@ -969,6 +1171,8 @@ impl Owner {
             windows = self.enqueue(id, targets);
         }
         self.compaction.schedule(id, key, &database);
+        self.compaction.schedule_maintenance(id, &database);
+        self.compaction.schedule_derived_if_pending(id, &database);
         Ok((outcomes, windows))
     }
 

@@ -1,17 +1,19 @@
-//! Publishing this device's note packages: the publisher lane. Each round
-//! takes up to sixteen notes' next unacknowledged runs (one per note, in
-//! local commit order), seals any that has no package yet, persists its
-//! exact bytes, then publishes those bytes under both fresh permits. A
-//! verified ordering proof records the position; the next run of that note
-//! goes in a later round. A note whose package cannot progress waits on its
-//! own; other notes carry on.
+//! Publishing this device's content packages: the publisher lane. Each round
+//! takes up to sixteen candidates in local commit order — a note's next
+//! unacknowledged run, or one pending typed mutation — seals any that has no
+//! package yet, persists its exact bytes, then publishes those bytes under
+//! both fresh permits. A verified ordering proof records the position; the
+//! next run of that note or mutation goes in a later round. A package that
+//! cannot progress waits on its own; everything else carries on.
 //!
 //! A note's new packages start at least `SPACING` apart and, by default,
 //! only after a quiet spell: 300 ms without an edit on that note, and at
 //! most 1 s after its first unsent edit. Both compose (`spaced.max(quiet)`),
-//! so the spacing still bounds how fast starts follow one another. A run is
-//! captured when it becomes eligible. Tests may choose another pacing
-//! (`Pacing`); the default is the shipped policy.
+//! so the spacing still bounds how fast starts follow one another. That
+//! policy is about typing: it applies to note work only, while typed work is
+//! already committed by its own layer and travels in the same bounded round.
+//! A run is captured when it becomes eligible. Tests may choose another
+//! pacing (`Pacing`); the default is the shipped policy.
 //! A retry of a sealed package is not a new start: it keeps its bytes and
 //! its own backoff. The lane publishes only while the receiver grants it,
 //! and every step after an await (persisting a seal, enqueueing, recording
@@ -25,9 +27,12 @@ use crate::{
 };
 use bh_authz_proto::{FromService, MAX_MESSAGE, Refusal, ToService, Want};
 use bh_device::{OwnerError, SealRefusal, SyncFence};
-use bh_storage::{NoteKey, PackagePreparation, StoredNotePackage, sync_state::OutboxHead};
+use bh_storage::{
+    NoteKey, OutboxCandidate, OutboxOrder, PackagePreparation, StoredNotePackage, TypedHead,
+    TypedPackagePreparation, sync_state::OutboxHead,
+};
 use bh_sync::{
-    BaseId, BodyObject, Commitment,
+    BaseId, BodyObject, Commitment, OpaqueEvent,
     permit::{self, LogId},
     wire::{self, Request, Response},
 };
@@ -41,7 +46,7 @@ use tokio::sync::watch;
 // The runtime's clock, so that tests with a paused clock control permit lives.
 use tokio::time::Instant;
 
-/// Notes published together in one round.
+/// Packages of both kinds published together in one round.
 const ROUND: usize = 16;
 /// The least time between one note's new package starts.
 pub(crate) const SPACING: Duration = Duration::from_millis(500);
@@ -127,12 +132,20 @@ impl Link {
     }
 }
 
+/// One package's identity in this lane's permits, holds and Acks. A note
+/// update id and a typed outbox id are separate spaces, so they never mix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PackageKey {
+    Note(i64),
+    Typed(i64),
+}
+
 /// Permits this client holds, by package and kind, until shortly before
 /// their deadline. A refused or expired one is dropped.
 #[derive(Default)]
-struct Permits(HashMap<(i64, bool), (Vec<u8>, Instant)>);
+struct Permits(HashMap<(PackageKey, bool), (Vec<u8>, Instant)>);
 impl Permits {
-    fn get(&mut self, update_id: i64, append: bool) -> Option<Vec<u8>> {
+    fn get(&mut self, update_id: PackageKey, append: bool) -> Option<Vec<u8>> {
         let key = (update_id, append);
         match self.0.get(&key) {
             Some((permit, until)) if Instant::now() < *until => Some(permit.clone()),
@@ -145,7 +158,7 @@ impl Permits {
     }
     fn insert(
         &mut self,
-        update_id: i64,
+        update_id: PackageKey,
         append: bool,
         root: [u8; 32],
         signed: Vec<u8>,
@@ -155,10 +168,10 @@ impl Permits {
             self.0.insert((update_id, append), (signed, until));
         }
     }
-    fn forget(&mut self, update_id: i64, append: bool) {
+    fn forget(&mut self, update_id: PackageKey, append: bool) {
         self.0.remove(&(update_id, append));
     }
-    fn retain(&mut self, live: &[i64]) {
+    fn retain(&mut self, live: &[PackageKey]) {
         self.0.retain(|(id, _), _| live.contains(id));
     }
 }
@@ -177,24 +190,24 @@ pub(crate) fn usable_until(
     (Instant::now() < until).then_some(until)
 }
 
-/// Notes whose next package cannot progress now, by that package's update:
-/// each waits out its own backoff and holds no other note back. An alarm (a
-/// refusal an honest device never causes) shows as not accepted; its work is
-/// kept and retried, byte for byte, only after the note's backoff.
+/// Work whose next package cannot progress now, by that package: each waits
+/// out its own backoff and holds nothing else back. An alarm (a refusal an
+/// honest device never causes) shows as not accepted; its work is kept and
+/// retried, byte for byte, only after its backoff.
 #[derive(Default)]
-pub(crate) struct Holds(HashMap<i64, Hold>);
+pub(crate) struct Holds(HashMap<PackageKey, Hold>);
 struct Hold {
     until: Instant,
     backoff: Backoff,
     alarm: bool,
 }
 impl Holds {
-    fn held(&self, update_id: i64) -> bool {
+    fn held(&self, update_id: PackageKey) -> bool {
         self.0
             .get(&update_id)
             .is_some_and(|hold| Instant::now() < hold.until)
     }
-    fn hold(&mut self, update_id: i64, alarm: bool) {
+    fn hold(&mut self, update_id: PackageKey, alarm: bool) {
         let hold = self.0.entry(update_id).or_insert(Hold {
             until: Instant::now(),
             backoff: Backoff::default(),
@@ -203,7 +216,7 @@ impl Holds {
         hold.alarm = alarm;
         hold.until = Instant::now() + hold.backoff.next();
     }
-    fn release(&mut self, update_id: i64) {
+    fn release(&mut self, update_id: PackageKey) {
         self.0.remove(&update_id);
     }
     /// Notes held by an alarm.
@@ -223,10 +236,19 @@ impl Holds {
             if !hold.alarm {
                 continue;
             }
-            let progress = db.package_progress(*update_id).map_err(|_| Fail::Local)?;
-            if progress.is_none_or(|p| {
+            let outcome = match update_id {
+                PackageKey::Note(id) => db
+                    .package_progress(*id)
+                    .map_err(|_| Fail::Local)?
+                    .map(|p| p.outcome),
+                PackageKey::Typed(id) => db
+                    .typed_package_progress(*id)
+                    .map_err(|_| Fail::Local)?
+                    .map(|p| p.outcome),
+            };
+            if outcome.is_none_or(|outcome| {
                 !matches!(
-                    p.outcome,
+                    outcome,
                     None | Some(PackageOutcome::Acked | PackageOutcome::Held)
                 )
             }) {
@@ -240,10 +262,21 @@ impl Holds {
     }
 }
 
-/// One package to publish this round.
+/// One package to publish this round, of either kind: exactly the bytes its
+/// own store persisted, under its own package identity.
 struct Package {
-    update_id: i64,
-    stored: StoredNotePackage,
+    key: PackageKey,
+    descriptor: OpaqueEvent,
+    body: Vec<u8>,
+}
+impl Package {
+    fn new(key: PackageKey, stored: StoredNotePackage) -> Self {
+        Self {
+            key,
+            descriptor: stored.descriptor,
+            body: stored.body,
+        }
+    }
 }
 
 /// What a round achieved.
@@ -271,10 +304,10 @@ impl Round {
     }
 }
 
-/// Where the next round's notes start: after the last note the previous
-/// round took, from the start once every note was considered.
+/// Where the next round's work starts: after the last package the previous
+/// round took, from the start once every candidate was considered.
 #[derive(Default)]
-struct Cursor(i64);
+struct Cursor(OutboxOrder);
 
 /// When each note may start its next new package. An entry lives only
 /// until then.
@@ -613,6 +646,80 @@ async fn sealed(
     Ok((stored, true))
 }
 
+/// Seal a typed mutation's package if it has none yet. Its exact payload
+/// bytes are sealed once, persisted before this returns and never replaced;
+/// only while `fence` holds, after the signer's await.
+async fn sealed_typed(
+    shared: &Shared,
+    head: TypedHead,
+    fence: &SyncFence,
+) -> Result<Package, Fail> {
+    let database = shared
+        .owner
+        .shared_database(shared.container)
+        .map_err(|_| Fail::Local)?;
+    let preparation = database
+        .lock()
+        .expect("container writer lock")
+        .prepare_typed_package(head.id)
+        .map_err(|_| Fail::Local)?;
+    let candidate = match preparation {
+        TypedPackagePreparation::Existing(stored) => {
+            return Ok(Package {
+                key: PackageKey::Typed(head.id),
+                descriptor: stored.descriptor,
+                body: stored.body,
+            });
+        }
+        TypedPackagePreparation::Candidate(candidate) => candidate,
+    };
+    let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
+    let mut request = None;
+    shared
+        .signer
+        .with_base_keys(BaseId(head.base), &mut |m, k| {
+            request = Some(shared.owner.prepare_typed_seal(
+                shared.container,
+                &identity.anchor,
+                shared.endpoint.hosting_root,
+                m,
+                k,
+                &candidate,
+            ))
+        })
+        .map_err(|_| Fail::Authorization)?;
+    let request = match request.ok_or(Fail::Authorization)? {
+        Ok(request) => request,
+        Err(OwnerError::SealRefused(SealRefusal::EpochClosed)) => return Err(Fail::Authorization),
+        Err(OwnerError::SealRefused(SealRefusal::AudienceUnsupported)) => return Err(Fail::Local),
+        Err(OwnerError::Unbound | OwnerError::AnchorMismatch) => return Err(Fail::Authorization),
+        Err(_) => return Err(Fail::Local),
+    };
+    // No lock is held while the platform signs.
+    let signature = shared
+        .signer
+        .sign_event(request.signing_bytes().to_vec())
+        .await
+        .map_err(|_| Fail::Authorization)?;
+    let encoded = request.finish(signature).map_err(|_| Fail::Local)?;
+    let body = BodyObject::new(encoded.body).map_err(|_| Fail::Local)?;
+    shared.commit_time(1).await;
+    let mut stored = None;
+    shared
+        .owner
+        .with_sync_fence(fence, |db| {
+            stored = Some(db.publish_typed_package(candidate, encoded.descriptor, body));
+            Ok(())
+        })
+        .map_err(fenced_fail)?;
+    let stored = stored.ok_or(Fail::Local)?.map_err(|_| Fail::Local)?;
+    Ok(Package {
+        key: PackageKey::Typed(head.id),
+        descriptor: stored.descriptor,
+        body: stored.body,
+    })
+}
+
 /// The worse of two reasons to wait: a stop, then unsupported, then
 /// authority, then network, then missing history, then a retry, then local
 /// holds.
@@ -644,55 +751,65 @@ struct State<'a> {
     ready: (&'a watch::Receiver<ReceiveFacts>, u64),
 }
 
-/// Up to a round of notes' heads that are not held, from the cursor on and
-/// then from the start, each note at most once. A head with no package yet
+/// Up to a round of candidates that are not held, from the cursor on and
+/// then from the start: note work and typed work in one local commit order,
+/// each note or mutation at most once. A note's head with no package yet
 /// waits out its note's spacing; the earliest such instant is returned.
-fn take_heads(
+fn take_candidates(
     db: &bh_storage::DeviceDatabase,
     holds: &Holds,
     cursor: &mut Cursor,
     spacing: &Spacing,
-) -> Result<(Vec<OutboxHead>, Option<Instant>), Fail> {
+) -> Result<(Vec<OutboxCandidate>, Option<Instant>), Fail> {
     let start = cursor.0;
     let now = Instant::now();
-    let mut heads = Vec::new();
+    let mut candidates = Vec::new();
     let mut due: Option<Instant> = None;
     let mut after = start;
     // Scanning again from the start, up to where this round began.
     let mut wrapped = false;
     loop {
-        let page = db.outbox_heads(after, ROUND).map_err(|_| Fail::Local)?;
-        for head in &page {
-            if wrapped && head.first > start {
-                cursor.0 = 0;
-                return Ok((heads, due));
+        let page = db
+            .outbox_candidates(after, wrapped.then_some(start), ROUND)
+            .map_err(|_| Fail::Local)?;
+        for candidate in &page {
+            after = candidate.order();
+            match candidate {
+                OutboxCandidate::Note(head) => {
+                    if holds.held(PackageKey::Note(head.first))
+                        || holds.held(PackageKey::Note(head.update_id))
+                    {
+                        continue;
+                    }
+                    // A sealed package is a retry, not a new start.
+                    let sealed = db
+                        .package_progress(head.update_id)
+                        .map_err(|_| Fail::Local)?
+                        .is_some();
+                    if !sealed && let Err(next) = spacing.eligible(head, now) {
+                        due = Some(due.map_or(next, |due| due.min(next)));
+                        continue;
+                    }
+                }
+                OutboxCandidate::Typed(head) => {
+                    if holds.held(PackageKey::Typed(head.id)) {
+                        continue;
+                    }
+                }
             }
-            after = head.first;
-            if holds.held(head.first) || holds.held(head.update_id) {
-                continue;
-            }
-            // A sealed package is a retry, not a new start.
-            let sealed = db
-                .package_progress(head.update_id)
-                .map_err(|_| Fail::Local)?
-                .is_some();
-            if !sealed && let Err(next) = spacing.eligible(head, now) {
-                due = Some(due.map_or(next, |due| due.min(next)));
-                continue;
-            }
-            heads.push(*head);
-            if heads.len() == ROUND {
-                cursor.0 = head.first;
-                return Ok((heads, due));
+            candidates.push(*candidate);
+            if candidates.len() == ROUND {
+                cursor.0 = after;
+                return Ok((candidates, due));
             }
         }
         if page.len() < ROUND {
-            if wrapped || start == 0 {
-                cursor.0 = 0;
-                return Ok((heads, due));
+            if wrapped || start == OutboxOrder::START {
+                cursor.0 = OutboxOrder::START;
+                return Ok((candidates, due));
             }
             wrapped = true;
-            after = 0;
+            after = OutboxOrder::START;
         }
     }
 }
@@ -711,10 +828,10 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
         .shared_database(shared.container)
         .map_err(|_| Fail::Local)?;
     spacing.expire(Instant::now());
-    let (heads, due, epoch) = {
+    let (candidates, due, epoch) = {
         let db = database.lock().expect("container writer lock");
         holds.settle(&db)?;
-        let (heads, due) = take_heads(&db, holds, cursor, spacing)?;
+        let (candidates, due) = take_candidates(&db, holds, cursor, spacing)?;
         let progress = db
             .log_progress(log.kind as u8, log.id)
             .map_err(|_| Fail::Local)?
@@ -722,10 +839,17 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
         if progress.stopped.is_some() {
             return Err(Fail::Local);
         }
-        (heads, due, progress.epoch_id)
+        (candidates, due, progress.epoch_id)
     };
-    permits.retain(&heads.iter().map(|h| h.update_id).collect::<Vec<_>>());
-    if heads.is_empty() {
+    let live: Vec<PackageKey> = candidates
+        .iter()
+        .map(|candidate| match candidate {
+            OutboxCandidate::Note(head) => PackageKey::Note(head.update_id),
+            OutboxCandidate::Typed(head) => PackageKey::Typed(head.id),
+        })
+        .collect();
+    permits.retain(&live);
+    if candidates.is_empty() {
         return Ok(Round::waiting(None, due));
     }
     // Everything this round decides is decided under the authority, control,
@@ -737,30 +861,39 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
     };
     let mut waiting = None;
     let mut packages = Vec::new();
-    for head in heads {
+    for candidate in candidates {
         let captured = Instant::now();
-        match sealed(shared, head, &fence).await {
-            Ok((stored, new)) => {
-                if new {
-                    spacing.started(head.key, captured);
+        match candidate {
+            OutboxCandidate::Note(head) => match sealed(shared, head, &fence).await {
+                Ok((stored, new)) => {
+                    if new {
+                        spacing.started(head.key, captured);
+                    }
+                    // A failed unsealed run is held by its stable first row;
+                    // later keystrokes must not bypass that note's backoff.
+                    if head.first != head.update_id {
+                        holds.release(PackageKey::Note(head.first));
+                    }
+                    packages.push(Package::new(PackageKey::Note(head.update_id), stored));
                 }
-                // A failed unsealed run is held by its stable first row;
-                // later keystrokes must not bypass that note's backoff.
-                if head.first != head.update_id {
-                    holds.release(head.first);
+                // This note's work cannot be sealed as it stands (no writer
+                // declaration, or its writer unreadable): it waits alone.
+                Err(Fail::Local) => {
+                    holds.hold(PackageKey::Note(head.first), false);
+                    waiting = worse(waiting, Fail::Local);
                 }
-                packages.push(Package {
-                    update_id: head.update_id,
-                    stored,
-                });
-            }
-            // This note's work cannot be sealed as it stands (no writer
-            // declaration, or its writer unreadable): it waits alone.
-            Err(Fail::Local) => {
-                holds.hold(head.first, false);
-                waiting = worse(waiting, Fail::Local);
-            }
-            Err(fail) => waiting = worse(waiting, fail),
+                Err(fail) => waiting = worse(waiting, fail),
+            },
+            OutboxCandidate::Typed(head) => match sealed_typed(shared, head, &fence).await {
+                Ok(package) => packages.push(package),
+                // Its saved work changed or retired between selection and the
+                // seal: it waits alone.
+                Err(Fail::Local) => {
+                    holds.hold(PackageKey::Typed(head.id), false);
+                    waiting = worse(waiting, Fail::Local);
+                }
+                Err(fail) => waiting = worse(waiting, fail),
+            },
         }
     }
     // A package sealed before its epoch closed waits for a new one: it is
@@ -788,16 +921,15 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
     // revoked by a later change.
     let mut sent = Vec::with_capacity(packages.len());
     for p in &packages {
-        let (Some(stage_permit), Some(append_permit)) = (
-            permits.get(p.update_id, false),
-            permits.get(p.update_id, true),
-        ) else {
+        let (Some(stage_permit), Some(append_permit)) =
+            (permits.get(p.key, false), permits.get(p.key, true))
+        else {
             sent.push(None);
             waiting = worse(waiting, Fail::Authorization);
             continue;
         };
-        let event = p.stored.descriptor.encode();
-        let body = p.stored.body.clone();
+        let event = p.descriptor.encode();
+        let body = p.body.clone();
         let enqueued = shared.owner.with_sync_fence(&fence, |_| {
             if receive.borrow().ready != Some(*generation) {
                 return Err(OwnerError::Changed);
@@ -845,7 +977,7 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
                 match permit::verify_published_ordering(
                     &root,
                     log,
-                    &package.stored.descriptor,
+                    &package.descriptor,
                     &ack,
                     &commitment,
                 ) {
@@ -859,11 +991,11 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
             Some(Ok(Response::Refused { reason, .. })) => {
                 // After either internal operation fails, neither grant is
                 // assumed usable. The persisted bytes remain immutable.
-                permits.forget(package.update_id, false);
-                permits.forget(package.update_id, true);
+                permits.forget(package.key, false);
+                permits.forget(package.key, true);
                 match refused(reason) {
                     Some(fail) => waiting = worse(waiting, fail),
-                    None => holds.hold(package.update_id, true),
+                    None => holds.hold(package.key, true),
                 }
             }
             // Not sent: its reason is already counted.
@@ -876,7 +1008,7 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
     let latest = recorded.as_ref().map_or(0, |done| {
         acked
             .iter()
-            .filter(|(package, _)| done.contains(&package.update_id))
+            .filter(|(package, _)| done.contains(&package.key))
             .map(|(_, ordered)| ordered.head().position)
             .max()
             .unwrap_or(0)
@@ -935,7 +1067,7 @@ fn sealed_epoch(shared: &Shared, log: LogId, package: &Package) -> Result<[u8; 3
         .signer
         .with_base_keys(BaseId(log.id), &mut |m, _| {
             epoch = Some(bh_event::sealed_epoch(
-                &package.stored.descriptor,
+                &package.descriptor,
                 m,
                 BaseId(log.id),
             ))
@@ -954,12 +1086,12 @@ async fn request_permits(
     packages: &[Package],
     follow: &mut bool,
 ) -> Result<(), Fail> {
-    let mut wants: Vec<(i64, bool, Want)> = Vec::new();
+    let mut wants: Vec<(PackageKey, bool, Want)> = Vec::new();
     for p in packages {
-        if permits.get(p.update_id, false).is_none() {
-            let body = BodyObject::new(p.stored.body.clone()).map_err(|_| Fail::Local)?;
+        if permits.get(p.key, false).is_none() {
+            let body = BodyObject::new(p.body.clone()).map_err(|_| Fail::Local)?;
             wants.push((
-                p.update_id,
+                p.key,
                 false,
                 Want::Stage {
                     log,
@@ -968,22 +1100,22 @@ async fn request_permits(
                 },
             ));
         }
-        if permits.get(p.update_id, true).is_none() {
+        if permits.get(p.key, true).is_none() {
             let epoch = match sealed_epoch(shared, log, p) {
                 Ok(epoch) => epoch,
                 // Its own persisted bytes do not open: it waits alone.
                 Err(Fail::Local) => {
-                    holds.hold(p.update_id, false);
+                    holds.hold(p.key, false);
                     continue;
                 }
                 Err(fail) => return Err(fail),
             };
             wants.push((
-                p.update_id,
+                p.key,
                 true,
                 Want::Append {
                     log,
-                    event: p.stored.descriptor.encode(),
+                    event: p.descriptor.encode(),
                     epoch,
                 },
             ));
@@ -1023,17 +1155,17 @@ async fn request_permits(
         if items.len() != batch.len() {
             return Err(Fail::Network);
         }
-        for ((update_id, append, _), item) in batch.iter().zip(items) {
+        for ((package, append, _), item) in batch.iter().zip(items) {
             match item {
                 Ok(signed) => permits.insert(
-                    *update_id,
+                    *package,
                     *append,
                     shared.endpoint.hosting_root,
                     signed,
                     requested_at,
                 ),
                 // The service could not read this package's event.
-                Err(Refusal::Malformed) => holds.hold(*update_id, true),
+                Err(Refusal::Malformed) => holds.hold(*package, true),
                 Err(reason) => {
                     // The base must first copy an account change, or this
                     // device's place in it changed: follow the account.
@@ -1057,20 +1189,25 @@ fn record_acks(
     shared: &Shared,
     fence: &SyncFence,
     acked: &[(&Package, Commitment)],
-) -> Result<Vec<i64>, Fail> {
+) -> Result<Vec<PackageKey>, Fail> {
     let mut recorded = Vec::new();
     for (package, ordered) in acked {
+        let key = package.key;
         shared
             .owner
             .with_sync_fence(fence, |db| {
-                db.acknowledge_note_update(package.update_id, ordered)
-                    .map_err(OwnerError::from)
+                match key {
+                    PackageKey::Note(update_id) => db.acknowledge_note_update(update_id, ordered),
+                    PackageKey::Typed(id) => db.acknowledge_typed_package(id, ordered),
+                }
+                .map(|_| ())
+                .map_err(OwnerError::from)
             })
             .map_err(|error| match error {
                 OwnerError::Store(_) => Fail::Local,
                 other => fenced_fail(other),
             })?;
-        recorded.push(package.update_id);
+        recorded.push(key);
     }
     Ok(recorded)
 }

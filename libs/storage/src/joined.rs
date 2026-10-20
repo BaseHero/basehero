@@ -150,6 +150,9 @@ impl DeviceDatabase {
             return Err(StoreError::MissingProgress);
         }
         tx.execute("UPDATE joined_device SET activated=1 WHERE id=1", [])?;
+        // Activation changes no typed state: a bootstrap reads the log from its
+        // start, so ordered decisions made during it were already fully
+        // informed, and this container could not list before now either.
         tx.commit()?;
         Ok(())
     }

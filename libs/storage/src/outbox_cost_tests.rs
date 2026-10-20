@@ -174,6 +174,79 @@ fn pending_helpers_have_linear_vm_work_and_do_not_walk_accepted_history() {
     }
 }
 
+/// History and a backlog in one scope must not make the per-wake typed read expensive.
+#[test]
+fn typed_candidates_and_status_cost_only_open_work() {
+    let measure = |history: i64, backlog: i64| {
+        let db = DeviceDatabase::open(":memory:").unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO data_scope(id,base,audience) VALUES(1,zeroblob(32),zeroblob(32))",
+                [],
+            )
+            .unwrap();
+        db.connection.execute(
+            "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<?1)
+             INSERT INTO typed_outbox(mutation,base,audience,after_note,event_id,descriptor,body,outcome)
+             SELECT CAST(printf('%016d',n) AS BLOB),zeroblob(32),zeroblob(32),0,
+                    CASE WHEN n<=?2 THEN CAST(printf('%032d',n) AS BLOB) ELSE NULL END,
+                    CASE WHEN n<=?2 THEN x'00' ELSE NULL END,
+                    CASE WHEN n<=?2 THEN x'00' ELSE NULL END,
+                    CASE WHEN n<=?2 THEN 2 ELSE NULL END FROM ids",
+            params![history + backlog, history],
+        ).unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO data_pending(seq,scope,mutation,payload,state)
+             SELECT id,1,mutation,x'00','pending' FROM typed_outbox WHERE outcome IS NULL",
+                [],
+            )
+            .unwrap();
+        let candidates = count(
+            &db,
+            || {
+                let found = db.outbox_candidates(OutboxOrder::START, None, 16).unwrap();
+                assert_eq!(
+                    found
+                        .iter()
+                        .filter(|c| matches!(c, OutboxCandidate::Typed(_)))
+                        .count(),
+                    1
+                );
+            },
+            false,
+        );
+        let status = count(
+            &db,
+            || {
+                let s = db.outbox_summary().unwrap();
+                assert_eq!(s.unaccepted_typed, backlog as u64);
+            },
+            false,
+        );
+        println!(
+            "typed history={history} backlog={backlog}: candidates={candidates}, status={status}"
+        );
+        (candidates, status)
+    };
+    let small = measure(100, 3);
+    let large = measure(10_000, 3);
+    let short_backlog = measure(100, 100);
+    let long_backlog = measure(100, 10_000);
+    assert!(
+        long_backlog.0 <= short_backlog.0 + 500,
+        "candidate scans one scope's backlog: {short_backlog:?} -> {long_backlog:?}"
+    );
+    assert!(
+        large.0 <= small.0 + 500,
+        "candidate scans history: {small:?} -> {large:?}"
+    );
+    assert!(
+        large.1 <= small.1 + 500,
+        "status scans history: {small:?} -> {large:?}"
+    );
+}
+
 /// The publisher's wake-time read is one indexed lookup: its SQLite work
 /// does not grow with an unsent backlog, so a slow or offline device
 /// holding thousands of rows wakes as cheaply as one holding ten.

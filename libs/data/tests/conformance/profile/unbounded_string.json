@@ -1,0 +1,8 @@
+{
+  "description": "unbounded string",
+  "schema": {
+    "type": "string"
+  },
+  "accept": false,
+  "keyword": "maxLength"
+}

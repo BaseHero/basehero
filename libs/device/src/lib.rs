@@ -11,6 +11,8 @@ mod copy;
 pub mod incoming;
 pub mod join;
 pub mod own_base;
+mod records;
+pub use records::{ApprovalRequest, RecordsHandle};
 mod seal;
 mod sync_fence;
 pub mod writers;
@@ -22,7 +24,13 @@ use bh_account::{
 };
 use bh_core::note::{Note, OrderedState};
 use bh_crypto::random;
-use bh_storage::{DeviceDatabase, NoteEntry, NoteKey, OpenError, StoreError, ViewRecord};
+use bh_data::{
+    KeyRef, RecordId, Scope, TypeId,
+    catalogue::Shipped,
+    query::{self, Budget, Completeness, Query, SortKey, TypeSelect},
+};
+use bh_storage::{DeviceDatabase, NoteEntry, NoteKey, OpenError, ReadPool, StoreError, ViewRecord};
+pub use compaction::MaintenanceTurn;
 use compaction::Scheduler;
 use coordinator::{Ack, AuthoritySource, Coordinator, Delivery, HostError, Opened};
 use std::{
@@ -96,6 +104,8 @@ impl AccountAuthority {
     }
 }
 type Session = Arc<Mutex<Coordinator<AccountAuthority>>>;
+type RecordsWake = Arc<dyn Fn(ContainerId) + Send + Sync>;
+type RecordsWakeSlot = Arc<Mutex<Option<RecordsWake>>>;
 type NoteWork = Mutex<HashMap<(ContainerId, NoteKey), Weak<Mutex<()>>>>;
 struct WorkSlot<'a> {
     owner: &'a Owner,
@@ -124,6 +134,7 @@ impl Drop for WorkSlot<'_> {
 struct Container {
     anchor: Option<[u8; 32]>,
     session: Session,
+    readers: Option<Arc<ReadPool>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct WindowRoute {
@@ -178,9 +189,77 @@ pub struct Owner {
     deliveries: Mutex<HashMap<String, SurfaceQueue>>,
     next_generation: AtomicU64,
     next_drain_token: AtomicU64,
-    compaction: Scheduler,
+    compaction: Arc<Scheduler>,
     note_work: NoteWork,
     writers: writers::Writers,
+    records_wake: RecordsWakeSlot,
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+impl Owner {
+    /// Test-only owner with background body extraction disabled.
+    pub fn without_maintenance() -> Self {
+        Self {
+            compaction: Arc::new(Scheduler::without_maintenance()),
+            ..Self::default()
+        }
+    }
+    /// Test-only release of a paused worker, using the ordinary scheduling path.
+    pub fn resume_maintenance(&self, id: ContainerId) -> Result<(), OwnerError> {
+        let database = self.shared_database(id)?;
+        self.compaction.resume_maintenance();
+        self.compaction.schedule_maintenance(id, &database);
+        self.compaction.schedule_derived_if_pending(id, &database);
+        Ok(())
+    }
+    /// Test-only signal for completed body extractions, without a clock wait.
+    pub fn notifying_maintenance(sender: std::sync::mpsc::Sender<(ContainerId, usize)>) -> Self {
+        Self {
+            compaction: Arc::new(Scheduler::notifying(sender)),
+            ..Self::default()
+        }
+    }
+    /// Test-only: as [`Self::notifying_maintenance`], on a caller-driven
+    /// clock with the given quiet period. Call [`Self::wake_maintenance`]
+    /// after moving the clock.
+    pub fn notifying_maintenance_with_clock(
+        sender: std::sync::mpsc::Sender<(ContainerId, usize)>,
+        now: impl Fn() -> std::time::Instant + Send + Sync + 'static,
+        quiet: std::time::Duration,
+    ) -> Self {
+        Self {
+            compaction: Arc::new(Scheduler::notifying_with_clock(sender, now, quiet)),
+            ..Self::default()
+        }
+    }
+    /// Test-only: let a worker waiting on the test clock recompute deadlines.
+    pub fn wake_maintenance(&self) {
+        self.compaction.wake();
+    }
+    /// Test-only: no maintenance or derived turn is queued, deferred or running.
+    pub fn maintenance_idle(&self, id: ContainerId) -> bool {
+        self.compaction.idle(id)
+    }
+    /// Test-only: as [`Self::notifying_maintenance`], with at most `turns`
+    /// derived turns, so a test can stop a build after an acknowledged turn.
+    pub fn notifying_derived_turns(
+        sender: std::sync::mpsc::Sender<(ContainerId, usize)>,
+        turns: usize,
+    ) -> Self {
+        Self {
+            compaction: Arc::new(Scheduler::notifying_with_derived_turns(sender, turns)),
+            ..Self::default()
+        }
+    }
+}
+
+/// One native Note page and its local coverage, kept separate from the UI's
+/// existing array-only binding.
+#[derive(Debug)]
+pub struct NoteListPage {
+    pub rows: Vec<NoteEntry>,
+    pub completeness: Completeness,
 }
 
 #[derive(Debug)]
@@ -412,6 +491,17 @@ impl Owner {
         }
         windows
     }
+    fn account_readers(&self, id: ContainerId) -> Result<(Session, Arc<ReadPool>), OwnerError> {
+        let registry = self.registry.lock().expect("owner registry lock");
+        let container = registry
+            .containers
+            .get(&id)
+            .ok_or(OwnerError::UnknownContainer)?;
+        Ok((
+            Arc::clone(&container.session),
+            Arc::clone(container.readers.as_ref().ok_or(OwnerError::Unbound)?),
+        ))
+    }
     fn account_session(&self, id: ContainerId) -> Result<Session, OwnerError> {
         let registry = self.registry.lock().expect("owner registry lock");
         Ok(Arc::clone(
@@ -543,10 +633,18 @@ impl Owner {
         write(&mut db, base)
     }
     pub fn create_note(&self, id: ContainerId) -> Result<[u8; 32], OwnerError> {
-        self.with_authorized_writer(id, |db, base| Ok(db.create_note(base, ORDINARY_AUDIENCE)?))
+        let note = self
+            .with_authorized_writer(id, |db, base| Ok(db.create_note(base, ORDINARY_AUDIENCE)?))?;
+        self.compaction
+            .schedule_maintenance(id, &self.shared_database(id)?);
+        Ok(note)
     }
     pub fn home_note(&self, id: ContainerId) -> Result<[u8; 32], OwnerError> {
-        self.with_authorized_writer(id, |db, base| Ok(db.home_note(base, ORDINARY_AUDIENCE)?))
+        let note =
+            self.with_authorized_writer(id, |db, base| Ok(db.home_note(base, ORDINARY_AUDIENCE)?))?;
+        self.compaction
+            .schedule_maintenance(id, &self.shared_database(id)?);
+        Ok(note)
     }
     /// True only for an ordinary note in this container's authorized own base.
     pub fn has_note(&self, id: ContainerId, note: [u8; 32]) -> Result<bool, OwnerError> {
@@ -615,38 +713,108 @@ impl Owner {
             .remove(window);
         Ok(())
     }
-    /// Read-pool query, with authority rechecked before returning results.
+    /// The existing native UI consumes only rows. Headless consumers that
+    /// need to distinguish a partial list use `list_notes_page` instead.
     pub fn list_notes(
         &self,
         id: ContainerId,
         after: Option<(i64, [u8; 32])>,
         limit: usize,
     ) -> Result<Vec<NoteEntry>, OwnerError> {
-        let session = self.account_session(id)?;
-        let (base, capability, pool) = {
-            let guard = session.lock().expect("container session lock");
-            let (base, capability) = guard.authority().current().ok_or(OwnerError::Unbound)?;
-            let pool = guard
-                .shared_database()
-                .lock()
-                .expect("container writer lock")
-                .read_pool();
-            (base, capability, pool)
-        };
-        let rows =
-            pool.ok_or(OwnerError::Unbound)?
-                .list_notes(base, ORDINARY_AUDIENCE, after, limit)?;
-        let guard = session.lock().expect("container session lock");
-        if guard
+        Ok(self.list_notes_page(id, after, limit)?.rows)
+    }
+
+    /// The Note-family query on a read-pool connection, with authority checked
+    /// before and after. `touched` in these rows is `$changed`: for ordinary
+    /// Notes it follows core Note touches; specialised Notes also move up after
+    /// typed field changes. Known limit: failed projections lag recency or disappear until repair.
+    /// Complete covers this replica's verified progress,
+    /// not catch-up to the known head. A future UI claiming "all notes" must
+    /// also require Synced or UpdateNeeded sync status.
+    pub fn list_notes_page(
+        &self,
+        id: ContainerId,
+        after: Option<(i64, [u8; 32])>,
+        limit: usize,
+    ) -> Result<NoteListPage, OwnerError> {
+        if limit > bh_storage::MAX_NOTE_PAGE {
+            return Err(OwnerError::Store(StoreError::InvalidNotePage));
+        }
+        let (session, pool) = self.account_readers(id)?;
+        let (base, capability) = session
+            .lock()
+            .expect("container session lock")
             .authority()
             .current()
-            .is_none_or(|(current_base, current)| {
-                current_base != base || !Arc::ptr_eq(&current, &capability)
-            })
-        {
+            .ok_or(OwnerError::Unbound)?;
+        let scope = Scope {
+            base,
+            audience: ORDINARY_AUDIENCE,
+        };
+        let reads = [scope];
+        let mut query = Query {
+            select: TypeSelect::Family(TypeId::core("note")),
+            filter: None,
+            sort: vec![SortKey {
+                key: KeyRef::Changed,
+                desc: true,
+            }],
+            fields: vec![bh_data::FieldPath::parse("/title").expect("core Note title")],
+            follow: vec![],
+            text: None,
+            limit: limit as u32,
+            after: None,
+        };
+        let result = pool.read_data(|conn| {
+            if let Some((changed, note)) = after {
+                query.after = Some(
+                    query::after_changed(
+                        conn,
+                        scope,
+                        &reads,
+                        &Shipped,
+                        &query,
+                        changed,
+                        RecordId(note),
+                    )
+                    .map_err(|error| bh_data::DataError::Sql(error.to_string()))?,
+                );
+            }
+            query::run(conn, scope, &reads, &Shipped, &query, Budget::INTERACTIVE)
+                .map_err(|error| bh_data::DataError::Sql(error.to_string()))
+        });
+        let current = session
+            .lock()
+            .expect("container session lock")
+            .authority()
+            .current()
+            .is_some_and(|(b, cap)| b == base && Arc::ptr_eq(&cap, &capability));
+        if !current {
             return Err(OwnerError::Unbound);
         }
-        Ok(rows)
+        let page = result.map_err(|error| OwnerError::Store(StoreError::Data(error)))?;
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|row| {
+                Ok(NoteEntry {
+                    note: row.record.0,
+                    title: row
+                        .values
+                        .get("/title")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(OwnerError::Store(StoreError::InvalidNotePage))?
+                        .to_owned(),
+                    touched: row
+                        .changed
+                        .ok_or(OwnerError::Store(StoreError::InvalidNotePage))?,
+                })
+            })
+            .collect::<Result<Vec<_>, OwnerError>>()?;
+        Ok(NoteListPage {
+            rows,
+            completeness: page.completeness,
+        })
     }
     /// Consume restart presentation only after authorize. A row never grants
     /// authority: discard non-own-base, non-zero-audience or absent notes and
@@ -804,6 +972,12 @@ impl Owner {
             })
             .collect()
     }
+    /// Recent bounded maintenance turns for this live container, oldest first.
+    /// Read-only local diagnostics; no telemetry or persistent samples.
+    pub fn maintenance_stats(&self, id: ContainerId) -> Result<Vec<MaintenanceTurn>, OwnerError> {
+        self.shared_database(id)?;
+        Ok(self.compaction.maintenance_stats(id))
+    }
     /// Native-only existing writer; does not create a second account store or
     /// grant note authority. A setup container remains unanchored until anchor.
     pub fn shared_database(
@@ -905,6 +1079,7 @@ impl Owner {
                 break candidate;
             }
         };
+        let readers = database.read_pool();
         let session = Coordinator::new(database, authority);
         let writer = session.shared_database();
         registry.containers.insert(
@@ -912,10 +1087,13 @@ impl Owner {
             Container {
                 anchor,
                 session: Arc::new(Mutex::new(session)),
+                readers,
             },
         );
         drop(registry);
         self.compaction.schedule_backfill(id, &writer);
+        self.compaction.schedule_maintenance(id, &writer);
+        self.compaction.schedule_derived_if_pending(id, &writer);
         Ok(id)
     }
     /// Setup and fixture routing only. Account routes require show_note's full
@@ -1224,6 +1402,8 @@ impl Owner {
                     }
                     self.compaction.schedule(id, scope.key, &database);
                     self.compaction.schedule_backfill(id, &database);
+                    self.compaction.schedule_maintenance(id, &database);
+                    self.compaction.schedule_derived_if_pending(id, &database);
                     return Ok(opened);
                 }
             }
@@ -1532,6 +1712,9 @@ impl Owner {
         drop(work);
         let (result, targets, database, sql_hold) = outcome?;
         self.compaction.schedule(id, scope.key, &database);
+        if !result.replayed {
+            self.compaction.schedule_local_maintenance(id, &database);
+        }
         Ok((result, targets, sql_hold))
     }
     fn delivery_scope(

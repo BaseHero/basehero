@@ -1,0 +1,151 @@
+{
+  "actions": [
+    {
+      "name": "archive",
+      "effects": [
+        "/archived"
+      ],
+      "source": "archive.js"
+    }
+  ],
+  "app": "0202020202020202020202020202020202020202020202020202020202020202",
+  "description": "A published article with its source and publication time.",
+  "evolution": {
+    "examples": {
+      "invalid": [
+        {
+          "title": 5,
+          "url": "https://example.test/a"
+        }
+      ],
+      "valid": [
+        {
+          "title": "A sample",
+          "url": "https://example.test/a"
+        }
+      ]
+    },
+    "migration": "",
+    "migration_ops": [],
+    "previous": null
+  },
+  "extends": null,
+  "fields": {
+    "/published": {
+      "absent": "Unknown publication time",
+      "kind": "timestamp",
+      "meaning": "Publication time from the source, not save time",
+      "unit": "ms since Unix epoch UTC",
+      "write": "direct"
+    },
+    "/state": {
+      "kind": "enum",
+      "meaning": "Reader's per-record state",
+      "write": "direct"
+    },
+    "/title": {
+      "kind": "string",
+      "meaning": "Article headline",
+      "write": "direct"
+    },
+    "/url": {
+      "kind": "string",
+      "meaning": "Source URL",
+      "write": "direct"
+    },
+    "/content": {
+      "kind": "reference",
+      "meaning": "Canonical content Note; never a body copy",
+      "ref": {
+        "family": true,
+        "targets": [
+          "core:note"
+        ]
+      },
+      "write": "direct"
+    },
+    "/archived": {
+      "kind": "boolean",
+      "meaning": "Only the archive action sets this",
+      "write": "action"
+    }
+  },
+  "format": "bh-type/1",
+  "indexes": [
+    {
+      "keys": [
+        "/published"
+      ],
+      "name": "by_published"
+    }
+  ],
+  "kind": "record",
+  "local": "01010101010101010101010101010101",
+  "name": "Article",
+  "queries": [],
+  "rationale": [
+    "Publication time and save time have separate meanings."
+  ],
+  "schema": {
+    "properties": {
+      "published": {
+        "type": "integer"
+      },
+      "state": {
+        "enum": [
+          "new",
+          "saved"
+        ],
+        "type": "string"
+      },
+      "title": {
+        "maxLength": 200,
+        "type": "string"
+      },
+      "url": {
+        "maxLength": 2048,
+        "type": "string"
+      },
+      "content": {
+        "additionalProperties": false,
+        "properties": {
+          "audience": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          },
+          "record": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "record"
+        ],
+        "type": "object"
+      },
+      "archived": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "title",
+      "url"
+    ],
+    "type": "object"
+  },
+  "search": {
+    "text": [],
+    "title": "/title"
+  },
+  "unique": [
+    {
+      "keys": [
+        "/url"
+      ],
+      "name": "url"
+    }
+  ],
+  "uses": []
+}

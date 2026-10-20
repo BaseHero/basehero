@@ -1,0 +1,60 @@
+{
+  "description": "too many branches",
+  "schema": {
+    "anyOf": [
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      },
+      {
+        "type": "null"
+      }
+    ]
+  },
+  "accept": false,
+  "keyword": "anyOf"
+}

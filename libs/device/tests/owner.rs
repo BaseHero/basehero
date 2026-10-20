@@ -3,6 +3,9 @@ use bh_account::{
     crypto::{KemKey, SigningKey},
 };
 use bh_core::note::{Note, OrderedState};
+use bh_data::{
+    FieldPath, KeyRef, RecordId, Scope as DataScope, TypeId, index, note, store::records,
+};
 use bh_device::{
     ContainerId, Owner, OwnerError,
     coordinator::{AuthoritySource, Scope},
@@ -15,6 +18,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+/// Generous bound on waiting for a worker report; it only stops a hung test.
+const HANG: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct TestIssuer(HashMap<String, Scope>);
@@ -69,6 +75,163 @@ fn anchored(path: &std::path::Path, verified: &VerifiedAccount, signed: &[u8]) -
     .unwrap();
     db
 }
+fn pending_body_jobs(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM data_text_job", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn owner_commit_triggers_body_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commit.db");
+    let (extracted, completed) = mpsc::channel();
+    let (proof, signed) = test_only_verified();
+    let mut key = scope(proof.id().0, 1).key;
+    let mut db = anchored(&path, &proof, &signed);
+    key.note = db.create_note(key.base, key.audience).unwrap();
+    let owner = Owner::notifying_maintenance(extracted);
+    let source = Box::new(TestIssuer(HashMap::from([(
+        "writer".to_owned(),
+        Scope {
+            account: proof.id().0,
+            key,
+        },
+    )])));
+    let id = owner.register(db, Some(&proof), source).unwrap();
+    owner.bind("writer", id).unwrap();
+    assert_eq!(completed.recv().unwrap().0, id);
+    let opened = owner.open("writer", key.note).unwrap();
+    assert_eq!(completed.recv().unwrap().0, id);
+    owner
+        .commit_queued(
+            "writer",
+            opened.generation,
+            [1; 16],
+            &Note::new().unwrap().append_paragraph("indexed").unwrap(),
+        )
+        .unwrap();
+    loop {
+        let (finished, extracted) = completed.recv().unwrap();
+        assert_eq!(finished, id);
+        if extracted > 0 {
+            break;
+        }
+    }
+    drop(owner);
+    assert_eq!(pending_body_jobs(&path), 0);
+}
+
+#[test]
+fn dropping_owner_mid_index_build_resumes_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    let data_scope = DataScope {
+        base: [2; 32],
+        audience: [0; 32],
+    };
+    let ix = db
+        .with_data_write(|tx| {
+            for n in 0..3000u32 {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&n.to_be_bytes());
+                note::upsert_projection(tx, data_scope, RecordId(id), &format!("Note {n:04}"))?;
+            }
+            let sid = records::lookup_scope(tx, data_scope)?.unwrap();
+            index::ensure_local(
+                tx,
+                sid,
+                TypeId::core("note"),
+                vec![KeyRef::Field(FieldPath::parse("/title").unwrap())],
+            )
+        })
+        .unwrap();
+    // At most one derived turn: its budget is spent before the turn reports,
+    // so after that report no worker starts or requeues another.
+    let (completed, turns) = mpsc::channel();
+    let owner = Owner::notifying_derived_turns(completed, 1);
+    let id = owner
+        .register(db, None, issuer([0; 32], 2, "writer"))
+        .unwrap();
+    let state = || index::state(&rusqlite::Connection::open(&path).unwrap(), ix).unwrap();
+    let partial = loop {
+        let (turn, _) = turns.recv_timeout(HANG).expect("first derived turn");
+        assert_eq!(turn, id);
+        let state = state();
+        if state.built > 0 {
+            break state;
+        }
+    };
+    assert_eq!(
+        partial.state, "building",
+        "one bounded turn leaves a persisted cursor"
+    );
+    assert!(partial.built < 3000);
+    drop(owner);
+    assert_eq!(state(), partial, "nothing ran after the acknowledged turn");
+    let db = DeviceDatabase::open(&path).unwrap();
+    let (completed, turns) = mpsc::channel();
+    let owner = Owner::notifying_maintenance(completed);
+    let reopened = owner
+        .register(db, None, issuer([0; 32], 2, "writer"))
+        .unwrap();
+    for _ in 0..300 {
+        let (turn, _) = turns.recv_timeout(HANG).expect("resumed derived turn");
+        assert_eq!(turn, reopened);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        if index::state(&conn, ix).unwrap().state == "ready" {
+            assert!(!index::has_pending(&conn).unwrap());
+            return;
+        }
+    }
+    panic!("reopened owner did not complete the persisted index build");
+}
+
+#[test]
+fn owner_open_triggers_body_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open.db");
+    let (extracted, completed) = mpsc::channel();
+    let (proof, signed) = test_only_verified();
+    let mut key = scope(proof.id().0, 1).key;
+    let mut db = anchored(&path, &proof, &signed);
+    key.note = db.create_note(key.base, key.audience).unwrap();
+    let owner = Owner::notifying_maintenance(extracted);
+    let source = Box::new(TestIssuer(HashMap::from([(
+        "writer".to_owned(),
+        Scope {
+            account: proof.id().0,
+            key,
+        },
+    )])));
+    let id = owner.register(db, Some(&proof), source).unwrap();
+    owner.bind("writer", id).unwrap();
+    assert_eq!(completed.recv().unwrap().0, id); // registration turn is done before seeding
+    let delta = Note::new()
+        .unwrap()
+        .append_paragraph("queued before open")
+        .unwrap();
+    let db = owner.shared_database(id).unwrap();
+    db.lock()
+        .unwrap()
+        .commit_working_update_with_title(key, 0, proof.id().0, [1; 16], &delta, "queued")
+        .unwrap();
+    assert_eq!(pending_body_jobs(&path), 1);
+    owner.open("writer", key.note).unwrap();
+    loop {
+        let (finished, extracted) = completed.recv().unwrap();
+        assert_eq!(finished, id);
+        if extracted > 0 {
+            break;
+        }
+    }
+    drop(db);
+    drop(owner);
+    assert_eq!(pending_body_jobs(&path), 0);
+}
+
 #[test]
 fn duplicate_anchor_and_tampered_registry_cannot_create_note_authority() {
     let dir = tempfile::tempdir().unwrap();
@@ -713,7 +876,7 @@ fn cold_open_seeds_first_save_and_checkpoint_without_replaying_legacy_rows() {
         )
         .unwrap();
     }
-    let owner = Owner::default();
+    let owner = Owner::without_maintenance();
     let id = owner
         .register(db, Some(&proof), issuer(proof.id().0, 1, "writer"))
         .unwrap();
@@ -1182,7 +1345,7 @@ fn realistic_legacy_owner_open_and_two_saves() {
         conn.execute_batch("COMMIT").unwrap();
         drop(source);
         let before_rss = rss();
-        let owner = Owner::default();
+        let owner = Owner::without_maintenance();
         let id = owner
             .register(db, Some(&proof), issuer(proof.id().0, 1, "writer"))
             .unwrap();

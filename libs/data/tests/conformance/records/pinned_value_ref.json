@@ -1,0 +1,19 @@
+{
+  "description": "pinned value ref",
+  "schema": {
+    "$ref": "bh:value:deadbeef@cafe"
+  },
+  "resources": {
+    "bh:value:deadbeef@cafe": {
+      "type": "string",
+      "maxLength": 3
+    }
+  },
+  "valid": [
+    "yes"
+  ],
+  "invalid": [
+    "long",
+    2
+  ]
+}

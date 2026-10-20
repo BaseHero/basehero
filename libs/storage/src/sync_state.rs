@@ -7,7 +7,7 @@
 //! verifies and decides; this adapter commits one batch's decisions in one
 //! transaction, or nothing. Verified rows are keyed by log and position, so
 //! a later covering checkpoint can prune them by range.
-use crate::{DeviceDatabase, NoteKey, StoreError, catalogue, read_package};
+use crate::{DeviceDatabase, NoteKey, StoreError, catalogue, data, read_package};
 use bh_core::note::OrderedState;
 use bh_sync::{
     BodyObject, Commitment, OpaqueEvent, permit::LogKind, receipt::RECEIPT_LEN, referenced_body,
@@ -262,8 +262,19 @@ pub enum PackageOutcome {
     /// Another event holds its event ID, so it cannot be ordered under it.
     Conflicted,
 }
+pub(crate) fn package_verdict(
+    outcome: &bh_data::mutation::apply::Outcome,
+) -> Option<PackageOutcome> {
+    use bh_data::mutation::apply::Outcome;
+    match outcome {
+        Outcome::Accepted { .. } => Some(PackageOutcome::Accepted),
+        Outcome::Rejected(_) => Some(PackageOutcome::Rejected),
+        Outcome::Waiting(_) | Outcome::Duplicate => None,
+    }
+}
+
 impl PackageOutcome {
-    fn code(self) -> (u8, Option<u8>) {
+    pub(crate) fn code(self) -> (u8, Option<u8>) {
         match self {
             Self::Acked => (1, None),
             Self::Held => (6, None),
@@ -273,7 +284,10 @@ impl PackageOutcome {
             Self::Conflicted => (5, None),
         }
     }
-    fn decode(code: Option<u8>, refusal: Option<u8>) -> Result<Option<Self>, StoreError> {
+    pub(crate) fn decode(
+        code: Option<u8>,
+        refusal: Option<u8>,
+    ) -> Result<Option<Self>, StoreError> {
         Ok(match (code, refusal) {
             (None, None) => None,
             (Some(1), None) => Some(Self::Acked),
@@ -318,6 +332,10 @@ pub struct OutboxSummary {
     pub unaccepted_notes: u64,
     /// Notes with a refused, rejected or conflicted package.
     pub not_accepted_notes: u64,
+    /// Pending typed mutations not yet accepted, acknowledged or not.
+    pub unaccepted_typed: u64,
+    /// Typed packages with a refused, rejected or conflicted package.
+    pub not_accepted_typed: u64,
 }
 
 /// A verified echo's verdict on one of this device's packages. For
@@ -362,11 +380,42 @@ pub enum SyncAlarm {
     PublishingStopped { update_id: i64 },
     /// A stored Ack disagreed with the verified ordered record, which won.
     AckMismatch { update_id: i64, position: u64 },
+    /// The same publishing stop, for one of this device's typed packages.
+    TypedPublishingStopped { package: i64 },
+    /// The same Ack mismatch, for one of this device's typed packages.
+    TypedAckMismatch { package: i64, position: u64 },
+}
+
+/// One effect a committed batch applies inside its single transaction. Steps
+/// are in log order, so a typed operation at an earlier position cannot see a
+/// Note whose first accepted event comes later, and one at a later position
+/// does see it.
+pub enum IncomingStep {
+    /// Commit note `index` of [`IncomingCommit::notes`].
+    Note(usize),
+    /// Mark a held Note unavailable at its first held event's position.
+    Hold(usize),
+    /// Apply a verified typed payload at its ordered position.
+    Typed(Box<TypedPayload>),
+    /// Keep content this build cannot apply, at its ordered position.
+    Retained(crate::retained::RetainedContent),
+}
+
+/// A verified typed payload: the authenticated scope, position and author of
+/// its event, and its exact bytes.
+pub struct TypedPayload {
+    pub scope: bh_data::Scope,
+    pub position: bh_data::Position,
+    pub actor: bh_data::Actor,
+    pub payload: Vec<u8>,
+    pub ordered: Commitment,
+    pub descriptor: Vec<u8>,
+    pub body: Vec<u8>,
 }
 
 /// One log batch's decisions. `after` is the progress it continues from;
 /// `records` are its events' verified rows in log order, the last one the
-/// new head.
+/// new head; `steps` are the batch's effects in log order.
 pub struct IncomingCommit {
     pub log_kind: u8,
     pub log_id: [u8; 32],
@@ -377,6 +426,7 @@ pub struct IncomingCommit {
     pub metadata_id: [u8; 32],
     pub epoch_id: Option<[u8; 32]>,
     pub notes: Vec<IncomingNote>,
+    pub steps: Vec<IncomingStep>,
     pub own: Vec<OwnOutcome>,
     pub held: Vec<(NoteKey, Vec<crate::held_notes::HeldEvent>)>,
 }
@@ -794,53 +844,6 @@ impl DeviceDatabase {
         .collect()
     }
 
-    /// The next package of each note to publish, at most `limit` (≤ 256)
-    /// whose first uncovered update is after `after`, in that first id's
-    /// order. The returned update id is the persisted package or the last
-    /// update of the bounded run to seal; `first` is the paging cursor.
-    /// A note none of whose
-    /// pending updates was refused, rejected or conflicted has one; such a
-    /// package holds its note back until a deliberate step resolves it.
-    pub fn outbox_heads(&self, after: i64, limit: usize) -> Result<Vec<OutboxHead>, StoreError> {
-        let mut stmt = self.connection.prepare_cached(
-            "SELECT MIN(CASE WHEN p.outcome IS NULL THEN w.update_id END) AS first,u.base,u.audience,u.note
-             FROM pending_note_work w CROSS JOIN note_updates u ON u.id=w.update_id
-             LEFT JOIN note_outbox_members m ON m.update_id=w.update_id
-             LEFT JOIN note_outbox_progress p ON p.update_id=COALESCE(m.package_update_id,w.update_id)
-             GROUP BY u.base,u.audience,u.note
-             HAVING first>?1 AND MAX(COALESCE(p.outcome IN (3,4,5),0))=0
-             ORDER BY first LIMIT ?2",
-        )?;
-        let limit = limit.min(256) as i64;
-        stmt.query_map(params![after, limit], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-            ))
-        })?
-        .map(|row| {
-            let (update_id, base, audience, note) = row?;
-            let key = NoteKey {
-                base: array(base)?,
-                audience: array(audience)?,
-                note: array(note)?,
-            };
-            let first = update_id;
-            let update_id = match crate::runs::covering(&self.connection, first)? {
-                Some(package) => package,
-                None => crate::runs::run_end(&self.connection, key, first)?,
-            };
-            Ok(OutboxHead {
-                first,
-                update_id,
-                key,
-            })
-        })
-        .collect()
-    }
-
     /// Pending updates with no Ack and no outcome, all pending updates, and
     /// notes held back by a refused, rejected or conflicted package.
     pub fn outbox_summary(&self) -> Result<OutboxSummary, StoreError> {
@@ -856,11 +859,15 @@ impl DeviceDatabase {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
+        let (typed_unacknowledged, unaccepted_typed, not_accepted_typed) =
+            crate::typed_outbox::summary(&self.connection)?;
         Ok(OutboxSummary {
-            unacknowledged: unsigned(unacknowledged)?,
-            unaccepted: unsigned(unaccepted)?,
+            unacknowledged: unsigned(unacknowledged)? + typed_unacknowledged,
+            unaccepted: unsigned(unaccepted)? + unaccepted_typed,
             unaccepted_notes: unsigned(unaccepted_notes)?,
             not_accepted_notes: unsigned(not_accepted_notes)?,
+            unaccepted_typed,
+            not_accepted_typed,
         })
     }
 
@@ -964,22 +971,32 @@ impl DeviceDatabase {
         let mut stmt = self
             .connection
             .prepare_cached("SELECT kind,update_id,position FROM sync_alarm ORDER BY id")?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, u8>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-            ))
-        })?
-        .map(|row| match row? {
-            (1, update_id, _) => Ok(SyncAlarm::PublishingStopped { update_id }),
-            (2, update_id, Some(position)) => Ok(SyncAlarm::AckMismatch {
-                update_id,
-                position: unsigned(position)?,
-            }),
-            _ => Err(StoreError::CorruptSyncState),
-        })
-        .collect()
+        let mut alarms: Vec<SyncAlarm> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, u8>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .map(|row| match row? {
+                (1, update_id, _) => Ok(SyncAlarm::PublishingStopped { update_id }),
+                (2, update_id, Some(position)) => Ok(SyncAlarm::AckMismatch {
+                    update_id,
+                    position: unsigned(position)?,
+                }),
+                _ => Err(StoreError::CorruptSyncState),
+            })
+            .collect::<Result<_, _>>()?;
+        // Typed work's alarms follow the note alarms in the order they arose.
+        for (kind, package, position) in crate::typed_outbox::alarms(&self.connection)? {
+            alarms.push(match (kind, position) {
+                (1, _) => SyncAlarm::TypedPublishingStopped { package },
+                (2, Some(position)) => SyncAlarm::TypedAckMismatch { package, position },
+                _ => return Err(StoreError::CorruptSyncState),
+            });
+        }
+        Ok(alarms)
     }
 
     /// Whether this container must publish nothing more (a publishing alarm).
@@ -1086,19 +1103,107 @@ impl DeviceDatabase {
         for own in &commit.own {
             record_own(&tx, commit.log_id, own)?;
         }
-        for (key, events) in &commit.held {
-            crate::held_notes::insert(&tx, *key, events)?;
-        }
-        let mut committed = Vec::with_capacity(commit.notes.len());
-        for (index, note) in commit.notes.iter().enumerate() {
+        // Every effect lands in log order inside this one transaction, so a
+        // crash leaves all of the batch or none of it.
+        let scope = crate::data::ordinary_scope(commit.log_id);
+        let covered_before = crate::data::covered(&tx, scope)?;
+        let mut committed: Vec<Option<CommittedNote>> =
+            (0..commit.notes.len()).map(|_| None).collect();
+        let mut held_seen = vec![false; commit.held.len()];
+        // Dependencies this batch brings: an accepted definition can unblock
+        // any queued work in the scope, while a Note projection unblocks only
+        // the work waiting on that record.
+        let mut definition = false;
+        let mut projections: Vec<[u8; 32]> = Vec::new();
+        for (index, step) in commit.steps.iter().enumerate() {
             between(index)?;
-            committed.push(commit_note(&tx, note)?);
+            match step {
+                IncomingStep::Note(index) => {
+                    // Each Note commits exactly once; a repeated step would
+                    // apply the same Note twice.
+                    if committed[*index].is_some() {
+                        return Err(StoreError::CorruptSyncState);
+                    }
+                    let note = &commit.notes[*index];
+                    let created = crate::data::note_projection_missing(&tx, note.key)?;
+                    committed[*index] = Some(commit_note(&tx, note)?);
+                    if created && !note.accepted.is_empty() {
+                        projections.push(note.key.note);
+                    }
+                }
+                IncomingStep::Hold(index) => {
+                    let seen = held_seen
+                        .get_mut(*index)
+                        .ok_or(StoreError::CorruptSyncState)?;
+                    if std::mem::replace(seen, true) {
+                        return Err(StoreError::CorruptSyncState);
+                    }
+                    let (key, events) = &commit.held[*index];
+                    crate::held_notes::insert(&tx, *key, events)?;
+                }
+                IncomingStep::Typed(typed) => {
+                    let echo = crate::typed_outbox::classify_echo(
+                        &tx,
+                        commit.log_id,
+                        typed.ordered.event_id().0,
+                        &typed.descriptor,
+                        &typed.body,
+                        &typed.actor,
+                    )?;
+                    let outcome = crate::data::apply_typed(
+                        &tx,
+                        typed.scope,
+                        typed.position,
+                        &typed.actor,
+                        &typed.payload,
+                    )?;
+                    definition |= matches!(
+                        outcome,
+                        bh_data::mutation::apply::Outcome::Accepted { record: None, .. }
+                    );
+                    if let Some((exact, own_key)) = echo
+                        && (!exact
+                            || !matches!(outcome, bh_data::mutation::apply::Outcome::Duplicate))
+                    {
+                        let verdict = if !exact {
+                            Some(PackageOutcome::Conflicted)
+                        } else {
+                            package_verdict(&outcome)
+                        };
+                        crate::typed_outbox::record_echo(
+                            &tx,
+                            commit.log_id,
+                            &crate::typed_outbox::TypedEcho {
+                                event_id: typed.ordered.event_id().0,
+                                ordered: typed.ordered,
+                                outcome: verdict,
+                                publishing_stopped: !exact && own_key,
+                            },
+                        )?;
+                    }
+                }
+                IncomingStep::Retained(row) => crate::retained::insert(&tx, row)?,
+            }
+        }
+        if committed.iter().any(Option::is_none) || held_seen.iter().any(|seen| !seen) {
+            return Err(StoreError::CorruptSyncState);
+        }
+        // Advance this scope's typed coverage to the committed position, then
+        // replay once at most: the whole queue for an accepted definition or a
+        // scope whose coverage this batch supplied, and only the rows waiting on
+        // one record for each projection this batch created.
+        crate::data::advance_coverage(&tx, scope, bh_data::Position(last.position))?;
+        if (definition || !covered_before) && crate::data::has_parked(&tx, scope)? {
+            crate::data::replay_parked(&tx, scope)?;
+        }
+        for note in projections {
+            crate::data::replay_parked_for(&tx, scope, note)?;
         }
         tx.commit()?;
         for note in &commit.notes {
             self.forget_note(note.key);
         }
-        Ok(committed)
+        Ok(committed.into_iter().flatten().collect())
     }
 
     /// Latch a proven contradiction. The log's progress and every note's
@@ -1234,6 +1339,9 @@ fn read_control(
 }
 
 pub(crate) fn publishing_stopped(conn: &rusqlite::Connection) -> Result<bool, StoreError> {
+    if crate::typed_outbox::publishing_stopped(conn)? {
+        return Ok(true);
+    }
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sync_alarm WHERE kind=1)",
         [],
@@ -1327,6 +1435,10 @@ pub(crate) fn commit_note(
         if let Some(title) = &note.title {
             catalogue::touch(tx, key, Some(title))?;
         }
+    }
+    if through.is_some() || !note.remote.is_empty() {
+        let title = data::catalogued_title(tx, key)?;
+        data::project_note(tx, key, &title)?;
     }
     Ok(CommittedNote {
         key,

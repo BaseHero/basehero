@@ -551,7 +551,45 @@ fn note_payload_names_its_writer_and_authenticated_author() {
 }
 
 #[test]
-fn note_payload_without_a_whole_declaration_is_rejected_and_a_newer_one_pauses() {
+fn a_recomposed_note_payload_is_byte_identical_to_the_opened_one() {
+    let f = Fixture::new();
+    let update = Note::new().unwrap().append_paragraph("canonical").unwrap();
+    let data = note_payload([7; 32], WRITER, &update);
+    let event = f.note(f.valid_receipt(), &data);
+    let mut history = f.history.clone();
+    let ordered =
+        Commitment::order(f.base, history.head(), &event.descriptor, Route::Content).unwrap();
+    let prepared = history
+        .prepare(
+            &ordered,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.content),
+        )
+        .unwrap();
+    let mut note = Note::new().unwrap();
+    let applied = history
+        .consume(
+            prepared,
+            Some(NoteTarget {
+                id: [7; 32],
+                note: &mut note,
+            }),
+        )
+        .unwrap();
+    // A reader keeps a Note payload only by recomposing it from the opened
+    // declaration and delta, so that must reproduce the author's exact bytes.
+    let AppliedKind::NoteAccepted { note_id, delta } = applied.kind() else {
+        panic!("the stored payload was not accepted as a Note update");
+    };
+    let writer = DeviceWriterDeclaration::decode(&data[32..131]).unwrap();
+    assert_eq!(writer, WRITER);
+    assert_eq!(note_payload(*note_id, writer, delta.expose()), data);
+}
+
+#[test]
+fn note_payload_without_a_whole_declaration_is_rejected_and_a_newer_one_is_retained() {
     let f = Fixture::new();
     // The ID and 98 bytes cannot hold a declaration.
     let mut short = vec![7; 32];
@@ -559,16 +597,22 @@ fn note_payload_without_a_whole_declaration_is_rejected_and_a_newer_one_pauses()
     short.resize(32 + 98, 0);
     f.assert_rejected(&f.note(f.valid_receipt(), &short), "short declaration");
     let update = Note::new().unwrap().append_paragraph("newer").unwrap();
+    // A declaration only a newer version reads names its note, so the event
+    // is consumed and retained for that note instead of pausing the base.
     for (offset, value, why) in [(1, 2, "declaration version 2"), (2, 2, "author tag 2")] {
         let mut data = note_payload([7; 32], WRITER, &update);
         data[32 + offset] = value;
         let mut history = f.history.clone();
+        let before = history.head();
         let mut note = Note::new().unwrap();
+        let empty = note.state().unwrap();
         assert_eq!(
             f.apply(&mut history, &f.note(f.valid_receipt(), &data), &mut note),
-            Outcome::UnsupportedPause,
+            Outcome::Retained,
             "{why}"
         );
+        assert_eq!(history.head().position, before.position + 1, "{why}");
+        assert_eq!(note.state().unwrap(), empty, "{why}");
         assert!(!history.is_stopped(), "{why}");
     }
 }

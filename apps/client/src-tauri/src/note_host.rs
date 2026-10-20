@@ -813,10 +813,11 @@ pub(crate) fn list_bound(
         Some(After { touched, note }) => Some((touched, note_id(note)?)),
         None => None,
     };
-    let rows = owner
-        .list_notes(id, after, MAX_NOTE_PAGE)
+    let page = owner
+        .list_notes_page(id, after, MAX_NOTE_PAGE)
         .map_err(|_| "note unavailable")?;
-    Ok(rows
+    Ok(page
+        .rows
         .into_iter()
         .map(|entry| NoteRow {
             note: entry.note.to_vec(),

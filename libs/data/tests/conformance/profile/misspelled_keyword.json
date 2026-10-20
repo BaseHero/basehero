@@ -1,0 +1,11 @@
+{
+  "description": "misspelled keyword",
+  "schema": {
+    "type": "object",
+    "requred": [
+      "x"
+    ]
+  },
+  "accept": false,
+  "keyword": "requred"
+}

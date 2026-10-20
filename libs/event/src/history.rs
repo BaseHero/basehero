@@ -24,6 +24,10 @@ pub enum Outcome {
     IntegrityStop,
     UnsupportedPause,
     UnavailablePause,
+    /// Verified and consumed, with its content retained exactly and not
+    /// applied by this build: typed data, a content kind this build does not
+    /// know, or a note event whose writer declaration this build cannot read.
+    Retained,
 }
 /// Selected Note, checked against the authenticated ID before writing. The
 /// compatibility `apply` API still stops on an externally guessed wrong target.
@@ -114,19 +118,28 @@ pub struct PreparedEvent {
     kind: PreparedKind,
 }
 impl PreparedEvent {
-    /// Only supported note events have a target. Controls return None.
+    /// Only a note event this build applies has a target. Controls, retained
+    /// content and unreadable declarations return None.
     pub fn note_id(&self) -> Option<[u8; 32]> {
         match &self.kind {
             PreparedKind::Note { id, .. } => Some(*id),
-            PreparedKind::Control { .. } | PreparedKind::Rejected => None,
+            PreparedKind::Control { .. }
+            | PreparedKind::Typed { .. }
+            | PreparedKind::UnknownContent { .. }
+            | PreparedKind::NoteUnsupported { .. }
+            | PreparedKind::Rejected => None,
         }
     }
     /// The producing writer a note event declares, unchecked against its
-    /// author; None for controls.
+    /// author; None for controls and every retained event.
     pub fn writer(&self) -> Option<DeviceWriterDeclaration> {
         match &self.kind {
             PreparedKind::Note { writer, .. } => Some(*writer),
-            PreparedKind::Control { .. } | PreparedKind::Rejected => None,
+            PreparedKind::Control { .. }
+            | PreparedKind::Typed { .. }
+            | PreparedKind::UnknownContent { .. }
+            | PreparedKind::NoteUnsupported { .. }
+            | PreparedKind::Rejected => None,
         }
     }
     /// An invalid submission: consuming it advances history with no effect.
@@ -156,7 +169,8 @@ pub struct AppliedEvent {
     account_change: Option<Vec<u8>>,
 }
 /// Authenticated history classification. A rejected content event advances
-/// the common history but must not change the Note.
+/// the common history but must not change the Note; a retained one advances
+/// it with its exact bytes kept and nothing applied.
 pub enum AppliedKind {
     /// With `History::consume`, the delta passed that history's Note judgment.
     /// With `History::consume_unapplied`, this is only an authenticated
@@ -168,6 +182,23 @@ pub enum AppliedKind {
     },
     NoteRejected {
         note_id: [u8; 32],
+    },
+    /// Typed data, exactly as its author sealed it. This layer does not parse
+    /// it; the device owner decides whether and how to apply it.
+    Typed {
+        payload: SecretBytes,
+    },
+    /// A content kind this build does not know: retained exactly, not applied,
+    /// and history continues past it.
+    UnknownContent {
+        kind: u16,
+        payload: SecretBytes,
+    },
+    /// A note event whose writer declaration this build cannot read: retained
+    /// exactly and not applied, so only this note waits for a newer build.
+    NoteUnsupported {
+        note_id: [u8; 32],
+        payload: SecretBytes,
     },
     Control,
     /// An invalid submission: it holds its position and nothing else.
@@ -208,7 +239,10 @@ impl AppliedEvent {
         match self.kind {
             AppliedKind::NoteRejected { .. } => Outcome::ContentRejected,
             AppliedKind::Rejected => Outcome::Rejected,
-            _ => Outcome::Accepted,
+            AppliedKind::Typed { .. }
+            | AppliedKind::UnknownContent { .. }
+            | AppliedKind::NoteUnsupported { .. } => Outcome::Retained,
+            AppliedKind::NoteAccepted { .. } | AppliedKind::Control => Outcome::Accepted,
         }
     }
     pub fn head(&self) -> Head {
@@ -254,15 +288,35 @@ impl AppliedEvent {
     }
     /// The writer a note event declares, rejected or not. Only its decoding
     /// is checked here: whether it binds [`Self::author`] is the note
-    /// owner's rule. None for controls.
+    /// owner's rule. None for controls and for a declaration this build
+    /// cannot read.
     pub fn writer(&self) -> Option<DeviceWriterDeclaration> {
         self.writer
     }
 }
+/// The exact decrypted payload an event retains, owned and wiped on drop.
+fn retained(payload: &OpenPayload) -> SecretBytes {
+    SecretBytes::from_vec(payload.data().to_vec())
+}
+
 enum PreparedKind {
     Note {
         id: [u8; 32],
         writer: DeviceWriterDeclaration,
+        payload: OpenPayload,
+    },
+    /// Typed data this build carries but does not parse.
+    Typed {
+        payload: OpenPayload,
+    },
+    /// A content kind this build does not know.
+    UnknownContent {
+        kind: u16,
+        payload: OpenPayload,
+    },
+    /// A note event whose writer declaration this build cannot read.
+    NoteUnsupported {
+        id: [u8; 32],
         payload: OpenPayload,
     },
     Control {
@@ -712,6 +766,13 @@ impl History {
                 writer,
                 payload,
             },
+            Judged::Typed { payload } => PreparedKind::Typed { payload },
+            Judged::UnknownContent { kind, payload } => {
+                PreparedKind::UnknownContent { kind, payload }
+            }
+            Judged::NoteUnsupported { id, payload } => {
+                PreparedKind::NoteUnsupported { id, payload }
+            }
             Judged::Control {
                 account,
                 change,
@@ -769,6 +830,26 @@ impl History {
         let (kind, note) = match &prepared.kind {
             PreparedKind::Control { .. } => (AppliedKind::Control, None),
             PreparedKind::Rejected => (AppliedKind::Rejected, None),
+            PreparedKind::Typed { payload } => (
+                AppliedKind::Typed {
+                    payload: retained(payload),
+                },
+                None,
+            ),
+            PreparedKind::UnknownContent { kind, payload } => (
+                AppliedKind::UnknownContent {
+                    kind: *kind,
+                    payload: retained(payload),
+                },
+                None,
+            ),
+            PreparedKind::NoteUnsupported { id, payload } => (
+                AppliedKind::NoteUnsupported {
+                    note_id: *id,
+                    payload: retained(payload),
+                },
+                None,
+            ),
             PreparedKind::Note { id, payload, .. } => {
                 let mut note = target.expect("target checked").note;
                 let delta = &payload.data()[NOTE_PREFIX..];
@@ -812,7 +893,11 @@ impl History {
                 *epoch_id,
                 prepared.digest.0,
             ),
-            PreparedKind::Note { .. } | PreparedKind::Rejected => (
+            PreparedKind::Note { .. }
+            | PreparedKind::Typed { .. }
+            | PreparedKind::UnknownContent { .. }
+            | PreparedKind::NoteUnsupported { .. }
+            | PreparedKind::Rejected => (
                 None,
                 self.metadata_id,
                 self.epoch_id,
@@ -910,6 +995,17 @@ impl History {
         let kind = match &prepared.kind {
             PreparedKind::Control { .. } => AppliedKind::Control,
             PreparedKind::Rejected => AppliedKind::Rejected,
+            PreparedKind::Typed { payload } => AppliedKind::Typed {
+                payload: retained(payload),
+            },
+            PreparedKind::UnknownContent { kind, payload } => AppliedKind::UnknownContent {
+                kind: *kind,
+                payload: retained(payload),
+            },
+            PreparedKind::NoteUnsupported { id, payload } => AppliedKind::NoteUnsupported {
+                note_id: *id,
+                payload: retained(payload),
+            },
             PreparedKind::Note { id, payload, .. } => {
                 let target = target.expect("target checked");
                 match apply_note(target.note, &payload.data()[NOTE_PREFIX..]) {
@@ -946,6 +1042,17 @@ impl History {
         let kind = match &prepared.kind {
             PreparedKind::Control { .. } => AppliedKind::Control,
             PreparedKind::Rejected => AppliedKind::Rejected,
+            PreparedKind::Typed { payload } => AppliedKind::Typed {
+                payload: retained(payload),
+            },
+            PreparedKind::UnknownContent { kind, payload } => AppliedKind::UnknownContent {
+                kind: *kind,
+                payload: retained(payload),
+            },
+            PreparedKind::NoteUnsupported { id, payload } => AppliedKind::NoteUnsupported {
+                note_id: *id,
+                payload: retained(payload),
+            },
             PreparedKind::Note { id, payload, .. } => {
                 let delta = &payload.data()[NOTE_PREFIX..];
                 AppliedKind::NoteAccepted {

@@ -629,17 +629,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "bh-data"
+version = "0.1.0"
+dependencies = [
+ "bh-crypto",
+ "bh-data",
+ "jsonschema",
+ "rusqlite",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bh-data-consumers"
+version = "0.1.0"
+dependencies = [
+ "bh-data",
+ "bh-data-fixtures",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "bh-data-fixtures"
+version = "0.1.0"
+dependencies = [
+ "bh-data",
+ "serde_json",
+]
+
+[[package]]
 name = "bh-device"
 version = "0.1.0"
 dependencies = [
  "bh-account",
  "bh-core",
  "bh-crypto",
+ "bh-data",
  "bh-event",
  "bh-storage",
  "bh-sync",
  "rusqlite",
  "rustix",
+ "serde_json",
  "tempfile",
 ]
 
@@ -714,6 +750,7 @@ dependencies = [
  "bh-authz-proto",
  "bh-core",
  "bh-crypto",
+ "bh-data",
  "bh-device",
  "bh-host",
  "bh-storage",
@@ -862,10 +899,13 @@ dependencies = [
  "bh-account",
  "bh-core",
  "bh-crypto",
+ "bh-data",
  "bh-event",
+ "bh-storage",
  "bh-sync",
  "rusqlite",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "yrs",
@@ -914,6 +954,7 @@ dependencies = [
  "bh-confidential-policy",
  "bh-core",
  "bh-crypto",
+ "bh-data",
  "bh-device",
  "bh-event",
  "bh-storage",

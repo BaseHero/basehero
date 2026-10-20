@@ -6,7 +6,7 @@ use bh_core::note::Note;
 use bh_crypto::{KemKey, Secret, SigningKey, aead_open, aead_seal, derive_key};
 use bh_event::{
     ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, GENESIS, History, NOTE,
-    NoteTarget, Outcome, Payload, key_id, seal,
+    NoteTarget, Outcome, OwnedNoteTarget, Payload, key_id, seal,
 };
 use bh_sync::receipt::{self, RECEIPT_LEN};
 use bh_sync::{BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, Route};
@@ -261,6 +261,19 @@ fn note_delta(text: &str) -> (Vec<u8>, Note) {
     let data = with_writer(&note.append_paragraph(text).unwrap());
     (data, note)
 }
+/// A note payload for an arbitrary note, from an arbitrary declared writer.
+fn note_payload_for(note: [u8; 32], update: &[u8]) -> Vec<u8> {
+    bh_event::note_payload(
+        note,
+        bh_event::writer::DeviceWriterDeclaration {
+            account: [4; 32],
+            device: [5; 32],
+            nonce: [6; 32],
+        },
+        update,
+    )
+}
+
 /// Note 7's payload from an arbitrary declared writer; history checks only
 /// that the declaration decodes.
 fn with_writer(update: &[u8]) -> Vec<u8> {
@@ -565,17 +578,20 @@ fn malformed_authentic_note_rejects_content_then_accepts_next() {
 }
 
 #[test]
-fn unsupported_semantics_pause_and_ciphertext_tamper_stops_without_losing_note() {
+fn unknown_control_pauses_and_ciphertext_tamper_stops_without_losing_note() {
     let mut f = Fixture::new();
     let (data, _) = note_delta("prior");
     let (event, order) = f.content(&f.first, NOTE, &data);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
     let before = f.note.state().unwrap();
-    let head = f.history.head();
+    // An unknown content kind is retained and consumed, never a stop and
+    // never applied to the note.
     let (unknown, order) = f.content(&f.first, 0xf123, &data);
-    assert_eq!(f.apply(&unknown, &order, true), Outcome::UnsupportedPause);
-    assert_eq!(f.history.head(), head);
+    assert_eq!(f.apply(&unknown, &order, true), Outcome::Retained);
+    assert_eq!(f.history.head(), order.head());
     assert_eq!(f.note.state().unwrap(), before);
+    // An unknown control kind still pauses the whole base.
+    let head = f.history.head();
     let (unknown, order) = f.create(
         f.binding(&f.first, CLASS_CONTROL),
         0xf124,
@@ -592,6 +608,439 @@ fn unsupported_semantics_pause_and_ciphertext_tamper_stops_without_losing_note()
     assert_eq!(f.note.state().unwrap(), before);
     assert_eq!(f.history.head(), head);
     assert!(f.history.is_stopped());
+}
+
+#[test]
+fn typed_and_unknown_content_are_retained_in_position_between_notes() {
+    let mut f = Fixture::new();
+    let (first, first_order) = f.content(&f.first, NOTE, &note_delta("before").0);
+    assert_eq!(f.apply(&first, &first_order, true), Outcome::Accepted);
+    let kept = f.note.state().unwrap();
+    let before = f.history.head();
+    // A typed payload this layer never parses: its bytes are kept exactly.
+    let typed_payload = b"typed-data-v1\x00payload".to_vec();
+    let (typed, typed_order) = f.content(&f.first, bh_event::TYPED_DATA, &typed_payload);
+    let prepare = |f: &mut Fixture| {
+        f.history
+            .prepare(
+                &typed_order,
+                &typed.descriptor,
+                Some(&typed.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap()
+    };
+    let prepared = prepare(&mut f);
+    assert_eq!(prepared.note_id(), None);
+    // Materializing it applies no note and claims no content acceptance.
+    let materialized = f.history.materialize(prepared, None).unwrap();
+    assert!(materialized.note.is_none());
+    assert_eq!(
+        materialized.transition.applied().outcome(),
+        Outcome::Retained
+    );
+    // A retained event has no note target: consume and materialize refuse one
+    // and leave both the note and history unchanged.
+    let prepared = prepare(&mut f);
+    assert_eq!(
+        f.history
+            .consume(
+                prepared,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::WrongTarget)
+    );
+    assert_eq!(f.note.state().unwrap(), kept);
+    assert_eq!(f.history.head(), before);
+    let working = Note::new().unwrap();
+    let working_before = working.state().unwrap();
+    let prepared = prepare(&mut f);
+    let failed = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: [7; 32],
+                note: working,
+            }),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(failed.reason, bh_event::ConsumeError::WrongTarget);
+    assert_eq!(failed.target.unwrap().note.state().unwrap(), working_before);
+    assert_eq!(f.history.head(), before);
+    let prepared = prepare(&mut f);
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.commitment(), typed_order);
+    assert_eq!(applied.head(), typed_order.head());
+    assert_eq!(applied.head().position, before.position + 1);
+    assert_eq!(
+        applied.author(),
+        Some((f.account.id().0, f.first.keys().id().0))
+    );
+    assert_eq!(applied.outcome(), Outcome::Retained);
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::Typed { payload } if payload.expose() == typed_payload.as_slice()
+    ));
+    // An unknown content class kind is retained the same way: consumed in
+    // position, never applied, and no pause.
+    let unknown_payload = b"a kind this build does not know".to_vec();
+    let (unknown, unknown_order) = f.content(&f.first, 0xf123, &unknown_payload);
+    let prepared = f
+        .history
+        .prepare(
+            &unknown_order,
+            &unknown.descriptor,
+            Some(&unknown.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    assert_eq!(prepared.note_id(), None);
+    assert_eq!(
+        f.history
+            .consume(
+                prepared,
+                Some(NoteTarget {
+                    id: [7; 32],
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::WrongTarget)
+    );
+    assert_eq!(f.note.state().unwrap(), kept);
+    assert_eq!(f.history.head(), typed_order.head());
+    let prepared = f
+        .history
+        .prepare(
+            &unknown_order,
+            &unknown.descriptor,
+            Some(&unknown.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let applied = f.history.consume(prepared, None).unwrap();
+    assert_eq!(applied.head(), unknown_order.head());
+    assert_eq!(
+        applied.author(),
+        Some((f.account.id().0, f.first.keys().id().0))
+    );
+    assert_eq!(applied.outcome(), Outcome::Retained);
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::UnknownContent { kind: 0xf123, payload }
+            if payload.expose() == unknown_payload.as_slice()
+    ));
+    // The note after them is still an ordinary candidate.
+    let (last, last_order) = f.content(&f.first, NOTE, &note_delta("after").0);
+    let prepared = f
+        .history
+        .prepare(
+            &last_order,
+            &last.descriptor,
+            Some(&last.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.outcome(), Outcome::Accepted);
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::NoteAccepted { note_id, .. } if *note_id == [7; 32]
+    ));
+    assert_eq!(applied.head(), last_order.head());
+    assert_eq!(f.history.head(), last_order.head());
+    assert!(!f.history.is_stopped());
+    // Nothing above ran a note engine: the earlier note is untouched.
+    assert_eq!(f.note.state().unwrap(), kept);
+}
+
+#[test]
+fn prepared_typed_content_seals_the_shared_content_binding_and_verifies_as_typed() {
+    let mut f = Fixture::new();
+    let payload = b"typed-data/1\x00exact bytes, never parsed here".to_vec();
+    let seen = bh_event::Seen {
+        head: f.history.head(),
+        control: f.control,
+        account: f.account.head(),
+    };
+    let request = bh_event::prepare_typed(
+        f.base,
+        &f.account,
+        f.first.keys().id(),
+        seen,
+        receipt_for(f.base, f.history.head()),
+        bh_event::TypedDraft {
+            event_id: EventId(bh_crypto::random()),
+            payload: &payload,
+        },
+        &f.metadata,
+        &f.epoch,
+    )
+    .unwrap();
+    // The ordinary device key signs exactly the bytes the binding names.
+    assert_eq!(*request.expected_key(), f.first.signing.public());
+    let signature = f.first.signing.sign(request.signing_bytes());
+    let event = request.finish(signature).unwrap();
+    let ordered =
+        Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content).unwrap();
+    let prepared = f
+        .history
+        .prepare(
+            &ordered,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+        )
+        .unwrap();
+    // Not a note: no note target and no writer declaration were manufactured.
+    assert_eq!(prepared.note_id(), None);
+    assert_eq!(prepared.writer(), None);
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.commitment(), ordered);
+    assert_eq!(applied.head(), ordered.head());
+    assert_eq!(
+        applied.author(),
+        Some((f.account.id().0, f.first.keys().id().0))
+    );
+    assert_eq!(applied.outcome(), Outcome::Retained);
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::Typed { payload: kept } if kept.expose() == payload.as_slice()
+    ));
+}
+
+#[test]
+fn an_unreadable_note_declaration_waits_for_its_note_only() {
+    let mut f = Fixture::new();
+    let note_a = [8; 32];
+    let note_b = [9; 32];
+    let update = |text: &str| Note::new().unwrap().append_paragraph(text).unwrap();
+    let prepare = |f: &mut Fixture, event: &Encoded, order: &Commitment| {
+        f.history
+            .prepare(
+                order,
+                &event.descriptor,
+                Some(&event.body),
+                &f.metadata,
+                Some(&f.epoch),
+            )
+            .unwrap()
+    };
+    // Note B before and after note A's unreadable declaration.
+    let (b_first, b_first_order) =
+        f.content(&f.first, NOTE, &note_payload_for(note_b, &update("b one")));
+    let prepared = prepare(&mut f, &b_first, &b_first_order);
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::NoteAccepted { note_id, .. } if *note_id == note_b
+    ));
+    let mut a_payload = note_payload_for(note_a, &update("a"));
+    a_payload[33] = 2; // writer declaration version 2
+    let (a_event, a_order) = f.content(&f.first, NOTE, &a_payload);
+    let prepared = prepare(&mut f, &a_event, &a_order);
+    assert_eq!(
+        prepared.note_id(),
+        None,
+        "an unreadable declaration has no apply target"
+    );
+    let kept = f.note.state().unwrap();
+    let before = f.history.head();
+    assert_eq!(
+        f.history
+            .consume(
+                prepared,
+                Some(NoteTarget {
+                    id: note_a,
+                    note: &mut f.note
+                })
+            )
+            .err(),
+        Some(bh_event::ConsumeError::WrongTarget)
+    );
+    assert_eq!(f.note.state().unwrap(), kept);
+    assert_eq!(f.history.head(), before);
+    let working = Note::new().unwrap();
+    let working_before = working.state().unwrap();
+    let prepared = prepare(&mut f, &a_event, &a_order);
+    let failed = f
+        .history
+        .materialize(
+            prepared,
+            Some(OwnedNoteTarget {
+                id: note_a,
+                note: working,
+            }),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(failed.reason, bh_event::ConsumeError::WrongTarget);
+    assert_eq!(failed.target.unwrap().note.state().unwrap(), working_before);
+    assert_eq!(f.history.head(), before);
+    let prepared = prepare(&mut f, &a_event, &a_order);
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.head(), a_order.head());
+    assert_eq!(applied.outcome(), Outcome::Retained);
+    assert_eq!(
+        applied.author(),
+        Some((f.account.id().0, f.first.keys().id().0))
+    );
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::NoteUnsupported { note_id, payload }
+            if *note_id == note_a && payload.expose() == a_payload.as_slice()
+    ));
+    let (b_next, b_next_order) =
+        f.content(&f.first, NOTE, &note_payload_for(note_b, &update("b two")));
+    let prepared = prepare(&mut f, &b_next, &b_next_order);
+    let applied = f.history.consume_unapplied(prepared).unwrap();
+    assert!(matches!(
+        applied.kind(),
+        bh_event::AppliedKind::NoteAccepted { note_id, .. } if *note_id == note_b
+    ));
+    assert_eq!(applied.head(), b_next_order.head());
+    assert_eq!(f.history.head(), b_next_order.head());
+    assert!(!f.history.is_stopped());
+}
+
+#[test]
+fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
+    let mut f = Fixture::new();
+    let (data, _) = note_delta("matrix");
+    let (note, note_order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(f.apply(&note, &note_order, true), Outcome::Accepted);
+    // A fresh event for the format checks below, never consumed: rewriting
+    // the applied one would reuse its event ID and be rejected for that.
+    let (fresh, _) = f.content(&f.first, NOTE, &data);
+    let head = f.history.head();
+    // An unknown control kind still pauses; nothing is consumed.
+    let (unknown, order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        0xf124,
+        &[],
+        &f.first.control,
+        None,
+    );
+    assert_eq!(f.apply(&unknown, &order, false), Outcome::UnsupportedPause);
+    assert_eq!(f.history.head(), head);
+    // A v3 header is recognised and paused, never read as v2.
+    let v3 = rebind(
+        &fresh.descriptor,
+        f.base,
+        &f.metadata,
+        &f.first.signing,
+        |s| {
+            s[..2].copy_from_slice(&3u16.to_be_bytes());
+            s[2..4].copy_from_slice(&3u16.to_be_bytes());
+        },
+    );
+    let order = Commitment::order(f.base, head, &v3, Route::Content).unwrap();
+    assert_eq!(
+        f.history.inspect(&order, &v3, &f.metadata).err(),
+        Some(Outcome::UnsupportedPause)
+    );
+    // Another audience's semantics are unknown, so it pauses.
+    let mut binding = f.binding(&f.first, CLASS_CONTENT);
+    binding.audience = [3; 32];
+    let event = seal(
+        binding,
+        Payload {
+            kind: NOTE,
+            data: &data,
+        },
+        &f.first.signing,
+        &f.metadata,
+        Some(&f.epoch),
+    )
+    .unwrap();
+    let order = Commitment::order(f.base, head, &event.descriptor, Route::Content).unwrap();
+    assert_eq!(
+        f.history.apply(
+            &order,
+            &event.descriptor,
+            Some(&event.body),
+            &f.metadata,
+            Some(&f.epoch),
+            NoteTarget {
+                id: [7; 32],
+                note: &mut f.note,
+            },
+        ),
+        Outcome::UnsupportedPause
+    );
+    assert_eq!(f.history.head(), head);
+    // A signed v4 header is not recognised at all: ordered with no effect.
+    let v4 = rebind(
+        &fresh.descriptor,
+        f.base,
+        &f.metadata,
+        &f.first.signing,
+        |s| {
+            s[..2].copy_from_slice(&4u16.to_be_bytes());
+            s[2..4].copy_from_slice(&4u16.to_be_bytes());
+        },
+    );
+    let order = Commitment::order(f.base, head, &v4, Route::Content).unwrap();
+    assert_eq!(
+        f.history.inspect(&order, &v4, &f.metadata).err(),
+        Some(Outcome::Rejected)
+    );
+    // A class above control is invalid under a version this build knows.
+    let class_two = rebind(
+        &fresh.descriptor,
+        f.base,
+        &f.metadata,
+        &f.first.signing,
+        |s| s[309] = 2,
+    );
+    let order = Commitment::order(f.base, head, &class_two, Route::Content).unwrap();
+    assert_eq!(
+        f.history.inspect(&order, &class_two, &f.metadata).err(),
+        Some(Outcome::Rejected)
+    );
+    // A known kind in the wrong class is still rejected, not retained.
+    let (wrong_class, wrong_class_order) = f.create(
+        f.binding(&f.first, CLASS_CONTENT),
+        GENESIS,
+        &[],
+        &f.first.signing,
+        Some(&f.epoch),
+    );
+    assert_eq!(
+        f.apply(&wrong_class, &wrong_class_order, true),
+        Outcome::Rejected
+    );
+    assert_eq!(f.history.head(), wrong_class_order.head());
+    // So is typed data on the control route.
+    let (typed_control, typed_control_order) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        bh_event::TYPED_DATA,
+        b"typed-data",
+        &f.first.control,
+        None,
+    );
+    assert_eq!(
+        f.apply(&typed_control, &typed_control_order, false),
+        Outcome::Rejected
+    );
+    assert_eq!(f.history.head(), typed_control_order.head());
+    let (data, _) = note_delta("later");
+    let (later, later_order) = f.content(&f.first, NOTE, &data);
+    assert_eq!(f.apply(&later, &later_order, true), Outcome::Accepted);
+    assert_eq!(f.history.head(), later_order.head());
+    assert_eq!(f.history.floor(), 2);
+    assert!(!f.history.is_stopped());
 }
 
 #[test]
@@ -1301,17 +1750,20 @@ fn prepared_routing_is_authenticated_and_local_target_errors_are_recoverable() {
         ),
         Err(Outcome::UnavailablePause)
     ));
+    // An unknown content kind prepares as retained content: no note to
+    // target, and no advance before it is consumed.
     let (unknown, unknown_order) = f.content(&f.first, 0xf123, &[8; 32]);
-    assert!(matches!(
-        f.history.prepare(
+    let prepared = f
+        .history
+        .prepare(
             &unknown_order,
             &unknown.descriptor,
             Some(&unknown.body),
             &f.metadata,
-            Some(&f.epoch)
-        ),
-        Err(Outcome::UnsupportedPause)
-    ));
+            Some(&f.epoch),
+        )
+        .unwrap();
+    assert_eq!(prepared.note_id(), None);
     assert_eq!(f.history.head(), before);
     corrupt.body[30] ^= 1;
     assert!(matches!(

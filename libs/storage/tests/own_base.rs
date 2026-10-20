@@ -55,3 +55,29 @@ fn own_base_requires_verified_account_anchor_and_does_not_write_on_failure() {
     ));
     assert_eq!(db.own_base().unwrap(), None);
 }
+
+#[test]
+fn a_new_own_base_lists_complete_empty_before_its_first_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.sqlite");
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    db.commit_account_verified([3; 32], &[b"signed account"], 1, [4; 32], false)
+        .unwrap();
+    db.create_own_base_if_absent(&record(3, 5), || true)
+        .unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let scope = bh_data::Scope {
+        base: [5; 32],
+        audience: [0; 32],
+    };
+    let sid = bh_data::store::records::lookup_scope(&raw, scope)
+        .unwrap()
+        .expect("the own base's ordinary audience");
+    assert_eq!(
+        bh_data::store::coverage::get(&raw, sid).unwrap(),
+        bh_data::store::coverage::Coverage {
+            through: Some(bh_data::Position(0)),
+            complete: true,
+        }
+    );
+}

@@ -82,6 +82,21 @@ fn hint_admission_and_activation_commit_in_order() {
     db.activate_joined().unwrap();
     db.activate_joined().unwrap();
     assert!(db.joined().unwrap().unwrap().activated);
+    drop(db);
+    // Activation changes no typed state: a bootstrap reads the base from its
+    // start, so ordered decisions made during it were fully informed and there
+    // was no coverage to restore.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let scope = bh_data::Scope {
+        base: [5; 32],
+        audience: [0; 32],
+    };
+    assert!(
+        bh_data::store::records::lookup_scope(&raw, scope)
+            .unwrap()
+            .is_none(),
+        "activation records no typed scope or coverage"
+    );
 }
 
 #[test]

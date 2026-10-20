@@ -1,0 +1,10 @@
+{
+  "description": "pattern",
+  "schema": {
+    "type": "string",
+    "maxLength": 3,
+    "pattern": "x"
+  },
+  "accept": false,
+  "keyword": "pattern"
+}

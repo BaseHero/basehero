@@ -3,6 +3,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 case "${1:-portable}" in
+  data-scale)
+    # Large data-query fixtures are opt-in and run with release SQLite/Rust costs.
+    cargo test --release --locked -p bh-data --tests -- --ignored
+    ;;
   portable)
     cargo metadata --no-deps --format-version 1 --locked | node -e '
       const { packages, workspace_members } = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
@@ -148,6 +152,10 @@ case "${1:-portable}" in
     python3 apps/client/plugins/device-keys/android/test-runner-safety.py
     bash apps/client/plugins/device-keys/android/run-emulator.sh
     ;;
+  data-android-emulator)
+    # Opt-in bh-data integration tests; run from nix develop .#androidEmulator.
+    bash scripts/check-data-android.sh
+    ;;
   android-crypto)
     artifacts=$(mktemp)
     trap 'rm -f "$artifacts"' EXIT
@@ -204,7 +212,7 @@ case "${1:-portable}" in
     bash apps/client/tests/webdriver/run-android.sh
     ;;
   *)
-    echo "usage: bash scripts/check.sh [portable|sync-release|ui|editor|desktop|android|android-sync-emulator|android-update-emulator|android-editor-emulator|android-continuity-emulator|android-fixture-emulator|android-device-keys|android-qr-scan|android-device-keys-emulator|android-crypto|wasm|wasm-crypto|wasm-sync|local-stack|local-sync|qualification-stress|webdriver|webdriver-linux|webdriver-macos|webdriver-android]" >&2
+    echo "usage: bash scripts/check.sh [portable|sync-release|ui|editor|desktop|android|android-sync-emulator|android-update-emulator|android-editor-emulator|android-continuity-emulator|android-fixture-emulator|android-device-keys|android-qr-scan|android-device-keys-emulator|android-crypto|wasm|wasm-crypto|wasm-sync|local-stack|local-sync|qualification-stress|webdriver|webdriver-linux|webdriver-macos|webdriver-android|data-android-emulator|data-scale]" >&2
     exit 2
     ;;
 esac

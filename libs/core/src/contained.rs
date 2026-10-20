@@ -300,6 +300,24 @@ impl Note {
             String::from_utf8(b.to_vec()).ok()
         })
     }
+    /// Plain body text, bounded by `max_bytes`; see the native note's
+    /// `body_text` contract.
+    pub fn body_text(&self, max_bytes: usize) -> Result<String, NoteError> {
+        let max_bytes = u64::try_from(max_bytes).map_err(|_| NoteError::Unavailable)?;
+        self.with_guest(|g, b| {
+            let out = response(g.invoke(
+                b,
+                "body_text",
+                Some(&max_bytes.to_le_bytes()),
+                |p, l| (p, l),
+            )?)?;
+            let text = String::from_utf8(out).map_err(|_| NoteError::Unavailable)?;
+            if text.len() > usize::try_from(max_bytes).expect("checked") {
+                return Err(NoteError::Unavailable);
+            }
+            Ok(text)
+        })
+    }
     pub fn document_positions(&self) -> Result<usize, NoteError> {
         self.read("document_positions", None, |b| {
             usize::try_from(u64::from_le_bytes(b.try_into().ok()?)).ok()

@@ -584,7 +584,7 @@ impl Fixture {
         {
             use bh_storage::{
                 held_notes::HeldEvent,
-                sync_state::{IncomingCommit, SeenRow, VerifiedRecord},
+                sync_state::{IncomingCommit, IncomingStep, SeenRow, VerifiedRecord},
             };
             let database = owner.shared_database(container).unwrap();
             let mut db = database.lock().unwrap();
@@ -592,48 +592,53 @@ impl Fixture {
             let event = OpaqueEvent::new(bh_sync::EventId([5; 32]), vec![0; 1024]).unwrap();
             let ordered =
                 Commitment::order(base, first.head(), &event, bh_sync::Route::Content).unwrap();
-            db.commit_incoming(
-                &IncomingCommit {
-                    log_kind: bh_storage::sync_state::LOG_BASE,
-                    log_id: key.base,
-                    hosting_root: [3; 32],
-                    after: (0, [0; 32]),
-                    receipt: [0; RECEIPT_LEN],
-                    records: [first, ordered]
-                        .into_iter()
-                        .map(|record| VerifiedRecord {
-                            seen: SeenRow {
-                                position: record.head().position,
-                                head_hash: record.head().hash.0,
-                                control_digest: first.event_digest().0,
-                                account_position: 1,
-                                account_hash: [6; 32],
-                            },
-                            event_id: record.event_id().0,
-                            digest: record.event_digest().0,
-                            account_change: None,
-                            judged_floor: 1,
-                            floor: 1,
-                        })
-                        .collect(),
-                    metadata_id: [7; 32],
-                    epoch_id: Some([8; 32]),
-                    notes: Vec::new(),
-                    own: Vec::new(),
-                    held: vec![(
-                        key,
-                        vec![HeldEvent {
-                            ordered,
-                            author: None,
-                            writer: None,
-                            delta: Some(vec![0, 0]),
-                            own_update: None,
-                        }],
-                    )],
-                },
-                |_| Ok(()),
-            )
-            .unwrap();
+            let mut commit = IncomingCommit {
+                log_kind: bh_storage::sync_state::LOG_BASE,
+                log_id: key.base,
+                hosting_root: [3; 32],
+                after: (0, [0; 32]),
+                receipt: [0; RECEIPT_LEN],
+                records: [first, ordered]
+                    .into_iter()
+                    .map(|record| VerifiedRecord {
+                        seen: SeenRow {
+                            position: record.head().position,
+                            head_hash: record.head().hash.0,
+                            control_digest: first.event_digest().0,
+                            account_position: 1,
+                            account_hash: [6; 32],
+                        },
+                        event_id: record.event_id().0,
+                        digest: record.event_digest().0,
+                        account_change: None,
+                        judged_floor: 1,
+                        floor: 1,
+                    })
+                    .collect(),
+                metadata_id: [7; 32],
+                epoch_id: Some([8; 32]),
+                notes: Vec::new(),
+                steps: vec![IncomingStep::Hold(0)],
+                own: Vec::new(),
+                held: vec![(
+                    key,
+                    vec![HeldEvent {
+                        ordered,
+                        author: None,
+                        writer: None,
+                        delta: Some(vec![0, 0]),
+                        own_update: None,
+                    }],
+                )],
+            };
+            // A held row without its ordered step must not silently vanish.
+            commit.steps.clear();
+            assert!(matches!(
+                db.commit_incoming(&commit, |_| Ok(())),
+                Err(bh_storage::StoreError::CorruptSyncState)
+            ));
+            commit.steps.push(IncomingStep::Hold(0));
+            db.commit_incoming(&commit, |_| Ok(())).unwrap();
         }
         let endpoint = Endpoint {
             edge_url: "http://unused.invalid".into(),

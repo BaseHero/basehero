@@ -8,4 +8,5 @@ test('sync status counts notes, not keystrokes, and ends at Synced', () => {
   assert.equal(cloudText.syncing({ pending: 1 }), 'Syncing 1 note');
   assert.equal(cloudText.syncing({ pending: 2 }), 'Syncing 2 notes');
   assert.equal(cloudText.synced({ pending: 0 }), 'Synced');
+  assert.equal(cloudText['update-needed']({ pending: 0 }), 'Some content needs an app update');
 });

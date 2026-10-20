@@ -33,6 +33,9 @@ impl DeviceWriterDeclaration {
         bytes
     }
 
+    /// Decoding must stay canonical: a reader that keeps this build's exact
+    /// payload recomposes it with [`Self::encode`], so an accepted declaration
+    /// must re-encode to exactly the bytes it was decoded from.
     pub fn decode(bytes: &[u8]) -> Result<Self, WriterDecodeError> {
         match bytes.len().cmp(&99) {
             std::cmp::Ordering::Less => return Err(WriterDecodeError::Malformed),
