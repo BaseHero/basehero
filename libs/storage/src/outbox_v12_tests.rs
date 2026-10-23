@@ -67,28 +67,12 @@ fn legacy(path: &Path) -> Connection {
         (14, None),
     ] {
         let (descriptor, body) = sealed(id as u8);
-        let ack = if outcome.is_some() {
-            Some(
-                Commitment::order(
-                    bh_sync::BaseId([2; 32]),
-                    bh_sync::Head {
-                        position: 1,
-                        hash: bh_sync::Digest([8; 32]),
-                    },
-                    &descriptor,
-                    bh_sync::Route::Content,
-                )
-                .unwrap()
-                .encode(),
-            )
-        } else {
-            None
-        };
+        let ack = outcome.map(|_| legacy_ack(&descriptor));
         conn.execute(
             "INSERT INTO note_outbox VALUES(?1,?2,?3,?4,?5)",
             params![
                 id,
-                descriptor.id().0,
+                descriptor.nonce().0,
                 descriptor.encode(),
                 body.bytes(),
                 ack
@@ -104,6 +88,23 @@ fn legacy(path: &Path) -> Connection {
         }
     }
     conn
+}
+// Construct the old v1 outer Ack bytes only as a historical migration row;
+// production ordering has no legacy constructor or decoding fallback.
+fn legacy_ack(descriptor: &OpaqueEvent) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(179);
+    bytes.extend(1u16.to_be_bytes());
+    bytes.extend([2; 32]);
+    bytes.extend(1u64.to_be_bytes());
+    bytes.extend([8; 32]);
+    bytes.extend(descriptor.nonce().0);
+    bytes.extend(descriptor.digest().0);
+    bytes.push(bh_sync::Route::Content as u8);
+    bytes.extend(2u64.to_be_bytes());
+    let mut chain = b"bh/chain/v1\0".to_vec();
+    chain.extend(&bytes);
+    bytes.extend(bh_crypto::hash(&chain));
+    bytes
 }
 fn sealed(id: u8) -> (OpaqueEvent, BodyObject) {
     use bh_event::{Binding, Payload};
@@ -166,7 +167,18 @@ fn preserved(
     after: &BTreeMap<String, Vec<Vec<Value>>>,
 ) {
     for (table, rows) in before {
-        assert_eq!(after.get(table), Some(rows), "{table} bytes retained");
+        if table == "account_state" {
+            // v14 adds a nullable canonical observation floor to this table.
+            let current = after.get(table).expect("account state retained");
+            assert_eq!(current.len(), rows.len());
+            for (old, new) in rows.iter().zip(current) {
+                assert_eq!(new.len(), old.len() + 1);
+                assert_eq!(&new[..old.len()], old, "{table} bytes retained");
+                assert_eq!(new.last(), Some(&Value::Null));
+            }
+        } else {
+            assert_eq!(after.get(table), Some(rows), "{table} bytes retained");
+        }
     }
 }
 /// A step may add only the tables its own layout defines; row equality above
@@ -185,6 +197,17 @@ fn only_layout_tables_added(
                 || table == "typed_outbox"
                 || table == "typed_alarm"
                 || table == "sqlite_sequence"
+                || table == "security_alerts"
+                || table == "security_alert_cursor"
+                || table == "staged_account_control"
+                || table == "account_confirmations"
+                || table == "account_directory_versions"
+                || table == "base_epoch_keys"
+                || table == "account_personal_delivery"
+                || table == "account_directory_state"
+                || table == "account_outer_progress"
+                || table.starts_with("base_control_")
+                || table == "base_seal_wait"
                 || table.starts_with("data_"),
             "upgrade added an unexpected table {table}"
         );
@@ -201,6 +224,7 @@ fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
     assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     preserved(&before, &snapshot(&raw));
     only_layout_tables_added(&before, &snapshot(&raw));
+    let upgraded = snapshot(&raw);
     assert_eq!(
         raw.query_row("SELECT count(*) FROM note_outbox_members", [], |r| r
             .get::<_, i64>(0))
@@ -240,7 +264,12 @@ fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
         "note_update_writer",
         "note_outbox_progress",
     ] {
-        assert_eq!(after[table], before[table], "{table} bytes retained");
+        let expected = if table == "account_state" {
+            &upgraded[table] // v14 added the nullable observation floor.
+        } else {
+            &before[table]
+        };
+        assert_eq!(&after[table], expected, "{table} bytes retained");
     }
     assert!(
         before["note_outbox"]
@@ -264,12 +293,16 @@ fn genuine_v11_upgrade_preserves_every_row_and_legacy_singletons() {
     let PackagePreparation::Existing(stored) = db.prepare_note_package(6).unwrap() else {
         panic!("persisted")
     };
+    let genesis = bh_sync::canonical::CanonicalCommitment::order(
+        bh_sync::BaseId([2; 32]),
+        bh_sync::OrderState::EMPTY,
+        bh_sync::Digest([2; 32]),
+        bh_sync::Route::Control,
+    )
+    .unwrap();
     let ordered = Commitment::order(
         bh_sync::BaseId([2; 32]),
-        bh_sync::Head {
-            position: 1,
-            hash: bh_sync::Digest([8; 32]),
-        },
+        genesis.after(),
         &stored.descriptor,
         bh_sync::Route::Content,
     )

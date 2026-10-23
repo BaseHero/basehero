@@ -1,10 +1,11 @@
+use crate::account_run::{base_account, encode_copies};
 use crate::codec::{Binding, Error, NOTE_PREFIX, OpenPayload, apply_note};
-use crate::control::{Judged, SignedContext, judge, verify_signed};
+use crate::control::{Judged, Signed, SignedContext, judge, verify_signed};
 use crate::writer::DeviceWriterDeclaration;
 use bh_account::{AccountId, Head as AccountHead, VerifiedAccount};
 use bh_core::note::{Note, NoteError};
 use bh_crypto::{Secret, SecretBytes};
-use bh_sync::{BaseId, Commitment, Digest, Head, OpaqueEvent, referenced_body};
+use bh_sync::{BaseId, Commitment, Digest, Head, OpaqueEvent, OrderState, referenced_body};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// These results establish only historical verification, never a currently
@@ -266,6 +267,7 @@ impl AppliedEvent {
     pub fn continuation(&self) -> Option<Continuation> {
         Some(Continuation {
             seen: self.seen,
+            order: self.ordered.after(),
             metadata_id: self.metadata_id?,
             epoch_id: self.epoch_id,
             floor: self.floor,
@@ -276,13 +278,16 @@ impl AppliedEvent {
     pub fn hosting_root(&self) -> Option<[u8; 32]> {
         self.hosting_root
     }
-    /// The exact verified account event an accepted account control applied
-    /// to the account projection.
+    /// What an accepted account control applied to the account projection,
+    /// as one record to store: a legacy copy's exact account event, or the
+    /// encoded copies of a run or rekey (`account_run::decode_copies`).
+    /// [`History::resume`] takes these records back.
     pub fn account_change(&self) -> Option<&[u8]> {
         self.account_change.as_deref()
     }
-    /// The verified signer: its account and active device. None for a
-    /// rejected submission, whose signer is not established.
+    /// The verified signer: its account and active device, or the recovery
+    /// author for a run the recovery key copied. None for a rejected
+    /// submission, whose signer is not established.
     pub fn author(&self) -> Option<([u8; 32], [u8; 32])> {
         self.author
     }
@@ -331,6 +336,7 @@ enum PreparedKind {
 struct Prestate {
     base: BaseId,
     head: Head,
+    order: OrderState,
     control: [u8; 32],
     account: AccountHead,
     metadata_id: Option<[u8; 32]>,
@@ -355,6 +361,7 @@ pub struct Seen {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Continuation {
     pub seen: Seen,
+    pub order: OrderState,
     pub metadata_id: [u8; 32],
     pub epoch_id: Option<[u8; 32]>,
     pub floor: u16,
@@ -385,6 +392,7 @@ struct Durable {
 #[derive(Clone)]
 pub struct History {
     base: BaseId,
+    order: OrderState,
     // Notes and transactional clones share this immutable verified snapshot.
     // An account-changing control prepares a separate owned successor.
     account: Arc<VerifiedAccount>,
@@ -442,6 +450,7 @@ impl History {
         }
         Ok(Self {
             base,
+            order: OrderState::EMPTY,
             account: Arc::new(account.clone()),
             durable: None,
             entries: vec![],
@@ -456,11 +465,12 @@ impl History {
     /// Continue from a durable verified continuation without replaying the
     /// log. `anchor` is the creator's account at the head the base genesis
     /// names, as for [`History::with_account`]; `account_changes` are the
-    /// exact verified account events base-log controls applied after it, in
-    /// position order. Earlier positions and event IDs are read through
-    /// `lookup`. `hosting_root` must be the root pinned when this base was
-    /// registered, taken from its authenticated hosting association; the
-    /// store owner refuses any other. Local state that does not reproduce
+    /// records [`AppliedEvent::account_change`] gave for the base-log
+    /// controls that changed the account after it, in position order.
+    /// Earlier positions and event IDs are read through `lookup`; confirmed
+    /// copies verify again under `hosting_root`, which must be the root
+    /// pinned when this base was registered, taken from its authenticated
+    /// hosting association; the store owner refuses any other. Local state that does not reproduce
     /// the continuation is `UnavailablePause`: nothing is judged.
     #[allow(clippy::too_many_arguments)]
     pub fn resume<C, A>(
@@ -478,16 +488,15 @@ impl History {
     {
         let unavailable = Outcome::UnavailablePause;
         if continuation.seen.head.position == 0
+            || continuation.order.head(base) != continuation.seen.head
             || continuation.floor == 0
             || remembered_floor == 0
             || anchor.is_stopped()
         {
             return Err(unavailable);
         }
-        let mut account = anchor.clone();
-        for change in account_changes {
-            account.apply(change.as_ref()).map_err(|_| unavailable)?;
-        }
+        let account =
+            base_account(anchor, account_changes, &hosting_root).map_err(|_| unavailable)?;
         if account.head() != continuation.seen.account
             || lookup.seen(continuation.seen.head.position) != Ok(Some(continuation.seen))
         {
@@ -495,6 +504,7 @@ impl History {
         }
         Ok(Self {
             base,
+            order: continuation.order,
             account: Arc::new(account),
             durable: Some(Durable {
                 last: continuation.seen,
@@ -562,6 +572,9 @@ impl History {
     }
     pub fn head(&self) -> Head {
         self.last_seen().map_or(Head::EMPTY, |s| s.head)
+    }
+    pub fn order_state(&self) -> OrderState {
+        self.order
     }
     pub fn floor(&self) -> u16 {
         self.floor
@@ -667,6 +680,7 @@ impl History {
         Prestate {
             base: self.base,
             head: self.head(),
+            order: self.order,
             control: self.last_control(),
             account: self.account.head(),
             metadata_id: self.metadata_id,
@@ -682,17 +696,32 @@ impl History {
     /// authority without fetching/opening a note body. This does not advance.
     /// An invalid submission is `Err(Rejected)`; [`History::prepare`] turns it
     /// into an event that advances history with no effect.
+    ///
+    /// A control whose author is not active before it (a run's copier added
+    /// in that run) is authenticated only once its body is judged.
     pub fn inspect(
         &self,
         ordered: &Commitment,
         event: &OpaqueEvent,
         metadata: &Secret<32>,
     ) -> Result<Binding, Outcome> {
+        self.inspect_signed(ordered, event, metadata)
+            .map(|signed| signed.binding)
+    }
+
+    fn inspect_signed(
+        &self,
+        ordered: &Commitment,
+        event: &OpaqueEvent,
+        metadata: &Secret<32>,
+    ) -> Result<Signed, Outcome> {
         if self.stopped {
             return Err(Outcome::IntegrityStop);
         }
         // The order must continue verified history and commit these bytes.
-        if ordered.verify_next(self.base, self.head()).is_err()
+        if self.order.head(self.base) != self.head()
+            || ordered.before() != self.order
+            || ordered.verify_next(self.base, self.head()).is_err()
             || ordered.verify_body(event).is_err()
         {
             return Err(Outcome::IntegrityStop);
@@ -739,7 +768,7 @@ impl History {
             body_commitment: referenced_body(event).unwrap_or(Digest([0; 32])),
             head: ordered.head(),
             digest: ordered.event_digest(),
-            event_id: event.id().0,
+            event_id: ordered.event_id().0,
             version: 0,
             author: None,
             kind: PreparedKind::Rejected,
@@ -754,7 +783,7 @@ impl History {
         metadata: &Secret<32>,
         content: Option<&Secret<32>>,
     ) -> Result<PreparedEvent, Outcome> {
-        let signed = self.inspect(ordered, event, metadata)?;
+        let signed = self.inspect_signed(ordered, event, metadata)?;
         let body = body.ok_or(Outcome::UnavailablePause)?;
         let kind = match judge(self, &signed, event, body, metadata, content)? {
             Judged::Note {
@@ -775,7 +804,7 @@ impl History {
             }
             Judged::Control {
                 account,
-                change,
+                copy,
                 metadata_id,
                 epoch_id,
             } => PreparedKind::Control {
@@ -784,7 +813,7 @@ impl History {
                 account: account.unwrap_or_else(|| Arc::clone(&self.account)),
                 metadata_id,
                 epoch_id,
-                change,
+                change: copy.map(|copy| encode_copies(&copy.copies)),
             },
         };
         Ok(PreparedEvent {
@@ -795,9 +824,9 @@ impl History {
             body_commitment: referenced_body(event).expect("inspected descriptor"),
             head: ordered.head(),
             digest: ordered.event_digest(),
-            event_id: event.id().0,
-            version: signed.version,
-            author: Some((signed.account.0, signed.device.0)),
+            event_id: ordered.event_id().0,
+            version: signed.binding.version,
+            author: Some((signed.binding.account.0, signed.binding.device.0)),
             kind,
         })
     }
@@ -966,6 +995,7 @@ impl History {
         self.metadata_id = transition.metadata_id;
         self.epoch_id = transition.epoch_id;
         self.entries.push(transition.seen);
+        self.order = transition.applied.ordered.after();
         // A rejected replay of an ordered ID keeps the first one's digest.
         self.ids
             .entry(transition.event_id)
@@ -1111,6 +1141,7 @@ impl History {
         } else {
             false
         };
+        self.order = prepared.ordered.after();
         self.entries.push(Seen {
             head: prepared.head,
             control: if is_control {
@@ -1248,8 +1279,8 @@ mod tests {
         genesis_data.extend(metadata_id);
         let genesis = seal(
             Binding {
-                version: 1,
-                highest: 1,
+                version: 3,
+                highest: 3,
                 mode: 1,
                 base: [0; 32],
                 audience: [0; 32],
@@ -1318,7 +1349,8 @@ mod tests {
         )
         .unwrap();
         let genesis_order =
-            Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+            Commitment::order(base, OrderState::EMPTY, &genesis.descriptor, Route::Control)
+                .unwrap();
         let prepared = history
             .prepare(
                 &genesis_order,
@@ -1339,8 +1371,8 @@ mod tests {
         );
 
         let binding = |history: &History, class| Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: base.0,
             audience: [0; 32],
@@ -1383,8 +1415,13 @@ mod tests {
             Some(&content),
         )
         .unwrap();
-        let ordered =
-            Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
+        let ordered = Commitment::order(
+            base,
+            history.order_state(),
+            &note.descriptor,
+            Route::Content,
+        )
+        .unwrap();
         let account_head = history.account_head();
         let prepared = history
             .prepare(
@@ -1430,8 +1467,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let ordered =
-            Commitment::order(base, candidate.head(), &changed.descriptor, Route::Control).unwrap();
+        let ordered = Commitment::order(
+            base,
+            candidate.order_state(),
+            &changed.descriptor,
+            Route::Control,
+        )
+        .unwrap();
         let prepared = candidate
             .prepare(
                 &ordered,
@@ -1459,8 +1501,13 @@ mod tests {
         let f = fixture();
         let base = BaseId::from_genesis(&f.genesis.descriptor);
         let mut history = History::anchored(&f.account, base, None, 1).unwrap();
-        let genesis_order =
-            Commitment::order(base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+        let genesis_order = Commitment::order(
+            base,
+            OrderState::EMPTY,
+            &f.genesis.descriptor,
+            Route::Control,
+        )
+        .unwrap();
         let prepared = history
             .prepare(
                 &genesis_order,
@@ -1492,8 +1539,8 @@ mod tests {
         );
         let note = seal(
             Binding {
-                version: 2,
-                highest: 2,
+                version: 3,
+                highest: 3,
                 mode: 0,
                 base: base.0,
                 audience: [0; 32],
@@ -1519,8 +1566,13 @@ mod tests {
             Some(&f.content),
         )
         .unwrap();
-        let ordered =
-            Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
+        let ordered = Commitment::order(
+            base,
+            history.order_state(),
+            &note.descriptor,
+            Route::Content,
+        )
+        .unwrap();
         // Without a pinned root this device cannot check the receipt: that is
         // missing local configuration, not evidence against the log.
         assert_eq!(

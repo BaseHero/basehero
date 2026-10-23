@@ -15,15 +15,18 @@ def prepare_endpoint(source, local_only, output, environment):
     if local_only:
         return env, {'mode': 'local-only'}
     raw = Path(source).read_bytes()
-    # Early, data-free transport/mode refusal. Rust build.rs checks all nine
-    # fields and their types; this is not an alternate endpoint authority.
+    # Early, data-free transport/mode refusal, and the home's recovery-key
+    # certificate must be there. Rust build.rs checks all ten fields, their
+    # types and the certificate's root; this is not an alternate endpoint
+    # authority.
     try:
         value = json.loads(raw)
-        valid = value['appraisal'] == 'hardware' and value['edge_url'].startswith('https://')
+        valid = (value['appraisal'] == 'hardware' and value['edge_url'].startswith('https://')
+                 and isinstance(value['recovery_key'], str) and value['recovery_key'] != '')
     except (ValueError, KeyError, TypeError, AttributeError):
         valid = False
     if not valid:
-        raise ValueError('a nonempty hardware/HTTPS endpoint JSON file is required')
+        raise ValueError('a nonempty hardware/HTTPS endpoint JSON file with its recovery key is required')
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     snapshot = output / 'sync-endpoint.json'

@@ -65,7 +65,7 @@ fn setup_with(
         &Password::new("correct horse battery staple").unwrap(),
     ))
     .unwrap();
-    account.confirm_home_ordered(status.head).unwrap();
+    account.confirm_home_ordered(status.head, None).unwrap();
     account.confirm_kit_saved().unwrap();
     let record = DeviceJournal::from_shared(db.clone())
         .load()
@@ -716,6 +716,96 @@ impl AcceptedBindings for Projection {
     }
 }
 #[test]
+fn registration_during_an_ordinary_save_commits_without_a_visible_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, _cap, note) = setup(dir.path());
+    let opened = owner.open_leased("one", note).unwrap();
+    let lease = opened.writer.unwrap();
+    let bytes = Owner::core_author(&opened)
+        .unwrap()
+        .try_append_paragraph("typed during registration")
+        .unwrap();
+    let (ack, _) = owner
+        .commit_leased_with_work_hook(
+            "one",
+            opened.generation,
+            lease.token,
+            [1; 16],
+            &bytes,
+            || owner.record_registration(id, BASE, None, [3; 32]).unwrap(),
+        )
+        .unwrap();
+    assert!(!ack.replayed);
+    let db = owner.shared_database(id).unwrap();
+    let pending = db.lock().unwrap().pending_note_updates().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].bytes, bytes);
+    assert!(
+        owner
+            .commit_leased("one", opened.generation, lease.token, [1; 16], &bytes)
+            .unwrap()
+            .0
+            .replayed
+    );
+}
+
+#[test]
+fn registration_with_a_conflicting_binding_still_refuses_the_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, id, _account, cap, note) = setup(dir.path());
+    let opened = owner.open_leased("one", note).unwrap();
+    let lease = opened.writer.unwrap();
+    let slot = owner
+        .shared_database(id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .writer_slots(key(note), cap.account_id().0, cap.device_id().0)
+        .unwrap()[0];
+    let bytes = Owner::core_author(&opened)
+        .unwrap()
+        .try_append_paragraph("must not commit")
+        .unwrap();
+    let result = owner.commit_leased_with_work_hook(
+        "one",
+        opened.generation,
+        lease.token,
+        [1; 16],
+        &bytes,
+        || {
+            owner.record_registration(id, BASE, None, [3; 32]).unwrap();
+            owner.install_binding_reader(
+                id,
+                Arc::new(Projection(std::sync::Mutex::new(BindingRead {
+                    revision: 1,
+                    binding: Some(bh_device::writers::VerifiedWriterBinding {
+                        account: [9; 32],
+                        device: slot.device,
+                        nonce: slot.nonce,
+                        client_id: slot.client_id,
+                        accepted_end: 0,
+                    }),
+                }))),
+            );
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(bh_device::OwnerError::WriterUnavailable)
+    ));
+    assert!(
+        owner
+            .shared_database(id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_note_updates()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn revision_change_during_an_attempt_refuses_it_and_identical_retry_uses_the_current_revision() {
     let dir = tempfile::tempdir().unwrap();
     let (owner, id, _account, _cap, note) = setup(dir.path());
@@ -1018,7 +1108,7 @@ fn real_prehost_genesis_first_note_reopens_same_nonce_and_id_with_fresh_token() 
         &Password::new("correct horse battery staple").unwrap(),
     ))
     .unwrap();
-    account.confirm_home_ordered(status.head).unwrap();
+    account.confirm_home_ordered(status.head, None).unwrap();
     account.confirm_kit_saved().unwrap();
     let cap = match ready(account.activate()).unwrap() {
         AccountLoad::Active(c) => Arc::new(c),

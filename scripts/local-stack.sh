@@ -195,6 +195,7 @@ launch_authz() {
     --permit-key "$LOCAL_STACK_DIR/keys/permit.seed" --permit-cert "$LOCAL_STACK_DIR/keys/permit.cert" \
     --app-root "$(<"$LOCAL_STACK_DIR/keys/app-root.pub")" \
     --policy "$LOCAL_STACK_DIR/keys/policy.json" --policy-signature "$LOCAL_STACK_DIR/keys/policy.sig" \
+    --recovery-key "$LOCAL_STACK_DIR/keys/recovery.seed" --recovery-cert "$LOCAL_STACK_DIR/keys/recovery.cert" \
     --synthetic-attestation >>"$LOCAL_STACK_DIR/authz.log" 2>&1 &
   local authz_pid=$! address='' born
   born=$(start_time "$authz_pid")
@@ -286,6 +287,10 @@ else
   # generation would conflict with a device's previously saved policy.
   "$CARGO_TARGET_DIR/debug/examples/local_keys" "$LOCAL_STACK_DIR/keys" renew
 fi
+# Renewing keeps the home's recovery key; keys made before it had one can't.
+[[ -s "$LOCAL_STACK_DIR/keys/recovery.seed" && -s "$LOCAL_STACK_DIR/keys/recovery.cert" ]] || {
+  echo 'stack keys have no recovery key; use a fresh LOCAL_STACK_DIR' >&2; exit 1;
+}
 # Always ask Cargo for the current sources, even with a nonempty generated
 # artifact. The incremental build is cheap; an existing file is not freshness.
 if [[ -z $LOCAL_STACK_PREBUILT ]]; then
@@ -348,6 +353,7 @@ LOCAL_STACK_HOST_EDGE_URL=$local_url
 LOCAL_STACK_HOSTING_ROOT=$(<"$LOCAL_STACK_DIR/keys/hosting-root.pub")
 LOCAL_STACK_APP_ROOT=$(<"$LOCAL_STACK_DIR/keys/app-root.pub")
 LOCAL_STACK_POLICY=$LOCAL_STACK_DIR/keys/policy.json
+LOCAL_STACK_RECOVERY_KEY=$(<"$LOCAL_STACK_DIR/keys/recovery.cert")
 EOF
 chmod 600 "$LOCAL_STACK_DIR/env"
 wait_up || exit 1

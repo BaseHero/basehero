@@ -152,11 +152,12 @@ const MAX_HELD = INITIAL_WINDOW;
 // a 4.2 MB Events frame, takes about 35 s at 1 Mbit/s.
 const STALL_MS = 120_000;
 // One Events item at the largest envelope: commitment and event blobs.
-const MAX_EVENTS_ITEM = 4 + 179 + 4 + 2 + 32 + 4 + 65536;
+const MAX_EVENTS_ITEM = 4 + 149 + 4 + 2 + 32 + 4 + 65536;
 const RECEIPT_LEN = 300;
-// Header, count, option flag, fixed-width receipt: 64 max items total
-// 4,209,014 bytes, below MAX_FRAME (4,259,840).
-const MAX_EVENTS_FIXED = 7 + 2 + 1 + RECEIPT_LEN;
+// Header, count, tail-receipt flag, coverage tag and the largest endpoint.
+const MAX_EVENTS_FIXED = 7 + 2 + 1 + 1 + 82 + RECEIPT_LEN;
+const EMPTY_OPENING = new Uint8Array(82);
+EMPTY_OPENING[1] = 2;
 const MAX_PERMIT = 4096;
 const MAX_IN_FLIGHT = 8;
 // R2 reads one body stream keeps in flight: each takes about 120 ms from the
@@ -174,7 +175,7 @@ const DATA_FIRST_PERMIT_MS = 5_000;
 // after this. Credit is not activity.
 const DATA_IDLE_MS = 10_000;
 const MAX_CONTROLS = 64;
-const SCOPES = { read: ['read_events', 'read_bodies', 'read_controls'], stage: ['stage'], append: ['append'], subscribe: ['subscribe'], store_home_objects: ['store_home_objects'], presence_join: ['presence'] };
+const SCOPES = { read: ['read_events', 'read_bodies', 'read_controls', 'read_control_range'], stage: ['stage'], append: ['append'], subscribe: ['subscribe'], store_home_objects: ['store_home_objects'], presence_join: ['presence'], read_directory: ['read_directory'], store_directory_entry: ['store_directory_entry'], retire_home_objects: ['retire_home_objects'] };
 // Presence: opaque sealed frames of at most this many bytes. Each join may
 // send 10 a second after a burst of 20; excess frames are dropped, and a socket
 // that drops more than 100 in a minute is closed.
@@ -193,15 +194,14 @@ const FRAME = 1;
 // The log object closes a presence socket with this when the epoch changes.
 const EPOCH_CLOSE = 4409;
 
-// Response frames: `version:u16 = 1` for legacy, version 2 for tags from 32
-// (Published, Presence, Peers); `tag:u8 || id:u32 || fields`, with
+// Data-wire v3 for every tag: `version:u16 || tag:u8 || id:u32 || fields`, with
 // variable byte strings as `length:u32 || bytes`.
 function response(tag, id, blobs, fixed = []) {
   const size = 7 + fixed.reduce((n, f) => n + f.length, 0) + blobs.reduce((n, b) => n + 4 + b.length, 0);
   if (size > MAX_FRAME) throw new Error('response frame too large');
   const out = new Uint8Array(size);
   const view = new DataView(out.buffer);
-  view.setUint16(0, tag >= 32 ? 2 : 1);
+  view.setUint16(0, 3);
   out[2] = tag;
   view.setUint32(3, id);
   let at = 7;
@@ -210,17 +210,32 @@ function response(tag, id, blobs, fixed = []) {
   return out;
 }
 const encode = {
-  events: (id, items, receipt) => {
-    if (items.length > 64 || (receipt && receipt.length !== RECEIPT_LEN)) throw new Error('events framing');
+  events: (id, items, receipt, coverage) => {
+    if (items.length > 64 || (receipt && (receipt.length !== RECEIPT_LEN || !items.length || coverage)) ||
+        items.some(i => i.commitment.length !== 149)) throw new Error('events framing');
+    let tag = 0;
+    if (coverage) {
+      if (coverage.order.length !== 82 ||
+          (coverage.receipt && coverage.receipt.length !== RECEIPT_LEN)) throw new Error('endpoint framing');
+      tag = coverage.receipt ? 2 : 1;
+    }
     return response(1, id, items.flatMap(i => [i.commitment, i.event]),
-      [be(items.length, 4).subarray(2), Uint8Array.of(receipt ? 1 : 0), ...(receipt ? [receipt] : [])]);
+      [be(items.length, 4).subarray(2), Uint8Array.of(receipt ? 1 : 0),
+        ...(receipt ? [receipt] : []), Uint8Array.of(tag),
+        ...(coverage ? [coverage.order, ...(coverage.receipt ? [coverage.receipt] : [])] : [])]);
   },
   body: (id, index, last, bytes) => response(2, id, [bytes], [Uint8Array.of(index, last ? 1 : 0)]),
   staged: id => response(3, id, []),
   homeObjectsStored: (id, prefix, digest) => response(7, id, [], [unhex(prefix), unhex(digest)]),
+  directory: (id, entries, more) => {
+    if (entries.length > 64) throw new Error('directory page');
+    return response(37, id, entries, [be(entries.length, 4).subarray(2), Uint8Array.of(more ? 1 : 0)]);
+  },
+  directoryEntryStored: id => response(38, id, []),
+  homeObjectsRetired: id => response(39, id, []),
   acked: (id, ack) => response(4, id, [ack]),
   published: (id, ack, commitment) => {
-    if (commitment.length !== 179) throw new Error('commitment length');
+    if (commitment.length !== 149) throw new Error('commitment length');
     const prefix = response(32, id, [ack]);
     const out = new Uint8Array(prefix.length + commitment.length);
     if (out.length > MAX_FRAME) throw new Error('response frame too large');
@@ -345,7 +360,7 @@ class DataSession {
     const frame = new Uint8Array(data instanceof Blob ? await data.arrayBuffer() : data);
     // A presence frame (version 2, tag 34) over its bound closes the socket
     // before it is decoded.
-    if (frame[0] === 0 && frame[1] === 2 && frame[2] === 34 && frame.length > 7 + 4 + MAX_PRESENCE) {
+    if (frame[0] === 0 && frame[1] === 3 && frame[2] === 34 && frame.length > 7 + 4 + MAX_PRESENCE) {
       this.#close(1009, 'presence too large');
       return;
     }
@@ -395,8 +410,21 @@ class DataSession {
       if (!this.#admit(id)) return;
       this.#busy();
       const log = this.#env.LOG.get(this.#env.LOG.idFromName(scope.log));
-      if (scope.scope === 'read_events') await this.#readEvents(wasm, id, scope, log);
-      else if (scope.scope === 'read_controls') await this.#readControls(wasm, id, scope, log);
+      if (scope.scope === 'read_directory') {
+        const bound = 10 + 64 * (4 + 65536);
+        await this.#take(scope, bound);
+        let page;
+        try { page = outcome(await log.readDirectory(permit, request.cursor ?? null)); }
+        catch (error) { this.#refund(bound); throw error; }
+        this.#send(scope, bound, () => encode.directory(id, page.entries.map(e => e.body), page.more));
+      } else if (scope.scope === 'store_directory_entry') {
+        outcome(await log.storeDirectoryEntry(permit, payload));
+        await this.#deliver(scope, 7, () => encode.directoryEntryStored(id));
+      } else if (scope.scope === 'retire_home_objects') {
+        outcome(await log.retireHomeObjects(permit));
+        await this.#deliver(scope, 7, () => encode.homeObjectsRetired(id));
+      } else if (scope.scope === 'read_events') await this.#readEvents(wasm, id, scope, log);
+      else if (scope.scope === 'read_controls' || scope.scope === 'read_control_range') await this.#readControls(wasm, id, scope, log);
       else if (scope.scope === 'read_bodies') await this.#readBodies(id, scope, log);
       else if (scope.scope === 'stage') {
         outcome(await log.stage(permit, payload));
@@ -430,17 +458,28 @@ class DataSession {
   async #readControls(wasm, id, scope, log) {
     const bound = MAX_EVENTS_FIXED + MAX_CONTROLS * MAX_EVENTS_ITEM;
     await this.#take(scope, bound);
-    await this.#events(wasm, id, scope, bound, () => log.controls(scope.after));
+    await this.#events(wasm, id, scope, bound, () => log.controls(scope.after, scope.through ?? null));
   }
 
   // Sends one Events frame from a read that took `bound` bytes of window.
   async #events(wasm, id, scope, bound, read) {
-    let items, receipt = null;
+    let items, receipt = null, coverage = null;
     try {
-      // The DO captures rows and completes storage.sync before returning.
-      // Neither the requester's cursor nor the live head supplies this head.
-      items = outcome(await read());
-      if (items.length && scope.log.startsWith('01')) {
+      // The DO captures rows/endpoint before its storage.sync barrier.
+      const captured = outcome(await read());
+      const sparse = scope.scope === 'read_controls' || scope.scope === 'read_control_range';
+      items = sparse ? captured.items : captured;
+      if (sparse) {
+        if (!scope.log.startsWith('01') || !Array.isArray(items)) refuse('Unavailable');
+        if (captured.endpoint === null) coverage = { order: EMPTY_OPENING, receipt: null };
+        else {
+          const endpoint = call(wasm, 'commitment_state', [unhex(scope.log.slice(2)), captured.endpoint]);
+          if (scope.through !== undefined && endpoint.position !== scope.through) refuse('Unavailable');
+          const signed = call(wasm, 'sign_head', [this.#keys.root, this.#keys.seed, this.#keys.cert, unhex(scope.log),
+            be(endpoint.position, 8), unhex(endpoint.hash)]);
+          coverage = { order: unhex(endpoint.order), receipt: unhex(signed.receipt) };
+        }
+      } else if (items.length && scope.log.startsWith('01')) {
         const tail = items.at(-1);
         const head = call(wasm, 'read_tail', [unhex(scope.log.slice(2)), tail.commitment, tail.event]);
         const signed = call(wasm, 'sign_head', [this.#keys.root, this.#keys.seed, this.#keys.cert, unhex(scope.log),
@@ -451,13 +490,13 @@ class DataSession {
       this.#refund(bound);
       throw error;
     }
-    this.#send(scope, bound, () => encode.events(id, items, receipt));
+    this.#send(scope, bound, () => encode.events(id, items, receipt, coverage));
   }
 
   // One Body frame per commitment in permit order, each waiting for window and
   // gated on the deadline before its body is read from R2. Up to BODY_READS
   // reads run at once, taking their window in permit order, and each frame is
-  // sent after the frames before it. A body that is not ordered, or not
+  // sent after the frames before it. A body the log does not serve, or not
   // found, ends the stream after the frames before it; a read not sent
   // returns its window once it has finished.
   async #readBodies(id, scope, log) {
@@ -529,7 +568,7 @@ class DataSession {
     if (Date.now() >= scope.deadline_ms) refuse('Expired');
     const result = outcome(await log.append(appendPermit, event));
     if (result.eventId !== scope.event_id || !safe(result.position) ||
-        typeof result.commitment !== 'string' || !/^[0-9a-f]{358}$/.test(result.commitment))
+        typeof result.commitment !== 'string' || !/^[0-9a-f]{298}$/.test(result.commitment))
       refuse('Unavailable');
     const commitment = unhex(result.commitment);
     // Rust recomputes the chain hash, binds the exact descriptor and content

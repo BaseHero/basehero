@@ -111,10 +111,11 @@ async fn maximum_events_receipt_returns_exact_frame_credit() {
         id,
         items: vec![(vec![0; bh_sync::Commitment::LEN], vec![0; 65574]); 64],
         receipt: Some([0x5a; 300]),
+        coverage: None,
     };
     // deliver asserts Credit equals this frame's exact encoded byte count.
     deliver(&mut peer, response.clone()).await;
-    assert_eq!(data.budget.lock().unwrap().total, 4_209_014);
+    assert_eq!(data.budget.lock().unwrap().total, 4_207_095);
     assert_eq!(answers.next().await, Some(response));
     assert_eq!(data.budget.lock().unwrap().total, 0);
 }
@@ -172,10 +173,11 @@ async fn aggregate_cap_includes_removed_ids_and_reserves_small_answers() {
             id: d,
             items: vec![],
             receipt: None,
+            coverage: None,
         },
     )
     .await;
-    assert_eq!(data.budget.lock().unwrap().total, 8_519_690);
+    assert_eq!(data.budget.lock().unwrap().total, 8_519_691);
     assert!(matches!(small.next().await, Some(Response::Events { .. })));
     assert_eq!(data.budget.lock().unwrap().total, 8_519_680);
     assert!(matches!(first.next().await, Some(Response::Body { .. })));

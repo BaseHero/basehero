@@ -439,6 +439,12 @@ pub fn derive_key(key: &Secret<32>, context: &[u8; KDF_CONTEXT], id: u64) -> Sec
     out
 }
 
+/// A base root's committed id: the hash of the X-Wing public key derived from
+/// it. Base genesis and rekeys commit to it; holders re-derive it from the root.
+pub fn committed_key_id(root: &Secret<32>) -> Hash {
+    hash(&KemKey::from_seed(&derive_key(root, b"bhKeyId1", 0)).public())
+}
+
 /// Raw-byte Argon2id13, not an account password/code encoding. The protocol
 /// caller pins salt, input encoding and costs per signed version and never takes
 /// parameters from a server. Borrowed password storage is the caller's to wipe.
@@ -481,6 +487,39 @@ pub fn pwhash_argon2id13(
     Ok(out)
 }
 
+/// A generated AEAD nonce that can be inspected before signing and consumed
+/// exactly once for encryption. There is no caller-chosen nonce constructor.
+///
+/// ```compile_fail
+/// let nonce = bh_crypto::AeadSealNonce::new();
+/// let key = bh_crypto::Secret::random();
+/// nonce.seal(&key, b"ad", b"first").unwrap();
+/// nonce.seal(&key, b"ad", b"second").unwrap(); // consumed
+/// ```
+pub struct AeadSealNonce([u8; AEAD_NONCE]);
+
+impl AeadSealNonce {
+    pub fn new() -> Self {
+        init_native_primitives();
+        Self(random())
+    }
+
+    pub fn bytes(&self) -> &[u8; AEAD_NONCE] {
+        &self.0
+    }
+
+    pub fn seal(self, key: &Secret<32>, ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        let length = aead_seal_length(ad, plaintext)?;
+        aead_seal_with_nonce(key, &self.0, ad, plaintext, length)
+    }
+}
+
+impl Default for AeadSealNonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Generate a fresh 24-byte nonce and encrypt caller-owned plaintext with
 /// authenticated associated data. The nonce must accompany the ciphertext for
 /// opening; these are primitives, not a signed seal or account wire format.
@@ -491,6 +530,12 @@ pub fn aead_seal(
     ad: &[u8],
     plaintext: &[u8],
 ) -> Result<([u8; AEAD_NONCE], Vec<u8>), Error> {
+    let nonce = AeadSealNonce::new();
+    let bytes = *nonce.bytes();
+    Ok((bytes, nonce.seal(key, ad, plaintext)?))
+}
+
+fn aead_seal_length(ad: &[u8], plaintext: &[u8]) -> Result<usize, Error> {
     init_native_primitives();
     let length = plaintext
         .len()
@@ -503,9 +548,7 @@ pub fn aead_seal(
     {
         return Err(Error::InvalidLength);
     }
-    let nonce = random::<AEAD_NONCE>();
-    let ciphertext = aead_seal_with_nonce(key, &nonce, ad, plaintext, length)?;
-    Ok((nonce, ciphertext))
+    Ok(length)
 }
 
 // Kept private: callers cannot accidentally reuse an explicit nonce with a key.
@@ -758,6 +801,24 @@ pub fn decapsulate(key: &KemKey, ct: &[u8; KEM_CIPHERTEXT]) -> Result<Secret<KEM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_seal_nonce_is_the_nonce_used_for_encryption() {
+        let key = Secret::random();
+        let nonce = AeadSealNonce::new();
+        let bytes = *nonce.bytes();
+        let ciphertext = nonce.seal(&key, b"binding AD", b"signed nonce").unwrap();
+        assert_eq!(
+            aead_open(&key, &bytes, b"binding AD", &ciphertext)
+                .unwrap()
+                .expose(),
+            b"signed nonce"
+        );
+        let mut wrong = bytes;
+        wrong[0] ^= 1;
+        assert!(aead_open(&key, &wrong, b"binding AD", &ciphertext).is_err());
+        assert!(aead_open(&key, &bytes, b"other AD", &ciphertext).is_err());
+    }
 
     #[test]
     fn hash_is_blake2b_256() {

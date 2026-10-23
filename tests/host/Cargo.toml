@@ -14,6 +14,7 @@ synthetic-attestation = ["bh-authz/synthetic-attestation", "bh-sync-client/synth
 bh-account.workspace = true
 bh-authz = { path = "../../services/authz" }
 bh-confidential-attestation.workspace = true
+bh-confidential-channel.workspace = true
 bh-confidential-policy.workspace = true
 bh-crypto.workspace = true
 bh-device.workspace = true

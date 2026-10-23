@@ -6,7 +6,7 @@ pub mod note;
 pub mod note_schema;
 
 /// Local SQLite layout version. This is not an event, protocol or release version.
-pub const LOCAL_DATA_VERSION: u32 = 13;
+pub const LOCAL_DATA_VERSION: u32 = 14;
 
 /// An older client must never downgrade or reset newer local data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,22 +27,37 @@ impl std::fmt::Display for NewerDataVersion {
 
 impl std::error::Error for NewerDataVersion {}
 
-/// Check compatibility before changing a database or starting a migration.
-/// Version zero is SQLite's empty/unversioned starting point.
-pub fn check_local_data_version(found: u32) -> Result<(), NewerDataVersion> {
-    if found > LOCAL_DATA_VERSION {
-        Err(NewerDataVersion {
-            found,
-            supported: LOCAL_DATA_VERSION,
-        })
+/// Compare a stored layout marker with the highest layout this client supports.
+/// This also lets tests exercise historical clients' fixed compatibility bounds.
+pub fn check_data_version(found: u32, supported: u32) -> Result<(), NewerDataVersion> {
+    if found > supported {
+        Err(NewerDataVersion { found, supported })
     } else {
         Ok(())
     }
 }
 
+/// Check compatibility before changing a database or starting a migration.
+/// Version zero is SQLite's empty/unversioned starting point.
+pub fn check_local_data_version(found: u32) -> Result<(), NewerDataVersion> {
+    check_data_version(found, LOCAL_DATA_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_supported_layout_refuses_newer_data() {
+        assert_eq!(check_data_version(13, 13), Ok(()));
+        assert_eq!(
+            check_data_version(14, 13),
+            Err(NewerDataVersion {
+                found: 14,
+                supported: 13
+            })
+        );
+    }
 
     #[test]
     fn accepts_initial_and_current_layouts_but_not_newer_data() {

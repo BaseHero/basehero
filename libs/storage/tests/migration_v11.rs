@@ -129,7 +129,14 @@ fn migration_v10_to_v11_preserves_pending_and_checkpoints() {
     let db = DeviceDatabase::open(&path).unwrap();
     assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     assert_eq!(version(&raw), LOCAL_DATA_VERSION);
-    let after: Vec<_> = V10_TABLES.iter().map(|t| dump(&raw, t)).collect();
+    let mut after: Vec<_> = V10_TABLES.iter().map(|t| dump(&raw, t)).collect();
+    let account = V10_TABLES
+        .iter()
+        .position(|t| *t == "account_state")
+        .unwrap();
+    for row in &mut after[account] {
+        assert_eq!(row.pop(), Some(Value::Null), "v14 floor starts unset");
+    }
     assert_eq!(before, after, "every v10 row survives byte for byte");
     for table in V11_TABLES {
         assert!(table_exists(&raw, table), "{table}");

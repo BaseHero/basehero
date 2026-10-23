@@ -230,6 +230,30 @@ impl Answers {
     }
 }
 
+#[cfg(test)]
+mod directory_response_tests {
+    use super::*;
+
+    #[test]
+    fn directory_replies_route_to_their_request_and_end_it() {
+        for (response, expected) in [
+            (
+                Response::Directory {
+                    id: 17,
+                    entries: vec![vec![1]],
+                    more: true,
+                },
+                17,
+            ),
+            (Response::DirectoryEntryStored { id: 18 }, 18),
+            (Response::HomeObjectsRetired { id: 19 }, 19),
+        ] {
+            assert_eq!(request_id(&response), expected);
+            assert!(last(&response));
+        }
+    }
+}
+
 fn request_id(response: &Response) -> u32 {
     match response {
         Response::Events { id, .. }
@@ -238,6 +262,9 @@ fn request_id(response: &Response) -> u32 {
         | Response::Acked { id, .. }
         | Response::Published { id, .. }
         | Response::HomeObjectsStored { id, .. }
+        | Response::Directory { id, .. }
+        | Response::DirectoryEntryStored { id }
+        | Response::HomeObjectsRetired { id }
         | Response::Head { id, .. }
         | Response::Refused { id, .. }
         | Response::Presence { id, .. }

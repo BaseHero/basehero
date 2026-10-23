@@ -1,20 +1,31 @@
-//! Two authenticated initial personal-seed envelopes, not later QR/rotation delivery.
+//! Personal-seed envelopes: the two initial ones, deliveries to an added
+//! device, a replacement kit's seal and a rotation's seals.
 use crate::crypto::{self, KemKey, Secret, SecretBytes};
+use crate::history::Control;
+use crate::recovery::RecoveryKeys;
+use crate::trust::RotationReason;
 use crate::{
-    AccountEvent, DeviceId, DevicePublicKeys, Error, VerifiedAccount,
+    AccountEvent, DeviceId, DevicePublicKeys, Error, RecoveryPublicKeys, SigningRequest,
+    VerifiedAccount,
     platform::{DeviceKeyStore, StoredDevice},
 };
+use std::collections::BTreeSet;
 
 const PREFIX: &[u8; 8] = b"BHPERS01";
 const SIZE: usize = 1299;
 const DELIVERY_PREFIX: &[u8; 8] = b"BHPDEL01";
 const DELIVERY_SIZE: usize = 8 + SIZE + 32 + 64;
+const ROTATION_PREFIX: &[u8; 8] = b"BHROTB01";
+const ROTATION_ENTRY: usize = 32 + SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealPurpose {
     FirstDevice,
     Recovery,
     Device,
+    /// A rotated personal key, sealed to a remaining device in the body the
+    /// rotation commits to.
+    Rotation,
 }
 impl SealPurpose {
     fn tag(self) -> u8 {
@@ -22,6 +33,7 @@ impl SealPurpose {
             Self::FirstDevice => 1,
             Self::Recovery => 2,
             Self::Device => 3,
+            Self::Rotation => 4,
         }
     }
 }
@@ -38,6 +50,9 @@ impl PersonalKey {
     /// Scoped receiver use without exporting its reconstructable seed.
     pub fn decapsulate(&self, ciphertext: &[u8; 1120]) -> Result<Secret<32>, Error> {
         crypto::decapsulate(&self.0, ciphertext).map_err(|_| Error::InvalidCredentials)
+    }
+    pub(crate) fn seed(&self) -> Secret<32> {
+        self.0.export_seed()
     }
 }
 
@@ -66,7 +81,7 @@ impl PreparedPublication {
     }
 }
 
-fn id(public: &[u8; 1216]) -> [u8; 32] {
+pub(crate) fn id(public: &[u8; 1216]) -> [u8; 32] {
     crypto::hash(&[b"BH personal key id v1\0".as_slice(), public].concat())
 }
 fn recipient_hash(public: &[u8; 1216]) -> [u8; 32] {
@@ -74,6 +89,14 @@ fn recipient_hash(public: &[u8; 1216]) -> [u8; 32] {
 }
 pub(crate) fn commitment(seal: &[u8]) -> [u8; 32] {
     crypto::hash(&[b"BH personal seal commit v1\0".as_slice(), seal].concat())
+}
+/// The digest an account event signs for one seal: a recovery seal named by
+/// a recovery replacement or a rotation.
+pub fn seal_digest(seal: &[u8]) -> [u8; 32] {
+    commitment(seal)
+}
+pub(crate) fn body_digest(body: &[u8]) -> [u8; 32] {
+    crypto::hash(&[b"BH personal rotation body v1\0".as_slice(), body].concat())
 }
 fn ad(
     purpose: SealPurpose,
@@ -132,7 +155,7 @@ pub fn prepare_publication(
     if key.public() == *first.receiving() || key.public() == *recovery.receiving() {
         return Err(Error::InvalidSetup);
     }
-    let seed = key.0.export_seed();
+    let seed = key.seed();
     let device_seal = seal(
         state,
         key,
@@ -172,27 +195,21 @@ fn checked<'a>(
     recipient: &[u8; 1216],
 ) -> Result<Checked<'a>, Error> {
     let publication = state.personal_publication()?;
-    if envelope.len() != SIZE
-        || &envelope[..8] != PREFIX
-        || &envelope[8..10] != 1u16.to_be_bytes().as_slice()
-        || envelope[10] != purpose.tag()
-    {
-        return Err(Error::Malformed);
-    }
+    header(envelope, purpose)?;
     let expected = match purpose {
         SealPurpose::FirstDevice => state.first_device()?.receiving(),
         SealPurpose::Recovery => state.recovery_keys()?.receiving(),
-        SealPurpose::Device => recipient,
+        SealPurpose::Device | SealPurpose::Rotation => recipient,
     };
     if recipient != expected {
         return Err(Error::InvalidCredentials);
     }
-    // Device delivery is signed in its domain-separated outer frame, not one
-    // of the two initial committed slots.
+    // Device delivery is signed in its domain-separated outer frame, and a
+    // rotation's seals by the body digest, not one of the committed slots.
     let signed_digest = match purpose {
         SealPurpose::FirstDevice => Some(publication.device_digest()),
         SealPurpose::Recovery => Some(publication.recovery_digest()),
-        SealPurpose::Device => None,
+        SealPurpose::Device | SealPurpose::Rotation => None,
     };
     if signed_digest.is_some_and(|digest| !crypto::constant_time_eq(&commitment(envelope), digest))
     {
@@ -217,6 +234,16 @@ fn checked<'a>(
         key_id,
         public: publication.public(),
     })
+}
+fn header(envelope: &[u8], purpose: SealPurpose) -> Result<(), Error> {
+    if envelope.len() != SIZE
+        || &envelope[..8] != PREFIX
+        || &envelope[8..10] != 1u16.to_be_bytes().as_slice()
+        || envelope[10] != purpose.tag()
+    {
+        return Err(Error::Malformed);
+    }
+    Ok(())
 }
 fn finish(
     state: &VerifiedAccount,
@@ -295,6 +322,8 @@ pub(crate) async fn open_initial_fenced(
 
 /// Recovery uses the independently reconstructed recovery receiver; only an
 /// authorized home release may supply these private bytes to a real caller.
+/// Accepts the current recovery seal: the initial one, a replacement kit's,
+/// or the latest rotation's.
 pub fn open_for_recovery(
     state: &VerifiedAccount,
     envelope: &[u8],
@@ -326,20 +355,15 @@ pub async fn seal_for_device(
     }
     // Stage before home ordering, but only for keys committed by the exact
     // authenticated pending add. It must be a successor of this verified view.
-    let draft = state.add_device(sender.keys.id(), recipient.clone())?;
-    let raw = admission.as_bytes();
-    if raw.len() != draft.signing_bytes().len() + 64 || !raw.starts_with(draft.signing_bytes()) {
-        return Err(Error::InvalidCredentials);
-    }
-    let signature: [u8; 64] = raw[raw.len() - 64..]
-        .try_into()
-        .map_err(|_| Error::Malformed)?;
-    draft.finish(signature)?;
+    exact_admission(
+        &state.add_device(sender.keys.id(), recipient.clone())?,
+        admission,
+    )?;
     store
         .load_matching(sender)
         .await
         .map_err(|_| Error::InvalidCredentials)?;
-    let seed = key.0.export_seed();
+    let seed = key.seed();
     let envelope = seal(
         state,
         key,
@@ -361,8 +385,78 @@ pub async fn seal_for_device(
     Ok(frame)
 }
 
+// `admission` is exactly `draft`, signed by its expected key.
+fn exact_admission(draft: &SigningRequest, admission: &AccountEvent) -> Result<(), Error> {
+    let raw = admission.as_bytes();
+    if raw.len() != draft.signing_bytes().len() + 64 || !raw.starts_with(draft.signing_bytes()) {
+        return Err(Error::InvalidCredentials);
+    }
+    let signature: [u8; 64] = raw[raw.len() - 64..]
+        .try_into()
+        .map_err(|_| Error::Malformed)?;
+    draft.finish(signature)?;
+    Ok(())
+}
+
+/// Seal the current personal key to a device the recovery key adds, signed
+/// by the recovery key as the recovery author. Only for the exact signed
+/// recovery addition of `recipient`, a successor of this verified view; the
+/// recovering device opened the key from the recovery seal.
+pub fn seal_for_device_by_recovery(
+    state: &VerifiedAccount,
+    key: &PersonalKey,
+    recovery: &RecoveryKeys,
+    recipient: &DevicePublicKeys,
+    admission: &AccountEvent,
+) -> Result<Vec<u8>, Error> {
+    if *state.personal_publication()?.public() != key.public() {
+        return Err(Error::InvalidCredentials);
+    }
+    let current = state.recovery_keys()?;
+    let public = recovery.public();
+    if current.signing() != public.signing() || current.receiving() != public.receiving() {
+        return Err(Error::InvalidCredentials);
+    }
+    exact_admission(&state.add_device_by_recovery(recipient.clone())?, admission)?;
+    let envelope = seal(
+        state,
+        key,
+        SealPurpose::Device,
+        recipient.receiving(),
+        &key.seed(),
+    )?;
+    let mut frame = Vec::with_capacity(DELIVERY_SIZE);
+    frame.extend_from_slice(DELIVERY_PREFIX);
+    frame.extend_from_slice(&envelope);
+    frame.extend_from_slice(&state.recovery_author()?.0);
+    let signature = recovery.sign(&frame);
+    frame.extend_from_slice(&signature);
+    Ok(frame)
+}
+
+/// Seal the current personal key to a replacement recovery key, for the
+/// ReplaceRecovery event that names its digest.
+pub fn seal_for_new_recovery(
+    state: &VerifiedAccount,
+    key: &PersonalKey,
+    recovery: &RecoveryPublicKeys,
+) -> Result<Vec<u8>, Error> {
+    if *state.personal_publication()?.public() != key.public() {
+        return Err(Error::InvalidCredentials);
+    }
+    state.check_new_recovery(recovery)?;
+    seal(
+        state,
+        key,
+        SealPurpose::Recovery,
+        recovery.receiving(),
+        &key.seed(),
+    )
+}
+
 // The signed frame's checks, shared by public verification and opening: exact
-// framing, a signature by a device active in this history, then the envelope's
+// framing, a signature by a device active in this history or by its current
+// recovery key, then the envelope's
 // account, current publication, purpose and recipient. No secret key is used.
 fn checked_delivery<'a>(
     state: &'a VerifiedAccount,
@@ -380,11 +474,15 @@ fn checked_delivery<'a>(
             .try_into()
             .map_err(|_| Error::Malformed)?,
     );
-    let signer = state.active_device(sender)?;
+    let signer = if sender == state.recovery_author()? {
+        state.recovery_keys()?.signing()
+    } else {
+        state.active_device(sender)?.signing()
+    };
     let signature: [u8; 64] = frame[DELIVERY_SIZE - 64..]
         .try_into()
         .map_err(|_| Error::Malformed)?;
-    crypto::verify(signer.signing(), &frame[..DELIVERY_SIZE - 64], &signature)
+    crypto::verify(signer, &frame[..DELIVERY_SIZE - 64], &signature)
         .map_err(|_| Error::BadSignature)?;
     let checked = checked(
         state,
@@ -396,7 +494,8 @@ fn checked_delivery<'a>(
 }
 
 /// Check a signed device-delivery frame without opening it: exact framing, a
-/// signature by a device active in `state`, this account, its current personal
+/// signature by a device active in `state` or by its current recovery key
+/// (returned as the recovery author), this account, its current personal
 /// publication, the Device purpose, and `recipient` as an active device whose
 /// receiving key the frame names. Returns the signing device. This is what a
 /// verifier holding no secret key can establish; it does not prove the sealed
@@ -429,4 +528,191 @@ pub async fn open_for_device(
         .await
         .map_err(|_| Error::InvalidCredentials)?;
     finish(state, envelope, SealPurpose::Device, &checked, &shared)
+}
+
+/// A new personal key sealed to every device active in the view it was
+/// prepared from and to the current recovery key. `body` holds the device
+/// seals; the rotation event signs both digests.
+pub struct PreparedRotation {
+    pub public: [u8; 1216],
+    pub body: Vec<u8>,
+    pub recovery_seal: Vec<u8>,
+    pub device_seals_digest: [u8; 32],
+    pub recovery_seal_digest: [u8; 32],
+}
+
+/// `after` is the account advanced to the time the rotation is made.
+pub fn prepare_rotation(
+    after: &VerifiedAccount,
+    new: &PersonalKey,
+) -> Result<PreparedRotation, Error> {
+    let recovery = after.recovery_keys()?;
+    if new.public() == *after.personal_publication()?.public()
+        || new.public() == *recovery.receiving()
+    {
+        return Err(Error::KeyReuse);
+    }
+    let seed = new.seed();
+    let devices: Vec<_> = after.active_devices()?.collect();
+    let count = u16::try_from(devices.len()).map_err(|_| Error::Malformed)?;
+    let mut body = Vec::with_capacity(10 + devices.len() * ROTATION_ENTRY);
+    body.extend_from_slice(ROTATION_PREFIX);
+    body.extend_from_slice(&count.to_be_bytes());
+    // Active devices iterate in id order, the order the body requires.
+    for keys in devices {
+        body.extend_from_slice(&keys.id().0);
+        body.extend(seal(
+            after,
+            new,
+            SealPurpose::Rotation,
+            keys.receiving(),
+            &seed,
+        )?);
+    }
+    let recovery_seal = seal(
+        after,
+        new,
+        SealPurpose::Recovery,
+        recovery.receiving(),
+        &seed,
+    )?;
+    Ok(PreparedRotation {
+        public: new.public(),
+        device_seals_digest: body_digest(&body),
+        recovery_seal_digest: commitment(&recovery_seal),
+        body,
+        recovery_seal,
+    })
+}
+
+// Exact framing: a count, then that many (device id, seal) in strictly
+// increasing id order.
+fn rotation_entries(body: &[u8]) -> Result<Vec<(DeviceId, &[u8])>, Error> {
+    if body.len() < 10 || &body[..8] != ROTATION_PREFIX {
+        return Err(Error::Malformed);
+    }
+    let count = usize::from(u16::from_be_bytes([body[8], body[9]]));
+    let rest = &body[10..];
+    if rest.len() != count * ROTATION_ENTRY {
+        return Err(Error::Malformed);
+    }
+    let mut entries: Vec<(DeviceId, &[u8])> = Vec::with_capacity(count);
+    for entry in rest.as_chunks::<ROTATION_ENTRY>().0 {
+        let device = DeviceId(entry[..32].try_into().map_err(|_| Error::Malformed)?);
+        if entries.last().is_some_and(|(last, _)| *last >= device) {
+            return Err(Error::Malformed);
+        }
+        entries.push((device, &entry[32..]));
+    }
+    Ok(entries)
+}
+
+/// Check a rotation's device seals against `after`, the account advanced to
+/// the rotation's time and not yet holding it: the body is the one `rotation`
+/// commits to; every device active in `after` is a recipient; no target of
+/// an effect this rotation fulfils is; any other recipient is the target of
+/// an effect still due after it (a deadline that passed after the body was
+/// made), which the next rotation replaces. A refusal here leaves the effect
+/// due; it is not a reason to stop the account.
+pub fn verify_rotation_body(
+    after: &VerifiedAccount,
+    rotation: &AccountEvent,
+    body: &[u8],
+) -> Result<(), Error> {
+    let Control::RotatePersonal {
+        reason,
+        publication,
+    } = &rotation.control
+    else {
+        return Err(Error::Malformed);
+    };
+    after.running()?;
+    let mut remaining = after.timeline.clone();
+    remaining.fulfil(*reason)?;
+    let target = |reason: RotationReason| match reason {
+        RotationReason::Removal { target, .. } | RotationReason::RemovedNow { target, .. } => {
+            Some(target)
+        }
+        RotationReason::RemovedSelf { device, .. } => Some(device),
+        RotationReason::RecoveryReplaced { .. } => None,
+    };
+    let still_due: BTreeSet<DeviceId> = remaining
+        .effects
+        .values()
+        .filter_map(|e| target(e.reason))
+        .collect();
+    if !crypto::constant_time_eq(&body_digest(body), publication.device_digest()) {
+        return Err(Error::InvalidCredentials);
+    }
+    let key_id = id(publication.public());
+    let entries = rotation_entries(body)?;
+    for (device, envelope) in &entries {
+        header(envelope, SealPurpose::Rotation)?;
+        if envelope[11..43] != after.id().0 || envelope[43..75] != key_id {
+            return Err(Error::InvalidCredentials);
+        }
+        match after.active_device(*device) {
+            Ok(keys) if envelope[75..107] == recipient_hash(keys.receiving()) => {}
+            Ok(_) => return Err(Error::InvalidCredentials),
+            // A fulfilled effect's target is never in `still_due`.
+            Err(_) if still_due.contains(device) => {}
+            Err(_) => return Err(Error::InvalidCredentials),
+        }
+    }
+    let sealed: BTreeSet<DeviceId> = entries.iter().map(|(device, _)| *device).collect();
+    if after
+        .active_devices()?
+        .any(|keys| !sealed.contains(&keys.id()))
+    {
+        return Err(Error::InvalidCredentials);
+    }
+    Ok(())
+}
+
+/// Open this device's seal from the body the account's current rotation
+/// commits to; `after` holds that rotation. A device not active in `after`
+/// is refused.
+pub async fn open_rotation_for_device(
+    after: &VerifiedAccount,
+    body: &[u8],
+    device: &StoredDevice,
+    store: &mut impl DeviceKeyStore,
+) -> Result<PersonalKey, Error> {
+    let publication = after.personal_publication()?;
+    if !crypto::constant_time_eq(&body_digest(body), publication.device_digest()) {
+        return Err(Error::InvalidCredentials);
+    }
+    if after.active_device(device.keys.id())? != &device.keys {
+        return Err(Error::InvalidCredentials);
+    }
+    let envelope = rotation_entries(body)?
+        .into_iter()
+        .find(|(id, _)| *id == device.keys.id())
+        .map(|(_, envelope)| envelope)
+        .ok_or(Error::InvalidCredentials)?;
+    let checked = checked(
+        after,
+        envelope,
+        SealPurpose::Rotation,
+        device.keys.receiving(),
+    )?;
+    store
+        .load_matching(device)
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    let shared = store
+        .decapsulate(device.handle.clone(), checked.ciphertext)
+        .await
+        .map_err(|_| Error::InvalidCredentials)?;
+    finish(after, envelope, SealPurpose::Rotation, &checked, &shared)
+}
+
+/// A rotation's recovery seal is the account's current recovery seal once
+/// `state` holds the rotation, so this is `open_for_recovery`.
+pub fn open_rotation_for_recovery(
+    state: &VerifiedAccount,
+    recovery_seal: &[u8],
+    receiver: &KemKey,
+) -> Result<PersonalKey, Error> {
+    open_for_recovery(state, recovery_seal, receiver)
 }

@@ -23,7 +23,7 @@
 //! app is foreground, a note window is open and presence is configured. It
 //! asks the shared authz session for one presence permit at a time, renewing
 //! before the permit's usable end. The content key never leaves
-//! `with_base_keys`, and each send and delivery rechecks the owner authority
+//! `with_epoch_keys`, and each send and delivery rechecks the owner authority
 //! and epoch under the short sync fence. Leaving sends `cleared` best effort
 //! and closes the join; a reconnect keeps this device's own selections so the
 //! next roster snapshot resends them.
@@ -35,7 +35,7 @@ use crate::{
     outbox::usable_until,
 };
 use bh_authz_proto::{FromService, ToService, Want};
-use bh_crypto::{Secret, random};
+use bh_crypto::random;
 use bh_device::{OwnerError, SyncFence};
 use bh_event::presence::{self, PresenceRecord, SEALED_LEN};
 use bh_storage::NoteKey;
@@ -1202,13 +1202,13 @@ async fn send_pending(
     let mut sealed = None;
     shared
         .signer
-        .with_base_keys(BaseId(base), &mut |_, content: &Secret<32>| {
+        .with_epoch_keys(BaseId(base), Some(epoch), &mut |_, content| {
             // The key stays inside this closure: only the sealed frame leaves.
             // It must be the stored epoch's key, or a removed device could
             // still hold the root a labelled frame is sealed under.
-            if bh_event::key_id(content) != epoch {
+            let Some(content) = content.filter(|k| bh_event::key_id(k) == epoch) else {
                 return;
-            }
+            };
             let record = PresenceRecord {
                 kind: if cleared { 2 } else { 1 },
                 handle: presence::handle(content, identity.device),
@@ -1267,10 +1267,10 @@ fn receive(
     let mut opened = None;
     if shared
         .signer
-        .with_base_keys(BaseId(base), &mut |_, content: &Secret<32>| {
-            if bh_event::key_id(content) != epoch {
+        .with_epoch_keys(BaseId(base), Some(epoch), &mut |_, content| {
+            let Some(content) = content.filter(|k| bh_event::key_id(k) == epoch) else {
                 return;
-            }
+            };
             opened = presence::open(content, base, base, epoch, sealed).ok();
         })
         .is_err()
@@ -1352,10 +1352,10 @@ async fn send_clears(shared: &Arc<Shared>, hub: &Arc<State>, session: &mut Sessi
         let mut sealed = None;
         let _ = shared
             .signer
-            .with_base_keys(BaseId(base), &mut |_, content: &Secret<32>| {
-                if bh_event::key_id(content) != epoch {
+            .with_epoch_keys(BaseId(base), Some(epoch), &mut |_, content| {
+                let Some(content) = content.filter(|k| bh_event::key_id(k) == epoch) else {
                     return;
-                }
+                };
                 let record = PresenceRecord {
                     kind: 2,
                     handle: presence::handle(content, identity.device),

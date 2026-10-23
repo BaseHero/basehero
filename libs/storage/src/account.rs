@@ -111,6 +111,7 @@ impl DeviceDatabase {
             "SELECT NOT EXISTS (
                 SELECT 1 FROM account_state UNION ALL
                 SELECT 1 FROM account_events UNION ALL
+                SELECT 1 FROM account_outer_progress UNION ALL
                 SELECT 1 FROM account_pending_setup UNION ALL
                 SELECT 1 FROM account_staged_admission UNION ALL
                 SELECT 1 FROM account_device UNION ALL
@@ -217,6 +218,56 @@ impl DeviceDatabase {
         stopped: bool,
         projection: Option<&AccountProjectionDelta>,
     ) -> Result<(), StoreError> {
+        self.commit_account_verified_confirmed(
+            anchor,
+            events,
+            head_position,
+            head_hash,
+            stopped,
+            projection,
+            &[],
+        )
+    }
+
+    /// Commit caller-verified originals, exact confirmation evidence and the
+    /// derived projection in one transaction. Evidence may name only this append.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_account_verified_confirmed(
+        &mut self,
+        anchor: [u8; 32],
+        events: &[&[u8]],
+        head_position: u64,
+        head_hash: [u8; 32],
+        stopped: bool,
+        projection: Option<&AccountProjectionDelta>,
+        confirmations: &[crate::ConfirmationRow],
+    ) -> Result<(), StoreError> {
+        self.commit_account_verified_with_alerts(
+            anchor,
+            events,
+            head_position,
+            head_hash,
+            stopped,
+            projection,
+            confirmations,
+            None,
+        )
+    }
+
+    /// The verified alert cursor and facts share the originals' transaction.
+    /// `None` preserves the older account-only API for setup and legacy callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_account_verified_with_alerts(
+        &mut self,
+        anchor: [u8; 32],
+        events: &[&[u8]],
+        head_position: u64,
+        head_hash: [u8; 32],
+        stopped: bool,
+        projection: Option<&AccountProjectionDelta>,
+        confirmations: &[crate::ConfirmationRow],
+        alerts: Option<&[crate::NewAlert]>,
+    ) -> Result<(), StoreError> {
         if projection.is_some() && events.is_empty() {
             return Err(StoreError::CorruptAccount);
         }
@@ -228,15 +279,15 @@ impl DeviceDatabase {
             [],
             |row| row.get::<_, i64>(0),
         )? as u64;
-        let stored: Option<(Vec<u8>, i64)> = transaction
+        let stored: Option<(Vec<u8>, i64, Option<i64>)> = transaction
             .query_row(
-                "SELECT anchor,head_position FROM account_state WHERE id=1",
+                "SELECT anchor,head_position,observed_earliest_ms FROM account_state WHERE id=1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         match &stored {
-            Some((previous_anchor, position))
+            Some((previous_anchor, position, _))
                 if previous_anchor.as_slice() != anchor.as_slice()
                     || *position != existing as i64 =>
             {
@@ -251,9 +302,32 @@ impl DeviceDatabase {
         if head_position != existing + events.len() as u64 {
             return Err(StoreError::HeadWithoutBytes);
         }
+        if confirmations
+            .iter()
+            .any(|row| row.position <= existing || row.position > head_position)
+        {
+            return Err(StoreError::CorruptSecurity);
+        }
+        // Only new originals are bound by a previously observed accepted-head
+        // time. Attaching the already accepted setup prefix's evidence is not
+        // a new append and must not retime that prefix against a later floor.
+        if !events.is_empty()
+            && let Some((_, _, Some(floor))) = stored
+        {
+            let floor = u64::try_from(floor).map_err(|_| StoreError::CorruptAccount)?;
+            if confirmations.len() != events.len() {
+                // No writes have occurred: absent evidence is a retryable
+                // refusal, not an authenticated time contradiction.
+                return Err(StoreError::MissingTime);
+            }
+            if confirmations.iter().any(|row| row.earliest_ms < floor) {
+                return Err(StoreError::TimeRegressed);
+            }
+        }
         for event in events {
             transaction.execute("INSERT INTO account_events(bytes) VALUES (?1)", [*event])?;
         }
+        crate::security::put_confirmations(&transaction, confirmations)?;
         transaction.execute(
             "INSERT INTO account_state(id,anchor,head_position,head_hash,stopped)\n             VALUES (1,?1,?2,?3,?4)\n             ON CONFLICT(id) DO UPDATE SET\n               anchor=excluded.anchor,\n               head_position=excluded.head_position,\n               head_hash=excluded.head_hash,\n               stopped=MAX(account_state.stopped,excluded.stopped)",
             params![
@@ -264,6 +338,77 @@ impl DeviceDatabase {
             ],
         )?;
         if let Some(delta) = projection {
+            index::apply_delta(&transaction, anchor, delta)?;
+        }
+        if let Some(alerts) = alerts {
+            crate::security::record_alerts_tx(&transaction, head_position, alerts)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Attach the home's confirmations of setup positions 2 and 3 to the prefix
+    /// this device committed untimed before reaching its home, replacing the
+    /// projection with `projection`, a fresh timed replay, in the same commit.
+    /// Only while setup is pending, the head is exactly that prefix with these
+    /// originals and no confirmation is stored; nothing else is ever retimed.
+    pub fn attach_setup_confirmations(
+        &mut self,
+        anchor: [u8; 32],
+        head: (u64, [u8; 32]),
+        originals: [&[u8]; 2],
+        confirmations: &[crate::ConfirmationRow; 2],
+        projection: Option<&AccountProjectionDelta>,
+    ) -> Result<(), StoreError> {
+        let [record, key] = confirmations;
+        if head.0 != 3
+            || (record.position, key.position) != (2, 3)
+            || key.earliest_ms < record.earliest_ms
+            || key.latest_ms < record.latest_ms
+            || projection.is_some_and(|d| {
+                d.epoch.is_some() || d.expected != (0, [0; 32]) || d.through != head
+            })
+        {
+            return Err(StoreError::CorruptSecurity);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (pending, timed, indexed, count): (bool, bool, bool, i64) = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_pending_setup WHERE id=1),
+                    EXISTS(SELECT 1 FROM account_confirmations),
+                    EXISTS(SELECT 1 FROM account_projection),
+                    (SELECT COALESCE(MAX(id),0) FROM account_events)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let state: Option<(Vec<u8>, i64, Vec<u8>, i64)> = transaction
+            .query_row(
+                "SELECT anchor,head_position,head_hash,stopped FROM account_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let stored = {
+            let mut statement = transaction
+                .prepare("SELECT bytes FROM account_events WHERE id IN (2,3) ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !pending
+            || timed
+            || count != 3
+            || indexed != projection.is_some()
+            || state != Some((anchor.to_vec(), 3, head.1.to_vec(), 0))
+            || stored != originals
+            || bh_crypto::hash(originals[1]) != head.1
+        {
+            return Err(StoreError::AuthorityChanged);
+        }
+        crate::security::put_confirmations(&transaction, confirmations)?;
+        if let Some(delta) = projection {
+            index::reset(&transaction, anchor)?;
             index::apply_delta(&transaction, anchor, delta)?;
         }
         transaction.commit()?;

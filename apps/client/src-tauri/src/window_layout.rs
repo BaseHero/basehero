@@ -52,6 +52,8 @@ mod menu {
     use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tauri::{AppHandle, Manager, Runtime};
 
+    const ABOUT: &str = "bh-about";
+    const DEVICES: &str = "bh-devices";
     const SIDEBAR: &str = "bh-sidebar";
     const NEW_NOTE: &str = "bh-new-note";
     const NEW_WINDOW: &str = "bh-new-window";
@@ -66,6 +68,21 @@ mod menu {
                 continue;
             };
             match submenu.text()?.as_str() {
+                name if name == app.package_info().name => {
+                    // Tauri's first app item is its predefined About. Replace
+                    // rather than add a second item with different content.
+                    if let Some(default_about) = submenu
+                        .items()?
+                        .first()
+                        .and_then(|item| item.as_predefined_menuitem().cloned())
+                    {
+                        submenu.remove(&default_about)?;
+                    }
+                    submenu.prepend_items(&[
+                        &MenuItem::with_id(app, ABOUT, "About BaseHero", true, None::<&str>)?,
+                        &MenuItem::with_id(app, DEVICES, "Devices…", true, None::<&str>)?,
+                    ])?;
+                }
                 "File" => submenu.prepend_items(&[
                     &MenuItem::with_id(app, NEW_NOTE, "New Note", true, Some("Cmd+N"))?,
                     &MenuItem::with_id(app, NEW_WINDOW, "New Window", true, Some("Alt+Cmd+N"))?,
@@ -90,6 +107,8 @@ mod menu {
     /// Hand a menu action to the focused window's page; a fixed script, no data.
     pub(crate) fn event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
         let script = match event.id().as_ref() {
+            ABOUT => "window.__bhAbout&&window.__bhAbout()",
+            DEVICES => "window.__bhMenu&&window.__bhMenu('devices')",
             SIDEBAR => "window.__bhMenu&&window.__bhMenu('sidebar')",
             NEW_NOTE => "window.__bhMenu&&window.__bhMenu('new-note')",
             NEW_WINDOW => "window.__bhMenu&&window.__bhMenu('new-window')",

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-account-recovery-status"
+description = "Enables the account_recovery_status command without any pre-configured scope."
+commands.allow = ["account_recovery_status"]
+
+[[permission]]
+identifier = "deny-account-recovery-status"
+description = "Denies the account_recovery_status command without any pre-configured scope."
+commands.deny = ["account_recovery_status"]

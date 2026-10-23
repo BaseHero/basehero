@@ -170,6 +170,7 @@ async fn unaccounted_base_control_refuses_presence_until_resync() {
                 body: Some(body),
                 epoch,
                 after: Some(harness.edge.head(mac.base_log())),
+                attached: None,
             }),
             &copy.descriptor,
         )

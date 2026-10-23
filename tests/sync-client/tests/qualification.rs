@@ -346,7 +346,7 @@ async fn two(hosted: &Arc<Hosted>, presence: bool) -> (Device, Started, Device, 
         mac.registered() && mac.progress().position >= 1
     })
     .await;
-    let fold = Device::join(&mac, hosted);
+    let fold = Device::join(&mac, hosted).await;
     if presence {
         fold.label_presence("Fold", 1);
     }
@@ -1227,7 +1227,7 @@ async fn cold(s: Setting) {
     .await;
     let registered = began.elapsed();
     let joined = Instant::now();
-    let fold = Device::join(&mac, &hosted);
+    let fold = Device::join(&mac, &hosted).await;
     until(120, "addition copied", || copied(&mac) == 4).await;
     let fc = fold.start_named(&hosted, "reader");
     until(120, "joined device caught up", || {
@@ -1739,7 +1739,10 @@ async fn a_grant_expiring_in_flight_is_renewed_with_the_same_bytes() {
     m.assert_bounded(&s);
     // Each sealed event is in the log once, with the bytes it was sealed with.
     let entries = hosted.edge.entries(mac.log());
-    let ids: std::collections::HashSet<_> = entries.iter().map(|(_, e)| e.id().0).collect();
+    let ids: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|(c, e)| e.publication_id(c.route()).0)
+        .collect();
     assert_eq!(ids.len(), entries.len(), "no event ordered twice");
     assert_eq!(fold.paragraphs(typist.note), vec![text]);
     same_note(&mac, &fold, typist.note);

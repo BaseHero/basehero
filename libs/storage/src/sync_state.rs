@@ -10,7 +10,8 @@
 use crate::{DeviceDatabase, NoteKey, StoreError, catalogue, data, read_package};
 use bh_core::note::OrderedState;
 use bh_sync::{
-    BodyObject, Commitment, OpaqueEvent, permit::LogKind, receipt::RECEIPT_LEN, referenced_body,
+    BaseId, BodyObject, Commitment, Digest, Head, OpaqueEvent, OrderState, permit::LogKind,
+    receipt::RECEIPT_LEN, referenced_body,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -159,6 +160,9 @@ pub const LOG_ACCOUNT: u8 = LogKind::Account as u8;
 pub struct LogProgress {
     pub position: u64,
     pub head_hash: [u8; 32],
+    pub order_format: u8,
+    pub order: OrderState,
+    pub floor_order: OrderState,
     pub receipt: Option<[u8; RECEIPT_LEN]>,
     pub control_digest: [u8; 32],
     /// Set once by a proven contradiction; never cleared.
@@ -170,6 +174,12 @@ pub struct LogProgress {
     pub metadata_id: Option<[u8; 32]>,
     pub epoch_id: Option<[u8; 32]>,
     pub floor: u16,
+}
+
+/// Account home's ordered-log checkpoint, distinct from its signed inner journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountOuterProgress {
+    pub order: OrderState,
 }
 
 /// What verified history had applied at one position.
@@ -186,6 +196,8 @@ pub struct SeenRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRecord {
     pub seen: SeenRow,
+    /// Complete opening after this ordered original, including rejections.
+    pub order: OrderState,
     pub event_id: [u8; 32],
     pub digest: [u8; 32],
     /// The exact verified account event an accepted account control applied.
@@ -421,6 +433,7 @@ pub struct IncomingCommit {
     pub log_id: [u8; 32],
     pub hosting_root: [u8; 32],
     pub after: (u64, [u8; 32]),
+    pub after_order: OrderState,
     pub receipt: [u8; RECEIPT_LEN],
     pub records: Vec<VerifiedRecord>,
     pub metadata_id: [u8; 32],
@@ -478,6 +491,9 @@ pub(crate) fn read_progress(
     type Row = (
         i64,
         Vec<u8>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
         Option<Vec<u8>>,
         Vec<u8>,
         Option<u8>,
@@ -490,7 +506,7 @@ pub(crate) fn read_progress(
     );
     let row: Option<Row> = conn
         .query_row(
-            "SELECT position,head_hash,receipt,control_digest,stopped_reason,hosting_root,
+            "SELECT position,head_hash,order_format,opening,floor_opening,receipt,control_digest,stopped_reason,hosting_root,
                account_position,account_hash,metadata_id,epoch_id,floor
              FROM log_progress WHERE log_kind=?1 AND log_id=?2",
             params![kind, id.as_slice()],
@@ -506,16 +522,53 @@ pub(crate) fn read_progress(
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
-                    r.get(10)?,
+                    r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(position, head, receipt, control, stopped, root, ap, ah, metadata, epoch, floor)| {
+        |(
+            position,
+            head,
+            format,
+            opening,
+            floor_opening,
+            receipt,
+            control,
+            stopped,
+            root,
+            ap,
+            ah,
+            metadata,
+            epoch,
+            floor,
+        )| {
+            if format != Some(2) {
+                return Err(StoreError::CorruptSyncState);
+            }
+            let order = OrderState::decode(&opening.ok_or(StoreError::CorruptSyncState)?)
+                .map_err(|_| StoreError::CorruptSyncState)?;
+            let floor_order =
+                OrderState::decode(&floor_opening.ok_or(StoreError::CorruptSyncState)?)
+                    .map_err(|_| StoreError::CorruptSyncState)?;
+            let position = unsigned(position)?;
+            let head_hash = array(head)?;
+            if order.head(BaseId(id))
+                != (Head {
+                    position,
+                    hash: Digest(head_hash),
+                })
+                || floor_order.position() > position
+            {
+                return Err(StoreError::CorruptSyncState);
+            }
             Ok(LogProgress {
-                position: unsigned(position)?,
-                head_hash: array(head)?,
+                position,
+                head_hash,
+                order_format: 2,
+                order,
+                floor_order,
                 receipt: receipt.map(array).transpose()?,
                 control_digest: array(control)?,
                 stopped,
@@ -535,6 +588,94 @@ pub(crate) fn read_progress(
 }
 
 impl DeviceDatabase {
+    /// Only an absent outer scope may begin at EMPTY. A legacy account log
+    /// progress row is never silently relabelled as a new outer checkpoint.
+    pub fn account_outer_progress(
+        &mut self,
+        id: [u8; 32],
+        root: [u8; 32],
+    ) -> Result<AccountOuterProgress, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let legacy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM log_progress WHERE log_kind=?1 AND log_id=?2)",
+            params![LOG_ACCOUNT, id.as_slice()],
+            |r| r.get(0),
+        )?;
+        if legacy {
+            return Err(StoreError::CorruptSyncState);
+        }
+        tx.execute(
+            "INSERT INTO account_outer_progress(log_id,hosting_root,order_format,opening,position,head_hash)
+             VALUES (?1,?2,2,?3,0,zeroblob(32)) ON CONFLICT DO NOTHING",
+            params![
+                id.as_slice(),
+                root.as_slice(),
+                OrderState::EMPTY.encode().as_slice()
+            ],
+        )?;
+        let row: (Vec<u8>, i64, Vec<u8>, i64, Vec<u8>) = tx.query_row(
+            "SELECT hosting_root,order_format,opening,position,head_hash
+             FROM account_outer_progress WHERE log_id=?1",
+            [id.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        if row.0.as_slice() != root || row.1 != 2 {
+            return Err(if row.0.as_slice() != root {
+                StoreError::RootConflict
+            } else {
+                StoreError::CorruptSyncState
+            });
+        }
+        let order = OrderState::decode(&row.2).map_err(|_| StoreError::CorruptSyncState)?;
+        if order.head(BaseId(id))
+            != (Head {
+                position: unsigned(row.3)?,
+                hash: Digest(array(row.4)?),
+            })
+        {
+            return Err(StoreError::CorruptSyncState);
+        }
+        tx.commit()?;
+        Ok(AccountOuterProgress { order })
+    }
+
+    /// CAS the authenticated outer suffix. A stale writer cannot replace a
+    /// newer checkpoint; a failed write leaves the old opening intact.
+    pub fn advance_account_outer(
+        &mut self,
+        id: [u8; 32],
+        root: [u8; 32],
+        before: OrderState,
+        after: OrderState,
+    ) -> Result<(), StoreError> {
+        if after.position() <= before.position() {
+            return Err(StoreError::CorruptSyncState);
+        }
+        let head = after.head(BaseId(id));
+        let previous = before.head(BaseId(id));
+        let changed = self.connection.execute(
+            "UPDATE account_outer_progress SET opening=?4,position=?5,head_hash=?6
+             WHERE log_id=?1 AND hosting_root=?2 AND order_format=2 AND opening=?3
+               AND position=?7 AND head_hash=?8",
+            params![
+                id.as_slice(),
+                root.as_slice(),
+                before.encode().as_slice(),
+                after.encode().as_slice(),
+                signed(head.position)?,
+                head.hash.0.as_slice(),
+                signed(previous.position)?,
+                previous.hash.0.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleProgress);
+        }
+        Ok(())
+    }
+
     pub fn log_progress(&self, kind: u8, id: [u8; 32]) -> Result<Option<LogProgress>, StoreError> {
         read_progress(&self.connection, kind, id)
     }
@@ -884,19 +1025,34 @@ impl DeviceDatabase {
     /// kept for the same successor already: that one is returned, never
     /// replaced, so every retry sends its exact bytes.
     pub fn stage_base_control(&mut self, control: &BaseControl) -> Result<BaseControl, StoreError> {
-        let descriptor =
-            OpaqueEvent::decode(&control.descriptor).map_err(|_| StoreError::InvalidPackage)?;
-        let body = BodyObject::new(control.body.clone()).map_err(|_| StoreError::InvalidPackage)?;
-        if control.account_position < 2
-            || descriptor.id().0 != control.event_id
-            || referenced_body(&descriptor).ok() != Some(body.commitment())
-        {
+        self.stage_kept_control(control, None)
+    }
+
+    /// As `stage_base_control`, for a rekey: the control and the exact seal
+    /// set it commits to are kept together in one transaction, so every
+    /// retry stages that set and sends that control. A control kept for the
+    /// successor already wins, with whatever set it was kept with.
+    pub fn stage_base_rekey(
+        &mut self,
+        control: &BaseControl,
+        seal_set: &[u8],
+    ) -> Result<BaseControl, StoreError> {
+        self.stage_kept_control(control, Some(seal_set))
+    }
+
+    fn stage_kept_control(
+        &mut self,
+        control: &BaseControl,
+        seal_set: Option<&[u8]>,
+    ) -> Result<BaseControl, StoreError> {
+        check_control(control, seal_set)?;
+        if control.account_position < 2 {
             return Err(StoreError::InvalidPackage);
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO base_control_outbox(base,account_position,event_id,descriptor,body)
                VALUES (?1,?2,?3,?4,?5) ON CONFLICT(base,account_position) DO NOTHING",
             params![
@@ -907,10 +1063,81 @@ impl DeviceDatabase {
                 control.body
             ],
         )?;
+        if inserted == 1 {
+            keep_seal_set(&tx, control.event_id, seal_set)?;
+        }
         let stored = read_control(&tx, control.base, control.account_position)?
             .ok_or(StoreError::CorruptOutbox)?;
         tx.commit()?;
         Ok(stored.0)
+    }
+
+    /// The seal set a kept rekey was kept with, by its control's event id;
+    /// None for any other kept control.
+    pub fn kept_seal_set(&self, event_id: [u8; 32]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT bytes FROM base_control_seal_set WHERE event_id=?1",
+                [event_id.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Replace `old`, the kept control for its successor, with `fresh`, a
+    /// new copy of the same successor, only while it is kept unsettled
+    /// exactly as read; returns what is kept then. For a kept copy whose
+    /// seen claim fell further behind the log than the services take: its
+    /// bytes can never be ordered, and are never sent again. A rekey's seal
+    /// set goes with it: the old set is dropped and `seal_set`, the fresh
+    /// control's own, kept in the same transaction.
+    pub fn replace_base_control(
+        &mut self,
+        old: &BaseControl,
+        fresh: &BaseControl,
+        seal_set: Option<&[u8]>,
+    ) -> Result<BaseControl, StoreError> {
+        check_control(fresh, seal_set)?;
+        if fresh.base != old.base || fresh.account_position != old.account_position {
+            return Err(StoreError::InvalidPackage);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored, settled) =
+            read_control(&tx, old.base, old.account_position)?.ok_or(StoreError::CorruptOutbox)?;
+        if stored != *old || settled.is_some() {
+            return Ok(stored);
+        }
+        tx.execute(
+            "DELETE FROM base_control_seal_set WHERE event_id=?1",
+            [old.event_id.as_slice()],
+        )?;
+        tx.execute(
+            "DELETE FROM base_control_outbox WHERE base=?1 AND account_position=?2 AND event_id=?3",
+            params![
+                old.base.as_slice(),
+                signed(old.account_position)?,
+                old.event_id.as_slice()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO base_control_outbox(base,account_position,event_id,descriptor,body)
+               VALUES (?1,?2,?3,?4,?5)",
+            params![
+                fresh.base.as_slice(),
+                signed(fresh.account_position)?,
+                fresh.event_id.as_slice(),
+                fresh.descriptor,
+                fresh.body
+            ],
+        )?;
+        keep_seal_set(&tx, fresh.event_id, seal_set)?;
+        let kept = read_control(&tx, fresh.base, fresh.account_position)?
+            .ok_or(StoreError::CorruptOutbox)?;
+        tx.commit()?;
+        Ok(kept.0)
     }
 
     /// The kept control for the base's next account successor that verified
@@ -1026,7 +1253,9 @@ impl DeviceDatabase {
         if progress.stopped.is_some() {
             return Err(StoreError::LogStopped);
         }
-        if (progress.position, progress.head_hash) != commit.after {
+        if (progress.position, progress.head_hash) != commit.after
+            || progress.order != commit.after_order
+        {
             return Err(StoreError::StaleProgress);
         }
         if progress.hosting_root != commit.hosting_root {
@@ -1034,9 +1263,20 @@ impl DeviceDatabase {
         }
         let (kind, id) = (commit.log_kind, commit.log_id.as_slice());
         let mut floor = progress.floor;
+        let mut floor_order = progress.floor_order;
+        let mut previous_order = progress.order;
         for record in &commit.records {
             let seen = &record.seen;
             let position = signed(seen.position)?;
+            if record.order.head(BaseId(commit.log_id))
+                != (Head {
+                    position: seen.position,
+                    hash: Digest(seen.head_hash),
+                })
+                || previous_order.position().checked_add(1) != Some(record.order.position())
+            {
+                return Err(StoreError::CorruptSyncState);
+            }
             tx.prepare_cached(
                 "INSERT INTO log_seen(log_kind,log_id,position,head_hash,control_digest,account_position,account_hash)
                    VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -1079,13 +1319,23 @@ impl DeviceDatabase {
                         params![kind, id, signed(after)?, raised],
                     )?;
                     floor = raised;
+                    floor_order = if after == seen.position {
+                        record.order
+                    } else {
+                        previous_order
+                    };
                 }
             }
+            previous_order = record.order;
+        }
+        if previous_order.position() != last.position {
+            return Err(StoreError::CorruptSyncState);
         }
         tx.execute(
             "UPDATE log_progress SET position=?3,head_hash=?4,receipt=?5,control_digest=?6,
-               account_position=?7,account_hash=?8,metadata_id=?9,epoch_id=?10,floor=?11
-             WHERE log_kind=?1 AND log_id=?2",
+               account_position=?7,account_hash=?8,metadata_id=?9,epoch_id=?10,floor=?11,
+               opening=?12,floor_opening=?13
+             WHERE log_kind=?1 AND log_id=?2 AND order_format=2 AND opening=?14",
             params![
                 kind,
                 id,
@@ -1097,7 +1347,10 @@ impl DeviceDatabase {
                 last.account_hash.as_slice(),
                 commit.metadata_id.as_slice(),
                 commit.epoch_id.as_ref().map(|e| e.as_slice()),
-                floor
+                floor,
+                previous_order.encode().as_slice(),
+                floor_order.encode().as_slice(),
+                progress.order.encode().as_slice(),
             ],
         )?;
         for own in &commit.own {
@@ -1290,10 +1543,11 @@ pub(crate) fn register(
         ],
     )?;
     tx.execute(
-        "INSERT INTO log_progress(log_kind,log_id,position,head_hash,control_digest,hosting_root,floor)
-           VALUES (?1,?2,0,zeroblob(32),zeroblob(32),?3,1)
+        "INSERT INTO log_progress(log_kind,log_id,position,head_hash,control_digest,hosting_root,floor,
+            order_format,opening,floor_opening)
+           VALUES (?1,?2,0,zeroblob(32),zeroblob(32),?3,1,2,?4,?4)
          ON CONFLICT DO NOTHING",
-        params![LOG_BASE, base.as_slice(), hosting_root.as_slice()],
+        params![LOG_BASE, base.as_slice(), hosting_root.as_slice(), OrderState::EMPTY.encode().as_slice()],
     )?;
     let pinned = read_progress(tx, LOG_BASE, base)?.ok_or(StoreError::MissingProgress)?;
     if pinned.hosting_root != hosting_root {
@@ -1301,6 +1555,75 @@ pub(crate) fn register(
     }
     crate::note_writers::mark_registered(tx, base)?;
     Ok(())
+}
+
+/// Whether this device's note package `package` is undecided: no Ack, no
+/// verdict, no alarm and no held judgment names it.
+pub(crate) fn package_undecided(
+    conn: &rusqlite::Connection,
+    package: i64,
+) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM note_outbox_progress WHERE update_id=?1
+             AND (acked_position IS NOT NULL OR outcome IS NOT NULL))
+           AND NOT EXISTS(SELECT 1 FROM sync_alarm WHERE update_id=?1)
+           AND NOT EXISTS(SELECT 1 FROM held_note_event WHERE own_update=?1)",
+        [package],
+        |r| r.get(0),
+    )?)
+}
+
+/// Whether the verified content of `base` is in another epoch than
+/// `sealed_epoch`: it has passed the control that replaced that epoch.
+pub(crate) fn content_left(
+    conn: &rusqlite::Connection,
+    base: [u8; 32],
+    sealed_epoch: [u8; 32],
+) -> Result<bool, StoreError> {
+    let content = read_progress(conn, LOG_BASE, base)?.ok_or(StoreError::MissingProgress)?;
+    Ok(content.epoch_id != Some(sealed_epoch))
+}
+
+/// A kept control's own consistency, and its seal set's shape.
+fn check_control(control: &BaseControl, seal_set: Option<&[u8]>) -> Result<(), StoreError> {
+    let descriptor =
+        OpaqueEvent::decode(&control.descriptor).map_err(|_| StoreError::InvalidPackage)?;
+    let body = BodyObject::new(control.body.clone()).map_err(|_| StoreError::InvalidPackage)?;
+    if descriptor.publication_id(bh_sync::Route::Control).0 != control.event_id
+        || referenced_body(&descriptor).ok() != Some(body.commitment())
+        || seal_set.is_some_and(|set| BodyObject::new(set.to_vec()).is_err())
+    {
+        return Err(StoreError::InvalidPackage);
+    }
+    Ok(())
+}
+
+fn keep_seal_set(
+    tx: &Transaction<'_>,
+    event_id: [u8; 32],
+    seal_set: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    if let Some(set) = seal_set {
+        tx.execute(
+            "INSERT INTO base_control_seal_set(event_id,bytes) VALUES (?1,?2)",
+            params![event_id.as_slice(), set],
+        )?;
+    }
+    Ok(())
+}
+
+/// The v14 table of kept rekeys' seal sets: each the exact body a kept
+/// `ACCOUNT_REKEY` commits to, staged before it on every send.
+pub(crate) fn migrate_kept_seal_sets(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE base_control_seal_set (
+            event_id BLOB PRIMARY KEY CHECK(length(event_id)=32)
+              REFERENCES base_control_outbox(event_id),
+            bytes BLOB NOT NULL CHECK(length(bytes)>0)
+        ) WITHOUT ROWID;
+        CREATE TRIGGER base_control_seal_set_exact BEFORE UPDATE ON base_control_seal_set
+          BEGIN SELECT RAISE(ABORT,'exact seal set'); END;",
+    )
 }
 
 fn read_control(

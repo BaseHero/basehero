@@ -18,6 +18,7 @@
     "allow-update-status",
     "allow-update-not-now",
     "allow-update-install",
-    "allow-window-sidebar"
+    "allow-window-sidebar",
+    "allow-app-about"
   ]
 }

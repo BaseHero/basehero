@@ -9,6 +9,8 @@ REGISTRY_CONFIG_DIR = '/dstack/bh-registry'
 RUNTIME_FILES = {
     'permit_key': 'BH_AUTHZ_PERMIT_KEY',
     'permit_cert': 'BH_AUTHZ_PERMIT_CERT',
+    'recovery_key': 'BH_AUTHZ_RECOVERY_KEY',
+    'recovery_cert': 'BH_AUTHZ_RECOVERY_CERT',
     'policy': 'BH_AUTHZ_POLICY',
     'policy_signature': 'BH_AUTHZ_POLICY_SIGNATURE',
     'collateral': 'BH_AUTHZ_COLLATERAL',

@@ -34,6 +34,9 @@ pub struct StoreState {
     /// Hold each control signature until the gate opens, as a native prompt
     /// the person has not answered yet.
     pub sign_gate: Option<Rc<SignGate>>,
+    /// Hold the next decapsulation only until the gate opens, as a native
+    /// key use another process may overtake.
+    pub decapsulate_gate: Option<Rc<SignGate>>,
     pub create_calls: usize,
     pub sign_calls: usize,
     pub content_sign_calls: usize,
@@ -98,6 +101,7 @@ impl FakeStore {
                 advance_generation_on_load: false,
                 advance_generation_on_sign: false,
                 sign_gate: None,
+                decapsulate_gate: None,
                 create_calls: 0,
                 sign_calls: 0,
                 content_sign_calls: 0,
@@ -237,6 +241,10 @@ impl DeviceKeyStore for FakeStore {
         handle: KeyHandle,
         ciphertext: [u8; 1120],
     ) -> Result<Secret<32>, KeyStoreError> {
+        let gate = self.state.borrow_mut().decapsulate_gate.take();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         let state = self.state.borrow();
         if handle != state.handle {
             return Err(KeyStoreError::Unavailable);

@@ -80,6 +80,7 @@ async fn fixture_with_root() -> (Arc<Authz>, Socket, Session<MemoryPolicy>, Sign
         gate: Arc::new(RwLock::new(())),
         admission: Arc::new(Semaphore::new(8)),
         stop_signal: watch::Sender::new(false),
+        not_active: watch::Sender::new(0),
         stopped: AtomicBool::new(false),
     });
     (authz, peer, service, root)
@@ -490,6 +491,33 @@ fn presence_size_preflight_matches_the_real_permits_encoder() {
     assert_eq!(single.encode().unwrap().len(), 71);
 }
 
+#[test]
+fn submit_control_size_preflight_matches_the_real_encoder() {
+    let log = bh_authz_proto::LogId {
+        kind: bh_authz_proto::LogKind::Account,
+        id: [7; 32],
+    };
+    let attachment = |record: Option<Vec<u8>>, body| bh_authz_proto::RecoveryAttachment {
+        record,
+        recovery_seal: vec![5; 1299],
+        rotation_body: body,
+    };
+    for attachment in [
+        None,
+        Some(attachment(Some(vec![4; 300]), None)),
+        Some(attachment(None, Some(bh_sync::Digest([6; 32])))),
+    ] {
+        let request = ToService::SubmitControl {
+            log,
+            event: vec![3; 1485],
+            delivery: None,
+            attachment: attachment.map(Box::new),
+        };
+        let encoded = request.encode().unwrap();
+        assert_eq!(dispatcher::check_size(&request), Ok(encoded.len()));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn oversized_request_is_local_and_does_not_invalidate_live_generation() {
     let (authz, mut peer, mut service) = fixture().await;
@@ -501,6 +529,7 @@ async fn oversized_request_is_local_and_does_not_invalidate_live_generation() {
         },
         event: vec![0; 65_536],
         delivery: None,
+        attachment: None,
     };
     assert_eq!(
         shared.authz.request(&shared, too_big).await,
@@ -531,8 +560,9 @@ async fn eight_maximum_records_and_replies_stay_bounded() {
                             kind: bh_authz_proto::LogKind::Base,
                             id: [1; 32],
                         },
-                        event: vec![marker; 65_536 - 41],
+                        event: vec![marker; 65_536 - 42],
                         delivery: None,
+                        attachment: None,
                     },
                 )
                 .await
@@ -544,7 +574,7 @@ async fn eight_maximum_records_and_replies_stay_bounded() {
         };
         assert_eq!(plain.expose().len(), 65_536);
         assert!(
-            matches!(ToService::decode(plain.expose()).unwrap(), ToService::SubmitControl { event, .. } if event == vec![marker;65_536-41])
+            matches!(ToService::decode(plain.expose()).unwrap(), ToService::SubmitControl { event, .. } if event == vec![marker;65_536-42])
         );
         assert_eq!(
             shared.authz.admission.available_permits(),
@@ -669,6 +699,7 @@ async fn backpressured_writer_still_drains_reply_and_stop_bypasses_full_queue() 
                         },
                         event: vec![3; 60_000],
                         delivery: None,
+                        attachment: None,
                     },
                 )
                 .await
@@ -784,6 +815,7 @@ async fn rotation_failure_preserves_policy_backoff_and_never_replays_control() {
             },
             event: vec![77],
             delivery: None,
+            attachment: None,
         };
         let ask = lease.ask(control.clone());
         tokio::pin!(ask);
@@ -880,6 +912,7 @@ async fn cancelled_shutdown_still_joins_and_concurrent_callers_complete() {
             },
             event: vec![7; 60_000],
             delivery: None,
+            attachment: None,
         });
         tokio::pin!(ask);
         test_support::pending(ask.as_mut()).await;

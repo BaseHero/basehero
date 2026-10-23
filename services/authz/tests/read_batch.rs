@@ -236,6 +236,7 @@ async fn account_delivery_uses_canonical_wrapper_and_verified_digest() {
                 body: Some(digest),
                 epoch: bh_authz::proto::ACCOUNT_EPOCH,
                 after: Some(after),
+                attached: None,
             }),
             &wrapped,
         )
@@ -304,6 +305,7 @@ async fn oversized_complete_page_returns_exact_legacy_repair_scope_once() {
                     body: Some(digest),
                     epoch: h.edge.epoch(log),
                     after: None,
+                    attached: None,
                 }),
                 &event,
             )
@@ -355,6 +357,7 @@ async fn oversized_complete_page_returns_exact_legacy_repair_scope_once() {
         id: 1,
         items: items.clone(),
         receipt: Some(*receipt),
+        coverage: None,
     }
     .encode()
     .unwrap();

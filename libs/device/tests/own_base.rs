@@ -183,7 +183,9 @@ fn concurrent_creation_returns_one_base() {
 #[test]
 fn control_advancing_during_native_signing_prevents_signup_base_publication() {
     let f = Fixture::new();
-    let (mut other, other_cap, _) = f.signup();
+    let (mut other, other_cap, setup) = f.signup();
+    // Later history needs a completed setup; a legacy home leaves it untimed.
+    other.confirm_home_ordered(setup.head, None).unwrap();
     let wait = std::rc::Rc::new(std::cell::Cell::new(true));
     let mut owner = AccountOwner::new(
         DeviceJournal::from_shared(f.db.clone()),
@@ -254,7 +256,7 @@ fn signup_own_base_identity_and_original_bytes_survive_restart() {
     assert_eq!(export.protected.own_base.account, setup.anchor.0);
     assert_eq!(export.protected.own_base.base, base.id().0);
     assert_eq!(export.protected.own_base.initial_key_package.len(), 3016);
-    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     assert!(f.db.lock().unwrap().pending_setup().unwrap().is_none());
     assert!(owner.pending_kit_code().is_err());
     drop(base);
@@ -415,9 +417,11 @@ fn valid_signed_content_seal_for_another_root_cannot_replace_genesis_key() {
 #[test]
 fn reopen_uses_initial_cut_but_missing_base_after_later_control_never_regenesises() {
     let f = Fixture::new();
-    let (mut owner, cap, _) = f.signup();
+    let (mut owner, cap, setup) = f.signup();
     let base = ready(create_or_open(&mut owner, cap.clone(), f.db.clone())).unwrap();
     let before = base.bootstrap_export(&owner).unwrap();
+    // Later history needs a completed setup; a legacy home leaves it untimed.
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     let keys = bh_account::DevicePublicKeys::new([80; 32], [81; 32], [82; 1216]).unwrap();
     let request = owner.prepare_add_device(&cap, keys).unwrap();
     let event = ready(owner.sign_control(&cap, &request)).unwrap();

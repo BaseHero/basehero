@@ -35,6 +35,7 @@ const PENDING_HOME: u8 = 2;
 /// All four roles under one fresh 256-bit namespace form a device.
 /// The caller must persist the returned handle *and* original verified account
 /// history; this adapter cannot commit the OS keychain and SQLite atomically.
+#[derive(Clone)]
 pub(super) struct MacKeyStore;
 
 fn name(handle: &KeyHandle, role: &str) -> String {
@@ -359,6 +360,26 @@ impl DeviceKeyStore for MacKeyStore {
     }
 }
 
+/// Delete every protected-keychain item of this device, treating an already
+/// absent one as erased and propagating any other failure.
+fn protected_erase(handle: &KeyHandle) -> Result<(), KeyStoreError> {
+    for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
+        match delete(handle, role) {
+            Ok(()) => {}
+            Err(KeyStoreError::Invalidated) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+impl bh_host::accounts::HostKeyStore for MacKeyStore {
+    const JOIN_POLICY: ControlKeyPolicy = ControlKeyPolicy::CurrentBiometricsOnly;
+    async fn erase_keys(&mut self, handle: KeyHandle) -> Result<(), KeyStoreError> {
+        protected_erase(&handle)
+    }
+}
+
 /// M1 only: the ordinary login/file-based keychain. This store is constructed
 /// independently from M2, never selected as a fallback from a protected-keychain
 /// error. The account owner must persist kind+policy beside its signed history.
@@ -389,6 +410,9 @@ async fn approve() -> Result<(), KeyStoreError> {
 
 impl bh_host::accounts::HostKeyStore for MacLoginKeyStore {
     const JOIN_POLICY: ControlKeyPolicy = ControlKeyPolicy::AppEnforcedOwnerConfirmation;
+    async fn erase_keys(&mut self, handle: KeyHandle) -> Result<(), KeyStoreError> {
+        login_erase(&handle)
+    }
     fn action_gate(&self) -> Option<bh_host::confirm::ActionGate> {
         Some(self.gate.clone())
     }
@@ -492,6 +516,19 @@ fn login_add_public(handle: &KeyHandle, public: &[u8; 32]) -> Result<(), KeyStor
 }
 fn login_delete(handle: &KeyHandle, role: &str) {
     let _ = helper().call(&Request::Delete(login_item(handle, role)));
+}
+
+/// Delete every login-keychain item of this device. An absent item is already
+/// erased; any other failure stops the erasure and keeps its marker.
+fn login_erase(handle: &KeyHandle) -> Result<(), KeyStoreError> {
+    for role in [ORDINARY, RECEIVER, CONTROL, CONTROL_PUBLIC] {
+        match helper().call(&Request::Delete(login_item(handle, role))) {
+            Ok(_) => {}
+            Err(HelperError::Status(-25300)) => {} // errSecItemNotFound
+            Err(error) => return Err(helper_code(error, login_status_code)),
+        }
+    }
+    Ok(())
 }
 
 impl DeviceKeyStore for MacLoginKeyStore {
@@ -673,6 +710,13 @@ impl PendingSetupProtector for MacPendingSetupProtector {
             return Err(ProtectorError::Failed);
         }
         seal_with_fresh_key(PENDING_HOME, Some(&handle), plaintext)
+    }
+    fn retire_key(&mut self, blob: &[u8]) -> Result<(), ProtectorError> {
+        let (_, key, _) = pending_blob(blob)?;
+        match helper().call(&Request::Delete(Item::Setup(key))) {
+            Ok(_) | Err(HelperError::Status(-25300)) => Ok(()),
+            Err(_) => Err(ProtectorError::Failed),
+        }
     }
     fn retire_kit_key(&mut self, saved: &[u8]) -> Result<(), ProtectorError> {
         let (kind, _, _) = pending_blob(saved)?;

@@ -40,14 +40,14 @@ fn presence_permit_has_signed_scope_tag_eight_and_exact_bytes() {
 }
 
 #[test]
-fn presence_frames_use_v2_new_tags_and_exact_layout() {
+fn presence_frames_use_v3_existing_tags_and_exact_layout() {
     let cases = [
         (
             Request::PresenceJoin {
                 id: 7,
                 permit: vec![0xca, 0xfe],
             },
-            vec![0, 2, 33, 0, 0, 0, 7, 0, 0, 0, 2, 0xca, 0xfe],
+            vec![0, 3, 33, 0, 0, 0, 7, 0, 0, 0, 2, 0xca, 0xfe],
             "PresenceJoin { id: 7, .. }",
         ),
         (
@@ -55,7 +55,7 @@ fn presence_frames_use_v2_new_tags_and_exact_layout() {
                 id: 7,
                 sealed: vec![0xca, 0xfe],
             },
-            vec![0, 2, 34, 0, 0, 0, 7, 0, 0, 0, 2, 0xca, 0xfe],
+            vec![0, 3, 34, 0, 0, 0, 7, 0, 0, 0, 2, 0xca, 0xfe],
             "Presence { id: 7, .. }",
         ),
     ];
@@ -71,7 +71,7 @@ fn presence_frames_use_v2_new_tags_and_exact_layout() {
         bad[1] = 1;
         assert_eq!(Request::decode(&bad), Err(wire::Error::Version));
         bad[1] = 2;
-        bad[2] = 37;
+        bad[2] = 40;
         assert_eq!(Request::decode(&bad), Err(wire::Error::Version));
     }
     let cases = [
@@ -81,7 +81,7 @@ fn presence_frames_use_v2_new_tags_and_exact_layout() {
                 from: 0x0102_0304,
                 sealed: vec![0xca, 0xfe],
             },
-            vec![0, 2, 35, 0, 0, 0, 7, 1, 2, 3, 4, 0, 0, 0, 2, 0xca, 0xfe],
+            vec![0, 3, 35, 0, 0, 0, 7, 1, 2, 3, 4, 0, 0, 0, 2, 0xca, 0xfe],
             "Presence { id: 7, .. }",
         ),
         (
@@ -91,7 +91,7 @@ fn presence_frames_use_v2_new_tags_and_exact_layout() {
                 event: 1,
                 slot: 0x0102_0304,
             },
-            vec![0, 2, 36, 0, 0, 0, 7, 0, 2, 1, 1, 2, 3, 4],
+            vec![0, 3, 36, 0, 0, 0, 7, 0, 2, 1, 1, 2, 3, 4],
             "Peers { id: 7, .. }",
         ),
     ];
@@ -129,16 +129,16 @@ fn presence_sealed_size_cap_is_checked_before_copying() {
         };
         assert_eq!(request.encode().map(|_| ()), expected);
         assert_eq!(response.encode().map(|_| ()), expected);
-        let mut request_bytes = vec![0, 2, 34, 0, 0, 0, 3];
+        let mut request_bytes = vec![0, 3, 34, 0, 0, 0, 3];
         request_bytes.extend((n as u32).to_be_bytes());
         request_bytes.extend(vec![8; n]);
-        let mut response_bytes = vec![0, 2, 35, 0, 0, 0, 3, 0, 0, 0, 4];
+        let mut response_bytes = vec![0, 3, 35, 0, 0, 0, 3, 0, 0, 0, 4];
         response_bytes.extend((n as u32).to_be_bytes());
         response_bytes.extend(vec![8; n]);
         assert_eq!(Request::decode(&request_bytes).map(|_| ()), expected);
         assert_eq!(Response::decode(&response_bytes).map(|_| ()), expected);
     }
-    let mut invalid = vec![0, 2, 34, 0, 0, 0, 3];
+    let mut invalid = vec![0, 3, 34, 0, 0, 0, 3];
     invalid.extend(513_u32.to_be_bytes());
     assert_eq!(Request::decode(&invalid), Err(wire::Error::Size));
     for event in [3, 255] {

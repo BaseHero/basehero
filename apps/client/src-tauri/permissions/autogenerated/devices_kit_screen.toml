@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-devices-kit-screen"
+description = "Enables the devices_kit_screen command without any pre-configured scope."
+commands.allow = ["devices_kit_screen"]
+
+[[permission]]
+identifier = "deny-devices-kit-screen"
+description = "Denies the devices_kit_screen command without any pre-configured scope."
+commands.deny = ["devices_kit_screen"]

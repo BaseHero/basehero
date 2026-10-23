@@ -12,6 +12,18 @@
     "allow-pairing-approve",
     "allow-pairing-cancel",
     "allow-pairing-reconfirm",
-    "allow-sync-status"
+    "allow-sync-status",
+    "allow-devices-view",
+    "allow-devices-request-removal",
+    "allow-devices-cancel-removal",
+    "allow-devices-remove-now",
+    "allow-devices-remove-self",
+    "allow-account-change-password",
+    "allow-account-confirm-new-kit",
+    "allow-devices-kit-screen",
+    "allow-account-print-kit",
+    "allow-account-email-kit",
+    "allow-account-save-kit-file",
+    "allow-alerts-list"
   ]
 }

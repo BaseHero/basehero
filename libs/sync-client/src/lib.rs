@@ -12,10 +12,12 @@
 //! code; `bootstrap` reads a joined device's base before it is usable.
 //!
 //! Every package's exact bytes are persisted before they are first sent, and
-//! a retry sends those bytes again; nothing reseals automatically and no
-//! local work is discarded. No network wait happens while a database guard
-//! or note work lock is held: sealing and acknowledgement are short store
-//! calls between network steps.
+//! a retry sends those bytes; nothing reseals automatically, except a package
+//! under an epoch the base replaced at a control position content has already
+//! passed, which can never be ordered and is resealed under the current
+//! epoch. No local work is discarded. No network wait happens while a
+//! database guard or note work lock is held: sealing and acknowledgement are
+//! short store calls between network steps.
 //!
 //! Synthetic appraisal exists only with the `synthetic-attestation` feature,
 //! which no release build enables:
@@ -25,28 +27,43 @@
 )]
 #![forbid(unsafe_code)]
 
+mod account_evidence;
 mod authz;
 mod backoff;
 pub mod bootstrap;
+mod controls;
 mod copier;
 pub mod data;
+mod directory;
 mod home;
+mod notices;
 mod outbox;
 pub mod pairing;
 mod presence;
 mod puller;
+mod recover;
 mod register;
+mod rekey;
 mod relay;
+mod removal;
 mod scheduler;
 mod status;
 pub mod transport;
+mod trust;
 mod tuning;
 
 pub use authz::AuthzSession;
 pub use presence::{
     MAX_LABEL, MAX_LOCAL_NOTES, MAX_REMOTE, Presence, RemotePresence, RemoteState, SEND_INTERVAL,
 };
+pub use recover::{RecoverError, RecoverStage, recover, recover_reporting};
+pub use rekey::EpochInstalled;
 pub use status::SyncStatus;
+pub use trust::{Ordered, OrderedControl};
+
+/// Directory entries as opened, in the order read: each one's content, or
+/// why it was refused.
+pub type OpenedEntries = Vec<Result<OpenedEntry, EntryRefused>>;
 
 // Pacing knobs are for tests (`Client::start_tuned`); a release build keeps
 // them out of the public API.
@@ -79,19 +96,72 @@ pub enum HomeRetryReason {
 }
 
 use bh_account::{
-    AccountId, DeviceId, Head as AccountHead, VerifiedAccount, device_auth,
-    journal::StagedAdmission,
-    owner::{InitialAccountPrefix, PendingHomeObjects},
+    AccountId, ConfirmedTime, DeviceId, Head as AccountHead, VerifiedAccount, device_auth,
+    directory::OpenedEntry,
+    journal::{StagedAdmission, StagedControl},
+    owner::{
+        InitialAccountPrefix, PendingHomeObjects,
+        staging::{EntryRefused, Settlement},
+    },
 };
 use bh_authz_proto::Refusal;
 use bh_confidential_policy::Limits;
 use bh_crypto::Secret;
-use bh_device::{ContainerId, Owner};
-use bh_sync::BaseId;
+use bh_device::{
+    ContainerId, Owner,
+    control::{InstallError, SealWait},
+};
+use bh_sync::{BaseId, evidence::RecoveryKeyCertificate};
 use futures_util::future::BoxFuture;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::{Notify, watch};
+
+/// The device's own clock is independent of the home's qualified bounds.
+pub trait DeviceClock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
+/// POSIX clock used outside tests. A removal deadline must have passed both
+/// this clock and the home's independently signed lower bound.
+pub struct SystemDeviceClock;
+impl DeviceClock for SystemDeviceClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.as_millis() as u64)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RemovalVerdict {
+    Active,
+    Pending {
+        deadline_ms: u64,
+        by: Option<DeviceId>,
+    },
+    /// A pre-handoff snapshot of locally unsent work for the banner. It is
+    /// not the frozen count the destructive step reports; a host must not
+    /// display it as final.
+    Removed {
+        unsent: u64,
+    },
+    Refused,
+}
+impl std::fmt::Debug for RemovalVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => f.write_str("Active"),
+            Self::Pending { deadline_ms, by } => f
+                .debug_struct("Pending")
+                .field("deadline_ms", deadline_ms)
+                .field("has_requester", &by.is_some())
+                .finish(),
+            Self::Removed { unsent } => f.debug_struct("Removed").field("unsent", unsent).finish(),
+            Self::Refused => f.write_str("Refused"),
+        }
+    }
+}
 use transport::{Connector, WsConnector};
 
 /// Which appraisal the device applies to the authorization service's proof.
@@ -123,6 +193,11 @@ pub struct Endpoint {
     /// The signed app build date at UTC midnight, in POSIX seconds.
     pub build_floor: u64,
     pub appraisal: Appraisal,
+    /// Independent local clock, never replaced by the service's bounds.
+    pub device_clock: Arc<dyn DeviceClock>,
+    /// The home's recovery key, which a recovering device seals its claim
+    /// to, certified under `hosting_root`.
+    pub recovery_key: RecoveryKeyCertificate,
 }
 
 /// Who this device is in its account, and the account at the head its own
@@ -153,7 +228,7 @@ pub struct HomeSetup {
 ///
 /// Lock order: the client calls the signer holding no lock of the Owner's
 /// (container session or writer), and the closure it passes to
-/// `with_base_keys` takes those locks itself. So the signer must not hold,
+/// `with_metadata_key` or `with_epoch_keys` takes those locks itself. So the signer must not hold,
 /// while it runs that closure, any lock the Owner takes, nor any lock that
 /// code holding an Owner lock may wait for.
 pub trait Signer: Send + Sync {
@@ -179,27 +254,51 @@ pub trait Signer: Send + Sync {
     fn initial_home_setup(&self) -> Result<Option<HomeSetup>, SignerError>;
     /// Complete first-device setup at `setup.prefix.head`. The client calls
     /// this only after a verified read of the account log holds exactly that
-    /// prefix and the service answered that its home durably stored exactly
-    /// these objects. Refused if the authority `setup.generation` names is
-    /// no longer current, or `setup` is not this account's; the client then
-    /// reads the setup again and retries with the same bytes.
-    fn confirm_home_ordered(&self, setup: &HomeSetup) -> Result<(), SignerError>;
+    /// prefix, with `evidence` the home's verified confirmations of its
+    /// positions 2 and 3 (exact bytes), and the service answered that its
+    /// home durably stored exactly these objects. The owner keeps those
+    /// times with the prefix (`AccountOwner::confirm_home_ordered`), and the
+    /// host then reads both its current account and its creator anchor
+    /// again. Refused if the authority `setup.generation` names is no longer
+    /// current, or `setup` is not this account's; the client then reads the
+    /// setup again and retries with the same bytes.
+    fn confirm_home_ordered(
+        &self,
+        setup: &HomeSetup,
+        evidence: [(ConfirmedTime, Vec<u8>); 2],
+    ) -> Result<(), SignerError>;
     /// An ordinary-key signature over a prepared event's signing bytes.
     fn sign_event(&self, message: Vec<u8>) -> BoxFuture<'_, Result<[u8; 64], SignerError>>;
     /// The account at its current verified head, from the account owner.
     /// `Identity::anchor` stays the account the base genesis names.
     fn current_account(&self) -> Result<VerifiedAccount, SignerError>;
-    /// Apply account originals the account log ordered after `after`
-    /// through the account owner (`AccountOwner::apply_incoming`): it
+    /// The newest account view this signer verified while the device was a
+    /// member, still available after its authority ended. Only a starting
+    /// point the removal check verifies the public evidence forward from.
+    fn last_verified_account(&self) -> Result<VerifiedAccount, SignerError> {
+        self.current_account()
+    }
+    /// Apply account originals the account log ordered after `after`, each
+    /// with the confirmed time and exact confirmation bytes the client
+    /// verified under the hosting root (`None` only for the genesis),
+    /// through the account owner (`AccountOwner::apply_incoming_timed`): it
     /// verifies them as the next signed history and commits them with
-    /// their head. Then the host reacquires current authority for this
-    /// container. `Unavailable`, with nothing applied, unless the owner's
-    /// verified head is exactly `after`.
-    fn apply_account(
+    /// their evidence and head. Then the host reacquires current authority
+    /// for this container. `Unavailable`, with nothing applied, unless the
+    /// owner's verified head is exactly `after`.
+    fn apply_account_timed(
         &self,
         after: AccountHead,
-        originals: Vec<Vec<u8>>,
+        originals: Vec<TimedOriginal>,
     ) -> BoxFuture<'_, Result<AccountHead, AccountApplyError>>;
+    /// Persist an independently authenticated accepted-head observation at
+    /// precisely the owner's current original head. The caller first checks
+    /// its confirmation commitment, including on empty follow reads.
+    fn observe_account_accepted(
+        &self,
+        head: AccountHead,
+        time: ConfirmedTime,
+    ) -> Result<(), SignerError>;
     /// A control-key signature over a base control's original
     /// (`AccountOwner::sign_base_control`), only within an action the
     /// person approved: today the copy of exactly the account event a
@@ -215,20 +314,137 @@ pub trait Signer: Send + Sync {
     /// not settled yet (`AccountOwner::staged_admission`). The client orders
     /// its exact bytes, carrying its delivery, and never asks for it to be
     /// signed again. Once applied history holds its position, the host's
-    /// `apply_account` settles the row
+    /// `apply_account_timed` settles the row
     /// (`AccountOwner::reconcile_staged_admission`).
     fn staged_addition(&self) -> Result<Option<StagedAdmission>, SignerError> {
         Ok(None)
     }
-    /// Use base `base`'s metadata root M and content root K (today only the
-    /// own base's). They are never copied out, logged or stored by the
-    /// client. See the lock order above.
-    fn with_base_keys(
+    /// The signed trust control this device staged and verified history has
+    /// not settled yet (`AccountOwner::staged_control`). The client orders
+    /// its exact bytes and never asks for it to be signed again.
+    fn staged_control(&self) -> Result<Option<StagedControl>, SignerError>;
+    /// Stage a personal-key rotation for the latest effect due at `at_ms`,
+    /// a verified accepted head's `earliest_ms`, never the device clock
+    /// (`AccountOwner::stage_rotation`): a new key sealed to the devices
+    /// active then and the recovery key, signed with the ordinary key, no
+    /// prompt. The accepted key and the keyring are untouched.
+    fn stage_rotation(&self, at_ms: u64) -> BoxFuture<'_, Result<StagedControl, SignerError>>;
+    /// Once verified history holds the staged control's position, how it was
+    /// taken, and the stage cleared (`AccountOwner::settle_staged`). `None`
+    /// while it has not, or nothing is staged.
+    fn settle_staged(&self) -> Result<Option<Settlement>, SignerError>;
+    /// Clear exactly `expected`, after the service definitively refused its
+    /// bytes while verified history still stands at their predecessor
+    /// (`AccountOwner::discard_staged`). Another row staged meanwhile stays.
+    fn discard_staged(&self, expected: &StagedControl) -> Result<(), SignerError>;
+    /// Accept the personal-key rotation ordered at `position` from its exact
+    /// raw device-seal body, never its padded transport object: the keyring
+    /// is ready (`ensure_keyring`), then `AccountOwner::accept_rotation`
+    /// re-seals it to the new key; the host then reads its current account
+    /// and creator anchor again. On any error nothing is accepted.
+    fn accept_rotation(
+        &self,
+        position: u64,
+        raw: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), SignerError>>;
+    /// The account-directory entry for base `base` at `version`: its key
+    /// package for `epoch` only (that epoch's content key, from memory,
+    /// sealed to the current personal key and signed with the ordinary
+    /// key), under `server`, sealed and signed
+    /// (`AccountOwner::prepare_directory_entry`). Refused while the epoch's
+    /// key is not held or history publishes a key this device has not
+    /// accepted.
+    fn prepare_base_entry(
         &self,
         base: BaseId,
-        use_keys: &mut dyn FnMut(&Secret<32>, &Secret<32>),
+        epoch: [u8; 32],
+        server: String,
+        version: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SignerError>>;
+    /// Open directory entries read from the home under the accepted personal
+    /// key, in order, each raising the version this device remembers for its
+    /// id (`AccountOwner::open_directory_entries`). An empty read only checks
+    /// that this device can open the directory.
+    fn open_directory_entries(
+        &self,
+        entries: Vec<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<OpenedEntries, SignerError>>;
+    /// The version of this device's own-base directory entry, and whether the
+    /// home is known to hold it.
+    fn directory_state(&self) -> Result<Option<(u64, bool)>, SignerError>;
+    fn set_directory_state(&self, version: u64, written: bool) -> Result<(), SignerError>;
+    // ---- This device's own directory entries, and what it reads back ----
+    /// This device's own directory entries the home is not known to hold,
+    /// each sealed to the accepted personal key and signed at the version it
+    /// is written at, `(version, bytes)` (`AccountOwner::prepare_own_entry`):
+    /// its name, once the host has one, and a password check it holds
+    /// unpublished, bound to the current recovery record. Empty once the
+    /// home holds each.
+    fn own_entries(&self) -> BoxFuture<'_, Result<OwnEntries, SignerError>>;
+    /// The home holds this device's entry `entry` at `version` or later
+    /// (`AccountOwner::own_entry_held`): it is not written again.
+    fn own_entry_held(&self, entry: [u8; 32], version: u64) -> Result<(), SignerError>;
+    /// Whether the host asked for the directory to be read now (its devices
+    /// view opened, or a password change needs the account's check). Asking
+    /// is cleared by this call.
+    fn directory_wanted(&self) -> bool;
+    /// What a directory read found, every entry opened under the accepted
+    /// personal key.
+    fn directory_read(&self, read: DirectoryRead);
+    /// A security alert was durably written outside account-history apply;
+    /// let the host deliver it to its existing alert subscribers. Called
+    /// only after releasing the database lock.
+    fn alerts_written(&self) {}
+    /// A read the host asked for, or one after an addition, failed: it is
+    /// tried again on its own backoff, and the host need not wait for it.
+    fn directory_unread(&self) {}
+    /// Use base `base`'s metadata root M (today only the own base's). Never
+    /// waits on a content key: M is given while the base's current epoch's
+    /// key is missing or its epoch is closed. Keys are never copied out,
+    /// logged or stored by the client. See the lock order above.
+    fn with_metadata_key(
+        &self,
+        base: BaseId,
+        use_key: &mut dyn FnMut(&Secret<32>),
     ) -> Result<(), SignerError>;
+    /// Use M and the content root of `epoch`, only from keys the host
+    /// already opened in memory: `None` for a closed epoch (`None`) or one
+    /// whose key it does not hold, never another epoch's key. No native key
+    /// work happens here, so it holds no lock across any.
+    fn with_epoch_keys(
+        &self,
+        base: BaseId,
+        epoch: Option<[u8; 32]>,
+        use_keys: &mut dyn FnMut(&Secret<32>, Option<&Secret<32>>),
+    ) -> Result<(), SignerError>;
+    /// Install the content key a rekey's seal set carries for this account:
+    /// `set` opened with M as exactly the set `wait` names, this account's
+    /// seal in it authenticated against verified history and opened with
+    /// the accepted personal key (`AccountOwner::open_current_personal`),
+    /// kept in the local keyring (`install_epoch_keys`) and the wait ended;
+    /// then the key is used from memory. On any error nothing is installed
+    /// and the wait stays.
+    fn install_epoch(
+        &self,
+        wait: SealWait,
+        set: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), InstallError>>;
 }
+
+/// This device's own directory entries to write: `(version, bytes)` each.
+pub type OwnEntries = Vec<(u64, Vec<u8>)>;
+
+/// What one read of the account directory found: each active device's name
+/// as that device signed it, and the password check bound to the current
+/// recovery record, if the directory holds one.
+pub struct DirectoryRead {
+    pub names: Vec<(DeviceId, String)>,
+    pub password_check: Option<bh_account::recovery::PasswordCheck>,
+}
+
+/// An account original with the confirmed time and exact confirmation
+/// bytes verified for it; `None` only for the genesis.
+pub type TimedOriginal = (Vec<u8>, Option<(ConfirmedTime, Vec<u8>)>);
 
 /// One base control for the control key: its exact signing bytes, the key
 /// that must sign them, and the original account event it copies into the
@@ -350,11 +566,18 @@ pub(crate) struct Shared {
     /// before it sleeps, so wakes that come together are never lost.
     wake: watch::Sender<u64>,
     home_wake: Notify,
+    removal_wake: Notify,
     /// Set once, when the client stops: both lanes end and close their links.
     halt: watch::Sender<bool>,
     status: watch::Sender<SyncStatus>,
     windows: WindowWakes,
     home_status: watch::Sender<HomeStatus>,
+    /// The last new content epoch installed on this device.
+    installed: watch::Sender<Option<EpochInstalled>>,
+    removal_verdict: watch::Sender<RemovalVerdict>,
+    /// The last trust control this device ordered, as verified history
+    /// settled it.
+    ordered: watch::Sender<Option<OrderedControl>>,
     presence: presence::Presence,
     tuning: Tuning,
 }
@@ -402,14 +625,36 @@ impl Shared {
             home_authz,
             wake: watch::Sender::new(0),
             home_wake: Notify::new(),
+            removal_wake: Notify::new(),
             halt: watch::Sender::new(false),
             status,
             windows: WindowWakes::default(),
             home_status,
+            installed: watch::Sender::new(None),
+            removal_verdict: watch::Sender::new(RemovalVerdict::Active),
+            ordered: watch::Sender::new(None),
             presence: presence::Presence::new(),
             tuning,
         })
     }
+}
+
+/// Check once, with no running client, whether this device's removal took
+/// effect, for a device whose own verified history no longer holds it
+/// active, so it can no longer authenticate. `last` is the newest view of
+/// that history in which `device` was a member; the public account evidence
+/// is verified forward from it, as a running client's check does. `None` if
+/// it could not be checked now. Only `Removed` is proof of removal.
+pub async fn check_removal(
+    endpoint: Endpoint,
+    connector: Arc<dyn Connector>,
+    owner: Arc<Owner>,
+    container: ContainerId,
+    device: DeviceId,
+    genesis: Vec<u8>,
+    last: VerifiedAccount,
+) -> Option<RemovalVerdict> {
+    removal::once(endpoint, connector, owner, container, device, genesis, last).await
 }
 
 /// The sync client of one anchored container.
@@ -479,9 +724,10 @@ impl Client {
         let task = tokio::spawn(scheduler::run(shared.clone()));
         let home_task = tokio::spawn(home::run(shared.clone()));
         let presence_task = tokio::spawn(presence::run(shared.clone()));
+        let removal_task = tokio::spawn(removal::run(shared.clone()));
         Self {
             shared,
-            tasks: std::sync::Mutex::new(vec![task, home_task, presence_task]),
+            tasks: std::sync::Mutex::new(vec![task, home_task, presence_task, removal_task]),
             shutdown_task: std::sync::Mutex::new(None),
             stopped: watch::Sender::new(false),
         }
@@ -493,9 +739,36 @@ impl Client {
         self.shared.presence.clone()
     }
 
+    /// Each new content epoch of the own base once this device installed
+    /// its key: the snapshot writer's signal. It names the base, the key id
+    /// and the rekey's ordered head, never a key.
+    pub fn epoch_installed(&self) -> watch::Receiver<Option<EpochInstalled>> {
+        self.shared.installed.subscribe()
+    }
+
+    /// Each trust control this device staged, once verified history settled
+    /// it: ordered (with its confirmed time), a cancel that came too late,
+    /// lost to another entry, or refused.
+    pub fn trust(&self) -> watch::Receiver<Option<OrderedControl>> {
+        self.shared.ordered.subscribe()
+    }
+
     /// Observe the home check without changing the note sync status.
     pub fn home_status(&self) -> watch::Receiver<HomeStatus> {
         self.shared.home_status.subscribe()
+    }
+
+    /// The verified removal result. A host must quiesce and erase before it
+    /// presents the final erased screen.
+    pub fn removal_verdict(&self) -> watch::Receiver<RemovalVerdict> {
+        self.shared.removal_verdict.subscribe()
+    }
+
+    /// Check this device's removal against the public evidence now. The
+    /// answer is published on `removal_verdict`; a check already under way
+    /// when asked is superseded rather than published.
+    pub fn check_removal(&self) {
+        self.shared.removal_wake.notify_one();
     }
 
     /// Windows to wake after remote changes commit. Every clone sees the
@@ -543,6 +816,11 @@ impl Client {
                     // best-effort clears and joins its own socket.
                     let home = tasks.next();
                     let presence = tasks.next();
+                    let removal = tasks.next();
+                    if let Some(removal) = removal {
+                        removal.abort();
+                        let _ = removal.await;
+                    }
                     if let Some(home) = home {
                         home.abort();
                         let _ = home.await;

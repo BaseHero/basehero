@@ -4,7 +4,21 @@ use bh_core::note::Note;
 use bh_crypto::{Secret, SigningKey};
 use bh_event::{Binding, CLASS_CONTENT, Encoded, NOTE, Payload, key_id, seal};
 use bh_storage::{DeviceDatabase, NoteKey, PackagePreparation, StoreError};
-use bh_sync::{BaseId, Commitment, EventId, Head, Route};
+use bh_sync::{BaseId, Commitment, Digest, EventId, Head, OrderState, RawControlHead, Route};
+
+// Untrusted opening fixture for outbox Ack comparisons only, never a
+// verified history or authority for the base.
+fn before_content() -> OrderState {
+    OrderState::new(
+        RawControlHead {
+            position: 1,
+            node_hash: Digest([9; 32]),
+        },
+        0,
+        Digest([0; 32]),
+    )
+    .unwrap()
+}
 use rusqlite::Connection;
 
 fn key() -> NoteKey {
@@ -22,8 +36,8 @@ fn package(id: EventId, delta: &[u8]) -> Encoded {
     data.extend(delta);
     seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: key().base,
             audience: key().audience,
@@ -123,7 +137,11 @@ fn packaged_exact_bytes_survive_reopen_and_duplicate_ack() {
         })
         .unwrap();
     assert_ne!(first.event_id.0, [8; 32]);
-    assert_eq!(first.descriptor.id(), first.event_id);
+    assert_eq!(
+        first.descriptor.publication_id(Route::Content),
+        first.event_id
+    );
+    assert_ne!(first.descriptor.nonce(), first.event_id);
     let exact_descriptor = first.descriptor.encode();
     let exact_body = first.body.clone();
     let mut called = false;
@@ -144,10 +162,7 @@ fn packaged_exact_bytes_survive_reopen_and_duplicate_ack() {
     assert_eq!(reopened.body, exact_body);
     let ordered = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &first.descriptor,
         Route::Content,
     )
@@ -211,10 +226,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
     // in another base's log. It must not retire this base's pending update.
     let wrong_base = Commitment::order(
         BaseId([10; 32]),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &first.descriptor,
         Route::Content,
     )
@@ -234,10 +246,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
     let other = package(EventId([99; 32]), &delta);
     let wrong = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &other.descriptor,
         Route::Content,
     )
@@ -249,10 +258,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
     assert_eq!(db.pending_note_updates().unwrap().len(), 1);
     let ack = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &first.descriptor,
         Route::Content,
     )
@@ -260,10 +266,7 @@ fn rejects_mismatched_package_and_ack_without_retiring_work() {
     assert!(db.acknowledge_note_update(update, &ack).unwrap());
     let different = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 2,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        ack.after(),
         &first.descriptor,
         Route::Content,
     )
@@ -323,7 +326,10 @@ fn child_abort_after_package_keeps_exact_bytes() {
     let original = db
         .package_note_update(pending[0].update_id, |_, _| unreachable!())
         .unwrap();
-    assert_eq!(original.event_id, original.descriptor.id());
+    assert_eq!(
+        original.event_id,
+        original.descriptor.publication_id(Route::Content)
+    );
     let conn = Connection::open(&path).unwrap();
     let bytes: Vec<u8> = conn
         .query_row("SELECT descriptor FROM note_outbox", [], |r| r.get(0))
@@ -355,10 +361,7 @@ fn failed_ack_commit_retains_pending_and_retries_exact_record() {
         .unwrap();
     let ack = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &first.descriptor,
         Route::Content,
     )
@@ -431,10 +434,7 @@ fn outbox_heads_one_per_note_in_order_and_summary() {
         .unwrap();
     let ack = Commitment::order(
         BaseId(key().base),
-        Head {
-            position: 1,
-            hash: bh_sync::Digest([9; 32]),
-        },
+        before_content(),
         &stored.descriptor,
         Route::Content,
     )
@@ -466,4 +466,69 @@ fn outbox_heads_one_per_note_in_order_and_summary() {
     );
     let summary = db.outbox_summary().unwrap();
     assert_eq!((summary.unacknowledged, summary.not_accepted_notes), (3, 1));
+}
+
+/// A package under an epoch the base's verified content has passed is
+/// replaced, in one transaction, by its run sealed again with a new id: only
+/// while nothing acknowledged it and content is in another epoch.
+#[test]
+fn a_package_under_a_passed_epoch_is_replaced_by_its_run_sealed_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reseal.sqlite");
+    let (mut db, update, delta) = setup(&path);
+    db.record_registration(key().base, None, [7; 32]).unwrap();
+    let sealed_under = [0x5e; 32];
+    let epoch = |epoch: Option<[u8; 32]>| {
+        let sql = Connection::open(&path).unwrap();
+        sql.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        sql.execute(
+            "UPDATE log_progress SET epoch_id=?2 WHERE log_kind=1 AND log_id=?1",
+            rusqlite::params![key().base.as_slice(), epoch.as_ref().map(|e| e.as_slice())],
+        )
+        .unwrap();
+    };
+    epoch(Some(sealed_under));
+    let first = db
+        .package_note_update(update, |id, _| sealed(id, &delta))
+        .unwrap();
+    let reseal = |db: &mut DeviceDatabase, old: EventId| {
+        let candidate = db.prepare_note_reseal(update).unwrap().unwrap();
+        assert_eq!(candidate.pending.bytes, delta);
+        let (descriptor, body) = sealed(candidate.event_id, &delta).unwrap();
+        db.publish_note_reseal(candidate, old, sealed_under, descriptor, body)
+            .unwrap()
+    };
+    // Content is still in the package's epoch: it stays as it is.
+    assert!(reseal(&mut db, first.event_id).is_none());
+    // Content passed the removal that closed it.
+    epoch(None);
+    assert!(
+        reseal(&mut db, EventId([1; 32])).is_none(),
+        "only the package as read"
+    );
+    let again = reseal(&mut db, first.event_id).unwrap();
+    assert_ne!(again.event_id, first.event_id);
+    assert!(
+        reseal(&mut db, first.event_id).is_none(),
+        "the old package is gone"
+    );
+    drop(db);
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    let kept = db
+        .package_note_update(update, |_, _| unreachable!())
+        .unwrap();
+    assert_eq!(kept.event_id, again.event_id);
+    assert_eq!(kept.descriptor.encode(), again.descriptor.encode());
+    assert_eq!(db.pending_note_updates().unwrap().len(), 1);
+    // Acknowledged, a package is never replaced.
+    let ordered = Commitment::order(
+        BaseId(key().base),
+        before_content(),
+        &again.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    db.acknowledge_note_update(update, &ordered).unwrap();
+    epoch(Some([0x6f; 32]));
+    assert!(db.prepare_note_reseal(update).unwrap().is_none());
 }

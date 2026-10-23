@@ -15,9 +15,14 @@
 //! A run is captured when it becomes eligible. Tests may choose another
 //! pacing (`Pacing`); the default is the shipped policy.
 //! A retry of a sealed package is not a new start: it keeps its bytes and
-//! its own backoff. The lane publishes only while the receiver grants it,
-//! and every step after an await (persisting a seal, enqueueing, recording
-//! an Ack) runs inside the owner's sync fence.
+//! its own backoff. Only a package under an epoch the base's verified
+//! content has since left, which no device or service accepts content under
+//! any more, is never sent again: once its work is sealed under the current
+//! epoch, the new package replaces it in one transaction.
+//! Work held for its epoch is looked at again once content's epoch moves or
+//! a new key installs, not only after its backoff. The lane publishes only
+//! while the receiver grants it, and every step after an await (persisting
+//! a seal, enqueueing, recording an Ack) runs inside the owner's sync fence.
 use crate::{
     ClientError, Shared,
     backoff::Backoff,
@@ -33,7 +38,7 @@ use bh_storage::{
 };
 use bh_sync::{
     BaseId, BodyObject, Commitment, OpaqueEvent,
-    permit::{self, LogId},
+    permit::{self, LogId, LogKind},
     wire::{self, Request, Response},
 };
 use futures_util::future::join_all;
@@ -482,9 +487,11 @@ async fn publish(
     let mut cursor = Cursor::default();
     let mut backoff = Backoff::default();
     let mut wake = shared.wake.subscribe();
+    let mut installed = shared.installed.subscribe();
     loop {
         // Every wake so far is seen before durable work is looked at.
         wake.borrow_and_update();
+        installed.borrow_and_update();
         let ready = receive.borrow_and_update().ready;
         let Some(generation) = ready else {
             // Not granted: the receiver says why. Wait for its grant.
@@ -504,6 +511,7 @@ async fn publish(
             spacing: &mut spacing,
             ready: (&receive, generation),
         };
+        let epoch = current_epoch(shared, log.id).ok().flatten();
         let round = round(shared, &mut state, log)
             .await
             .unwrap_or_else(|fail| Round::waiting(Some(fail), None));
@@ -549,6 +557,11 @@ async fn publish(
         let until = round
             .due
             .map_or(Instant::now() + wait, |due| due.min(Instant::now() + wait));
+        // Work held for its epoch (closed, its key not held, or refused
+        // under it) goes on once content is in another epoch, not after its
+        // backoff.
+        let held = waiting == Some(Fail::Authorization);
+        let passes = receive.clone();
         tokio::select! {
             _ = tokio::time::sleep_until(until) => {}
             _ = wake.changed() => {}
@@ -557,6 +570,41 @@ async fn publish(
             changed = receive.wait_for(|facts| facts.ready != ready) => {
                 if changed.is_err() { return }
             }
+            _ = epoch_moved(shared, log, passes, &mut installed, epoch), if held => {}
+        }
+    }
+}
+
+/// Ends on the receiver's next pass after a new content key installed (the
+/// install alone is too early: content must also reach its epoch), or after
+/// a pass that left the base's content in another epoch than `seen`, its
+/// epoch when the round began.
+async fn epoch_moved(
+    shared: &Shared,
+    log: LogId,
+    mut passes: watch::Receiver<ReceiveFacts>,
+    installed: &mut watch::Receiver<Option<crate::EpochInstalled>>,
+    seen: Option<[u8; 32]>,
+) {
+    loop {
+        let pass = passes.borrow_and_update().revision;
+        tokio::select! {
+            changed = installed.changed() => {
+                if changed.is_err()
+                    || passes.wait_for(|facts| facts.revision != pass).await.is_err()
+                {
+                    return std::future::pending().await;
+                }
+                return;
+            }
+            changed = passes.changed() => {
+                if changed.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+        }
+        if current_epoch(shared, log.id).is_ok_and(|now| now != seen) {
+            return;
         }
     }
 }
@@ -583,9 +631,25 @@ fn fenced_fail(error: OwnerError) -> Fail {
     }
 }
 
-/// Seal `head` if it has no package yet, capturing its run now. Its exact
-/// bytes are persisted before this returns, and never replaced; only while
-/// `fence` holds, after the signer's await. Whether it is new.
+/// The content epoch new packages of `base` are sealed under: the one its
+/// verified history holds now (None while closed). The seal checks it again.
+fn current_epoch(shared: &Shared, base: [u8; 32]) -> Result<Option<[u8; 32]>, Fail> {
+    let database = shared
+        .owner
+        .shared_database(shared.container)
+        .map_err(|_| Fail::Local)?;
+    let progress = database
+        .lock()
+        .expect("container writer lock")
+        .log_progress(LogKind::Base as u8, base)
+        .map_err(|_| Fail::Local)?;
+    Ok(progress.and_then(|p| p.epoch_id))
+}
+
+/// Seal `head` if it has no package yet, capturing its run now, or again
+/// once content has left its package's epoch. Its exact bytes are persisted
+/// before this returns, and otherwise never replaced; only while `fence`
+/// holds, after the signer's await. Whether it is new.
 async fn sealed(
     shared: &Shared,
     head: OutboxHead,
@@ -600,25 +664,50 @@ async fn sealed(
         .expect("container writer lock")
         .prepare_note_package(head.update_id)
         .map_err(|_| Fail::Local)?;
-    let candidate = match preparation {
-        PackagePreparation::Existing(stored) => return Ok((stored, false)),
-        PackagePreparation::Candidate(candidate) => candidate,
+    let (candidate, replacing) = match preparation {
+        PackagePreparation::Existing(stored) => {
+            // Under an epoch content has passed, its bytes can never be
+            // ordered: its work is sealed again, replacing it.
+            let Some(sealed_under) = passed(
+                shared,
+                head.key.base,
+                &stored.descriptor,
+                stored.ack.is_some(),
+            )?
+            else {
+                return Ok((stored, false));
+            };
+            let reseal = database
+                .lock()
+                .expect("container writer lock")
+                .prepare_note_reseal(head.update_id)
+                .map_err(|_| Fail::Local)?;
+            let Some(candidate) = reseal else {
+                return Ok((stored, false));
+            };
+            (candidate, Some((stored.event_id, sealed_under)))
+        }
+        PackagePreparation::Candidate(candidate) => (candidate, None),
     };
     let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
+    let epoch = current_epoch(shared, head.key.base)?;
     let mut request = None;
     shared
         .signer
-        .with_base_keys(BaseId(head.key.base), &mut |m, k| {
-            request = Some(shared.owner.prepare_note_seal(
-                shared.container,
-                &identity.anchor,
-                shared.endpoint.hosting_root,
-                m,
-                k,
-                &candidate,
-            ))
+        .with_epoch_keys(BaseId(head.key.base), epoch, &mut |m, k| {
+            request = k.map(|k| {
+                shared.owner.prepare_note_seal(
+                    shared.container,
+                    &identity.anchor,
+                    shared.endpoint.hosting_root,
+                    m,
+                    k,
+                    &candidate,
+                )
+            })
         })
         .map_err(|_| Fail::Authorization)?;
+    // A closed epoch, or one whose key this device does not hold yet, waits.
     let request = match request.ok_or(Fail::Authorization)? {
         Ok(request) => request,
         Err(OwnerError::SealRefused(SealRefusal::EpochClosed)) => return Err(Fail::Authorization),
@@ -638,22 +727,34 @@ async fn sealed(
     shared
         .owner
         .with_sync_fence(fence, |db| {
-            stored = Some(db.publish_note_package(candidate, encoded.descriptor, body));
+            stored = Some(match replacing {
+                None => db
+                    .publish_note_package(candidate, encoded.descriptor, body)
+                    .map(Some),
+                Some((old, sealed_under)) => {
+                    db.publish_note_reseal(candidate, old, sealed_under, encoded.descriptor, body)
+                }
+            });
             Ok(())
         })
         .map_err(fenced_fail)?;
-    let stored = stored.ok_or(Fail::Local)?.map_err(|_| Fail::Local)?;
+    // A package that changed meanwhile is looked at again.
+    let stored = stored
+        .ok_or(Fail::Local)?
+        .map_err(|_| Fail::Local)?
+        .ok_or(Fail::Retry)?;
     Ok((stored, true))
 }
 
-/// Seal a typed mutation's package if it has none yet. Its exact payload
-/// bytes are sealed once, persisted before this returns and never replaced;
-/// only while `fence` holds, after the signer's await.
+/// Seal a typed mutation's package if it has none yet, or again once
+/// content has left its package's epoch. Its exact payload bytes are
+/// persisted before this returns and otherwise never replaced; only while
+/// `fence` holds, after the signer's await. Whether it is new.
 async fn sealed_typed(
     shared: &Shared,
     head: TypedHead,
     fence: &SyncFence,
-) -> Result<Package, Fail> {
+) -> Result<(Package, bool), Fail> {
     let database = shared
         .owner
         .shared_database(shared.container)
@@ -663,31 +764,50 @@ async fn sealed_typed(
         .expect("container writer lock")
         .prepare_typed_package(head.id)
         .map_err(|_| Fail::Local)?;
-    let candidate = match preparation {
+    let existing = |stored: bh_storage::StoredTypedPackage| Package {
+        key: PackageKey::Typed(head.id),
+        descriptor: stored.descriptor,
+        body: stored.body,
+    };
+    let (candidate, replacing) = match preparation {
         TypedPackagePreparation::Existing(stored) => {
-            return Ok(Package {
-                key: PackageKey::Typed(head.id),
-                descriptor: stored.descriptor,
-                body: stored.body,
-            });
+            // As for a note: sealed again once content passed its epoch.
+            let Some(sealed_under) =
+                passed(shared, head.base, &stored.descriptor, stored.ack.is_some())?
+            else {
+                return Ok((existing(stored), false));
+            };
+            let reseal = database
+                .lock()
+                .expect("container writer lock")
+                .prepare_typed_reseal(head.id)
+                .map_err(|_| Fail::Local)?;
+            let Some(candidate) = reseal else {
+                return Ok((existing(stored), false));
+            };
+            (candidate, Some((stored.event_id, sealed_under)))
         }
-        TypedPackagePreparation::Candidate(candidate) => candidate,
+        TypedPackagePreparation::Candidate(candidate) => (candidate, None),
     };
     let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
+    let epoch = current_epoch(shared, head.base)?;
     let mut request = None;
     shared
         .signer
-        .with_base_keys(BaseId(head.base), &mut |m, k| {
-            request = Some(shared.owner.prepare_typed_seal(
-                shared.container,
-                &identity.anchor,
-                shared.endpoint.hosting_root,
-                m,
-                k,
-                &candidate,
-            ))
+        .with_epoch_keys(BaseId(head.base), epoch, &mut |m, k| {
+            request = k.map(|k| {
+                shared.owner.prepare_typed_seal(
+                    shared.container,
+                    &identity.anchor,
+                    shared.endpoint.hosting_root,
+                    m,
+                    k,
+                    &candidate,
+                )
+            })
         })
         .map_err(|_| Fail::Authorization)?;
+    // A closed epoch, or one whose key this device does not hold yet, waits.
     let request = match request.ok_or(Fail::Authorization)? {
         Ok(request) => request,
         Err(OwnerError::SealRefused(SealRefusal::EpochClosed)) => return Err(Fail::Authorization),
@@ -708,16 +828,68 @@ async fn sealed_typed(
     shared
         .owner
         .with_sync_fence(fence, |db| {
-            stored = Some(db.publish_typed_package(candidate, encoded.descriptor, body));
+            stored = Some(match replacing {
+                None => db
+                    .publish_typed_package(candidate, encoded.descriptor, body)
+                    .map(Some),
+                Some((old, sealed_under)) => {
+                    db.publish_typed_reseal(candidate, old, sealed_under, encoded.descriptor, body)
+                }
+            });
             Ok(())
         })
         .map_err(fenced_fail)?;
-    let stored = stored.ok_or(Fail::Local)?.map_err(|_| Fail::Local)?;
-    Ok(Package {
-        key: PackageKey::Typed(head.id),
-        descriptor: stored.descriptor,
-        body: stored.body,
-    })
+    let stored = stored
+        .ok_or(Fail::Local)?
+        .map_err(|_| Fail::Local)?
+        .ok_or(Fail::Retry)?;
+    Ok((
+        Package {
+            key: PackageKey::Typed(head.id),
+            descriptor: stored.descriptor,
+            body: stored.body,
+        },
+        true,
+    ))
+}
+
+/// The epoch a package of `base` nothing acknowledged was sealed under, if
+/// the base's verified content is no longer in it: content has passed the
+/// control that replaced it, after which no device or service accepts
+/// content under it, so it can never be ordered. None while it may: until
+/// content passes that control it waits as it is.
+fn passed(
+    shared: &Shared,
+    base: [u8; 32],
+    descriptor: &OpaqueEvent,
+    acked: bool,
+) -> Result<Option<[u8; 32]>, Fail> {
+    if acked {
+        return Ok(None);
+    }
+    // Its own bytes do not open: it waits alone when its permits are asked.
+    let sealed_under = match descriptor_epoch(shared, base, descriptor) {
+        Ok(epoch) => epoch,
+        Err(Fail::Local) => return Ok(None),
+        Err(fail) => return Err(fail),
+    };
+    Ok((current_epoch(shared, base)? != Some(sealed_under)).then_some(sealed_under))
+}
+
+/// The epoch `descriptor`, a package of `base`, was sealed under.
+fn descriptor_epoch(
+    shared: &Shared,
+    base: [u8; 32],
+    descriptor: &OpaqueEvent,
+) -> Result<[u8; 32], Fail> {
+    let mut epoch = None;
+    shared
+        .signer
+        .with_metadata_key(BaseId(base), &mut |m| {
+            epoch = Some(bh_event::sealed_epoch(descriptor, m, BaseId(base)))
+        })
+        .map_err(|_| Fail::Authorization)?;
+    epoch.ok_or(Fail::Authorization)?.map_err(|_| Fail::Local)
 }
 
 /// The worse of two reasons to wait: a stop, then unsupported, then
@@ -868,6 +1040,9 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
                 Ok((stored, new)) => {
                     if new {
                         spacing.started(head.key, captured);
+                        // Any permits under its key were for bytes it replaced.
+                        permits.forget(PackageKey::Note(head.update_id), false);
+                        permits.forget(PackageKey::Note(head.update_id), true);
                     }
                     // A failed unsealed run is held by its stable first row;
                     // later keystrokes must not bypass that note's backoff.
@@ -885,7 +1060,13 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
                 Err(fail) => waiting = worse(waiting, fail),
             },
             OutboxCandidate::Typed(head) => match sealed_typed(shared, head, &fence).await {
-                Ok(package) => packages.push(package),
+                Ok((package, new)) => {
+                    if new {
+                        permits.forget(package.key, false);
+                        permits.forget(package.key, true);
+                    }
+                    packages.push(package);
+                }
                 // Its saved work changed or retired between selection and the
                 // seal: it waits alone.
                 Err(Fail::Local) => {
@@ -896,8 +1077,8 @@ async fn round(shared: &Shared, state: &mut State<'_>, log: LogId) -> Result<Rou
             },
         }
     }
-    // A package sealed before its epoch closed waits for a new one: it is
-    // never resealed.
+    // While the epoch is closed nothing is sent: a package under the epoch
+    // it replaced is sealed again once content holds a new one.
     if epoch.is_none() {
         return Ok(Round::waiting(worse(waiting, Fail::Authorization), due));
     }
@@ -1062,18 +1243,7 @@ fn refused(reason: wire::Refusal) -> Option<Fail> {
 /// The epoch `package` was sealed under, which its append permit must name
 /// whatever the log's epoch is now: a package is never moved to another.
 fn sealed_epoch(shared: &Shared, log: LogId, package: &Package) -> Result<[u8; 32], Fail> {
-    let mut epoch = None;
-    shared
-        .signer
-        .with_base_keys(BaseId(log.id), &mut |m, _| {
-            epoch = Some(bh_event::sealed_epoch(
-                &package.descriptor,
-                m,
-                BaseId(log.id),
-            ))
-        })
-        .map_err(|_| Fail::Authorization)?;
-    epoch.ok_or(Fail::Authorization)?.map_err(|_| Fail::Local)
+    descriptor_epoch(shared, log.id, &package.descriptor)
 }
 
 /// Fetch fresh permits for every package that lacks one, in as few

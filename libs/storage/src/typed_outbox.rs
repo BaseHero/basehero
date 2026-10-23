@@ -38,6 +38,23 @@ use bh_sync::{BodyObject, Commitment, EventId, OpaqueEvent, referenced_body};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
+/// v14: an unsent, undecided package may be retired to be sealed again
+/// under the same entry (`publish_typed_reseal`); the table's checks keep
+/// that from touching an acknowledged or judged one. Otherwise its bytes
+/// stay exact.
+pub(crate) fn migrate_retirement(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "DROP TRIGGER typed_outbox_exact;
+        CREATE TRIGGER typed_outbox_exact BEFORE UPDATE ON typed_outbox
+          WHEN NEW.mutation!=OLD.mutation OR NEW.base!=OLD.base OR NEW.audience!=OLD.audience
+            OR NEW.after_note!=OLD.after_note
+            OR (OLD.event_id IS NOT NULL AND NEW.event_id IS NOT NULL
+              AND (NEW.event_id IS NOT OLD.event_id
+                OR NEW.descriptor IS NOT OLD.descriptor OR NEW.body IS NOT OLD.body))
+          BEGIN SELECT RAISE(ABORT,'exact typed package'); END;",
+    )
+}
+
 pub(crate) fn migrate(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     // Additive: nothing here rewrites a note, its outbox or `data_pending`.
     // `after_note` snapshots the note-update clock at queueing so typed work
@@ -85,6 +102,51 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             position INTEGER CHECK(position IS NULL OR position>0)
         );",
     )
+}
+
+/// A fresh candidate for typed entry `id`'s saved work, as it is saved now.
+fn saved_candidate(conn: &Connection, id: i64) -> Result<TypedPackageCandidate, StoreError> {
+    let Some((mutation, base, audience, _, _, _)) = row(conn, id)? else {
+        return Err(StoreError::MissingPending);
+    };
+    let mutation: [u8; 16] = array(mutation)?;
+    let stored: Option<SavedRow> = conn
+        .query_row(
+            "SELECT p.payload,p.state,s.base,s.audience FROM data_pending p
+                   JOIN data_scope s ON s.id=p.scope WHERE p.mutation=?1",
+            [mutation.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((payload, state, saved_base, saved_audience)) = stored else {
+        return Err(StoreError::MissingPending);
+    };
+    if state != "pending" && state != "waiting" {
+        return Err(StoreError::MissingPending);
+    }
+    if saved_base != base || saved_audience != audience {
+        return Err(StoreError::RequestConflict);
+    }
+    Ok(TypedPackageCandidate {
+        event_id: EventId(bh_crypto::random::<32>()),
+        id,
+        mutation,
+        base: array(base)?,
+        audience: array(audience)?,
+        payload,
+    })
+}
+
+/// Whether typed package `id` is undecided: no Ack, no ordered position, no
+/// verdict and no alarm names it.
+fn typed_undecided(conn: &Connection, id: i64) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT acked_position IS NULL AND ordered_position IS NULL AND outcome IS NULL
+           AND NOT EXISTS(SELECT 1 FROM typed_alarm WHERE package=?1)
+         FROM typed_outbox WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 
 fn signed(value: u64) -> Result<i64, StoreError> {
@@ -272,7 +334,7 @@ fn read_package(conn: &Connection, id: i64) -> Result<Option<StoredTypedPackage>
     let event_id = EventId(array(id)?);
     let descriptor = OpaqueEvent::decode(&descriptor).map_err(|_| StoreError::CorruptOutbox)?;
     let object = BodyObject::new(body).map_err(|_| StoreError::CorruptOutbox)?;
-    if descriptor.id() != event_id
+    if descriptor.publication_id(bh_sync::Route::Content) != event_id
         || referenced_body(&descriptor).map_err(|_| StoreError::CorruptOutbox)?
             != object.commitment()
     {
@@ -399,36 +461,7 @@ impl DeviceDatabase {
         if let Some(existing) = read_package(&self.connection, id)? {
             return Ok(TypedPackagePreparation::Existing(existing));
         }
-        let Some((mutation, base, audience, _, _, _)) = row(&self.connection, id)? else {
-            return Err(StoreError::MissingPending);
-        };
-        let mutation: [u8; 16] = array(mutation)?;
-        let stored: Option<SavedRow> = self
-            .connection
-            .query_row(
-                "SELECT p.payload,p.state,s.base,s.audience FROM data_pending p
-                   JOIN data_scope s ON s.id=p.scope WHERE p.mutation=?1",
-                [mutation.as_slice()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((payload, state, saved_base, saved_audience)) = stored else {
-            return Err(StoreError::MissingPending);
-        };
-        if state != "pending" && state != "waiting" {
-            return Err(StoreError::MissingPending);
-        }
-        if saved_base != base || saved_audience != audience {
-            return Err(StoreError::RequestConflict);
-        }
-        Ok(TypedPackagePreparation::Candidate(TypedPackageCandidate {
-            event_id: EventId(bh_crypto::random::<32>()),
-            id,
-            mutation,
-            base: array(base)?,
-            audience: array(audience)?,
-            payload,
-        }))
+        saved_candidate(&self.connection, id).map(TypedPackagePreparation::Candidate)
     }
 
     /// Phase 2: the short IMMEDIATE CAS rejects a mutation whose saved work
@@ -440,7 +473,7 @@ impl DeviceDatabase {
         body: BodyObject,
     ) -> Result<StoredTypedPackage, StoreError> {
         if candidate.event_id.0 == [0; 32]
-            || descriptor.id() != candidate.event_id
+            || descriptor.nonce() != candidate.event_id
             || referenced_body(&descriptor).map_err(|_| StoreError::InvalidPackage)?
                 != body.commitment()
         {
@@ -480,7 +513,7 @@ impl DeviceDatabase {
             "UPDATE typed_outbox SET event_id=?2,descriptor=?3,body=?4 WHERE id=?1 AND event_id IS NULL",
             params![
                 candidate.id,
-                candidate.event_id.0.as_slice(),
+                descriptor.publication_id(bh_sync::Route::Content).0.as_slice(),
                 descriptor.encode(),
                 body.bytes()
             ],
@@ -524,6 +557,86 @@ impl DeviceDatabase {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Phase 1 of a reseal: a fresh candidate for typed package `id`'s saved
+    /// work, while the package is kept undecided; for a package under an
+    /// epoch content has left (`publish_typed_reseal` checks that).
+    pub fn prepare_typed_reseal(
+        &self,
+        id: i64,
+    ) -> Result<Option<TypedPackageCandidate>, StoreError> {
+        if crate::sync_state::publishing_stopped(&self.connection)? {
+            return Err(StoreError::PublishingStopped);
+        }
+        let Some(stored) = read_package(&self.connection, id)? else {
+            return Ok(None);
+        };
+        if stored.ack.is_some() || !typed_undecided(&self.connection, id)? {
+            return Ok(None);
+        }
+        saved_candidate(&self.connection, id).map(Some)
+    }
+
+    /// Phase 2 of a reseal, in one transaction: package `old` of the same
+    /// entry, sealed under `sealed_epoch`, is retired and `candidate`'s exact
+    /// new bytes replace it, only while it is still kept undecided as read,
+    /// its saved work unchanged, and its base's verified content in another
+    /// epoch: content passed the control that replaced it, so it can never
+    /// be ordered and its bytes are never sent again. None otherwise.
+    pub fn publish_typed_reseal(
+        &mut self,
+        candidate: TypedPackageCandidate,
+        old: EventId,
+        sealed_epoch: [u8; 32],
+        descriptor: OpaqueEvent,
+        body: BodyObject,
+    ) -> Result<Option<StoredTypedPackage>, StoreError> {
+        if candidate.event_id.0 == [0; 32]
+            || descriptor.nonce() != candidate.event_id
+            || referenced_body(&descriptor).map_err(|_| StoreError::InvalidPackage)?
+                != body.commitment()
+        {
+            return Err(StoreError::InvalidPackage);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if crate::sync_state::publishing_stopped(&tx)? {
+            return Err(StoreError::PublishingStopped);
+        }
+        let Some(stored) = read_package(&tx, candidate.id)? else {
+            return Ok(None);
+        };
+        if stored.event_id != old
+            || stored.ack.is_some()
+            || !typed_undecided(&tx, candidate.id)?
+            || !crate::sync_state::content_left(&tx, candidate.base, sealed_epoch)?
+            || saved_candidate(&tx, candidate.id).ok().is_none_or(|saved| {
+                saved.payload != candidate.payload
+                    || saved.mutation != candidate.mutation
+                    || saved.base != candidate.base
+                    || saved.audience != candidate.audience
+            })
+        {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE typed_outbox SET event_id=NULL,descriptor=NULL,body=NULL,staged=0 WHERE id=?1",
+            [candidate.id],
+        )?;
+        tx.execute(
+            "UPDATE typed_outbox SET event_id=?2,descriptor=?3,body=?4 WHERE id=?1 AND event_id IS NULL",
+            params![
+                candidate.id,
+                descriptor.publication_id(bh_sync::Route::Content).0.as_slice(),
+                descriptor.encode(),
+                body.bytes()
+            ],
+        )?;
+        let stored = read_package(&tx, candidate.id)?.ok_or(StoreError::CorruptOutbox)?;
+        tx.commit()?;
+        Ok(Some(stored))
     }
 
     /// Record a verified echo's verdict on one of this device's typed

@@ -61,7 +61,7 @@ test('native-signed grant for opaque genesis, lost response, fresh approval afte
   } finally { await mf.dispose(); rmSync(path, { recursive: true, force: true }); }
 });
 
-test('expired/stale/wrong key/wrong response binding/mutated approval and conflicting retry do not consume', async () => {
+test('expired/stale/wrong key/wrong response binding/mutated approval refuse; distinct original has distinct identity', async () => {
   const mf = new Miniflare(config());
   try {
     await provision(mf);
@@ -75,9 +75,58 @@ test('expired/stale/wrong key/wrong response binding/mutated approval and confli
     refused(await consume(mf, op('append', fixture.append, { event: fixture.event })));
     refused(await consume(mf, op('append', fixture.wrong_key, { event: fixture.event })));
     refused(await consume(mf, op('append', fixture.replay, { event: fixture.event, binding: '00'.repeat(32) })));
-    refused(await consume(mf, op('append', fixture.conflict, { event: fixture.conflicting_event })));
     assert.deepEqual(await inspect(mf), after);
+    const distinct = await consume(mf, op('append', fixture.conflict, { event: fixture.conflicting_event }));
+    assert.equal(distinct.status, 200);
+    assert.notEqual(distinct.result.ack, fixture.commitment);
+    assert.equal((await inspect(mf)).rows.length, 2);
   } finally { await mf.dispose(); }
+});
+
+test('planner refuses a valid earlier gate beside a later actual tail without modifying rows', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    assert.equal((await consume(mf, op('append', fixture.append, { event: fixture.event }))).status, 200);
+    const first = await inspect(mf);
+    assert.equal((await consume(mf, op('append', fixture.second_append, { event: fixture.second }))).status, 200);
+    assert.equal((await send(mf, 'rewindGate', { gate: first.gate })).status, 200);
+    const damaged = await inspect(mf);
+    assert.equal(damaged.gate.position, 1);
+    assert.equal(damaged.rows.length, 2);
+    refused(await consume(mf, op('stage', fixture.stage_after_genesis, { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), damaged);
+    refused(await consume(mf, op('append', fixture.second_append, { event: fixture.second })));
+    assert.deepEqual(await inspect(mf), damaged);
+  } finally { await mf.dispose(); }
+});
+
+test('planner refuses an empty gate beside a stored genesis', async () => {
+  const mf = new Miniflare(config());
+  try {
+    await provision(mf);
+    assert.equal((await consume(mf, op('append', fixture.append, { event: fixture.event }))).status, 200);
+    assert.equal((await send(mf, 'rewindGate', { gate: fixture.gate })).status, 200);
+    const damaged = await inspect(mf);
+    assert.equal(damaged.gate.position, 0);
+    assert.equal(damaged.rows.length, 1);
+    refused(await consume(mf, op('stage', fixture.stage, { body: fixture.stage_body })));
+    assert.deepEqual(await inspect(mf), damaged);
+  } finally { await mf.dispose(); }
+});
+
+test('planner refuses missing or corrupt actual tail without changing gate', async () => {
+  for (const mode of ['missing', 'corrupt']) {
+    const mf = new Miniflare(config());
+    try {
+      await provision(mf);
+      assert.equal((await consume(mf, op('append', fixture.append, { event: fixture.event }))).status, 200);
+      assert.equal((await send(mf, 'damageTail', { mode })).status, 200);
+      const damaged = await inspect(mf);
+      refused(await consume(mf, op('stage', fixture.stage_after_genesis, { body: fixture.stage_body })));
+      assert.deepEqual(await inspect(mf), damaged, mode);
+    } finally { await mf.dispose(); }
+  }
 });
 
 test('malformed operation and historical body/index corruption refuse without moving gate', async () => {

@@ -18,6 +18,7 @@ case "${1:-portable}" in
       }
     '
     cargo fmt --all --check
+    bash scripts/check.sh flags
     node scripts/affected.mjs --layers
     node --test scripts/affected.test.mjs scripts/webdriver-exclusion.test.mjs scripts/check-webdriver-markers.test.mjs
     node scripts/webdriver-exclusion.mjs
@@ -62,6 +63,21 @@ case "${1:-portable}" in
     npm ci --prefix tests/interop --ignore-scripts --no-audit --no-fund
     npm test --prefix tests/interop
     bash scripts/check.sh editor
+    ;;
+  flags)
+    cargo test --locked -p bh-flags
+    BH_FLAG_REMOVAL_WAIT=5m cargo test --locked -p bh-flags
+    error=$(mktemp)
+    trap 'rm -f "$error"' EXIT
+    if BH_RELEASE=1 BH_FLAG_REMOVAL_WAIT=5m cargo build --locked -p bh-flags 2>"$error"; then
+      echo 'release accepted off-default flags' >&2; exit 1
+    fi
+    grep -F 'release builds refuse off-default flags' "$error"
+    if BH_FLAG_REMOVAL_WAIT=invalid cargo build --locked -p bh-flags 2>"$error"; then
+      echo 'unknown flag value accepted' >&2; exit 1
+    fi
+    grep -F 'BH_FLAG_REMOVAL_WAIT must be 5m or unset' "$error"
+    BH_RELEASE=1 cargo build --locked -p bh-flags
     ;;
   sync-release)
     python3 -m unittest discover -s scripts -p 'test_sync_*.py'
@@ -213,6 +229,7 @@ case "${1:-portable}" in
     ;;
   *)
     echo "usage: bash scripts/check.sh [portable|sync-release|ui|editor|desktop|android|android-sync-emulator|android-update-emulator|android-editor-emulator|android-continuity-emulator|android-fixture-emulator|android-device-keys|android-qr-scan|android-device-keys-emulator|android-crypto|wasm|wasm-crypto|wasm-sync|local-stack|local-sync|qualification-stress|webdriver|webdriver-linux|webdriver-macos|webdriver-android|data-android-emulator|data-scale]" >&2
+    echo 'additional check: flags' >&2
     exit 2
     ;;
 esac

@@ -1,7 +1,8 @@
 //! Completing a first device's setup at its account home. Signup retained
 //! the original three-event prefix and three private objects (recovery
 //! record, device seal, recovery seal). Setup completes only after a
-//! verified read of the account log holds exactly that prefix and the
+//! verified read of the account log holds exactly that prefix, with the
+//! home's confirmations of positions 2 and 3 the device keeps with it, and the
 //! service answers that the home durably stored exactly those objects, and
 //! then only if the native authority that read them is still current.
 //!
@@ -15,7 +16,7 @@ use crate::{
     HomeRetryReason, HomeSetup, HomeStatus, Shared, backoff::Backoff, outbox::Fail, outbox::Link,
     register,
 };
-use bh_account::{Head as AccountHead, VerifiedAccount};
+use bh_account::{ConfirmedTime, Head as AccountHead, VerifiedAccount};
 use bh_authz_proto::{FromService, ToService};
 use bh_sync::home_objects;
 use std::sync::Arc;
@@ -99,12 +100,28 @@ async fn complete(shared: &Shared, link: &mut Link) -> Result<Option<()>, HomeFa
     )
     .await
     .map_err(|fail| HomeFailure::step(home_fail(fail)))?;
-    let read: Vec<&[u8]> = ordered.iter().map(Vec::as_slice).collect();
-    if ordered != prefix.events
+    let read: Vec<&[u8]> = ordered.iter().map(|e| e.original.as_slice()).collect();
+    if read != prefix.events
         || register::replayed(&identity, &read).map_err(HomeFailure::step)? != prefix.head
     {
         return Err(HomeFailure::retained());
     }
+    // The home's confirmations of positions 2 and 3, verified with them.
+    let evidence = match ordered.as_slice() {
+        [_, record, key] => [record, key].map(|e| {
+            Some((
+                ConfirmedTime {
+                    earliest_ms: e.time?.earliest_ms,
+                    latest_ms: e.time?.latest_ms,
+                },
+                e.proof.as_ref()?.encode().to_vec(),
+            ))
+        }),
+        _ => return Err(HomeFailure::retained()),
+    };
+    let [Some(record), Some(key)] = evidence else {
+        return Err(HomeFailure::step(Fail::Missing));
+    };
     // A prior authorization retry may have preceded this store attempt;
     // while its answer is outstanding the home check is pending, not refused.
     shared.home_status.send_replace(HomeStatus::Pending);
@@ -137,7 +154,7 @@ async fn complete(shared: &Shared, link: &mut Link) -> Result<Option<()>, HomeFa
     }
     shared
         .signer
-        .confirm_home_ordered(&setup)
+        .confirm_home_ordered(&setup, [record, key])
         .map_err(|_| HomeFailure::step(Fail::Authorization))?;
     Ok(Some(()))
 }

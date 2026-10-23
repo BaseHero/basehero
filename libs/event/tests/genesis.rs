@@ -77,8 +77,13 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
     assert_eq!(verified.content_key_id, key_id(&epoch));
     let hosting = Hosting::new();
     let mut history = History::with_account(&account, base, hosting.root.public(), 1).unwrap();
-    let ordered =
-        Commitment::order(base, Head::EMPTY, &encoded.descriptor, Route::Control).unwrap();
+    let ordered = Commitment::order(
+        base,
+        bh_sync::OrderState::EMPTY,
+        &encoded.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let prepared = history
         .prepare(&ordered, &encoded.descriptor, Some(&encoded.body), &m, None)
         .unwrap();
@@ -105,8 +110,8 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
     );
     let note = seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: base.0,
             audience: [0; 32],
@@ -131,8 +136,13 @@ fn external_signature_after_account_setup_and_note_under_epoch() {
         Some(&epoch),
     )
     .unwrap();
-    let note_order =
-        Commitment::order(base, history.head(), &note.descriptor, Route::Content).unwrap();
+    let note_order = Commitment::order(
+        base,
+        history.order_state(),
+        &note.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     let replay = History::replay_with_account(
         &account,
         base,
@@ -272,8 +282,8 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
     data[72] = 0;
     let non_genesis = seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: base.0,
             ..binding
@@ -301,15 +311,26 @@ fn genesis_refuses_substitutions_and_bad_first_events() {
     .unwrap();
     let mut history =
         History::with_account(&account, base, Hosting::new().root.public(), 1).unwrap();
-    let order = Commitment::order(base, Head::EMPTY, &encoded.descriptor, Route::Control).unwrap();
+    let order = Commitment::order(
+        base,
+        bh_sync::OrderState::EMPTY,
+        &encoded.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let prepared = history
         .prepare(&order, &encoded.descriptor, Some(&encoded.body), &m, None)
         .unwrap();
     history
         .publish_committed(history.materialize(prepared, None).unwrap().transition)
         .unwrap();
-    let second_order =
-        Commitment::order(base, history.head(), &second.descriptor, Route::Control).unwrap();
+    let second_order = Commitment::order(
+        base,
+        history.order_state(),
+        &second.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     // A second genesis after the first is an invalid submission, not a fork.
     assert!(
         history

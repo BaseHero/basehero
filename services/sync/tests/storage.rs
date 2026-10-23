@@ -33,6 +33,7 @@ fn initial() -> GateState {
     let genesis = event(1);
     GateState {
         base: BaseId::from_genesis(&genesis),
+        order: OrderState::EMPTY,
         head: Head::EMPTY,
         incarnation: [4; 32],
         sequence: 0,
@@ -153,7 +154,7 @@ fn exact_reads_consume_sequence_not_head_and_fail_closed() {
 }
 
 #[test]
-fn conflicts_bad_signature_and_duplicate_prior_approval_do_not_mutate() {
+fn routed_identity_allows_distinct_originals_but_rejects_stale_and_bad_signature() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("base.db");
     let mut first = new_db(&path);
@@ -161,16 +162,17 @@ fn conflicts_bad_signature_and_duplicate_prior_approval_do_not_mutate() {
     let op = Operation::Append(event(1));
     let prior = grant(initial(), &op);
     first.consume(&prior, &op, BINDING, &HostClock).unwrap();
-    let after = first.state().unwrap();
     assert_eq!(
         second.consume(&prior, &op, BINDING, &HostClock),
         Err(Refusal::Access(AccessError::Stale))
     );
+    // A reused nonce does not claim the first publication's route/digest ID.
     let changed = Operation::Append(event_with_body(1, 9));
-    assert_eq!(
-        consume(&mut second, &changed),
-        Err(Refusal::Access(AccessError::ReplayConflict))
+    let other = consume(&mut second, &changed).unwrap();
+    assert!(
+        matches!(other, Outcome::Ack(c) if c.event_id() != event(1).publication_id(Route::Control))
     );
+    let after = second.state().unwrap();
     let mut forged = grant(after, &op);
     forged.signature[0] ^= 1;
     assert_eq!(
@@ -178,7 +180,7 @@ fn conflicts_bad_signature_and_duplicate_prior_approval_do_not_mutate() {
         Err(Refusal::Access(AccessError::Signature))
     );
     assert_eq!(second.state().unwrap(), after);
-    assert_eq!(count_rows(&path), 1);
+    assert_eq!(count_rows(&path), 2);
 }
 
 #[test]
@@ -243,7 +245,7 @@ fn corrupt_historical_body_commitment_or_index_blocks_replay_and_read() {
         assert_eq!(count_rows(&path), 3, "row count changed for {column}");
         conn.execute(
             "UPDATE events SET event_id=?1, event_digest=?2, commitment=?3, body=?4 WHERE position=1",
-            rusqlite::params![event(1).id().0.as_slice(), event(1).digest().0.as_slice(), original.encode(), event(1).encode()],
+            rusqlite::params![original.event_id().0.as_slice(), event(1).digest().0.as_slice(), original.encode(), event(1).encode()],
         )
         .unwrap();
     }
@@ -347,14 +349,14 @@ fn newer_schema_refuses_before_mutating() {
     let path = dir.path().join("base.db");
     drop(new_db(&path));
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
     assert!(matches!(Database::open(&path), Err(Refusal::Unavailable)));
     let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -367,6 +369,7 @@ fn body_rows(path: &Path) -> i64 {
 fn initial_for(genesis: &OpaqueEvent) -> GateState {
     GateState {
         base: BaseId::from_genesis(genesis),
+        order: OrderState::EMPTY,
         head: Head::EMPTY,
         incarnation: [4; 32],
         sequence: 0,

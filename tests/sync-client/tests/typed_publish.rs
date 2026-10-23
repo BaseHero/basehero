@@ -203,11 +203,15 @@ async fn a_round_never_pipelines_two_typed_packages_from_one_scope() {
     assert!(first_at < second_at);
     let entries = hosted.edge.entries(log);
     assert_eq!(
-        entries[first_at as usize - 1].1.id(),
+        entries[first_at as usize - 1]
+            .1
+            .publication_id(bh_sync::Route::Content),
         device.typed_package(first).unwrap().event_id
     );
     assert_eq!(
-        entries[second_at as usize - 1].1.id(),
+        entries[second_at as usize - 1]
+            .1
+            .publication_id(bh_sync::Route::Content),
         device.typed_package(second).unwrap().event_id
     );
     client.shutdown().await;
@@ -248,13 +252,13 @@ async fn waiting_typed_work_publishes_before_the_next_save_in_its_scope() {
     assert_eq!(
         entries[device.typed_acked(package).unwrap() as usize - 1]
             .1
-            .id(),
+            .publication_id(bh_sync::Route::Content),
         device.typed_package(package).unwrap().event_id
     );
     assert_eq!(
         entries[device.typed_acked(next).unwrap() as usize - 1]
             .1
-            .id(),
+            .publication_id(bh_sync::Route::Content),
         device.typed_package(next).unwrap().event_id
     );
     client.shutdown().await;
@@ -319,10 +323,7 @@ async fn a_typed_publishing_stop_stops_every_package() {
     let progress = device.progress();
     let ordered = bh_sync::Commitment::order(
         bh_sync::BaseId(device.base.0),
-        bh_sync::Head {
-            position: progress.position,
-            hash: bh_sync::Digest(progress.head_hash),
-        },
+        progress.order,
         &stored.descriptor,
         bh_sync::Route::Content,
     )

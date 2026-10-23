@@ -14,7 +14,7 @@ class EndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             source = root / 'endpoint.json'
-            raw = b'{"appraisal":"hardware","edge_url":"https://fixture.invalid"}\n'
+            raw = b'{"appraisal":"hardware","edge_url":"https://fixture.invalid","recovery_key":"0001ab"}\n'
             source.write_bytes(raw)
             artifact = root / 'fixture.apk'
             # A portable process-boundary fixture, not an Android build.
@@ -46,7 +46,7 @@ class EndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             source = root / 'input.json'
-            exact = b'{"appraisal": "hardware", "edge_url": "https://fixture.invalid"}\n'
+            exact = b'{"appraisal": "hardware", "edge_url": "https://fixture.invalid", "recovery_key": "0001ab"}\n'
             source.write_bytes(exact)
             env, proof = module.prepare_endpoint(source, False, root / 'out', {'BH_SYNC_ENDPOINT': '/unrelated'})
             self.assertEqual(pathlib.Path(env['BH_SYNC_ENDPOINT']).read_bytes(), exact)
@@ -59,7 +59,11 @@ class EndpointTests(unittest.TestCase):
             for path, local in ((None, False), (source, True), (root / 'missing', False)):
                 with self.assertRaises((ValueError, OSError)):
                     module.prepare_endpoint(path, local, root / 'bad', {})
-            for content in (b'', b'  ', b'{', b'{"appraisal":"synthetic"}', b'{"appraisal":"hardware","edge_url":"http://fixture.invalid"}'):
+            for content in (b'', b'  ', b'{', b'{"appraisal":"synthetic"}', b'{"appraisal":"hardware","edge_url":"http://fixture.invalid","recovery_key":"0001ab"}',
+                            # No recovery key, or not one as text.
+                            b'{"appraisal":"hardware","edge_url":"https://fixture.invalid"}',
+                            b'{"appraisal":"hardware","edge_url":"https://fixture.invalid","recovery_key":""}',
+                            b'{"appraisal":"hardware","edge_url":"https://fixture.invalid","recovery_key":1}'):
                 source.write_bytes(content)
                 with self.assertRaises(ValueError):
                     module.prepare_endpoint(source, False, root / 'bad', {})

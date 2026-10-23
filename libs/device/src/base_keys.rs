@@ -150,6 +150,29 @@ pub fn prepare_seal(
     })
 }
 
+/// Authenticate a seal without any private key: every expected context field,
+/// then the historical account/head, the personal key that history published
+/// as recipient, and the signature of a device active there. A key already
+/// rotated away can still be checked this way; nothing is opened.
+pub fn verify_seal(
+    history: &VerifiedAccount,
+    expected: &SealHeader,
+    seal: &[u8],
+) -> Result<(), SealError> {
+    let header = SealHeader::decode(seal)?;
+    if header != *expected {
+        return Err(SealError::Context);
+    }
+    let recipient = history.personal_public().map_err(|_| SealError::Context)?;
+    let signer = header.signer(history, recipient)?;
+    verify(
+        &signer,
+        &signing_bytes(&seal[..SEAL_LEN - 64]),
+        &array(&seal[SEAL_LEN - 64..])?,
+    )
+    .map_err(|_| SealError::Signature)
+}
+
 /// Check historical account/head/signer and every expected context field before
 /// touching the receiver. A matching seal key id is still provisional until the
 /// caller verifies the exact genesis that commits that id.
@@ -159,17 +182,11 @@ pub fn open_seal(
     seal: &[u8],
     personal: &PersonalKey,
 ) -> Result<Secret<32>, SealError> {
-    let header = SealHeader::decode(seal)?;
-    if header != *expected {
+    verify_seal(history, expected, seal)?;
+    if history.personal_public().map_err(|_| SealError::Context)? != &personal.public() {
         return Err(SealError::Context);
     }
-    let signer = header.signer(history, &personal.public())?;
-    verify(
-        &signer,
-        &signing_bytes(&seal[..SEAL_LEN - 64]),
-        &array(&seal[SEAL_LEN - 64..])?,
-    )
-    .map_err(|_| SealError::Signature)?;
+    let header = *expected;
     let shared = personal
         .decapsulate(&array(&seal[243..1363])?)
         .map_err(|_| SealError::Crypto)?;

@@ -237,16 +237,21 @@ fn backlog(path: &std::path::Path) -> (DeviceDatabase, i64) {
         )
         .unwrap();
     // Ordered at position 7: the genesis, five other events, then this one.
-    let mut head = Commitment::order(BaseId(base()), Head::EMPTY, &genesis(), Route::Control)
-        .unwrap()
-        .head();
+    let mut order = Commitment::order(
+        BaseId(base()),
+        bh_sync::OrderState::EMPTY,
+        &genesis(),
+        Route::Control,
+    )
+    .unwrap()
+    .after();
     for _ in 2..7 {
         let filler = sealed(EventId(bh_crypto::random()), b"filler");
-        head = Commitment::order(BaseId(base()), head, &filler.descriptor, Route::Content)
+        order = Commitment::order(BaseId(base()), order, &filler.descriptor, Route::Content)
             .unwrap()
-            .head();
+            .after();
     }
-    let at = Commitment::order(BaseId(base()), head, &stored.descriptor, Route::Content).unwrap();
+    let at = Commitment::order(BaseId(base()), order, &stored.descriptor, Route::Content).unwrap();
     assert_eq!(at.head().position, 7);
     let payload: Vec<u8> = db
         .with_data_read(|conn| {

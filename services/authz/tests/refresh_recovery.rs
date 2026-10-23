@@ -47,10 +47,9 @@ impl EdgeReader for Fault {
                     let mut bad = original.to_vec();
                     *bad.last_mut().unwrap() ^= 1; // signature, not outer chain
                     let event = account_log_wrap(&bad, body).unwrap();
-                    *ordered =
-                        Commitment::order(old.base(), old.previous(), &event, Route::Control)
-                            .unwrap()
-                            .encode();
+                    *ordered = Commitment::order(old.base(), old.before(), &event, Route::Control)
+                        .unwrap()
+                        .encode();
                     *bytes = event.encode();
                 }
             }

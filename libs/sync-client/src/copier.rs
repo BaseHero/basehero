@@ -1,8 +1,9 @@
 //! Following the account and copying its changes into the own base.
 //!
 //! The account owner holds the account's verified history. The client reads
-//! the account log after the owner's head, unwraps each original exactly and
-//! hands them to the owner, which verifies and commits them. Bytes that are
+//! the account log after its separate durable outer checkpoint, unwraps each original exactly and
+//! hands them, each with the home's ordering confirmation verified under the
+//! hosting root, to the owner, which verifies and commits them. Bytes that are
 //! not the next verified history are refused and read again later; an event
 //! this build cannot read pauses; only authenticated history contradicting
 //! the owner's stops it, and then this client.
@@ -14,40 +15,55 @@
 //! following, which alone settles the addition.
 //!
 //! A base learns of an account change only from a control that copies the
-//! account's next event into it. Once the base is caught up, the client
-//! prepares that one copy, has the control key sign it within an approved
-//! action, and keeps the exact signed bytes before first sending them.
-//! Every retry, also after a lost answer or a restart, sends those bytes:
-//! nothing is signed again because an answer went missing. Only the
-//! verified base log settles a kept copy: its exact bytes ordered there
-//! with their effect, or the account change copied by another event first.
+//! account's next events, each with its kept confirmation, into it: a run
+//! of at most 64 the control key signs within an approved action, or, for a
+//! personal-key rotation that takes effect, the base's rekey, which the
+//! ordinary key signs with no prompt (`runs`). Once the base's current
+//! state is verified (content caught up, or, while content waits for a key
+//! or a body, the control feed's scan of the pass), the client prepares
+//! that copy with M alone and keeps the exact signed bytes, with a rekey's
+//! seal set, before first sending them. Every retry, also after a lost
+//! answer or a restart, sends those bytes: nothing is signed again because
+//! an answer went missing. Only a kept copy whose seen claim fell further
+//! behind the log than the services take (`SEEN_WINDOW`), which could never
+//! be ordered, is replaced by a copy from the same entry prepared and
+//! signed afresh from the base's current state; a rekey's with a new key
+//! and seal set. Only the verified base log settles a kept copy: its exact
+//! bytes ordered there with their effect, or its first entry copied by
+//! another event first, whose rekey's key is then never used.
 //! A refusal alone never does. Other bytes under its id, or the copy
 //! ordered without effect, leave it kept, unsent and shown as not accepted.
 //! The next copy is prepared only after it settles.
+mod runs;
+
 use crate::{
-    AccountApplyError, BaseControlRequest, ControlSignError, Shared,
+    AccountApplyError, Shared,
+    account_evidence::{self, VerifiedEvent},
     outbox::{Fail, Link},
-    puller::{Receiver, granted, read_account},
+    puller::{Held, Receiver, granted, read_account},
     scheduler::Readiness,
 };
 use bh_account::{
-    DevicePublicKeys, VerifiedAccount,
+    AccountId, ConfirmedTime, DevicePublicKeys, Head as AccountHead, VerifiedAccount,
     journal::{AccountJournal, HistoryCursor, StagedAdmission},
     storage::DeviceJournal,
 };
 use bh_authz_proto::{
-    Delivery, FromService, MetadataKey, Refusal, ToService, account_log_id, account_log_wrap,
+    Delivery, FromService, MetadataKey, Refusal, ToService, Want, account_log_id, account_log_wrap,
     delivery_body,
 };
-use bh_device::OwnerError;
-use bh_storage::sync_state::{BaseControl, ControlOutcome};
+use bh_storage::{
+    DeviceDatabase,
+    sync_state::{BaseControl, ControlOutcome},
+};
 use bh_sync::{
-    BaseId, OpaqueEvent,
+    BaseId, BodyObject, OpaqueEvent, OrderState,
+    evidence::{AcceptedHead, OrderingConfirmation, TimeBounds},
     permit::{AppendAck, LogId, LogKind},
     receipt,
     wire::{self, Request, Response},
 };
-use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -74,39 +90,290 @@ pub(crate) struct Copier {
     pub(crate) stopped: bool,
 }
 
-/// Read the account log after the owner's verified head and apply what it
-/// adds through the owner.
+/// Compare only the already committed bounded inner prefix. The journal
+/// checks the pinned cut and returns exact stored originals, not just hashes.
+pub(crate) fn matched_prefix(
+    journal: &DeviceJournal,
+    account: AccountId,
+    inner: AccountHead,
+    before: u64,
+    originals: &[&[u8]],
+) -> Result<usize, Fail> {
+    let matched = originals
+        .len()
+        .min(inner.position.saturating_sub(before) as usize);
+    if matched > 0 {
+        let page = local(journal.history_prefix(
+            Some(HistoryCursor {
+                anchor: account,
+                cut: inner,
+                next_position: before + 1,
+            }),
+            matched,
+        ))?
+        .ok_or(Fail::Local)?;
+        if page.events.len() != matched
+            || page
+                .events
+                .iter()
+                .zip(originals)
+                .any(|(stored, ordered)| stored != ordered)
+        {
+            // The home confirmed other bytes where this device committed
+            // history. Only the account owner judges a contradiction and
+            // latches a stop, and it never sees these: the committed prefix
+            // stays, the checkpoint does not move, and the log is read again.
+            return Err(Fail::Network);
+        }
+    }
+    Ok(matched)
+}
+
+/// The exact evidence the reader verified for one original, as the account
+/// owner keeps it.
+fn evidence(event: &VerifiedEvent) -> Option<(ConfirmedTime, Vec<u8>)> {
+    Some((
+        event.time.map(|time| ConfirmedTime {
+            earliest_ms: time.earliest_ms,
+            latest_ms: time.latest_ms,
+        })?,
+        event.proof.as_ref()?.encode().to_vec(),
+    ))
+}
+
+/// The stored verified time of the account entry at `position`, if any.
+pub(crate) fn stored_time(
+    database: &Mutex<DeviceDatabase>,
+    position: u64,
+) -> Result<Option<TimeBounds>, Fail> {
+    if position < 2 {
+        return Ok(None);
+    }
+    Ok(local(
+        database
+            .lock()
+            .expect("container writer lock")
+            .confirmation(position),
+    )?
+    .map(|row| TimeBounds {
+        earliest_ms: row.earliest_ms,
+        latest_ms: row.latest_ms,
+    }))
+}
+
+fn accepted_head(accepted: AcceptedHead) -> AccountHead {
+    AccountHead {
+        position: accepted.original_head.position,
+        hash: accepted.original_head.hash.0,
+    }
+}
+
+/// Match an empty read's challenged head to the exact durable original and
+/// stored confirmation, never to the mere absence of new entries.
+#[allow(clippy::too_many_arguments)] // One exact head's independently pinned history, root and opening.
+pub(crate) fn match_stored_accepted(
+    journal: &DeviceJournal,
+    database: &Mutex<DeviceDatabase>,
+    account: AccountId,
+    head: AccountHead,
+    accepted: AcceptedHead,
+    root: [u8; 32],
+    log: LogId,
+    opening: OrderState,
+) -> Result<(), Fail> {
+    if accepted_head(accepted) != head {
+        return Err(Fail::Network);
+    }
+    let page = local(journal.history_prefix(
+        Some(HistoryCursor {
+            anchor: account,
+            cut: head,
+            next_position: head.position,
+        }),
+        1,
+    ))?
+    .ok_or(Fail::Local)?;
+    let original = page.events.first().ok_or(Fail::Local)?;
+    if bh_crypto::hash(original) != head.hash {
+        return Err(Fail::Network);
+    }
+    let proof = if head.position == 1 {
+        [0; 32]
+    } else {
+        let row = local(
+            database
+                .lock()
+                .expect("container writer lock")
+                .confirmation(head.position),
+        )?
+        .ok_or(Fail::Missing)?;
+        let proof = OrderingConfirmation::decode(&row.bytes).map_err(|_| Fail::Network)?;
+        let claim = proof
+            .verify_for(&root, original, proof.claim().body)
+            .map_err(|_| Fail::Network)?;
+        if claim.log != log
+            || claim.original_head != accepted.original_head
+            || claim.ordered != opening.head(BaseId(log.id))
+            || accepted.bounds.earliest_ms < claim.bounds.earliest_ms
+            || accepted.bounds.latest_ms < claim.bounds.latest_ms
+        {
+            return Err(Fail::Network);
+        }
+        proof.commitment()
+    };
+    if accepted.evidence != proof {
+        return Err(Fail::Network);
+    }
+    Ok(())
+}
+
+fn observe(shared: &Shared, accepted: AcceptedHead) -> Result<(), Fail> {
+    shared
+        .signer
+        .observe_account_accepted(
+            accepted_head(accepted),
+            ConfirmedTime {
+                earliest_ms: accepted.bounds.earliest_ms,
+                latest_ms: accepted.bounds.latest_ms,
+            },
+        )
+        .map_err(|_| Fail::Authorization)
+}
+
+/// Follow the independently verified outer log. Signup, pairing, or an
+/// interrupted prior follow may already have committed an inner prefix:
+/// compare its exact journal bytes rather than applying its effects again.
+/// Every original after the genesis carries its verified confirmation to
+/// the account owner; a missing one leaves everything as it was.
 async fn follow(shared: &Shared, link: &mut Link) -> Result<(), Fail> {
     let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
     let log = LogId {
         kind: LogKind::Account,
         id: local(account_log_id(&identity.genesis))?,
     };
+    let database = local(shared.owner.shared_database(shared.container))?;
+    let journal = DeviceJournal::from_shared(database.clone());
+    // A challenged head may be beyond a full page. Keep every unresolved
+    // authenticated claim until its exact original and proof are checked.
+    let mut pending: Vec<AcceptedHead> = Vec::new();
     loop {
-        let after = shared
+        let before = local(
+            database
+                .lock()
+                .expect("container writer lock")
+                .account_outer_progress(log.id, shared.endpoint.hosting_root),
+        )?
+        .order;
+        let prior = stored_time(&database, before.position())?;
+        let (events, accepted, full, ahead) =
+            read_account(shared, link, log, before, prior).await?;
+        let reached = account_evidence::match_page_claims(&mut pending, &events, accepted)?;
+        let inner = shared
             .signer
             .current_account()
-            .map_err(|_| Fail::Authorization)?
-            .head();
-        let (originals, full) = read_account(shared, link, log, after.position + 1).await?;
-        if originals.is_empty() {
+            .map_err(|_| Fail::Authorization)?;
+        if inner.id() != identity.account || before.position() > inner.head().position {
+            return Err(Fail::Local);
+        }
+        if events.is_empty() {
+            if ahead
+                || inner.head().position != before.position()
+                || pending
+                    .iter()
+                    .any(|claim| claim.original_head.position != before.position())
+            {
+                return Err(Fail::Missing);
+            }
+            for claim in pending.drain(..) {
+                match_stored_accepted(
+                    &journal,
+                    &database,
+                    identity.account,
+                    inner.head(),
+                    claim,
+                    shared.endpoint.hosting_root,
+                    log,
+                    before,
+                )?;
+                observe(shared, claim)?;
+            }
             return Ok(());
         }
-        shared
-            .signer
-            .apply_account(after, originals)
-            .await
-            .map_err(|error| match error {
-                // Not the account's history: the log is read again.
-                AccountApplyError::Refused => Fail::Network,
-                AccountApplyError::Unsupported => Fail::Unsupported,
-                AccountApplyError::Stopped => Fail::Stopped,
-                AccountApplyError::Unavailable => Fail::Authorization,
-            })?;
+        let originals: Vec<&[u8]> = events.iter().map(|e| e.original.as_slice()).collect();
+        let matched = matched_prefix(
+            &journal,
+            identity.account,
+            inner.head(),
+            before.position(),
+            &originals,
+        )?;
+        let mut current = inner.head();
+        let mut next = matched;
+        // Each reached head is an observation point in account-head order.
+        // Check overlap against the exact kept proof, and observe a committed
+        // challenged head before advancing through any uncommitted suffix.
+        for (index, claim) in reached {
+            let at = &events[index];
+            if index < matched {
+                match_stored_accepted(
+                    &journal,
+                    &database,
+                    identity.account,
+                    accepted_head(claim),
+                    claim,
+                    shared.endpoint.hosting_root,
+                    log,
+                    at.opening,
+                )?;
+            } else if index >= next {
+                current = apply_verified(shared, current, &events[next..=index]).await?;
+                next = index + 1;
+            }
+            if current == accepted_head(claim) {
+                observe(shared, claim)?;
+            }
+        }
+        if next < events.len() {
+            apply_verified(shared, current, &events[next..]).await?;
+        }
+        let last = events.last().expect("nonempty account page").opening;
+        local(
+            database
+                .lock()
+                .expect("container writer lock")
+                .advance_account_outer(log.id, shared.endpoint.hosting_root, before, last),
+        )?;
         if !full {
-            return Ok(());
+            return if ahead || !pending.is_empty() {
+                Err(Fail::Missing)
+            } else {
+                Ok(())
+            };
         }
     }
+}
+
+async fn apply_verified(
+    shared: &Shared,
+    current: AccountHead,
+    events: &[VerifiedEvent],
+) -> Result<AccountHead, Fail> {
+    let suffix = events
+        .iter()
+        .map(|event| (event.original.clone(), evidence(event)))
+        .collect();
+    let after = shared
+        .signer
+        .apply_account_timed(current, suffix)
+        .await
+        .map_err(|error| match error {
+            AccountApplyError::Refused => Fail::Network,
+            AccountApplyError::Unsupported => Fail::Unsupported,
+            AccountApplyError::Stopped => Fail::Stopped,
+            AccountApplyError::Unavailable => Fail::Authorization,
+        })?;
+    shared.removal_wake.notify_one();
+    Ok(after)
 }
 
 /// One step: follow the account if it is due or an addition is kept, order
@@ -165,20 +432,29 @@ pub(crate) async fn step(
     if progress.stopped.is_some() {
         return Ok(false);
     }
-    let Some((copied, _)) = progress.account else {
+    // The base's verified copy of the account: the control feed's while it
+    // is ahead of content, so that copying needs M alone and goes on while
+    // content waits for a key.
+    let Some(verified) = local(shared.owner.verified_copy(shared.container, log))? else {
         // The genesis is not applied yet.
         return Ok(false);
     };
+    let copied = verified.account.0;
+    // Copy only from a base whose current state this device verified, so
+    // the copy claims what the base holds now: content caught up, or, while
+    // content waits, the control feed's scan of this pass, which reached
+    // the control head the service verified.
+    let current_base = receiver.caught_up(progress.position)
+        || (receiver.held != Held::No && receiver.controls_current);
     copier.not_accepted = false;
     if let Some(kept) = kept {
         copier.unsettled = true;
         // Only verified history settles it: the first bytes the log ordered
         // under its id, and the base's copy of the account.
         let ordered = local(
-            database
-                .lock()
-                .expect("container writer lock")
-                .log_event_digest(LogKind::Base as u8, base, kept.event_id),
+            shared
+                .owner
+                .ordered_control(shared.container, log, kept.event_id),
         )?;
         let digest = local(OpaqueEvent::decode(&kept.descriptor))?.digest().0;
         let outcome = match ordered {
@@ -203,10 +479,36 @@ pub(crate) async fn step(
             )?;
             return Ok(true);
         }
-        if !receiver.caught_up(progress.position) {
+        if !current_base {
             return Ok(false);
         }
         ready.withdraw();
+        // A copy orders after every head known now. One whose seen claim is
+        // further behind that than the services take could never be
+        // ordered: its bytes are never sent again. The same change is
+        // prepared and signed afresh from the base's current state.
+        let kept = if behind(window(shared), seen(shared, log, &kept)?, receiver.latest) {
+            if behind(window(shared), verified.through, receiver.latest) {
+                return Ok(false);
+            }
+            let current = shared
+                .signer
+                .current_account()
+                .map_err(|_| Fail::Authorization)?;
+            let Some((fresh, set)) =
+                runs::prepare(shared, link, log, &current, kept.account_position).await?
+            else {
+                return Ok(false);
+            };
+            local(
+                database
+                    .lock()
+                    .expect("container writer lock")
+                    .replace_base_control(&kept, &fresh, set.as_deref()),
+            )?
+        } else {
+            kept
+        };
         return submit(shared, link, receiver, log, &kept).await;
     }
     let current = shared
@@ -214,77 +516,54 @@ pub(crate) async fn step(
         .current_account()
         .map_err(|_| Fail::Authorization)?;
     copier.unsettled = current.head().position > copied;
-    // Copy only from a base this device has caught up with, so the copy
-    // claims what the base holds now.
-    if !copier.unsettled || !receiver.caught_up(progress.position) {
+    // Never prepare a copy whose seen claim would already be too old.
+    if !copier.unsettled
+        || !current_base
+        || behind(window(shared), verified.through, receiver.latest)
+    {
         return Ok(false);
     }
-    let position = copied + 1;
     ready.withdraw();
-    let journal = DeviceJournal::from_shared(database.clone());
-    let page = local(journal.history_prefix(
-        Some(HistoryCursor {
-            anchor: current.id(),
-            cut: current.head(),
-            next_position: position,
-        }),
-        1,
-    ))?
-    .ok_or(Fail::Local)?;
-    let original = page.events.first().ok_or(Fail::Local)?;
-    let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
-    let mut request = None;
+    let Some((copy, set)) = runs::prepare(shared, link, log, &current, copied + 1).await? else {
+        return Ok(false);
+    };
+    // Kept, with a rekey's seal set, before it is first sent. A copy kept
+    // already for this successor wins, and is what gets sent.
+    let kept = {
+        let mut db = database.lock().expect("container writer lock");
+        local(match &set {
+            Some(set) => db.stage_base_rekey(&copy, set),
+            None => db.stage_base_control(&copy),
+        })?
+    };
+    submit(shared, link, receiver, log, &kept).await
+}
+
+/// How far behind its own position the services take an event's seen
+/// claim, controls included: a rule they will enforce.
+pub(crate) const SEEN_WINDOW: u64 = 8192;
+
+fn window(shared: &Shared) -> u64 {
+    shared.tuning.seen_window.unwrap_or(SEEN_WINDOW)
+}
+
+/// Whether a seen claim at `seen` is further behind than `window` the
+/// position a control would order at now: after the `latest` head known.
+fn behind(window: u64, seen: u64, latest: u64) -> bool {
+    latest.saturating_add(1).saturating_sub(seen) > window
+}
+
+/// The base position `kept`'s seen claim names, read back with M.
+fn seen(shared: &Shared, log: LogId, kept: &BaseControl) -> Result<u64, Fail> {
+    let descriptor = local(OpaqueEvent::decode(&kept.descriptor))?;
+    let mut seen = None;
     shared
         .signer
-        .with_base_keys(BaseId(base), &mut |m, _| {
-            request = Some(shared.owner.prepare_account_change_copy(
-                shared.container,
-                &identity.anchor,
-                m,
-                original,
-            ));
+        .with_metadata_key(BaseId(log.id), &mut |m| {
+            seen = Some(bh_event::sealed_seen(&descriptor, m, BaseId(log.id)))
         })
         .map_err(|_| Fail::Authorization)?;
-    let request = match request.ok_or(Fail::Authorization)? {
-        Ok(request) => request,
-        Err(OwnerError::Stopped) => return Ok(false),
-        // This device is not in the base's copy of the account, or its
-        // authority is not current: another device must copy it.
-        Err(OwnerError::CopyRefused | OwnerError::Unbound | OwnerError::AnchorMismatch) => {
-            return Err(Fail::Authorization);
-        }
-        Err(_) => return Err(Fail::Local),
-    };
-    let signature = match shared
-        .signer
-        .sign_base_control(BaseControlRequest {
-            expected_key: *request.expected_key(),
-            message: request.signing_bytes().to_vec(),
-            copies: original.clone(),
-        })
-        .await
-    {
-        Ok(signature) => signature,
-        Err(ControlSignError::ConfirmationNeeded | ControlSignError::Unavailable) => {
-            return Err(Fail::Authorization);
-        }
-    };
-    let encoded = request.finish(signature).map_err(|_| Fail::Local)?;
-    // Kept before it is first sent. A copy kept already for this successor
-    // wins, and is what gets sent.
-    let kept = local(
-        database
-            .lock()
-            .expect("container writer lock")
-            .stage_base_control(&BaseControl {
-                base,
-                account_position: position,
-                event_id: encoded.descriptor.id().0,
-                descriptor: encoded.descriptor.encode(),
-                body: encoded.body,
-            }),
-    )?;
-    submit(shared, link, receiver, log, &kept).await
+    Ok(local(seen.ok_or(Fail::Authorization)?)?.position)
 }
 
 /// The staged addition, while it is the account's next event.
@@ -302,14 +581,20 @@ fn next_addition(shared: &Shared) -> Result<Option<StagedAdmission>, Fail> {
 }
 
 /// The keys of the one device `event` adds to `current`, its predecessor.
-fn added_keys(current: &VerifiedAccount, event: &[u8]) -> Result<DevicePublicKeys, Fail> {
-    let before: BTreeSet<_> = local(current.active_devices())?.map(|k| k.id()).collect();
-    let after = local(current.clone().applied(event))?;
-    let mut added = local(after.active_devices())?.filter(|k| !before.contains(&k.id()));
-    match (added.next(), added.next()) {
-        (Some(keys), None) => Ok(keys.clone()),
-        _ => Err(Fail::Local),
+fn added_keys(
+    current: &VerifiedAccount,
+    device: bh_account::DeviceId,
+    event: &[u8],
+) -> Result<DevicePublicKeys, Fail> {
+    let decoded = local(bh_account::AccountEvent::decode(event))?;
+    let keys = decoded.added_device_keys().ok_or(Fail::Local)?.clone();
+    let request = local(current.add_device(device, keys.clone()))?;
+    let message = request.signing_bytes();
+    if event.len() != message.len() + 64 || !event.starts_with(message) {
+        return Err(Fail::Local);
     }
+    local(request.finish(local(event[message.len()..].try_into())?))?;
+    Ok(keys)
 }
 
 /// Order a staged device addition on the account log: the exact signed
@@ -330,7 +615,7 @@ pub(crate) async fn order_addition(
         .signer
         .current_account()
         .map_err(|_| Fail::Authorization)?;
-    let recipient = added_keys(&current, &staged.event)?;
+    let recipient = added_keys(&current, identity.device, &staged.event)?;
     let body = local(delivery_body(&staged.delivery))?;
     let wrapped = local(account_log_wrap(&staged.event, Some(body.commitment())))?;
     let answer = {
@@ -343,6 +628,7 @@ pub(crate) async fn order_addition(
                     recipient,
                     frame: staged.delivery.clone(),
                 })),
+                attachment: None,
             })
             .await?
     };
@@ -381,7 +667,10 @@ pub(crate) async fn order_addition(
     match appended {
         Response::Acked { ack, .. } => {
             let ack = AppendAck::decode(&ack).map_err(|_| Fail::Network)?;
-            if ack.log != log || ack.event != wrapped.id() || ack.head.position != staged.position {
+            if ack.log != log
+                || ack.event != wrapped.publication_id(bh_sync::Route::Control)
+                || ack.head.position != staged.position
+            {
                 return Err(Fail::Network);
             }
             Ok(())
@@ -394,8 +683,9 @@ pub(crate) async fn order_addition(
     }
 }
 
-/// Send a kept copy, byte for byte: permits from the service, then stage and
-/// append. Its outcome is learned by reading the base log.
+/// Send a kept copy, byte for byte: permits from the service, then stage a
+/// rekey's kept seal set, stage the body and append. Its outcome is learned
+/// by reading the base log.
 async fn submit(
     shared: &Shared,
     link: &mut Link,
@@ -403,10 +693,17 @@ async fn submit(
     log: LogId,
     kept: &BaseControl,
 ) -> Result<bool, Fail> {
+    let database = local(shared.owner.shared_database(shared.container))?;
+    let seal_set = local(
+        database
+            .lock()
+            .expect("container writer lock")
+            .kept_seal_set(kept.event_id),
+    )?;
     let mut metadata = None;
     shared
         .signer
-        .with_base_keys(BaseId(log.id), &mut |m, _| {
+        .with_metadata_key(BaseId(log.id), &mut |m| {
             metadata = Some(MetadataKey::new(m))
         })
         .map_err(|_| Fail::Authorization)?;
@@ -435,7 +732,37 @@ async fn submit(
     };
     let [stage, append] = <[_; 2]>::try_from(items).map_err(|_| Fail::Network)?;
     let (stage, append) = (granted(stage)?, granted(append)?);
+    // A rekey's seal set is staged first: the append names it.
+    let set_stage = match &seal_set {
+        Some(set) => {
+            let object = BodyObject::new(set.clone()).map_err(|_| Fail::Local)?;
+            let answer = shared
+                .authz
+                .request(
+                    shared,
+                    ToService::Permits {
+                        items: vec![Want::Stage {
+                            log,
+                            body: object.commitment(),
+                            len: set.len() as u32,
+                        }],
+                    },
+                )
+                .await?;
+            Some((crate::puller::only(answer)?, set.clone()))
+        }
+        None => None,
+    };
     let data = link.data(shared).await?;
+    if let Some((permit, body)) = set_stage {
+        let staged = data
+            .ask(|id| Request::Stage { id, permit, body })
+            .await
+            .map_err(|_| Fail::Network)?;
+        if !matches!(staged, Response::Staged { .. }) {
+            return Err(Fail::from_response(&staged));
+        }
+    }
     let body = kept.body.clone();
     let staged = data
         .ask(|id| Request::Stage {
@@ -480,5 +807,57 @@ async fn submit(
             Err(Fail::Retry)
         }
         other => Err(Fail::from_response(&other)),
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn a_seen_claim_is_behind_only_past_the_window_at_the_next_position() {
+        // Ordered next at 8193, a claim at 1 is exactly 8192 behind.
+        assert!(!behind(SEEN_WINDOW, 1, 8192));
+        assert!(behind(SEEN_WINDOW, 1, 8193));
+        assert!(!behind(SEEN_WINDOW, 8193, 8193));
+        assert!(!behind(3, 5, 7));
+        assert!(behind(3, 4, 7));
+        assert!(!behind(SEEN_WINDOW, u64::MAX, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use bh_crypto::hash;
+    use bh_storage::DeviceDatabase;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_different_already_stored_original_cannot_advance_the_outer_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(
+            DeviceDatabase::open(dir.path().join("device.sqlite")).unwrap(),
+        ));
+        let account = AccountId([9; 32]);
+        let inner = AccountHead {
+            position: 2,
+            hash: hash(b"kept"),
+        };
+        db.lock()
+            .unwrap()
+            .commit_account_verified(account.0, &[b"genesis", b"kept"], 2, inner.hash, false)
+            .unwrap();
+        let journal = DeviceJournal::from_shared(db);
+        let originals: [&[u8]; 2] = [b"genesis", b"different"];
+        assert!(matches!(
+            matched_prefix(&journal, account, inner, 0, &originals),
+            Err(Fail::Network)
+        ));
+        let originals: [&[u8]; 2] = [b"genesis", b"kept"];
+        assert_eq!(
+            matched_prefix(&journal, account, inner, 0, &originals).unwrap(),
+            2
+        );
     }
 }

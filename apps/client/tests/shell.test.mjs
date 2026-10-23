@@ -29,8 +29,17 @@ test("shell bundles its assets and grants only Android main-window camera scan, 
     assert(name.endsWith(".json"), `capability ${name} must be JSON so the check can parse it`);
     const parsed = JSON.parse(await readFile(new URL(name, capabilitiesDir), "utf8"));
     for (const capability of capabilitiesIn(parsed)) {
-      const prefixes = { "shell.json": ["allow-note-", "allow-update-", "allow-window-sidebar"],
-        "signup.json": ["allow-account-", "allow-pairing-join"], "pairing.json": ["allow-pairing-", "allow-sync-status"],
+      const prefixes = { "shell.json": ["allow-note-", "allow-update-", "allow-window-sidebar", "allow-app-about"],
+        "signup.json": ["allow-account-screen", "allow-account-retry", "allow-account-suggest-password",
+          "allow-account-create", "allow-account-confirm-kit", "allow-account-return", "allow-account-open-note",
+          "allow-pairing-join", "allow-pairing-join-status", "allow-account-recover", "allow-account-check-code",
+          "allow-account-recovery-status"],
+        "pairing.json": ["allow-pairing-show", "allow-pairing-status", "allow-pairing-approve",
+          "allow-pairing-cancel", "allow-pairing-reconfirm", "allow-sync-status", "allow-devices-view",
+          "allow-devices-request-removal", "allow-devices-cancel-removal", "allow-devices-remove-now",
+          "allow-devices-remove-self", "allow-account-change-password", "allow-account-confirm-new-kit",
+          "allow-devices-kit-screen", "allow-account-print-kit", "allow-account-email-kit",
+          "allow-account-save-kit-file", "allow-alerts-list"],
         "scan.json": ["qr-scan:allow-request-permissions", "qr-scan:allow-scan", "qr-scan:allow-cancel"],
         "window.json": ["core:window:allow-start-dragging", "core:window:allow-internal-toggle-maximize"] }[name];
       if (name === "window.json") assert.deepEqual(capability.platforms, ["macOS"]);
@@ -39,7 +48,9 @@ test("shell bundles its assets and grants only Android main-window camera scan, 
         assert.deepEqual(capability.windows, ["main"]);
         assert.deepEqual(capability.permissions, ["qr-scan:allow-request-permissions", "qr-scan:allow-scan", "qr-scan:allow-cancel"]);
       }
-      for (const permission of capability.permissions) assert(prefixes.some((prefix) => permission.startsWith(prefix)), permission);
+      for (const permission of capability.permissions) {
+        assert(name === "shell.json" ? prefixes.some((prefix) => permission.startsWith(prefix)) : prefixes.includes(permission), permission);
+      }
       assert.equal(capability.remote, undefined);
     }
   }

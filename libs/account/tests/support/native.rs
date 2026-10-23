@@ -147,6 +147,29 @@ pub fn open_device(
     ))
 }
 
+pub fn open_rotation(
+    state: &VerifiedAccount,
+    body: &[u8],
+    keys: &DevicePublicKeys,
+    receiver: &KemKey,
+) -> Result<PersonalKey, Error> {
+    let device = StoredDevice {
+        handle: KeyHandle([1; 32]),
+        keys: keys.clone(),
+        policy: ControlKeyPolicy::CurrentBiometricsOnly,
+        kind: DeviceKeyStoreKind::MacDataProtectionKeychainV1,
+    };
+    ready(personal::open_rotation_for_device(
+        state,
+        body,
+        &device,
+        &mut SyntheticReceiver {
+            keys: keys.clone(),
+            receiver,
+        },
+    ))
+}
+
 pub fn open_for_receiver(
     state: &VerifiedAccount,
     envelope: &[u8],

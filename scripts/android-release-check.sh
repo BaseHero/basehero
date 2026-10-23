@@ -26,7 +26,8 @@ import zipfile
 
 apk, mode = sys.argv[1:]
 # Literal strings the emulator fixture compiles into the native library.
-FIXTURE = [b'EMULATOR FIXTURE', b'Create emulator test account']
+FIXTURE = [b'EMULATOR FIXTURE', b'Create emulator test account',
+           b'Create test account and show kit', 'TEST ONLY — Password: '.encode()]
 SYNTHETIC = [b'synthetic-attestation', b'synthetic_attestation', b'SYNTHETIC ATTESTATION']
 def entries():
     if zipfile.is_zipfile(apk):

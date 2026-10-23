@@ -2,6 +2,7 @@
 // window identity; the native session supplies the note ID, and native IPC
 // derives the actual calling WebView. No web storage or remote content.
 import { pairingButton, syncLine } from './pairing.js';
+import { devicesButton, openDevices } from './devices.js';
 const invoke = window.__TAURI_INTERNALS__?.invoke;
 if (invoke) {
   let boundNote = false, retryOpen, currentPage, currentNote, editor, closeLoad = () => {};
@@ -196,12 +197,15 @@ if (invoke) {
   // says it has one, never in a local-only build.
   const addDevice = pairingButton(invoke,icon('M3.5 1.5h6v13h-6z','M6 12.5h1','M12.5 5v5M10 7.5h5'));
   addDevice.hidden = true;
+  const devices = devicesButton(invoke);
+  devices.hidden = true;
+  window.__bhDevices = () => openDevices(invoke);
   tools.append(
     iconButton('New note',['⌘N','Ctrl+N'],icon('M8 2.5H2.5v11h11V8','M6.5 9.5l.5-2.5 6-6 2 2-6 6z'),newNote),
     iconButton('New window',['⌥⌘N','Ctrl+Alt+N'],icon('M1.5 4.5h10v9h-10z','M4.5 4.5v-3h10v9h-3'),newWindow),
-    addDevice);
+    addDevice, devices);
   // The same actions from the native menu (File, View) and their shortcuts.
-  const actions = {sidebar:()=>setSidebar(!sidebarVisible()), 'new-note':newNote, 'new-window':newWindow};
+  const actions = {sidebar:()=>setSidebar(!sidebarVisible()), 'new-note':newNote, 'new-window':newWindow,devices:()=>openDevices(invoke)};
   window.__bhMenu = action => {
     if (!workspace || !Object.hasOwn(actions, action)) return 'ignored';
     void actions[action]();
@@ -238,6 +242,7 @@ if (invoke) {
   // The network's view of this account, apart from the editor's local save.
   const line = syncLine(cloud, invoke, view => {
     addDevice.hidden = !(view.network === 'on' && view.account === 'active');
+    devices.hidden = view.account !== 'active';
   });
   cloud.append(icon('M4.5 12.5h7a3 3 0 00.4-6A4 4 0 004.4 6 3.3 3.3 0 004.5 12.5z'), ...line.nodes);
   let preference;

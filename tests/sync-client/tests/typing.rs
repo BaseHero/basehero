@@ -60,7 +60,7 @@ async fn two(hosted: &Arc<Hosted>) -> (Device, Started, Device, Started) {
         mac.registered() && mac.progress().position >= 1
     })
     .await;
-    let fold = Device::join(&mac, hosted);
+    let fold = Device::join(&mac, hosted).await;
     until(60, "addition copied", || copied(&mac) == 4).await;
     let fold_client = fold.start(hosted);
     until(60, "joined device caught up", || {

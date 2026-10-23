@@ -152,7 +152,7 @@ class MacPackageTests(unittest.TestCase):
         endpoint = self.root / 'endpoint.json'
         endpoint.write_text(json.dumps({'edge_url': 'https://edge.invalid', 'hosting_root': '11' * 32,
                                        'app_root': '22' * 32, 'policy': '', 'policy_signature': '',
-                                       'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
+                                       'recovery_key': '03', 'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
                                        'build_floor': 1, 'appraisal': 'hardware'}) + '\n')
         env = {'BH_TEST_ENDPOINT': str(endpoint),"PATH": str(tools) + os.pathsep + os.environ["PATH"],
                "CARGO_TARGET_DIR": str(self.root / "inherited-target"),

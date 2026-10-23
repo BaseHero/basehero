@@ -192,7 +192,7 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
                 JValue::Object(&arrays[0]),
                 JValue::Long(id),
             ],
-            "retirePending" => vec![
+            "retirePending" | "deleteKeys" => vec![
                 JValue::Object(activity.as_obj()),
                 JValue::Object(&h),
                 JValue::Long(id),
@@ -202,7 +202,7 @@ fn call(method: &str, roles: &[&[u8]], handle: Option<&str>, role: Option<&str>)
         let sig = match method {
             "create" => "(Landroid/app/Activity;Ljava/lang/String;[B[B[BJ)V",
             "readOrdinary" => "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;J)V",
-            "readControl" | "readControlPublic" | "retirePending" => {
+            "readControl" | "readControlPublic" | "retirePending" | "deleteKeys" => {
                 "(Landroid/app/Activity;Ljava/lang/String;J)V"
             }
             _ => "(Landroid/app/Activity;Ljava/lang/String;[BJ)V",
@@ -380,6 +380,15 @@ impl DeviceKeyStore for AndroidKeyStore {
     }
 }
 
+impl AndroidKeyStore {
+    /// Delete this device's Keystore aliases and encrypted records. An already
+    /// absent alias or file succeeds; a real failure propagates so the caller
+    /// keeps its erasure marker.
+    pub fn erase_keys(&self, handle: KeyHandle) -> Result<(), KeyStoreError> {
+        call("deleteKeys", &[], Some(&handle_name(&handle)), None).map(drop)
+    }
+}
+
 /// Each seal creates its own no-auth Keystore key named in the blob
 /// (`pending::frame`); opening never creates a replacement key.
 #[derive(Clone, Copy, Default)]
@@ -431,6 +440,17 @@ impl PendingSetupProtector for AndroidPendingSetupProtector {
             return Err(ProtectorError::Failed);
         }
         seal_with_fresh_key(pending::HOME, Some(&old.key), plaintext)
+    }
+    fn retire_key(&mut self, blob: &[u8]) -> Result<(), ProtectorError> {
+        let blob = pending::parse(blob)?;
+        call(
+            "retirePending",
+            &[],
+            Some(&handle_name(&KeyHandle(blob.key))),
+            None,
+        )
+        .map(drop)
+        .map_err(protector_error)
     }
     fn retire_kit_key(&mut self, saved: &[u8]) -> Result<(), ProtectorError> {
         let saved = pending::parse(saved)?;

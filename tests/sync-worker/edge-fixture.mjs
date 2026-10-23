@@ -118,6 +118,7 @@ export class SlowLog extends LogObject {
   }
   async read(...args) { this.calls.read++; return this.#held('read', await super.read(...args)); }
   async controls(...args) { return this.#held('controls', await super.controls(...args)); }
+  async readDirectory(...args) { return this.#held('readDirectory', await super.readDirectory(...args)); }
   async #held(method, result) {
     await sleep(this.holds[method] ?? 0);
     return result;

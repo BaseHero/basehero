@@ -19,7 +19,8 @@
       "update_status",
       "update_not_now",
       "update_install",
-      "window_sidebar"
+      "window_sidebar",
+      "app_about"
     ]
   },
   "basehero-client-setup": {
@@ -33,12 +34,12 @@
       "account_create",
       "account_confirm_kit",
       "account_return",
-      "account_print_kit",
-      "account_email_kit",
-      "account_save_kit_file",
       "account_open_note",
       "pairing_join",
-      "pairing_join_status"
+      "pairing_join_status",
+      "account_recover",
+      "account_check_code",
+      "account_recovery_status"
     ]
   },
   "basehero-client-pairing": {
@@ -52,7 +53,19 @@
       "pairing_approve",
       "pairing_cancel",
       "pairing_reconfirm",
-      "sync_status"
+      "sync_status",
+      "devices_view",
+      "devices_request_removal",
+      "devices_cancel_removal",
+      "devices_remove_now",
+      "devices_remove_self",
+      "account_change_password",
+      "account_confirm_new_kit",
+      "devices_kit_screen",
+      "account_print_kit",
+      "account_email_kit",
+      "account_save_kit_file",
+      "alerts_list"
     ]
   },
   "basehero-client-camera-scan": {

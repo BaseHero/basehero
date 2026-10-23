@@ -47,7 +47,7 @@ fn validate_with_compose(
 
 fn validate(input: &serde_json::Value) -> Result<String, &'static str> {
     use bh_confidential_policy::{Limits, PolicyGate};
-    use bh_crypto::{Secret, SigningKey};
+    use bh_crypto::{KemKey, Secret, SigningKey};
     let text = serde_json::to_string(&input["endpoint"]).map_err(|_| "endpoint required")?;
     let fields = endpoint::built(Some(&text), false)
         .map_err(|_| "app endpoint rejected")?
@@ -68,6 +68,20 @@ fn validate(input: &serde_json::Value) -> Result<String, &'static str> {
     }
     bh_sync::permit::verify_certificate(&fields.hosting_root, &certificate)
         .map_err(|_| "permit certificate/root/version/signature mismatch")?;
+    let recovery_seed = hex_file(files, "recovery_key")?;
+    if recovery_seed.len() != 32 {
+        return Err("recovery seed must be 32 bytes");
+    }
+    let recovery_key =
+        KemKey::from_seed(&Secret::from_slice(&recovery_seed).map_err(|_| "recovery seed")?);
+    let recovery_bytes = hex_file(files, "recovery_cert")?;
+    let recovery_cert = bh_sync::evidence::RecoveryKeyCertificate::decode(&recovery_bytes)
+        .map_err(|_| "recovery certificate encoding/length/version")?;
+    bh_authz::RecoveryHomeKey::new(recovery_key, recovery_cert, &fields.hosting_root)
+        .map_err(|_| "recovery key/certificate/root mismatch")?;
+    if recovery_bytes != fields.recovery_key {
+        return Err("runtime recovery certificate differs from app endpoint");
+    }
     let receipt = hex_file(&input["cloudflare"], "receipt_cert_file")?;
     bh_sync::receipt::verify_certificate(&fields.hosting_root, &receipt)
         .map_err(|_| "receipt certificate/root mismatch")?;
@@ -157,12 +171,13 @@ mod tests {
     use super::*;
 
     fn fixture(dir: &std::path::Path) -> serde_json::Value {
-        use bh_crypto::{Secret, SigningKey};
+        use bh_crypto::{KemKey, Secret, SigningKey};
         let key = |byte| SigningKey::from_seed(&Secret::from_slice(&[byte; 32]).unwrap());
         let hosting = key(31);
         let app = key(32);
         let permit = key(33);
         let receipt = key(34);
+        let recovery = KemKey::from_seed(&Secret::from_slice(&[38; 32]).unwrap());
         let policy = serde_json::json!({
             "version": 1, "generation": 1, "issued_at": 1, "expires_at": 100,
             "builds": [{"role": "checker", "compose_sha256": vec![35; 32],
@@ -172,9 +187,14 @@ mod tests {
         .into_bytes();
         let signature =
             app.sign(&[b"basehero.confidential-policy.v1\0".as_slice(), &policy].concat());
+        let recovery_cert = hex::encode(
+            bh_sync::evidence::certify_recovery_key(&hosting, &recovery.public()).encode(),
+        );
         let mut files = serde_json::Map::new();
         for (name, bytes) in [
             ("permit_key", hex::encode([33; 32]).into_bytes()),
+            ("recovery_key", hex::encode([38; 32]).into_bytes()),
+            ("recovery_cert", recovery_cert.clone().into_bytes()),
             (
                 "permit_cert",
                 hex::encode(bh_sync::permit::certify(&hosting, permit.public())).into_bytes(),
@@ -208,7 +228,7 @@ mod tests {
                 "time_config": [1000000000u64, 100, 1000000, 120000000000u64, 1000]},
             "endpoint": {"edge_url": "https://edge.invalid", "hosting_root": hex::encode(hosting.public()),
                 "app_root": hex::encode(app.public()), "policy": hex::encode(policy), "policy_signature": hex::encode(signature),
-                "max_lifetime_secs": 1000, "max_uncertainty_secs": 30, "build_floor": 1, "appraisal": "hardware"}
+                "recovery_key": recovery_cert, "max_lifetime_secs": 1000, "max_uncertainty_secs": 30, "build_floor": 1, "appraisal": "hardware"}
         })
     }
 
@@ -252,6 +272,58 @@ mod tests {
             validate(&good).is_err(),
             "receipt-domain certificate is not a permit certificate"
         );
+    }
+
+    #[test]
+    fn recovery_certificate_matches_runtime_key_and_pinned_root() {
+        use bh_crypto::{KemKey, Secret, SigningKey};
+        let temp = tempfile::tempdir().unwrap();
+        let good = fixture(temp.path());
+        assert!(validate(&good).is_ok());
+        let cert = temp.path().join("recovery_cert");
+        let seed = temp.path().join("recovery_key");
+        std::fs::write(&seed, hex::encode([39; 32])).unwrap();
+        assert!(validate(&good).is_err(), "wrong recovery seed");
+        std::fs::write(&seed, hex::encode([38; 32])).unwrap();
+        let other_root = SigningKey::from_seed(&Secret::from_slice(&[40; 32]).unwrap());
+        let recovery = KemKey::from_seed(&Secret::from_slice(&[38; 32]).unwrap());
+        std::fs::write(
+            &cert,
+            hex::encode(
+                bh_sync::evidence::certify_recovery_key(&other_root, &recovery.public()).encode(),
+            ),
+        )
+        .unwrap();
+        assert!(validate(&good).is_err(), "wrong recovery certificate root");
+        let hosting = SigningKey::from_seed(&Secret::from_slice(&[31; 32]).unwrap());
+        let other_key = KemKey::from_seed(&Secret::from_slice(&[39; 32]).unwrap());
+        std::fs::write(
+            &cert,
+            hex::encode(
+                bh_sync::evidence::certify_recovery_key(&hosting, &other_key.public()).encode(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            validate(&good).is_err(),
+            "mismatched recovery certificate key"
+        );
+        std::fs::write(&cert, "00").unwrap();
+        assert!(
+            validate(&good).is_err(),
+            "invalid recovery certificate length"
+        );
+        std::fs::remove_file(&seed).unwrap();
+        assert!(validate(&good).is_err(), "missing recovery seed");
+        // The app's endpoint names another key the root certified.
+        let good = fixture(temp.path());
+        let mut bad = good.clone();
+        bad["endpoint"]["recovery_key"] = hex::encode(
+            bh_sync::evidence::certify_recovery_key(&hosting, &other_key.public()).encode(),
+        )
+        .into();
+        assert!(validate_prepare(&bad).is_ok());
+        assert!(validate(&bad).is_err(), "endpoint recovery key differs");
     }
 
     #[test]
@@ -434,10 +506,12 @@ mod tests {
         );
         for name in ["endpoint.json", "compose.json", "wrangler.json"] {
             let rendered = std::fs::read_to_string(output.join("config").join(name)).unwrap();
-            assert!(
-                !rendered.contains(&hex::encode([33; 32])),
-                "permit seed leaked into {name}"
-            );
+            for (seed, label) in [([33; 32], "permit"), ([38; 32], "recovery")] {
+                assert!(
+                    !rendered.contains(&hex::encode(seed)),
+                    "{label} seed leaked into {name}"
+                );
+            }
         }
         let checked = std::process::Command::new("python3")
             .arg(&script)

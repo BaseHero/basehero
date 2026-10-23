@@ -2,27 +2,26 @@
 //! before it is first sent, and only verified history settles it.
 use bh_account::{AccountId, DeviceId, Head as AccountHead};
 use bh_crypto::{Secret, SigningKey};
-use bh_event::{Binding, CLASS_CONTENT, Encoded, NOTE, Payload, key_id, seal};
+use bh_event::{Binding, CLASS_CONTROL, Encoded, NOTE, Payload, key_id, seal};
 use bh_storage::{
     DeviceDatabase, StoreError,
     sync_state::{BaseControl, ControlOutcome},
 };
-use bh_sync::{EventId, Head};
+use bh_sync::{EventId, Head, Route};
 
 const BASE: [u8; 32] = [1; 32];
 
 /// Test-only sealed bytes: storage keeps them opaque and never judges them.
 fn sealed(id: u8) -> Encoded {
     let metadata = Secret::from_slice(&[4; 32]).unwrap();
-    let content = Secret::from_slice(&[5; 32]).unwrap();
     seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: BASE,
             audience: [0; 32],
-            epoch: key_id(&content),
+            epoch: key_id(&metadata),
             event_id: EventId([id; 32]),
             account: AccountId([6; 32]),
             device: DeviceId([7; 32]),
@@ -32,7 +31,7 @@ fn sealed(id: u8) -> Encoded {
             },
             seen: Head::EMPTY,
             seen_control: [0; 32],
-            class: CLASS_CONTENT,
+            class: CLASS_CONTROL,
             padded: 0,
             commitment: [0; 32],
             seen_receipt: [0; bh_sync::receipt::RECEIPT_LEN],
@@ -43,7 +42,7 @@ fn sealed(id: u8) -> Encoded {
         },
         &SigningKey::generate(),
         &metadata,
-        Some(&content),
+        None,
     )
     .unwrap()
 }
@@ -53,7 +52,7 @@ fn control(position: u64, id: u8) -> BaseControl {
     BaseControl {
         base: BASE,
         account_position: position,
-        event_id: [id; 32],
+        event_id: encoded.descriptor.publication_id(Route::Control).0,
         descriptor: encoded.descriptor.encode(),
         body: encoded.body,
     }
@@ -163,4 +162,96 @@ fn unaccepted_counts_acked_work_until_accepted() {
     .unwrap();
     let summary = db.outbox_summary().unwrap();
     assert_eq!((summary.unacknowledged, summary.unaccepted), (0, 1));
+}
+
+#[test]
+fn a_stale_kept_control_is_replaced_only_while_unsettled_and_as_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.db");
+    let first = control(4, 0x71);
+    let fresh = control(4, 0x72);
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    db.stage_base_control(&first).unwrap();
+    // Only the kept bytes as read are replaced, by a valid copy of the same
+    // successor; anything else keeps what is kept.
+    let mut other = control(5, 0x73);
+    assert!(matches!(
+        db.replace_base_control(&first, &other, None),
+        Err(StoreError::InvalidPackage)
+    ));
+    other.account_position = 4;
+    other.event_id = [0x74; 32];
+    assert!(matches!(
+        db.replace_base_control(&first, &other, None),
+        Err(StoreError::InvalidPackage)
+    ));
+    assert_eq!(
+        db.replace_base_control(&fresh, &first, None).unwrap(),
+        first
+    );
+    assert_eq!(
+        db.replace_base_control(&first, &fresh, None).unwrap(),
+        fresh
+    );
+    drop(db);
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.pending_base_control(BASE).unwrap(), Some(fresh.clone()));
+    // A second replacement from the old bytes finds the fresh copy kept.
+    assert_eq!(
+        db.replace_base_control(&first, &control(4, 0x75), None)
+            .unwrap(),
+        fresh
+    );
+    // Settled, it stays as evidence and is never replaced.
+    db.settle_base_control(BASE, 4, fresh.event_id, ControlOutcome::Committed)
+        .unwrap();
+    assert_eq!(
+        db.replace_base_control(&fresh, &control(4, 0x76), None)
+            .unwrap(),
+        fresh
+    );
+    assert_eq!(
+        db.base_control_outcome(BASE, 4).unwrap(),
+        Some(Some(ControlOutcome::Committed))
+    );
+}
+
+/// A rekey is kept with its exact seal set in one transaction; a stale one
+/// is replaced, set and all, and the old set is gone with it.
+#[test]
+fn a_kept_rekey_keeps_its_seal_set_and_is_replaced_with_its_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rekey.db");
+    let rekey = control(6, 0x81);
+    let set = vec![0x11; 4096];
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    assert!(matches!(
+        db.stage_base_rekey(&rekey, &[1, 2, 3]),
+        Err(StoreError::InvalidPackage)
+    ));
+    assert_eq!(db.kept_seal_set(rekey.event_id).unwrap(), None);
+    assert_eq!(db.stage_base_rekey(&rekey, &set).unwrap(), rekey);
+    // Another rekey for the same successor keeps the first and its set.
+    let other = control(6, 0x82);
+    assert_eq!(db.stage_base_rekey(&other, &[0x22; 4096]).unwrap(), rekey);
+    assert_eq!(db.kept_seal_set(other.event_id).unwrap(), None);
+    drop(db);
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.pending_base_control(BASE).unwrap(), Some(rekey.clone()));
+    assert_eq!(db.kept_seal_set(rekey.event_id).unwrap(), Some(set.clone()));
+    let fresh = control(6, 0x83);
+    let fresh_set = vec![0x33; 4096];
+    assert_eq!(
+        db.replace_base_control(&rekey, &fresh, Some(&fresh_set))
+            .unwrap(),
+        fresh
+    );
+    assert_eq!(db.kept_seal_set(rekey.event_id).unwrap(), None);
+    assert_eq!(db.kept_seal_set(fresh.event_id).unwrap(), Some(fresh_set));
+    // A run replacing a run keeps no set.
+    let run = control(7, 0x84);
+    db.stage_base_control(&run).unwrap();
+    let newer = control(7, 0x85);
+    db.replace_base_control(&run, &newer, None).unwrap();
+    assert_eq!(db.kept_seal_set(newer.event_id).unwrap(), None);
 }

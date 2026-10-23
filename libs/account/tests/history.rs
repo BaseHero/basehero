@@ -652,3 +652,425 @@ fn consumed_application_refuses_the_same_errors_as_mutable_application() {
     );
     assert_eq!(stopped.applied(&valid).err(), Some(Error::Stopped));
 }
+
+fn signed(request: bh_account::SigningRequest, key: &SigningKey) -> Vec<u8> {
+    request
+        .finish(key.sign(request.signing_bytes()))
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+/// A native journal holding a signed-up Mac with complete materials and the
+/// Fold, all untimed, and the indexed view at its head.
+fn journaled(
+    path: &std::path::Path,
+) -> (
+    bh_account::storage::DeviceJournal,
+    Device,
+    Device,
+    bh_account::recovery::RecoveryKeys,
+    VerifiedAccount,
+) {
+    use bh_account::journal::AccountJournal;
+    let mut journal = bh_account::storage::DeviceJournal::open(path).unwrap();
+    let (mac, fold) = (Device::new(), Device::new());
+    let recovery = bh_account::recovery::RecoveryKeys::generate();
+    let genesis = signed(
+        AccountEvent::genesis(mac.public.clone(), recovery.public()),
+        &mac.control,
+    );
+    let id = AccountId(hash(&genesis));
+    let head = bh_account::Head {
+        position: 1,
+        hash: hash(&genesis),
+    };
+    journal
+        .commit_verified(id, &[&genesis], head, false)
+        .unwrap();
+    let mut acct = journal.load_projection().unwrap().unwrap().account;
+    let mut events = Vec::new();
+    let record = signed(
+        acct.prepare_recovery_record(mac.public.id(), [3; 32])
+            .unwrap(),
+        &mac.control,
+    );
+    acct.apply(&record).unwrap();
+    events.push(record);
+    let personal = signed(
+        acct.publish_personal_key(
+            mac.public.id(),
+            KemKey::generate().public(),
+            [4; 32],
+            [5; 32],
+        )
+        .unwrap(),
+        &mac.control,
+    );
+    acct.apply(&personal).unwrap();
+    events.push(personal);
+    let add = signed(
+        acct.add_device(mac.public.id(), fold.public.clone())
+            .unwrap(),
+        &mac.control,
+    );
+    acct.apply(&add).unwrap();
+    events.push(add);
+    let acct = commit(&mut journal, acct, &events);
+    (journal, mac, fold, recovery, acct)
+}
+
+/// Commit as the owner does, returning the view rebased on the stored index.
+fn commit(
+    journal: &mut bh_account::storage::DeviceJournal,
+    acct: VerifiedAccount,
+    events: &[Vec<u8>],
+) -> VerifiedAccount {
+    commit_timed(journal, acct, events, &vec![None; events.len()])
+}
+
+fn commit_timed(
+    journal: &mut bh_account::storage::DeviceJournal,
+    acct: VerifiedAccount,
+    events: &[Vec<u8>],
+    times: &[Option<bh_account::ConfirmedTime>],
+) -> VerifiedAccount {
+    use bh_account::journal::AccountJournal;
+    let refs: Vec<_> = events.iter().map(Vec::as_slice).collect();
+    let evidence: Vec<_> = times
+        .iter()
+        .map(|time| time.map(|time| (time, b"verified confirmation fixture".to_vec())))
+        .collect();
+    journal
+        .commit_timed_fenced(
+            acct.id(),
+            &refs,
+            &evidence,
+            acct.head(),
+            false,
+            Some(&acct),
+            |ok| assert!(ok),
+        )
+        .unwrap();
+    journal.rebase_projection(acct).unwrap()
+}
+
+#[test]
+fn projection_round_trips_pending_effects_and_times() {
+    use bh_account::journal::AccountJournal;
+    use bh_account::{
+        ConfirmedTime, DeviceState, REMOVAL_WAIT_MS as W, RequestState, RotationReason,
+        recovery::RecoveryKeys,
+    };
+    let t = |earliest_ms, latest_ms| {
+        Some(ConfirmedTime {
+            earliest_ms,
+            latest_ms,
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut journal, mac, fold, _, mut acct) = journaled(&dir.path().join("account.sqlite"));
+    let (phone, tablet) = (Device::new(), Device::new());
+    let next = RecoveryKeys::generate();
+    let mut events = Vec::new();
+    let mut times = Vec::new();
+    let mut step = |acct: &mut VerifiedAccount, bytes: Vec<u8>, time| {
+        acct.apply_timed(&bytes, time).unwrap();
+        events.push(bytes);
+        times.push(time);
+        acct.head().position
+    };
+    let bytes = signed(
+        acct.add_device(mac.public.id(), phone.public.clone())
+            .unwrap(),
+        &mac.control,
+    );
+    step(&mut acct, bytes, t(0, 0));
+    let bytes = signed(
+        acct.add_device(mac.public.id(), tablet.public.clone())
+            .unwrap(),
+        &mac.control,
+    );
+    step(&mut acct, bytes, t(50, 60));
+    let bytes = signed(
+        acct.request_removal(mac.public.id(), fold.public.id())
+            .unwrap(),
+        &mac.control,
+    );
+    let pending = step(&mut acct, bytes, t(100, 100));
+    let bytes = signed(
+        acct.replace_recovery(mac.public.id(), next.public(), [6; 32], [7; 32])
+            .unwrap(),
+        &mac.control,
+    );
+    let replaced = step(&mut acct, bytes, t(110, 110));
+    let bytes = signed(
+        acct.request_removal(mac.public.id(), phone.public.id())
+            .unwrap(),
+        &mac.control,
+    );
+    let cancelled = step(&mut acct, bytes, t(120, 120));
+    let bytes = acct
+        .cancel_removal_by_recovery(cancelled)
+        .unwrap()
+        .finish_with_recovery(&next)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    step(&mut acct, bytes, t(130, 130));
+    commit_timed(&mut journal, acct.clone(), &events, &times);
+
+    let loaded = journal.load_projection().unwrap().unwrap().account;
+    assert_eq!(loaded.head(), acct.head(), "the stored view, not a rebuild");
+    // How a request ended is kept only while the projection is loaded.
+    assert_eq!(
+        acct.request_state(cancelled, 200),
+        Ok(RequestState::Cancelled)
+    );
+    assert_eq!(
+        loaded.request_state(cancelled, 200),
+        Ok(RequestState::Resolved)
+    );
+    for view in [&acct, &loaded] {
+        assert_eq!(view.pending_removals(200), acct.pending_removals(200));
+        assert_eq!(view.pending_removals(200).len(), 1);
+        assert_eq!(
+            view.request_state(pending, 200),
+            Ok(RequestState::Pending {
+                deadline_ms: 100 + W
+            })
+        );
+        assert_eq!(
+            view.rotation_due(200),
+            Some(RotationReason::RecoveryReplaced { position: replaced })
+        );
+        assert_eq!(
+            view.device_state(fold.public.id(), 100 + W),
+            Ok(DeviceState::Removed)
+        );
+        assert!(view.recovery_keys().unwrap() == &next.public());
+        assert_eq!(view.record_digest(), Ok([6; 32]));
+        // Devices from before the first confirmed entry mature from it.
+        assert_eq!(view.added_at(mac.public.id()), Some(0));
+        assert_eq!(view.added_at(phone.public.id()), Some(0));
+        // The last confirmed bounds persist: times never go backwards, and
+        // every later entry needs a confirmation.
+        let more = signed(
+            view.add_device(mac.public.id(), Device::new().public)
+                .unwrap(),
+            &mac.control,
+        );
+        assert_eq!(
+            view.clone().apply_timed(&more, t(129, 140)),
+            Err(Error::TimeRegressed)
+        );
+        assert_eq!(
+            view.clone().apply_timed(&more, None),
+            Err(Error::MissingTime)
+        );
+        view.clone().apply_timed(&more, t(130, 130)).unwrap();
+        // Personal keys stay used keys, the current one and, after a
+        // rotation, the one it replaced.
+        let initial = *view.personal_public().unwrap();
+        let reusing = |receiving| {
+            DevicePublicKeys::new(
+                SigningKey::generate().public(),
+                SigningKey::generate().public(),
+                receiving,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            view.add_device(mac.public.id(), reusing(initial)).err(),
+            Some(Error::KeyReuse)
+        );
+        let mut rotated = view.clone();
+        let rotation = signed(
+            rotated
+                .rotate_personal(
+                    mac.public.id(),
+                    replaced,
+                    KemKey::generate().public(),
+                    [8; 32],
+                    [9; 32],
+                )
+                .unwrap(),
+            &mac.ordinary,
+        );
+        rotated.apply_timed(&rotation, t(130, 130)).unwrap();
+        assert_eq!(rotated.rotation_due(200), None);
+        assert_eq!(
+            rotated.add_device(mac.public.id(), reusing(initial)).err(),
+            Some(Error::KeyReuse)
+        );
+    }
+    assert_eq!(acct.added_at(tablet.public.id()), Some(60));
+    assert_eq!(loaded.added_at(tablet.public.id()), Some(60));
+    assert!(loaded.is_mature(tablet.public.id(), 60 + W));
+}
+
+#[test]
+fn a_summary_from_before_confirmed_times_loads_with_none() {
+    use bh_account::journal::AccountJournal;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let (journal, mac, _, _, acct) = journaled(&path);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let mut summary: Vec<u8> = raw
+        .query_row("SELECT summary FROM account_projection", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(&summary[..8], b"BHACSM02");
+    // The earlier summary is this one's prefix under its own magic.
+    summary.truncate(2602);
+    summary[..8].copy_from_slice(b"BHACSM01");
+    raw.execute("UPDATE account_projection SET summary=?1", [&summary])
+        .unwrap();
+    let loaded = journal.load_projection().unwrap().unwrap().account;
+    assert_eq!(loaded.head(), acct.head(), "the stored view, not a rebuild");
+    assert!(loaded.pending_removals(0).is_empty());
+    assert_eq!(loaded.rotation_due(u64::MAX), None);
+    assert_eq!(loaded.added_at(mac.public.id()), None);
+    assert_eq!(loaded.record_digest(), Ok([3; 32]));
+    let more = signed(
+        loaded
+            .add_device(mac.public.id(), Device::new().public)
+            .unwrap(),
+        &mac.control,
+    );
+    loaded.clone().apply_timed(&more, None).unwrap();
+}
+
+#[test]
+fn resolved_outcomes_are_not_in_the_summary() {
+    use bh_account::journal::AccountJournal;
+    use bh_account::{ConfirmedTime, RequestState};
+    let t = |ms| {
+        Some(ConfirmedTime {
+            earliest_ms: ms,
+            latest_ms: ms,
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let (mut journal, mac, fold, recovery, mut acct) = journaled(&path);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let size = || {
+        raw.query_row("SELECT length(summary) FROM account_projection", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let before = size();
+    let mut events = Vec::new();
+    let mut first = None;
+    for i in 0..1000 {
+        let request = signed(
+            acct.request_removal(mac.public.id(), fold.public.id())
+                .unwrap(),
+            &mac.control,
+        );
+        acct.apply_timed(&request, t(10 + 2 * i)).unwrap();
+        let position = acct.head().position;
+        first.get_or_insert(position);
+        let cancel = acct
+            .cancel_removal_by_recovery(position)
+            .unwrap()
+            .finish_with_recovery(&recovery)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        acct.apply_timed(&cancel, t(11 + 2 * i)).unwrap();
+        events.extend([request, cancel]);
+    }
+    let first = first.unwrap();
+    let times: Vec<_> = (10..2010).map(t).collect();
+    commit_timed(&mut journal, acct.clone(), &events, &times);
+    assert_eq!(size(), before);
+    assert_eq!(acct.request_state(first, 5000), Ok(RequestState::Cancelled));
+    let loaded = journal.load_projection().unwrap().unwrap().account;
+    assert_eq!(loaded.head(), acct.head(), "the stored view, not a rebuild");
+    assert_eq!(
+        loaded.request_state(first, 5000),
+        Ok(RequestState::Resolved)
+    );
+    assert!(loaded.pending_removals(5000).is_empty());
+}
+
+#[test]
+fn a_new_kit_supersedes_an_unrotated_kit_change() {
+    use bh_account::{ConfirmedTime, RotationReason, recovery::RecoveryKeys};
+    let t = |ms| {
+        Some(ConfirmedTime {
+            earliest_ms: ms,
+            latest_ms: ms,
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let (mut journal, mac, _, _, mut acct) = journaled(&path);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let size = || {
+        raw.query_row("SELECT length(summary) FROM account_projection", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let replace = |acct: &mut VerifiedAccount, ms| {
+        let bytes = signed(
+            acct.replace_recovery(
+                mac.public.id(),
+                RecoveryKeys::generate().public(),
+                [6; 32],
+                [7; 32],
+            )
+            .unwrap(),
+            &mac.control,
+        );
+        acct.apply_timed(&bytes, t(ms)).unwrap();
+        (bytes, acct.head().position)
+    };
+    let rotate = |acct: &VerifiedAccount, reason| {
+        let bytes = signed(
+            acct.rotate_personal(
+                mac.public.id(),
+                reason,
+                KemKey::generate().public(),
+                [8; 32],
+                [9; 32],
+            )
+            .unwrap(),
+            &mac.ordinary,
+        );
+        let mut rotated = acct.clone();
+        rotated.apply_timed(&bytes, t(5000)).map(|()| rotated)
+    };
+
+    let (bytes, first) = replace(&mut acct, 10);
+    let acct = commit_timed(&mut journal, acct, &[bytes], &[t(10)]);
+    let single = size();
+    let mut acct = acct;
+    let (bytes, second) = replace(&mut acct, 11);
+    let mut events = vec![bytes];
+    // Only the latest kit is due; the rotation seals to it alone.
+    assert_eq!(
+        acct.rotation_due(5000),
+        Some(RotationReason::RecoveryReplaced { position: second })
+    );
+    assert_eq!(rotate(&acct, first).err(), Some(Error::NotPermitted));
+    let rotated = rotate(&acct, second).unwrap();
+    assert_eq!(rotated.rotation_due(5000), None);
+
+    for i in 2..1000 {
+        let (bytes, _) = replace(&mut acct, 10 + i);
+        events.push(bytes);
+    }
+    let times: Vec<_> = (11..1010).map(t).collect();
+    let acct = commit_timed(&mut journal, acct, &events, &times);
+    assert_eq!(size(), single, "one outstanding kit change");
+    assert_eq!(
+        acct.rotation_due(5000),
+        Some(RotationReason::RecoveryReplaced {
+            position: acct.head().position
+        })
+    );
+}

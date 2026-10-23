@@ -8,6 +8,7 @@
 
 use crate::crypto::{Secret, SecretBytes};
 use crate::history::{AccountId, DevicePublicKeys, Head, VerifiedAccount};
+use crate::trust::ConfirmedTime;
 
 /// Exact signed admission and signed recipient-encrypted delivery. The event's
 /// one-based position and predecessor are checked by the account layer, never
@@ -20,7 +21,54 @@ pub struct StagedAdmission {
     pub delivery: Vec<u8>,
 }
 
+/// One exact signed trust control staged before its order, and what its
+/// submission carries. `kind` is the control's tag in `event`. A recovery
+/// replacement (kind 8) and a personal rotation (kind 9) both carry the raw
+/// recovery seal as `attachment`; `body` is the replacement's recovery
+/// record (8) or the rotation's exact raw device-seal frame (9). A
+/// replacement's `sealed_kit` is its new code, sealed by the pending-setup
+/// protector, until the person saves the kit; it is not sent while present.
+/// Other controls carry nothing.
+/// Nothing staged is accepted: the owner settles it only from verified history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedControl {
+    pub kind: u8,
+    pub event: Vec<u8>,
+    pub body: Option<Vec<u8>>,
+    pub attachment: Option<Vec<u8>>,
+    pub sealed_kit: Option<Vec<u8>>,
+}
+
 use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle};
+
+/// One held base root, sealed locally to the accepted personal key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyringRow {
+    pub base: [u8; 32],
+    pub key_id: [u8; 32],
+    pub purpose: crate::local_seal::LocalKeyPurpose,
+    pub seal: Vec<u8>,
+}
+
+/// The durable evidence of the personal key this device accepted, opened
+/// again at its own verified position.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AcceptedPersonal {
+    /// The first device's initial seal.
+    Initial,
+    /// The delivery this device's addition carried.
+    Delivered { added_at: u64, frame: Vec<u8> },
+    /// An accepted rotation's ordered device-seal body.
+    Rotated { position: u64, body: Vec<u8> },
+}
+
+/// What accepting a rotation read and compares at commit.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyringState {
+    pub head: Head,
+    pub accepted: AcceptedPersonal,
+    pub rows: Vec<KeyringRow>,
+}
 
 /// Framing version of the owner's pending first-device setup blob.
 pub const PENDING_SETUP_VERSION: u16 = 1;
@@ -118,6 +166,8 @@ pub struct HistoryPage {
     pub cut: Head,
     pub first_position: u64,
     pub events: Vec<Vec<u8>>,
+    /// Each event's confirmed time, where the journal stores one.
+    pub times: Vec<Option<ConfirmedTime>>,
     pub next: Option<HistoryCursor>,
 }
 
@@ -137,12 +187,27 @@ pub struct InitialBootstrapRecord {
 pub enum JournalError {
     /// The storage adapter failed; no state change is implied.
     Storage,
+    /// Required confirmation is absent; refused before writes, safe to retry.
+    MissingTime,
+    /// A newly appended confirmed original predates a durable observation.
+    TimeRegressed,
     /// Stored account state is internally inconsistent.
     Corrupt,
     /// A previous admission remains unresolved; never overwrite its bytes.
     StagedAdmissionExists,
     /// A stale completion cannot clear a newer row.
     StagedAdmissionChanged,
+    /// Another trust control is staged; never overwrite its bytes.
+    StagedControlExists,
+    /// The staged control changed since it was read; nothing was cleared.
+    /// Read it again and retry.
+    StagedControlChanged,
+    /// The accepted personal key, head or keyring changed since it was read;
+    /// nothing was written. Retry from a fresh read.
+    KeyringChanged,
+    /// A held base has no local keyring rows yet; nothing was written.
+    /// Initialize the keyring, then retry.
+    KeyringIncomplete,
 }
 
 /// Durable state an account owner needs. Implementations commit each mutation
@@ -220,6 +285,7 @@ pub trait AccountJournal {
             cut: c.cut,
             first_position: c.next_position,
             events: events.to_vec(),
+            times: vec![None; events.len()],
             next: (end < c.cut.position).then_some(HistoryCursor {
                 next_position: end + 1,
                 ..c
@@ -270,8 +336,93 @@ pub trait AccountJournal {
         projection: Option<&VerifiedAccount>,
         fence: impl FnOnce(bool),
     ) -> Result<(), JournalError> {
-        let _ = projection;
+        let start = head.position.checked_sub(events.len() as u64);
+        if projection.is_some_and(|p| {
+            start.is_none_or(|start| {
+                (start + 1..=head.position)
+                    .any(|position| !matches!(p.confirmed_time(position), Ok(None)))
+            })
+        }) {
+            fence(false);
+            return Err(JournalError::Corrupt);
+        }
         self.commit_verified_fenced(anchor, events, head, stopped, fence)
+    }
+
+    /// `commit_projected_fenced` with each original's caller-verified confirmed
+    /// bounds and exact proof bytes, stored in the same commit. Journals that
+    /// cannot store this evidence refuse timed events. A `MissingTime` refusal
+    /// must precede all writes and must not invoke `fence`; authority is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_timed_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        evidence: &[Option<(ConfirmedTime, Vec<u8>)>],
+        head: Head,
+        stopped: bool,
+        projection: Option<&VerifiedAccount>,
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        if evidence.len() != events.len() || evidence.iter().any(Option::is_some) {
+            fence(false);
+            return Err(JournalError::Storage);
+        }
+        self.commit_projected_fenced(anchor, events, head, stopped, projection, fence)
+    }
+
+    /// Commit verified alert facts with the account originals in one transaction.
+    /// Non-device journals have no local notification store. The same no-write,
+    /// no-fence rule for `MissingTime` as `commit_timed_fenced` applies.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_timed_alerted_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        evidence: &[Option<(ConfirmedTime, Vec<u8>)>],
+        head: Head,
+        stopped: bool,
+        projection: Option<&VerifiedAccount>,
+        _alerts: &[bh_storage::NewAlert],
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        self.commit_timed_fenced(anchor, events, evidence, head, stopped, projection, fence)
+    }
+
+    /// An accepted-head observation can establish a deadline with no new entry.
+    /// Only device journals persist local notifications.
+    fn record_observed_alerts(
+        &mut self,
+        _anchor: AccountId,
+        _head: Head,
+        _observed_earliest_ms: u64,
+        _alerts: &[bh_storage::NewAlert],
+    ) -> Result<(), JournalError> {
+        Ok(())
+    }
+
+    /// Local lower bound from an accepted-head observation; replay does not
+    /// consume it until the projection has reached the stored account head.
+    fn observed_account_floor(&self) -> Result<Option<u64>, JournalError> {
+        Ok(None)
+    }
+
+    /// Attach the home's caller-verified confirmations of setup positions 2
+    /// and 3 to the prefix a kit save committed untimed, with `projection`,
+    /// that prefix's fresh timed replay, in one commit. Only while setup is
+    /// pending, the head is exactly `setup_head` at position 3 with these
+    /// originals at 2 and 3, and no confirmation is stored. Genesis is never
+    /// timed, and no other entry is ever retimed. Journals that cannot store
+    /// this evidence refuse.
+    fn attach_setup_confirmations(
+        &mut self,
+        _anchor: AccountId,
+        _setup_head: Head,
+        _originals: [&[u8]; 2],
+        _evidence: &[(ConfirmedTime, Vec<u8>); 2],
+        _projection: &VerifiedAccount,
+    ) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
     }
 
     fn device(&self) -> Result<Option<JournaledDevice>, JournalError>;
@@ -302,6 +453,60 @@ pub trait AccountJournal {
     fn staged_admission(&self) -> Result<Option<StagedAdmission>, JournalError>;
     fn insert_staged_admission(&mut self, row: &StagedAdmission) -> Result<(), JournalError>;
     fn clear_staged_admission(&mut self, expected: &StagedAdmission) -> Result<(), JournalError>;
+
+    /// At most one staged trust control. Insert refuses a second row, even
+    /// with the same bytes; clearing compares the whole row and clears
+    /// nothing (`StagedControlChanged`) if it changed. Clearing an absent row
+    /// succeeds. Journals without this store fail closed.
+    fn staged_control(&self) -> Result<Option<StagedControl>, JournalError> {
+        Err(JournalError::Storage)
+    }
+    fn stage_control(&mut self, _row: &StagedControl) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
+    }
+    fn clear_staged_control(&mut self, _expected: &StagedControl) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
+    }
+    /// Clear the `sealed_kit` of `expected`, the exact staged row, in one
+    /// durable write that keeps the control staged; any other row, or none,
+    /// is `StagedControlChanged` and nothing changes.
+    fn clear_staged_kit(&mut self, _expected: &StagedControl) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
+    }
+
+    /// The highest version this device accepted for a directory entry id.
+    fn directory_version(&self, _entry: [u8; 32]) -> Result<Option<u64>, JournalError> {
+        Err(JournalError::Storage)
+    }
+    /// Raise the remembered version; returns whether it advanced. A lower or
+    /// equal version leaves it unchanged.
+    fn remember_directory_version(
+        &mut self,
+        _entry: [u8; 32],
+        _version: u64,
+    ) -> Result<bool, JournalError> {
+        Err(JournalError::Storage)
+    }
+
+    /// The head, accepted personal key and every keyring row, read together.
+    /// Journals without a keyring fail closed.
+    fn keyring_state(&self) -> Result<KeyringState, JournalError> {
+        Err(JournalError::Storage)
+    }
+    /// Accept the rotation at `position` and replace every row with its
+    /// re-sealed form in one commit, only if `expected` is still exactly what
+    /// is stored and `current` holds under the writer. A change is
+    /// `KeyringChanged`; a held base without rows is `KeyringIncomplete`.
+    fn commit_accepted_rotation(
+        &mut self,
+        _expected: &KeyringState,
+        _position: u64,
+        _body: &[u8],
+        _rows: &[KeyringRow],
+        _current: impl Fn() -> bool,
+    ) -> Result<(), JournalError> {
+        Err(JournalError::Storage)
+    }
 }
 
 /// Native protection for the pending setup blob. A production adapter seals it
@@ -324,6 +529,13 @@ pub trait PendingSetupProtector {
     /// Idempotently retire the old code-bearing key; call on every restart of
     /// a saved setup and before it may be cleared after home acknowledgement.
     fn retire_kit_key(&mut self, _saved: &[u8]) -> Result<(), ProtectorError> {
+        Err(ProtectorError::Unavailable)
+    }
+    /// Idempotently delete the key `blob` is sealed under, once nothing
+    /// durable holds `blob`: a changed kit the person saved, or one whose
+    /// replacement was lost. `Unavailable` where the adapter has no such
+    /// deletion; the caller then retires it as a saved setup kit is.
+    fn retire_key(&mut self, _blob: &[u8]) -> Result<(), ProtectorError> {
         Err(ProtectorError::Unavailable)
     }
 }

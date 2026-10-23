@@ -189,7 +189,7 @@ fn cancelled_session_never_accepts_late_signature() {
     // A late native signature is never passed to durable staging.
     let mut persisted = false;
     assert_eq!(
-        session.stage::<()>(&[0; 64], &[1], |_, _| {
+        session.stage(&[0; 64], &[1], |_, _| {
             persisted = true;
             Ok(())
         }),

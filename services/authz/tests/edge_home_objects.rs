@@ -92,6 +92,7 @@ async fn private_writes_and_reads_multiplex_by_id_with_out_of_order_answers() {
                 id,
                 items: vec![],
                 receipt: None,
+                coverage: None,
             }
             .encode()
             .unwrap()
@@ -113,8 +114,9 @@ async fn private_writes_and_reads_multiplex_by_id_with_out_of_order_answers() {
             let answer = match r {
                 Request::Read { id, .. } => Response::Events {
                     id,
-                    items: vec![(vec![1], vec![2])],
+                    items: vec![(vec![1; bh_sync::Commitment::LEN], vec![2])],
                     receipt: None,
+                    coverage: None,
                 },
                 Request::StoreHomeObjects { id, bundle, .. } => Response::HomeObjectsStored {
                     id,
@@ -136,7 +138,10 @@ async fn private_writes_and_reads_multiplex_by_id_with_out_of_order_answers() {
         client.read_log(vec![1]),
         client.store_home_objects(vec![2], bundle.clone())
     );
-    assert_eq!(read.unwrap(), vec![(vec![1], vec![2])]);
+    assert_eq!(
+        read.unwrap(),
+        vec![(vec![1; bh_sync::Commitment::LEN], vec![2])]
+    );
     assert_eq!(
         stored.unwrap().bundle_digest,
         home_objects::digest(&bundle).unwrap()
@@ -169,6 +174,7 @@ async fn unrelated_response_is_not_a_storage_acknowledgement() {
                 id,
                 items: vec![],
                 receipt: None,
+                coverage: None,
             }
             .encode()
             .unwrap()

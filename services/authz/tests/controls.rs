@@ -15,6 +15,7 @@ use bh_sync::{
     permit::{LogId, LogKind, Scope},
     referenced_body,
 };
+use rusqlite::Connection as SqlConnection;
 use std::sync::atomic::Ordering;
 use support::{
     native::{Fold, Mac, order},
@@ -52,6 +53,7 @@ async fn a_new_account_orders_its_genesis_and_controls_through_the_service() {
         body,
         epoch,
         after,
+        attached: None,
     } = harness.permit(&signed).scope
     else {
         panic!("append")
@@ -133,6 +135,89 @@ async fn removed_device_refused_after_control() {
 }
 
 #[tokio::test]
+async fn failed_home_key_lookup_returns_unavailable_without_append_permit() {
+    let h = Harness::new();
+    let owner = Device::new();
+    let mut account = Account::create(&owner);
+    h.publish(&account);
+    let service = h.service();
+    let mut connection = session(&service, &account, &owner).await;
+    let original = account.add_device(&owner, &Device::new());
+    let before = h.edge.head(account.log);
+    SqlConnection::open(h.disk())
+        .unwrap()
+        .execute_batch("DROP TABLE projection_keys")
+        .unwrap();
+    let answer = submit(&h, &mut connection, &account, &original).await;
+    assert!(matches!(answer, FromService::Unavailable), "{answer:?}");
+    assert_eq!(h.edge.head(account.log), before);
+    let db = SqlConnection::open(h.disk()).unwrap();
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM account_events WHERE account=?1",
+            [account.id.0.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn failed_home_membership_lookup_returns_unavailable_without_permit() {
+    let h = Harness::new();
+    let owner = Device::new();
+    let removed = Device::new();
+    let mut account = Account::create(&owner);
+    account.add_device(&owner, &removed);
+    h.publish(&account);
+    let service = h.service();
+    let mut leaving = session(&service, &account, &removed).await;
+    let removal = account.remove_self(&removed);
+    single_permit(submit(&h, &mut leaving, &account, &removal).await);
+    let before = h.edge.head(account.log);
+    SqlConnection::open(h.disk())
+        .unwrap()
+        .execute_batch("DROP TABLE projection_devices")
+        .unwrap();
+    let answer = leaving
+        .handle(ToService::Permits {
+            items: vec![read_events(account.log)],
+        })
+        .await;
+    assert!(matches!(answer, FromService::Unavailable), "{answer:?}");
+    assert_eq!(h.edge.head(account.log), before);
+}
+
+#[tokio::test]
+async fn failed_base_index_lookup_confirming_a_copy_returns_unavailable() {
+    let (harness, mut mac, _service, mut connection) = own_base().await;
+    let add = mac.pair(&Fold::new());
+    mac.submit_account(&harness, &mut connection, &add).await;
+    let copy = mac.copy(add.as_bytes()).unwrap();
+    let answer = connection.handle(mac.submit_copy(&copy)).await;
+    order(&harness, &answer, &copy).unwrap();
+    // Applying the ordered copy reads the BASE copy's index, which fails:
+    // a transient fault, not a record the device must register again.
+    SqlConnection::open(harness.disk())
+        .unwrap()
+        .execute(
+            "DELETE FROM projection_sources WHERE kind=2 AND source=?1",
+            [mac.base.0.as_slice()],
+        )
+        .unwrap();
+    let answer = connection
+        .handle(ToService::ReadBatch {
+            want: Want::ReadBatch {
+                log: mac.base_log(),
+                after: Head::EMPTY,
+                max_events: 48,
+            },
+        })
+        .await;
+    assert!(matches!(answer, FromService::Unavailable), "{answer:?}");
+}
+
+#[tokio::test]
 async fn invalid_control_refused_no_permit() {
     let harness = Harness::new();
     let first = Device::new();
@@ -171,6 +256,7 @@ async fn invalid_control_refused_no_permit() {
                 log: account.log,
                 event,
                 delivery: None,
+                attachment: None,
             })
             .await;
         assert!(
@@ -189,6 +275,7 @@ async fn invalid_control_refused_no_permit() {
             log: elsewhere.log,
             event: elsewhere.genesis.clone(),
             delivery: None,
+            attachment: None,
         })
         .await;
     assert!(
@@ -208,6 +295,7 @@ async fn invalid_control_refused_no_permit() {
             },
             event: vec![1; 1024],
             delivery: None,
+            attachment: None,
         })
         .await;
     refused(answer, Refusal::Unsupported);
@@ -251,6 +339,7 @@ async fn register_base_verifies_its_genesis_and_takes_the_content_epoch() {
                 body: Some(commitment),
                 epoch,
                 after: Some(Head::EMPTY),
+                attached: None,
             }
     );
     order_genesis(&harness, &answer, &genesis);
@@ -495,6 +584,7 @@ fn submit_with(account: &Account, event: &[u8], recipient: &Device, frame: &[u8]
             recipient: recipient.keys.clone(),
             frame: frame.to_vec(),
         })),
+        attachment: None,
     }
 }
 
@@ -529,6 +619,7 @@ async fn an_addition_and_its_delivery_are_staged_and_ordered_together() {
                 body: Some(commitment),
                 epoch: ACCOUNT_EPOCH,
                 after: Some(head),
+                attached: None,
             }
     );
     // The original signed bytes travel unchanged inside the wrapper.
@@ -773,6 +864,7 @@ async fn base_copy_of_ordered_add_permitted() {
                     body: Some(body),
                     epoch,
                     after: Some(genesis_head),
+                    attached: None,
                 },
             ]
     );
@@ -967,6 +1059,107 @@ async fn removal_copy_permit_closes_epoch() {
 }
 
 #[tokio::test]
+async fn service_rekey_orders_attached_seal_set_and_refuses_old_epoch() {
+    use bh_account::personal::{self, PersonalKey};
+    use bh_authz::proto::{RecoveryAttachment, account_log_wrap, rotation_body};
+    let (h, mut mac, _service, mut connection) = own_base().await;
+    assert!(matches!(
+        connection.handle(mac.home_objects.clone()).await,
+        FromService::HomeObjectsStored { .. }
+    ));
+    let fold = Fold::new();
+    let add = mac.pair(&fold);
+    mac.submit_account(&h, &mut connection, &add).await;
+    mac.copy_ordered(&h, &mut connection, add.as_bytes()).await;
+    let removed = mac.remove(&fold);
+    h.order_original(mac.log, removed.as_bytes());
+    mac.copy_ordered(&h, &mut connection, removed.as_bytes())
+        .await;
+    // This fixture's local owner still has legacy (untimed) originals;
+    // rekey preparation must use the same confirmed projection the home and
+    // base copied, not its untimed compatibility view.
+    let time = bh_account::ConfirmedTime {
+        earliest_ms: h.clock.now(),
+        latest_ms: h.clock.now(),
+    };
+    let mut timed = mac.anchor.clone();
+    timed.apply_timed(add.as_bytes(), Some(time)).unwrap();
+    timed.apply_timed(removed.as_bytes(), Some(time)).unwrap();
+    mac.ordered = timed;
+    let old_epoch = bh_event::key_id(&mac.content);
+    assert_eq!(h.edge.epoch(mac.base_log()), [0; 32]);
+    let next_personal = PersonalKey::generate();
+    let prepared = personal::prepare_rotation(&mac.ordered, &next_personal).unwrap();
+    let rotation = mac.sign_rotation(removed.head().position, &prepared);
+    let commitment = stage_rotation(&h, &mut connection, mac.log, &prepared.body).await;
+    let answer = connection
+        .handle(ToService::SubmitControl {
+            log: mac.log,
+            event: rotation.as_bytes().to_vec(),
+            delivery: None,
+            attachment: Some(Box::new(RecoveryAttachment {
+                record: None,
+                recovery_seal: prepared.recovery_seal.clone(),
+                rotation_body: Some(commitment),
+            })),
+        })
+        .await;
+    let FromService::Permits { items } = answer else {
+        panic!("{answer:?}")
+    };
+    let body = rotation_body(&prepared.body).unwrap();
+    let wrapped = account_log_wrap(rotation.as_bytes(), Some(body.commitment())).unwrap();
+    let [append] = <[_; 1]>::try_from(items).unwrap();
+    h.edge.append(append.as_ref().unwrap(), &wrapped).unwrap();
+    let answer = connection
+        .handle(ToService::ConfirmControl {
+            log: mac.log,
+            event: wrapped.digest(),
+            challenge: [19; 32],
+        })
+        .await;
+    let FromService::Confirmed { confirmation, .. } = answer else {
+        panic!("{answer:?}")
+    };
+    let next_epoch = bh_crypto::Secret::<32>::random();
+    let (rekey, seal_set) = mac.signed_rekey(&rotation, &confirmation, &next_epoch);
+    let answer = connection.handle(mac.submit_copy(&rekey)).await;
+    let FromService::Permits { items } = &answer else {
+        panic!("{answer:?}")
+    };
+    assert_eq!(items.len(), 2, "base body and append");
+    let scopes = scopes(&h, &answer);
+    assert!(
+        matches!(scopes[1], Scope::Append { attached: Some(digest), .. }
+        if digest == seal_set.commitment())
+    );
+    let seal_stage = single_permit(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::Stage {
+                    log: mac.base_log(),
+                    body: seal_set.commitment(),
+                    len: seal_set.bytes().len() as u32,
+                }],
+            })
+            .await,
+    );
+    h.edge.stage(&seal_stage, seal_set.bytes()).unwrap();
+    h.edge
+        .stage(items[0].as_ref().unwrap(), &rekey.body)
+        .unwrap();
+    h.edge
+        .append(items[1].as_ref().unwrap(), &rekey.descriptor)
+        .unwrap();
+    assert_eq!(
+        write(&mut connection, &mac, old_epoch).await,
+        Err(Refusal::Epoch)
+    );
+    let new_id = bh_event::key_id(&next_epoch);
+    assert!(write(&mut connection, &mac, new_id).await.is_ok());
+}
+
+#[tokio::test]
 async fn content_refused_while_removal_uncopied() {
     let (harness, mut mac, _service, mut connection) = own_base().await;
     let epoch = bh_event::key_id(&mac.content);
@@ -1155,4 +1348,56 @@ async fn registering_again_keeps_a_pending_control() {
     write(&mut folded, &mac, bh_event::key_id(&mac.content))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn base_run_of_ordered_add_permitted_and_confirmed() {
+    let (harness, mut mac, service, mut connection) = own_base().await;
+    let epoch = bh_event::key_id(&mac.content);
+    let fold = Fold::new();
+    let add = mac.pair(&fold);
+    mac.submit_account(&harness, &mut connection, &add).await;
+    let confirmation = mac.confirm(&add);
+    let copy = mac.copy_run(&[(add.as_bytes().to_vec(), confirmation)]);
+    let answer = connection.handle(mac.submit_copy(&copy)).await;
+    // An addition keeps the epoch, and a run attaches no other body.
+    let Scope::Append {
+        epoch: permitted,
+        attached,
+        ..
+    } = scopes(&harness, &answer)[1].clone()
+    else {
+        panic!("append")
+    };
+    assert_eq!((permitted, attached), (epoch, None));
+    order(&harness, &answer, &copy).unwrap();
+    assert_eq!(mac.pull(&harness), vec![bh_event::Outcome::Accepted]);
+    // Confirming the run by its readback applies it, with its confirmed
+    // time, to the base's copy of the account: the Fold writes.
+    let mut folded = mac.fold_session(&service, &fold).await;
+    write(&mut folded, &mac, epoch).await.unwrap();
+    write(&mut connection, &mac, epoch).await.unwrap();
+}
+
+#[tokio::test]
+async fn base_run_must_equal_ordered_account_events() {
+    let (harness, mut mac, _service, mut connection) = own_base().await;
+    let at_base = mac.ordered.clone();
+    let (first, second) = (Fold::new(), Fold::new());
+    let add = mac.pair(&first);
+    mac.submit_account(&harness, &mut connection, &add).await;
+    // A valid next event for the base's copy, never ordered in the account.
+    let forged = mac.sign_add(&at_base, &second);
+    let confirmation = mac.confirm(&forged);
+    let copy = mac.copy_run(&[(forged.as_bytes().to_vec(), confirmation)]);
+    refused(
+        connection.handle(mac.submit_copy(&copy)).await,
+        Refusal::Invalid,
+    );
+    let confirmation = mac.confirm(&add);
+    let copy = mac.copy_run(&[(add.as_bytes().to_vec(), confirmation)]);
+    let answer = connection.handle(mac.submit_copy(&copy)).await;
+    order(&harness, &answer, &copy).unwrap();
+    assert_eq!(mac.pull(&harness), vec![bh_event::Outcome::Accepted]);
+    assert_eq!(mac.history.account_head(), add.head());
 }

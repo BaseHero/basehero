@@ -52,7 +52,10 @@ fn main() {
     // way; capabilities grant them to the Android main window only.
     let qr_scan =
         tauri_build::InlinedPlugin::new().commands(&["request_permissions", "scan", "cancel"]);
-    let attributes = tauri_build::Attributes::new().plugin("qr-scan", qr_scan);
+    let notify = tauri_build::InlinedPlugin::new().commands(&["notify"]);
+    let attributes = tauri_build::Attributes::new()
+        .plugin("qr-scan", qr_scan)
+        .plugin("notify", notify);
     tauri_build::try_build(
         attributes.app_manifest(tauri_build::AppManifest::new().commands(&[
             "note_binding",
@@ -88,6 +91,19 @@ fn main() {
             "update_not_now",
             "update_install",
             "window_sidebar",
+            "app_about",
+            "devices_kit_screen",
+            "devices_view",
+            "devices_request_removal",
+            "devices_cancel_removal",
+            "devices_remove_now",
+            "devices_remove_self",
+            "account_change_password",
+            "account_confirm_new_kit",
+            "alerts_list",
+            "account_recover",
+            "account_check_code",
+            "account_recovery_status",
         ])),
     )
     .expect("Tauri client build failed");

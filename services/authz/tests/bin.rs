@@ -13,6 +13,7 @@ use bh_sync::{
 use futures_util::{SinkExt, StreamExt};
 use std::{
     io::{BufRead, BufReader, Read},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -35,6 +36,7 @@ async fn empty_edge() -> String {
                             id,
                             items: vec![],
                             receipt: None,
+                            coverage: None,
                         };
                         let _ = ws
                             .send(Message::Binary(empty.encode().unwrap().into()))
@@ -64,17 +66,22 @@ struct Started {
     root: SigningKey,
     policy_root: SigningKey,
 }
-fn start(dir: &tempfile::TempDir, edge: &str) -> Started {
-    let file = |name: &str, bytes: &[u8]| {
-        let path = dir.path().join(name);
-        std::fs::write(&path, bytes).unwrap();
-        path
-    };
-    let root = SigningKey::generate();
+fn file(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path.display().to_string()
+}
+/// The binary in synthetic mode with fresh keys and policy under `root`.
+fn command(
+    dir: &tempfile::TempDir,
+    edge: &str,
+    root: &SigningKey,
+    policy_root: &SigningKey,
+) -> Command {
+    let file = |name: &str, bytes: &[u8]| PathBuf::from(file(dir, name, bytes));
     let seed: [u8; 32] = bh_crypto::random();
     let key = SigningKey::from_seed(&bh_crypto::Secret::from_slice(&seed).unwrap());
-    let policy_root = SigningKey::generate();
-    let config = channel_config(&policy_root);
+    let config = channel_config(policy_root);
     let args = [
         ("--listen", "127.0.0.1:0".to_string()),
         (
@@ -93,7 +100,7 @@ fn start(dir: &tempfile::TempDir, edge: &str) -> Started {
             "--permit-cert",
             file(
                 "cert",
-                hex::encode(permit::certify(&root, key.public())).as_bytes(),
+                hex::encode(permit::certify(root, key.public())).as_bytes(),
             )
             .display()
             .to_string(),
@@ -114,9 +121,14 @@ fn start(dir: &tempfile::TempDir, edge: &str) -> Started {
     for (flag, value) in &args {
         command.arg(flag).arg(value);
     }
+    command.arg("--synthetic-attestation");
+    command
+}
+fn start(dir: &tempfile::TempDir, edge: &str) -> Started {
+    let root = SigningKey::generate();
+    let policy_root = SigningKey::generate();
     let mut child = Running(
-        command
-            .arg("--synthetic-attestation")
+        command(dir, edge, &root, &policy_root)
             .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -181,6 +193,7 @@ async fn the_binary_serves_the_attested_channel_locally() {
             log: account.log,
             event: account.genesis.clone(),
             delivery: None,
+            attachment: None,
         },
     )
     .await;
@@ -233,4 +246,66 @@ async fn a_connection_that_never_upgrades_is_closed() {
         waited >= Duration::from_secs(4) && waited < Duration::from_secs(10),
         "{waited:?}"
     );
+}
+
+#[tokio::test]
+async fn a_recovery_certificate_must_name_its_key_under_the_hosting_root() {
+    use bh_crypto::{KemKey, Secret};
+    use bh_sync::evidence::certify_recovery_key;
+    let dir = tempfile::tempdir().unwrap();
+    let edge = empty_edge().await;
+    let (root, policy_root) = (SigningKey::generate(), SigningKey::generate());
+    let seed: [u8; 32] = bh_crypto::random();
+    let key = KemKey::from_seed(&Secret::from_slice(&seed).unwrap());
+    let other = KemKey::generate();
+    let key_file = file(&dir, "recovery-key", hex::encode(seed).as_bytes());
+    for (named, under) in [
+        (other.public(), &root),
+        (key.public(), &SigningKey::generate()),
+    ] {
+        let certificate = certify_recovery_key(under, &named).encode();
+        let output = command(&dir, &edge, &root, &policy_root)
+            .args(["--recovery-key", &key_file])
+            .args([
+                "--recovery-cert",
+                &file(&dir, "recovery-cert", hex::encode(certificate).as_bytes()),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("--recovery-cert does not name --recovery-key under --hosting-root"),
+            "{message}"
+        );
+        // The key itself is never written out.
+        assert!(!message.contains(&hex::encode(seed)));
+    }
+    // A key without its certificate is refused too.
+    let output = command(&dir, &edge, &root, &policy_root)
+        .args(["--recovery-key", &key_file])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--recovery-cert is required"));
+    // With its certificate, the service starts.
+    let certificate = certify_recovery_key(&root, &key.public()).encode();
+    let mut child = Running(
+        command(&dir, &edge, &root, &policy_root)
+            .args(["--recovery-key", &key_file])
+            .args([
+                "--recovery-cert",
+                &file(&dir, "recovery-cert", hex::encode(certificate).as_bytes()),
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("listening on") {
+        line.clear();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "bh-authz exited");
+        assert!(!line.contains(&hex::encode(seed)));
+    }
 }

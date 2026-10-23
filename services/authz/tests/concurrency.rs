@@ -4,7 +4,9 @@
 #![cfg(feature = "synthetic-attestation")]
 mod support;
 use bh_authz::proto::{FromService, LogId, LogKind, ReadBatchResult, Refusal, ToService, Want};
-use bh_authz::{Connection, EdgeError, EdgeReader, FixedClock, LogItems, LogRead, Service};
+use bh_authz::{
+    Connection, EdgeError, EdgeReader, FixedClock, HomeObjectsAck, LogItems, LogRead, Service,
+};
 use bh_sync::{
     Head,
     permit::{self, Scope},
@@ -18,6 +20,7 @@ use std::{
     time::Duration,
 };
 use support::{
+    claims::{Home, mismatch, try_claim},
     native::{Fold, Mac, order},
     *,
 };
@@ -27,6 +30,51 @@ use tokio::{
 };
 
 const D: Duration = Duration::from_millis(80);
+
+#[tokio::test]
+async fn same_account_recovery_tries_wait_for_one_held_refresh() {
+    let h = Arc::new(Harness::new());
+    let slow = Slow::new(&h, Duration::ZERO);
+    let service = Arc::new(
+        Service::open_with_recovery(
+            &h.dir.path().join("authz.sqlite"),
+            h.keys(),
+            h.recovery_key(),
+            h.clock.clone(),
+            slow.clone(),
+        )
+        .unwrap(),
+    );
+    let home = Arc::new(Home::new(&h, &service).await);
+    let before = slow.count(Kind::Refresh);
+    slow.hold(Kind::Refresh, home.signup.account.log, false);
+    let first = {
+        let (h, service, home) = (h.clone(), service.clone(), home.clone());
+        tokio::spawn(async move { try_claim(&h, &service, &home.wrong_password).await })
+    };
+    slow.held.notified().await;
+    // Poll through the second request until it blocks: unlike a spawned
+    // task plus yields, this proves it reached the held account refresh.
+    let second = try_claim(&h, &service, &home.right);
+    tokio::pin!(second);
+    assert!(matches!(
+        futures_util::poll!(second.as_mut()),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        slow.count(Kind::Refresh),
+        before + 1,
+        "same account joins one in-flight refresh"
+    );
+    assert!(!first.is_finished());
+    slow.release.add_permits(1);
+    let wrong = first.await.unwrap();
+    let right = second.await;
+    assert_eq!(wrong, mismatch(4, None));
+    assert_eq!(right, FromService::Recovery(home.released()));
+    // Both tries crossed the same account's held refresh; neither was
+    // answered from cached records while the account was unavailable.
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -149,6 +197,16 @@ impl Slow {
     }
 }
 impl EdgeReader for Slow {
+    fn store_home_objects(
+        &self,
+        p: Vec<u8>,
+        bundle: Vec<u8>,
+    ) -> BoxFuture<'_, Result<HomeObjectsAck, EdgeError>> {
+        self.edge.store_home_objects(p, bundle)
+    }
+    fn retire_home_objects(&self, p: Vec<u8>) -> BoxFuture<'_, Result<(), EdgeError>> {
+        self.edge.retire_home_objects(p)
+    }
     fn read_log(&self, p: Vec<u8>) -> BoxFuture<'_, Result<LogItems, EdgeError>> {
         Box::pin(async move { self.read(&p.clone(), false, self.edge.read_log(p)).await })
     }
@@ -494,11 +552,16 @@ async fn a_delayed_registration_replay_cannot_overwrite_newer_base_authority() {
         "{permitted2:?}"
     );
     assert_eq!(durable_base(&h, base), (2, 1));
-    // Releasing the stale replay must neither regress C1 nor drop P2.
+    let disk = h.dir.path().join("concurrency.sqlite");
+    let newer = base_authority(&disk, base);
+    // Releasing the stale replay must neither regress C1 nor drop P2: the
+    // durable authority is exactly as the newer confirmation left it (its
+    // retried replay may republish that same state in a new generation).
     edge.release.add_permits(1);
     let answer = held.await.unwrap();
     assert!(matches!(answer, FromService::Permits { .. }), "{answer:?}");
     assert_eq!(durable_base(&h, base), (2, 1));
+    assert_eq!(base_authority(&disk, base), newer);
     drop(first);
     drop(second);
     drop(service);

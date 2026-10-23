@@ -7,7 +7,7 @@ use bh_sync::wire::{self, Refusal};
 use bh_sync::{BODY_SIZES, ENVELOPE_SIZES};
 use bh_sync::{
     BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent, Operation,
-    Route, SignedApproval, TimeWindow, plan_consumption, receipt, referenced_body,
+    OrderState, Route, SignedApproval, TimeWindow, plan_consumption, receipt, referenced_body,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +26,8 @@ const MAX_SAFE: u64 = (1 << 53) - 1;
 #[serde(deny_unknown_fields)]
 struct Gate {
     base: String,
+    order_format: u16,
+    order: String,
     position: u64,
     hash: String,
     incarnation: String,
@@ -80,6 +82,7 @@ struct Request {
 struct ResultPlan {
     position: u64,
     hash: String,
+    order: String,
     sequence: u64,
     append: Option<String>,
     ack: Option<String>,
@@ -126,8 +129,13 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 fn gate(value: Gate) -> Result<GateState, ()> {
+    if value.order_format != 2 {
+        return Err(());
+    }
+    let order = OrderState::decode(&unhex::<82>(&value.order)?).map_err(|_| ())?;
     Ok(GateState {
         base: BaseId(unhex(&value.base)?),
+        order,
         head: Head {
             position: value.position,
             hash: Digest(unhex(&value.hash)?),
@@ -161,13 +169,22 @@ fn row(value: &Row, state: GateState) -> Result<(Commitment, OpaqueEvent), ()> {
         || value.position > state.head.position
         || commitment.base() != state.base
         || commitment.head().position != value.position
-        || commitment.event_id() != event.id()
+        || commitment.event_id() != event.publication_id(commitment.route())
         || commitment.event_digest() != event.digest()
-        || unhex::<32>(&value.event_id)? != event.id().0
+        || unhex::<32>(&value.event_id)? != commitment.event_id().0
         || unhex::<32>(&value.event_digest)? != event.digest().0
         || commitment.verify_next(state.base, previous).is_err()
+        || (value.position == 1 && commitment.before() != OrderState::EMPTY)
+        || (value.position > 1 && {
+            let prior = Commitment::decode(&unhex_bytes(
+                value.previous.as_deref().ok_or(())?,
+                Commitment::LEN,
+            )?)
+            .map_err(|_| ())?;
+            commitment.before() != prior.after()
+        })
         || commitment.verify_body(&event).is_err()
-        || (value.position == state.head.position && commitment.head() != state.head)
+        || (value.position == state.head.position && commitment.after() != state.order)
     {
         return Err(());
     }
@@ -235,7 +252,7 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
             }
             if let Some(found) = request.selected.first() {
                 let (commitment, stored) = row(found, state)?;
-                if stored.id() != event.id() {
+                if stored.digest() != event.digest() {
                     return Err(());
                 }
                 Some(commitment)
@@ -288,6 +305,7 @@ fn plan(bytes: &[u8]) -> Result<Vec<u8>, ()> {
     let output = ResultPlan {
         position: result.next.head.position,
         hash: hex(&result.next.head.hash.0),
+        order: hex(&result.next.order.encode()),
         sequence: result.next.sequence,
         append: result.append.map(|c| hex(&c.encode())),
         ack: result.ack.map(|c| hex(&c.encode())),
@@ -307,6 +325,16 @@ enum ScopeOut {
         prefix_digest: String,
         bundle_digest: String,
     },
+    ReadDirectory,
+    StoreDirectoryEntry {
+        entry: String,
+        version: u64,
+        body: String,
+        len: u32,
+    },
+    RetireHomeObjects {
+        prefix_digest: String,
+    },
     ReadEvents {
         first: u64,
         last: u64,
@@ -324,10 +352,16 @@ enum ScopeOut {
         body: Option<String>,
         epoch: String,
         after: Option<HeadOut>,
+        /// A second staged body ordered with a control's own.
+        attached: Option<String>,
     },
     Subscribe,
     ReadControls {
         after: u64,
+    },
+    ReadControlRange {
+        after: u64,
+        through: u64,
     },
     Presence {
         epoch: String,
@@ -350,6 +384,7 @@ struct VerifiedPermit {
 #[derive(Serialize)]
 struct Ordered {
     commitment: String,
+    order: String,
     position: u64,
     hash: String,
     event_id: String,
@@ -367,6 +402,7 @@ struct DecodedRequest {
     event: Option<[usize; 2]>,
     body: Option<[usize; 2]>,
     after: Option<u64>,
+    cursor: Option<String>,
     credit: Option<u32>,
 }
 
@@ -444,6 +480,7 @@ fn verify_permit_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
             body,
             epoch,
             after,
+            attached,
         } => {
             let decoded = OpaqueEvent::decode(payload).map_err(|_| Refusal::Malformed)?;
             if decoded.digest() != event {
@@ -457,11 +494,18 @@ fn verify_permit_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
             (
                 log,
                 ScopeOut::Append {
-                    event_id: hex(&decoded.id().0),
+                    event_id: hex(&decoded
+                        .publication_id(if after.is_some() {
+                            Route::Control
+                        } else {
+                            Route::Content
+                        })
+                        .0),
                     digest: hex(&event.0),
                     body: body.map(|d| hex(&d.0)),
                     epoch: hex(&epoch),
                     after: after.map(head_out).transpose()?,
+                    attached: attached.map(|d| hex(&d.0)),
                 },
             )
         }
@@ -482,11 +526,52 @@ fn verify_permit_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
                 },
             )
         }
+        Scope::ReadDirectory { log } if payload.is_empty() => (log, ScopeOut::ReadDirectory),
+        Scope::StoreDirectoryEntry {
+            log,
+            entry,
+            version,
+            body,
+            len,
+        } => {
+            if payload.len() != len as usize || payload.is_empty() || payload.len() > 65536 {
+                return Err(Refusal::Malformed);
+            }
+            if bh_crypto::hash(payload) != body.0 {
+                return Err(Refusal::Scope);
+            }
+            (
+                log,
+                ScopeOut::StoreDirectoryEntry {
+                    entry: hex(&entry),
+                    version: safe(version)?,
+                    body: hex(&body.0),
+                    len,
+                },
+            )
+        }
+        Scope::RetireHomeObjects { log, prefix_digest } if payload.is_empty() => (
+            log,
+            ScopeOut::RetireHomeObjects {
+                prefix_digest: hex(&prefix_digest.0),
+            },
+        ),
         Scope::Subscribe { log } if payload.is_empty() => (log, ScopeOut::Subscribe),
         Scope::ReadControls { log, after } if payload.is_empty() => (
             log,
             ScopeOut::ReadControls {
                 after: safe(after)?,
+            },
+        ),
+        Scope::ReadControlRange {
+            log,
+            after,
+            through,
+        } if payload.is_empty() => (
+            log,
+            ScopeOut::ReadControlRange {
+                after: safe(after)?,
+                through: safe(through)?,
             },
         ),
         Scope::Presence { log, epoch } if payload.is_empty() => {
@@ -504,13 +589,13 @@ fn verify_permit_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
     })
 }
 
-/// Input `log_id:32 || previous_position:u64 || previous_hash:32 || route:u8 ||
-/// event`, with route 0 for content and 1 for a control. The first event of a
+/// Input `log_id:32 || before:82 || route:u8 || event`, with route 0 for
+/// content and 1 for a control. The first event of a
 /// log must be the genesis its id names, on the control route.
 fn order_commitment_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
     let (log, rest) = split::<32>(bytes)?;
-    let (position, rest) = split::<8>(rest)?;
-    let (hash, rest) = split::<32>(rest)?;
+    let (opening, rest) = split::<82>(rest)?;
+    let before = OrderState::decode(&opening).map_err(|_| Refusal::Malformed)?;
     let (route, rest) = split::<1>(rest)?;
     let route = match route {
         [0] => Route::Content,
@@ -518,25 +603,55 @@ fn order_commitment_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
         _ => return Err(Refusal::Malformed),
     };
     let event = OpaqueEvent::decode(rest).map_err(|_| Refusal::Malformed)?;
-    let previous = Head {
-        position: u64::from_be_bytes(position),
-        hash: Digest(hash),
-    };
     let commitment =
-        Commitment::order(BaseId(log), previous, &event, route).map_err(|error| match error {
+        Commitment::order(BaseId(log), before, &event, route).map_err(|error| match error {
             bh_sync::Error::GenesisMismatch => Refusal::Scope,
             _ => Refusal::Unavailable,
         })?;
     json(&Ordered {
         commitment: hex(&commitment.encode()),
+        order: hex(&commitment.after().encode()),
         position: safe(commitment.head().position).map_err(|_| Refusal::Unavailable)?,
         hash: hex(&commitment.head().hash.0),
-        event_id: hex(&event.id().0),
+        event_id: hex(&commitment.event_id().0),
         digest: hex(&event.digest().0),
     })
 }
 
-/// Input `base:32 || stored_commitment:179 || stored_descriptor`.
+/// Derive an append lookup identity from exact original bytes and its named
+/// log; retrying genesis after content still has the control route.
+fn routed_id_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
+    let (base, event) = split::<32>(bytes)?;
+    let event = OpaqueEvent::decode(event).map_err(|_| Refusal::Malformed)?;
+    let route = if event.digest().0 == base {
+        Route::Control
+    } else {
+        Route::Content
+    };
+    json(&serde_json::json!({ "event_id": hex(&event.publication_id(route).0) }))
+}
+
+/// Body-free verified state of a retained immutable commitment. Used by
+/// endpoint reads and lost-Ack retries, never as an author acceptance proof.
+/// Input `base:32 || commitment:149`.
+fn commitment_state_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
+    let (base, record) = split::<32>(bytes)?;
+    let commitment = Commitment::decode(record).map_err(|_| Refusal::Unavailable)?;
+    if commitment.base() != BaseId(base) {
+        return Err(Refusal::Unavailable);
+    }
+    let head = commitment.head();
+    json(&Ordered {
+        commitment: hex(record),
+        order: hex(&commitment.after().encode()),
+        position: safe(head.position).map_err(|_| Refusal::Unavailable)?,
+        hash: hex(&head.hash.0),
+        event_id: hex(&commitment.event_id().0),
+        digest: hex(&commitment.event_digest().0),
+    })
+}
+
+/// Input `base:32 || stored_commitment:149 || stored_descriptor`.
 /// Decode the immutable tail returned by a durable read, checking its base,
 /// self-consistency and exact descriptor commitment before signing its head.
 /// This proves ordering bytes only, never the encrypted author's authority.
@@ -660,11 +775,23 @@ fn decode_request_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
             event: Some(fields[2]),
             body: Some(fields[3]),
             after: None,
+            cursor: None,
             credit: None,
         });
     }
     let (kind, id, permit, payload, after) = match &request {
         wire::Request::Read { id, permit } => ("read", *id, permit, None, None),
+        wire::Request::ReadDirectory {
+            id,
+            permit,
+            after: _,
+        } => ("read_directory", *id, permit, None, None),
+        wire::Request::StoreDirectoryEntry { id, permit, body } => {
+            ("store_directory_entry", *id, permit, Some(body), None)
+        }
+        wire::Request::RetireHomeObjects { id, permit } => {
+            ("retire_home_objects", *id, permit, None, None)
+        }
         wire::Request::StoreHomeObjects { id, permit, bundle } => {
             ("store_home_objects", *id, permit, Some(bundle), None)
         }
@@ -688,6 +815,7 @@ fn decode_request_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
                 event: None,
                 body: None,
                 after: None,
+                cursor: None,
                 credit: None,
             });
         }
@@ -702,6 +830,7 @@ fn decode_request_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
                 event: None,
                 body: None,
                 after: None,
+                cursor: None,
                 credit: Some(*bytes),
             });
         }
@@ -716,6 +845,10 @@ fn decode_request_at(bytes: &[u8]) -> Result<Vec<u8>, Refusal> {
         event: None,
         body: None,
         after,
+        cursor: match &request {
+            wire::Request::ReadDirectory { after, .. } => after.map(|entry| hex(&entry)),
+            _ => None,
+        },
         credit: None,
     })
 }
@@ -798,6 +931,14 @@ pub extern "C" fn order_commitment(len: u32) -> u32 {
     helper(order_commitment_at, len)
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn commitment_state(len: u32) -> u32 {
+    helper(commitment_state_at, len)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn routed_id(len: u32) -> u32 {
+    helper(routed_id_at, len)
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn decode_request(len: u32) -> u32 {
     helper(decode_request_at, len)
 }
@@ -836,6 +977,7 @@ mod tests {
         let operation = Operation::stage_body(body.clone());
         let gate = GateState {
             base: BaseId(event.digest().0),
+            order: OrderState::EMPTY,
             head: Head::EMPTY,
             incarnation: [5; 32],
             sequence: 0,
@@ -859,6 +1001,7 @@ mod tests {
         let request = serde_json::json!({
             "version": 1,
             "gate": { "base": hex(&gate.base.0), "position": 0,
+                "order_format": 2, "order": hex(&gate.order.encode()),
                 "hash": hex(&gate.head.hash.0), "incarnation": hex(&gate.incarnation),
                 "sequence": 0, "checker_key": hex(&gate.checker_key) },
             "approval": hex(&signed.encode()),
@@ -906,7 +1049,7 @@ mod tests {
         event[..2].copy_from_slice(&1u16.to_be_bytes());
         event[34..38].copy_from_slice(&65537u32.to_be_bytes());
         assert!(unhex_bytes(&hex(&event), MAX_EVENT).is_err());
-        let mut input = vec![0; 32 + 8 + 32 + 1];
+        let mut input = vec![0; 32 + 82 + 1];
         input.extend(event);
         assert_eq!(order_commitment_at(&input), Err(Refusal::Malformed));
     }
@@ -1014,6 +1157,34 @@ mod tests {
             NOW,
         );
         assert_eq!(check(&account, &[], NOW), Err(Refusal::Malformed));
+    }
+
+    #[test]
+    fn bounded_control_scope_verifies_for_worker() {
+        let root = key(1);
+        let log = LogId {
+            kind: LogKind::Base,
+            id: [5; 32],
+        };
+        let signed = signed(
+            &root,
+            Scope::ReadControlRange {
+                log,
+                after: 2,
+                through: MAX_SAFE,
+            },
+            NOW,
+        );
+        let result =
+            parsed(verify_permit_at(&verify_input(root.public(), NOW, &signed, &[])).unwrap());
+        assert_eq!(result["scope"], "read_control_range");
+        assert_eq!(result["after"], 2);
+        assert_eq!(result["through"], MAX_SAFE);
+        assert_eq!(result["log"], format!("01{}", "05".repeat(32)));
+        assert_eq!(
+            verify_permit_at(&verify_input(root.public(), NOW, &signed, &[0])),
+            Err(Refusal::Malformed)
+        );
     }
 
     #[test]
@@ -1130,13 +1301,14 @@ mod tests {
                 body: Some(body.commitment()),
                 epoch: [6; 32],
                 after: Some(Head::EMPTY),
+                attached: None,
             },
             NOW,
         );
         let ok = parsed(
             verify_permit_at(&verify_input(root.public(), NOW, &append, &event.encode())).unwrap(),
         );
-        assert_eq!(ok["event_id"], "08".repeat(32));
+        assert_eq!(ok["event_id"], hex(&event.publication_id(Route::Control).0));
         assert_eq!(ok["body"], hex(&body.commitment().0));
         assert_eq!(ok["after"]["position"], 0);
         let other = OpaqueEvent::new(EventId([8; 32]), vec![7; 1024]).unwrap();
@@ -1198,7 +1370,7 @@ mod tests {
     fn read_tail_uses_stored_commitment_and_refuses_other_log_or_bytes() {
         let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
         let base = BaseId(genesis.digest().0);
-        let ordered = Commitment::order(base, Head::EMPTY, &genesis, Route::Control).unwrap();
+        let ordered = Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control).unwrap();
         let mut input = base.0.to_vec();
         input.extend(ordered.encode());
         input.extend(genesis.encode());
@@ -1226,9 +1398,9 @@ mod tests {
     fn publish_tail_refuses_control_commitment_and_changed_descriptor() {
         let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
         let base = BaseId(genesis.digest().0);
-        let control = Commitment::order(base, Head::EMPTY, &genesis, Route::Control).unwrap();
+        let control = Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control).unwrap();
         let content = OpaqueEvent::new(EventId([2; 32]), vec![3; 1024]).unwrap();
-        let ordered = Commitment::order(base, control.head(), &content, Route::Content).unwrap();
+        let ordered = Commitment::order(base, control.after(), &content, Route::Content).unwrap();
         let mut input = base.0.to_vec();
         input.extend(ordered.encode());
         input.extend(content.encode());
@@ -1343,35 +1515,73 @@ mod tests {
         assert_eq!(sign_head_at(&[0; 40]).err(), Some(Refusal::Malformed));
     }
 
-    fn order_input(log: [u8; 32], previous: Head, route: u8, event: &OpaqueEvent) -> Vec<u8> {
+    fn order_input(log: [u8; 32], before: OrderState, route: u8, event: &OpaqueEvent) -> Vec<u8> {
         let mut input = log.to_vec();
-        input.extend(previous.position.to_be_bytes());
-        input.extend(previous.hash.0);
+        input.extend(before.encode());
         input.push(route);
         input.extend(event.encode());
         input
     }
 
     #[test]
+    fn event_routing_uses_genesis_digest_even_after_content() {
+        let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
+        let base = BaseId::from_genesis(&genesis);
+        let content = OpaqueEvent::new(EventId([1; 32]), vec![3; 1024]).unwrap();
+        let input = |event: &OpaqueEvent| [base.0.as_slice(), &event.encode()].concat();
+        assert_eq!(
+            parsed(routed_id_at(&input(&genesis)).unwrap())["event_id"],
+            hex(&genesis.publication_id(Route::Control).0)
+        );
+        assert_eq!(
+            parsed(routed_id_at(&input(&content)).unwrap())["event_id"],
+            hex(&content.publication_id(Route::Content).0)
+        );
+    }
+
+    #[test]
+    fn body_free_commitment_state_derives_opening_head_and_routed_identity() {
+        let event = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
+        let base = BaseId::from_genesis(&event);
+        let commitment =
+            Commitment::order(base, bh_sync::OrderState::EMPTY, &event, Route::Control).unwrap();
+        let mut input = base.0.to_vec();
+        input.extend(commitment.encode());
+        let state = parsed(commitment_state_at(&input).unwrap());
+        assert_eq!(state["order"], hex(&commitment.after().encode()));
+        assert_eq!(state["position"], 1);
+        assert_eq!(state["hash"], hex(&commitment.head().hash.0));
+        assert_eq!(
+            state["event_id"],
+            hex(&event.publication_id(Route::Control).0)
+        );
+        let mut wrong = input;
+        wrong[0] ^= 1;
+        assert_eq!(commitment_state_at(&wrong), Err(Refusal::Unavailable));
+    }
+
+    #[test]
     fn order_commitment_requires_the_named_genesis() {
         let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
         let base = BaseId(genesis.digest().0);
-        let ok =
-            parsed(order_commitment_at(&order_input(base.0, Head::EMPTY, 1, &genesis)).unwrap());
-        let expected = Commitment::order(base, Head::EMPTY, &genesis, Route::Control).unwrap();
+        let ok = parsed(
+            order_commitment_at(&order_input(base.0, OrderState::EMPTY, 1, &genesis)).unwrap(),
+        );
+        let expected =
+            Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control).unwrap();
         assert_eq!(ok["commitment"], hex(&expected.encode()));
         assert_eq!(ok["position"], 1);
         assert_eq!(
-            order_commitment_at(&order_input([9; 32], Head::EMPTY, 1, &genesis)).err(),
+            order_commitment_at(&order_input([9; 32], OrderState::EMPTY, 1, &genesis)).err(),
             Some(Refusal::Scope)
         );
         // A genesis is always a control.
         assert_eq!(
-            order_commitment_at(&order_input(base.0, Head::EMPTY, 0, &genesis)).err(),
+            order_commitment_at(&order_input(base.0, OrderState::EMPTY, 0, &genesis)).err(),
             Some(Refusal::Scope)
         );
         assert_eq!(
-            order_commitment_at(&[0; 73]).err(),
+            order_commitment_at(&[0; 115]).err(),
             Some(Refusal::Malformed)
         );
     }
@@ -1380,19 +1590,20 @@ mod tests {
     fn order_commitment_commits_the_route() {
         let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
         let base = BaseId(genesis.digest().0);
-        let head = Commitment::order(base, Head::EMPTY, &genesis, Route::Control)
+        let before = Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control)
             .unwrap()
-            .head();
+            .after();
         let next = OpaqueEvent::new(EventId([3; 32]), vec![4; 1024]).unwrap();
         for (byte, route) in [(0, Route::Content), (1, Route::Control)] {
-            let ok = parsed(order_commitment_at(&order_input(base.0, head, byte, &next)).unwrap());
-            let expected = Commitment::order(base, head, &next, route).unwrap();
+            let ok =
+                parsed(order_commitment_at(&order_input(base.0, before, byte, &next)).unwrap());
+            let expected = Commitment::order(base, before, &next, route).unwrap();
             assert_eq!(ok["commitment"], hex(&expected.encode()));
             assert_eq!(ok["hash"], hex(&expected.head().hash.0));
         }
         for unknown in [2, 0xff] {
             assert_eq!(
-                order_commitment_at(&order_input(base.0, head, unknown, &next)).err(),
+                order_commitment_at(&order_input(base.0, before, unknown, &next)).err(),
                 Some(Refusal::Malformed)
             );
         }

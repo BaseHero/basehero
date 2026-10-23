@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-account-confirm-new-kit"
+description = "Enables the account_confirm_new_kit command without any pre-configured scope."
+commands.allow = ["account_confirm_new_kit"]
+
+[[permission]]
+identifier = "deny-account-confirm-new-kit"
+description = "Denies the account_confirm_new_kit command without any pre-configured scope."
+commands.deny = ["account_confirm_new_kit"]

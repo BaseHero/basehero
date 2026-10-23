@@ -42,6 +42,7 @@ async fn home_completes_only_after_public_and_exact_private_ack() {
     assert_eq!(retained.head.position, 3);
     let hold = hosted.edge.hold_next_home_store();
     let (client, _) = device.start(&hosted);
+    let home = client.home_status();
     tokio::time::timeout(Duration::from_secs(20), hold.arrived)
         .await
         .expect("stored")
@@ -53,7 +54,8 @@ async fn home_completes_only_after_public_and_exact_private_ack() {
     assert!(device.home_pending());
     assert!(device.signer.home_ordered.lock().unwrap().is_empty());
     hold.release.send(()).unwrap();
-    until(20, "home confirmed", || !device.home_pending()).await;
+    until(20, "home confirmed", || *home.borrow() == HomeStatus::Done).await;
+    assert!(!device.home_pending());
     assert_eq!(
         device.signer.home_ordered.lock().unwrap().as_slice(),
         &[(retained.head, 0)]
@@ -99,7 +101,8 @@ async fn a_held_home_answer_does_not_delay_new_note_ack() {
     assert!(device.signer.home_ordered.lock().unwrap().is_empty());
 
     hold.release.send(()).unwrap();
-    until(20, "home confirmed", || !device.home_pending()).await;
+    until(20, "home confirmed", || *home.borrow() == HomeStatus::Done).await;
+    assert!(!device.home_pending());
     assert_eq!(
         device.signer.home_ordered.lock().unwrap().as_slice(),
         &[(retained.head, 0)]
@@ -227,7 +230,9 @@ async fn stop_after_durable_store_then_restart_completes_with_the_same_bundle() 
     assert!(device.home_pending());
     assert!(device.signer.home_ordered.lock().unwrap().is_empty());
     let (client, _) = device.start(&hosted);
-    until(20, "home confirmed", || !device.home_pending()).await;
+    let home = client.home_status();
+    until(20, "home confirmed", || *home.borrow() == HomeStatus::Done).await;
+    assert!(!device.home_pending());
     assert!(hosted.edge.home_stores().len() >= 2);
     assert_stored_once(&hosted, &device);
     assert_eq!(device.signer.home_ordered.lock().unwrap().len(), 1);
@@ -240,6 +245,7 @@ async fn authority_superseded_during_storage_completes_only_when_current() {
     let device = Device::new();
     let hold = hosted.edge.hold_next_home_store();
     let (client, _) = device.start(&hosted);
+    let home = client.home_status();
     tokio::time::timeout(Duration::from_secs(20), hold.arrived)
         .await
         .expect("stored")
@@ -247,7 +253,8 @@ async fn authority_superseded_during_storage_completes_only_when_current() {
     // Locked and unlocked while the answer is outstanding.
     let current = device.signer.relock();
     hold.release.send(()).unwrap();
-    until(20, "home confirmed", || !device.home_pending()).await;
+    until(20, "home confirmed", || *home.borrow() == HomeStatus::Done).await;
+    assert!(!device.home_pending());
     assert!(
         device
             .signer

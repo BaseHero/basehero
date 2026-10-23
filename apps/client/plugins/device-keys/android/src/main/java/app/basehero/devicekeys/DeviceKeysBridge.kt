@@ -334,6 +334,30 @@ object DeviceKeysBridge {
             decrypt(wrapper, associatedData, blob)
         }
     }
+    /** Delete this device's Keystore aliases and encrypted records for a
+     *  verified removal. An absent alias or file was already erased; a real
+     *  failure throws so the caller keeps its durable erasure marker. */
+    @Suppress("UNUSED_PARAMETER")
+    @JvmStatic fun deleteKeys(activity: Activity, handle: String, ticket: Long) {
+        reply(ticket) {
+            ad(handle, "ordinary") // validate the handle before any path or alias
+            val dir = directory(activity)
+            var failed = false
+            for (role in listOf("ordinary", "receiver", "control", "control-public")) {
+                for (suffix in listOf("", ".tmp")) {
+                    val file = File(dir, name(handle, role) + suffix)
+                    if (file.exists() && !file.delete()) failed = true
+                }
+            }
+            for (keyAlias in listOf(alias(handle, "ordinary"), alias(handle, "control"))) {
+                if (store.containsAlias(keyAlias) &&
+                    runCatching { store.deleteEntry(keyAlias) }.isFailure) failed = true
+            }
+            if (failed) throw IllegalStateException("device-key erasure failed")
+            byteArrayOf()
+        }
+    }
+
     /** Idempotent: an absent key was already retired. */
     @Suppress("UNUSED_PARAMETER")
     @JvmStatic fun retirePending(activity: Activity, handle: String, ticket: Long) {

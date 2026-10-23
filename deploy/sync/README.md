@@ -60,7 +60,7 @@ explicit allowed environment names, and no automatic SSH/user_config. No
 unmeasured bootstrap, arbitrary script hook, model/worker capability, or
 onchain KMS is introduced. Signing a policy does not change these bytes.
 
-The five runtime files are provided later as **encrypted environment inputs**
+The seven runtime files are provided later as **encrypted environment inputs**
 for the fixed measured prelaunch, not embedded in app-compose, CLI arguments or
 public config. The local `authz.files` paths are for final *local* validation,
 never remote bind paths:
@@ -69,6 +69,8 @@ never remote bind paths:
 | --- | --- | --- | --- |
 | `authz.files.permit_key` | `BH_AUTHZ_PERMIT_KEY` | `/dstack/bh-authz-runtime/permit_key` | `/run/config/permit_key` |
 | `authz.files.permit_cert` | `BH_AUTHZ_PERMIT_CERT` | `/dstack/bh-authz-runtime/permit_cert` | `/run/config/permit_cert` |
+| `authz.files.recovery_key` | `BH_AUTHZ_RECOVERY_KEY` | `/dstack/bh-authz-runtime/recovery_key` | `/run/config/recovery_key` |
+| `authz.files.recovery_cert` | `BH_AUTHZ_RECOVERY_CERT` | `/dstack/bh-authz-runtime/recovery_cert` | `/run/config/recovery_cert` |
 | `authz.files.policy` | `BH_AUTHZ_POLICY` | `/dstack/bh-authz-runtime/policy` | `/run/config/policy` |
 | `authz.files.policy_signature` | `BH_AUTHZ_POLICY_SIGNATURE` | `/dstack/bh-authz-runtime/policy_signature` | `/run/config/policy_signature` |
 | `authz.files.collateral` | `BH_AUTHZ_COLLATERAL` | `/dstack/bh-authz-runtime/collateral` | `/run/config/collateral` |
@@ -133,15 +135,17 @@ Worker secret. `HOSTING_ROOT` and `RECEIPT_CERT` are public bindings. No seed is
 accepted as a config value.
 
 Authz inputs name the explicitly selected protected persistent host directory,
-a quote socket, explicit non-root UID/GID, permit key/certificate, signed
-policy/signature and collateral files. File references are absolute **local
+a quote socket, explicit non-root UID/GID, permit and recovery keys/certificates,
+signed policy/signature and collateral files. File references are absolute **local
 source paths** for final validation, not secret values or remote mount paths.
-The configure machine must be able to read the public files and the permit key
-for a local key/certificate consistency check. The Rust validator uses the app's
+The configure machine must be able to read the public files and both private keys
+for local key/certificate consistency checks. The Rust validator uses the app's
 actual endpoint parser, existing policy/receipt verifiers and authz key matching.
-It verifies the permit certificate's existing signature without issuing a permit
-or signing anything. No real keys are used by the test suite. Only public output
-is copied.
+It verifies the permit and recovery certificates against the pinned hosting root
+without issuing either certificate or signing anything. An operator must supply
+certificates issued through the approved hosting-root signing route; this tool
+cannot issue them and does not verify real issuance or hardware deployment.
+No real keys are used by the test suite. Only public output is copied.
 dstack 0.5.12's guest image creates `/var/run/dstack.sock` through systemd
 socket activation with mode 0777 and its guest agent does not authorize callers
 by UID, so the non-root service can open a read-only bind of that socket
@@ -170,7 +174,7 @@ Devices trust the attested channel, not the ingress path.
 The service's outgoing data path is the endpoint's `/v1/data` WebSocket.
 
 The final output contains `config/worker/`, `config/wrangler.json`,
-`config/compose.json` and `config/endpoint.json` with exactly nine public fields
+`config/compose.json` and `config/endpoint.json` with exactly ten public fields
 and `appraisal=hardware`, plus `manifest.json`. Its manifest binds the bundle,
 prepared deployment manifest/candidate, operator-input hash, rendered file set
 and endpoint hash. Run `verify-config` before handing its printed endpoint path

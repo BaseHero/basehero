@@ -2,6 +2,68 @@ use bh_sync::wire::{self, Refusal, Request, Response};
 use bh_sync::{Digest, Head};
 
 #[test]
+fn directory_frames_round_trip() {
+    let requests = [
+        Request::ReadDirectory {
+            id: 11,
+            permit: vec![0xaa],
+            after: None,
+        },
+        Request::ReadDirectory {
+            id: 12,
+            permit: vec![0xbb],
+            after: Some([0x23; 32]),
+        },
+        Request::StoreDirectoryEntry {
+            id: 13,
+            permit: vec![0xcc],
+            body: vec![0x44; 1024],
+        },
+        Request::RetireHomeObjects {
+            id: 14,
+            permit: vec![0xdd],
+        },
+    ];
+    for request in requests {
+        let bytes = request.encode().unwrap();
+        assert_eq!(Request::decode(&bytes), Ok(request));
+        for n in 0..bytes.len() {
+            assert!(Request::decode(&bytes[..n]).is_err());
+        }
+    }
+    let responses = [
+        Response::Directory {
+            id: 11,
+            entries: vec![vec![0xa1; 1024], vec![0xb2; 1024]],
+            more: true,
+        },
+        Response::Directory {
+            id: 12,
+            entries: vec![],
+            more: false,
+        },
+        Response::DirectoryEntryStored { id: 13 },
+        Response::HomeObjectsRetired { id: 14 },
+    ];
+    for response in responses {
+        let bytes = response.encode().unwrap();
+        assert_eq!(Response::decode(&bytes), Ok(response));
+        for n in 0..bytes.len() {
+            assert!(Response::decode(&bytes[..n]).is_err());
+        }
+    }
+    assert_eq!(
+        Response::Directory {
+            id: 1,
+            entries: vec![vec![]; 65],
+            more: true
+        }
+        .encode(),
+        Err(wire::Error::Size)
+    );
+}
+
+#[test]
 fn wire_roundtrip_each_variant() {
     let requests = [
         Request::Read {
@@ -36,8 +98,9 @@ fn wire_roundtrip_each_variant() {
     let responses = [
         Response::Events {
             id: 1,
-            items: vec![(vec![1; 178], vec![2; 1062])],
+            items: vec![(vec![1; bh_sync::Commitment::LEN], vec![2; 1062])],
             receipt: None,
+            coverage: None,
         },
         Response::Body {
             id: 2,
@@ -88,7 +151,7 @@ fn wire_roundtrip_each_variant() {
 }
 
 #[test]
-fn legacy_stage_append_and_ack_vectors_remain_version_one() {
+fn stage_append_and_ack_keep_tags_under_version_three() {
     assert_eq!(
         Request::Stage {
             id: 1,
@@ -97,7 +160,7 @@ fn legacy_stage_append_and_ack_vectors_remain_version_one() {
         }
         .encode()
         .unwrap(),
-        [0, 1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0xaa, 0, 0, 0, 1, 0xbb]
+        [0, 3, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0xaa, 0, 0, 0, 1, 0xbb]
     );
     assert_eq!(
         Request::Append {
@@ -107,11 +170,11 @@ fn legacy_stage_append_and_ack_vectors_remain_version_one() {
         }
         .encode()
         .unwrap(),
-        [0, 1, 3, 0, 0, 0, 1, 0, 0, 0, 1, 0xaa, 0, 0, 0, 1, 0xbb]
+        [0, 3, 3, 0, 0, 0, 1, 0, 0, 0, 1, 0xaa, 0, 0, 0, 1, 0xbb]
     );
     assert_eq!(
         Response::Staged { id: 1 }.encode().unwrap(),
-        [0, 1, 3, 0, 0, 0, 1]
+        [0, 3, 3, 0, 0, 0, 1]
     );
     assert_eq!(
         Response::Acked {
@@ -120,12 +183,12 @@ fn legacy_stage_append_and_ack_vectors_remain_version_one() {
         }
         .encode()
         .unwrap(),
-        [0, 1, 4, 0, 0, 0, 1, 0, 0, 0, 1, 0xab]
+        [0, 3, 4, 0, 0, 0, 1, 0, 0, 0, 1, 0xab]
     );
 }
 
 #[test]
-fn compound_frames_are_v2_tag32_only_and_bounded() {
+fn compound_frames_are_v3_tag32_only_and_bounded() {
     let publish = Request::Publish {
         id: 0x01020304,
         stage_permit: vec![0xaa],
@@ -137,7 +200,7 @@ fn compound_frames_are_v2_tag32_only_and_bounded() {
     assert_eq!(
         frame,
         [
-            0, 2, 32, 1, 2, 3, 4, 0, 0, 0, 1, 0xaa, 0, 0, 0, 2, 0xbb, 0xcc, 0, 0, 0, 1, 0xdd, 0, 0,
+            0, 3, 32, 1, 2, 3, 4, 0, 0, 0, 1, 0xaa, 0, 0, 0, 2, 0xbb, 0xcc, 0, 0, 0, 1, 0xdd, 0, 0,
             0, 2, 0xee, 0xff
         ]
     );
@@ -148,7 +211,7 @@ fn compound_frames_are_v2_tag32_only_and_bounded() {
         commitment: vec![0x5a; bh_sync::Commitment::LEN],
     };
     let answer = published.encode().unwrap();
-    assert_eq!(&answer[..12], &[0, 2, 32, 1, 2, 3, 4, 0, 0, 0, 1, 0xab]);
+    assert_eq!(&answer[..12], &[0, 3, 32, 1, 2, 3, 4, 0, 0, 0, 1, 0xab]);
     assert_eq!(&answer[12..], &[0x5a; bh_sync::Commitment::LEN]);
     assert_eq!(Response::decode(&answer), Ok(published.clone()));
     for n in 0..frame.len() {
@@ -157,7 +220,7 @@ fn compound_frames_are_v2_tag32_only_and_bounded() {
     for n in 0..answer.len() {
         assert!(Response::decode(&answer[..n]).is_err());
     }
-    for (bad_version, bad_tag) in [(1, 32), (2, 1), (2, 33)] {
+    for (bad_version, bad_tag) in [(1, 32), (2, 32), (3, 8)] {
         let mut invalid = frame.clone();
         invalid[1] = bad_version;
         invalid[2] = bad_tag;
@@ -198,20 +261,16 @@ fn compound_frames_are_v2_tag32_only_and_bounded() {
 
 #[test]
 fn events_require_a_strict_fixed_width_receipt_option() {
-    // Empty Events: header, count, mandatory option flag. Old framing must
-    // not be silently accepted as the new transport response.
-    let old = vec![0, 1, 1, 0, 0, 0, 7, 0, 0];
-    assert_eq!(Response::decode(&old), Err(wire::Error::Encoding));
-    let mut none = old.clone();
-    none.push(0);
+    let none = vec![0, 3, 1, 0, 0, 0, 7, 0, 0, 0, 0];
     assert_eq!(Response::decode(&none).unwrap().encode().unwrap(), none);
-    let mut present = old.clone();
-    present.push(1);
-    present.extend([0x5a; 300]);
-    assert_eq!(
-        Response::decode(&present).unwrap().encode().unwrap(),
-        present
-    );
+    let with_receipt = Response::Events {
+        id: 7,
+        items: vec![(vec![0; bh_sync::Commitment::LEN], vec![9; 1024])],
+        receipt: Some([0x5a; 300]),
+        coverage: None,
+    };
+    let present = with_receipt.encode().unwrap();
+    assert_eq!(Response::decode(&present), Ok(with_receipt.clone()));
     for n in 0..present.len() {
         assert_eq!(Response::decode(&present[..n]), Err(wire::Error::Encoding));
     }
@@ -224,12 +283,15 @@ fn events_require_a_strict_fixed_width_receipt_option() {
         frame.push(0);
         assert_eq!(Response::decode(&frame), Err(wire::Error::Encoding));
     }
+    let mut old = with_receipt.encode().unwrap();
+    old[1] = 2;
+    assert_eq!(Response::decode(&old), Err(wire::Error::Version));
 }
 
 #[test]
 fn credit_frame_has_request_id_zero_and_a_positive_grant() {
     let frame = Request::Credit { bytes: 0x0102_0304 }.encode().unwrap();
-    assert_eq!(frame, [0, 1, 5, 0, 0, 0, 0, 1, 2, 3, 4]);
+    assert_eq!(frame, [0, 3, 5, 0, 0, 0, 0, 1, 2, 3, 4]);
     assert_eq!(Request::Credit { bytes: 9 }.encoded_len(), Ok(11));
     assert_eq!(
         Request::Credit { bytes: 0 }.encode(),
@@ -271,9 +333,10 @@ fn sixty_four_maximum_envelopes_and_receipt_fit_and_count_is_bounded() {
         id: 5,
         items: vec![(vec![0; bh_sync::Commitment::LEN], descriptor); 64],
         receipt: Some([0x5a; 300]),
+        coverage: None,
     };
     let frame = response.encode().unwrap();
-    assert_eq!(frame.len(), 4_209_014);
+    assert_eq!(frame.len(), 4_207_095);
     assert!(frame.len() <= wire::MAX_FRAME_LEN);
     assert_eq!(Response::decode(&frame), Ok(response.clone()));
     if let Response::Events { items, .. } = &mut response {
@@ -296,7 +359,7 @@ fn maximum_size_body_frame_roundtrips() {
     };
     let frame = response.encode().unwrap();
     assert_eq!(frame.len(), 7 + 1 + 1 + 4 + 4 * 1024 * 1024);
-    assert_eq!(&frame[..13], &[0, 1, 2, 0, 0, 0, 39, 63, 1, 0, 64, 0, 0]);
+    assert_eq!(&frame[..13], &[0, 3, 2, 0, 0, 0, 39, 63, 1, 0, 64, 0, 0]);
     assert_eq!(Response::decode(&frame), Ok(response));
     let mut invalid = frame;
     invalid[7] = 64;
@@ -322,8 +385,9 @@ fn oversize_encode_preflight_refuses_payload() {
     };
     let events = Response::Events {
         id: 1,
-        items: vec![(vec![0; 178], huge)],
+        items: vec![(vec![0; bh_sync::Commitment::LEN], huge)],
         receipt: Some([0x5a; 300]),
+        coverage: None,
     };
     for result in [
         request.encoded_len(),

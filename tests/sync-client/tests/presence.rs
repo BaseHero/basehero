@@ -58,7 +58,7 @@ async fn pair(hosted: &Arc<Hosted>) -> (Device, Device, [u8; 32]) {
         first.registered() && first.progress().position == 1
     })
     .await;
-    let second = Device::join(&first, hosted);
+    let second = Device::join(&first, hosted).await;
     a.wake();
     let (b, _) = second.start(hosted);
     until(20, "second joined", || second.progress().position >= 2).await;
@@ -1354,7 +1354,11 @@ async fn a_closed_epoch_drops_presence_and_refuses_a_new_caret() {
     let stale = presence::seal(&key, base, base, epoch, &record).unwrap();
 
     // The Fold removes itself; the Mac copies the removal, which closes the
-    // base's content epoch.
+    // base's content epoch. The Mac stages no rotation, so its base's
+    // rekey does not reopen it.
+    mac.signer
+        .refuse_rotation
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let removal = fold.signer.remove_self();
     hosted.edge.order_account(mac.account_log, &removal);
     a.wake();

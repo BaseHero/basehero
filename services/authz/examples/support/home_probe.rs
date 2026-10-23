@@ -221,6 +221,7 @@ pub async fn run(phase: &str, dir: &Path) {
                     log,
                     event: original.clone(),
                     delivery: None,
+                    attachment: None,
                 },
             )
             .await
@@ -303,7 +304,7 @@ pub async fn run(phase: &str, dir: &Path) {
             "home-first: real AccountOwner objects stored through attested authz; response lost before local confirmation"
         );
     } else {
-        owner.confirm_home_ordered(prefix.head).unwrap();
+        owner.confirm_home_ordered(prefix.head, None).unwrap();
         assert!(owner.setup_status().unwrap().is_none());
         println!(
             "home-again: cold authz replay, exact durable retry, verified public prefix, then home confirmation"

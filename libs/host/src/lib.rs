@@ -11,10 +11,13 @@
 //! - `confirm`: one confirmation covering a pairing addition and its copy,
 //!   on a key store whose control confirmation the app enforces.
 //! - `endpoint`: the build's fixed sync endpoint file.
+//! - `devices`: Your devices, its removals and password change, and the
+//!   security alerts kept on this device.
 #![forbid(unsafe_code)]
 
 pub mod accounts;
 pub mod confirm;
+pub mod devices;
 pub mod endpoint;
 pub mod pairing;
 pub mod sync;

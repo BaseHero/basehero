@@ -83,7 +83,7 @@ async fn two_devices_exchange_typed_records_and_specialised_notes_after_restart(
         a.registered() && a.progress().position >= 1
     })
     .await;
-    let b = Device::join(&a, &hosted);
+    let b = Device::join(&a, &hosted).await;
     until(20, "addition copied", || {
         a.progress()
             .account
@@ -749,7 +749,7 @@ async fn queued_documentation_revision_cannot_restore_a_new_protected_policy() {
     let a = Device::new();
     let (a_client, _) = a.start(&hosted);
     drive(|| a.registered() && a.progress().position >= 1).await;
-    let b = Device::join(&a, &hosted);
+    let b = Device::join(&a, &hosted).await;
     drive(|| {
         a.progress()
             .account
@@ -898,7 +898,7 @@ async fn revised_article_index_and_search_resume_parked_work_on_two_devices() {
         a.registered() && a.progress().position >= 1
     })
     .await;
-    let b = Device::join_with_maintenance(&a, &hosted, false);
+    let b = Device::join_with_maintenance(&a, &hosted, false).await;
     until(120, "addition copied", || {
         a.progress().account.is_some_and(|(p, _)| p == 4)
     })

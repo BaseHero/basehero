@@ -467,6 +467,7 @@ name = "bh-account"
 version = "0.1.0"
 dependencies = [
  "bh-crypto",
+ "bh-flags",
  "bh-storage",
  "rusqlite",
  "tempfile",
@@ -523,6 +524,7 @@ dependencies = [
  "bh-crypto",
  "bh-device",
  "bh-device-keys",
+ "bh-flags",
  "bh-host",
  "bh-mac-keychain-helper",
  "bh-mac-lifecycle",
@@ -530,7 +532,11 @@ dependencies = [
  "bh-provider-policy-store",
  "bh-release",
  "bh-storage",
+ "block2",
  "flate2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-user-notifications",
  "plist",
  "rfd",
  "rusqlite",
@@ -568,6 +574,7 @@ dependencies = [
  "bh-confidential-attestation",
  "bh-confidential-policy",
  "bh-crypto",
+ "bh-flags",
  "cc-eventlog",
  "dcap-qvl",
  "ez-hash",
@@ -701,6 +708,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bh-flags"
+version = "0.1.0"
+dependencies = [
+ "bh-crypto",
+]
+
+[[package]]
 name = "bh-host"
 version = "0.1.0"
 dependencies = [
@@ -708,6 +722,7 @@ dependencies = [
  "bh-confidential-policy",
  "bh-crypto",
  "bh-device",
+ "bh-event",
  "bh-storage",
  "bh-sync",
  "bh-sync-client",
@@ -727,6 +742,7 @@ dependencies = [
  "bh-account",
  "bh-authz",
  "bh-confidential-attestation",
+ "bh-confidential-channel",
  "bh-confidential-policy",
  "bh-crypto",
  "bh-device",
@@ -951,12 +967,14 @@ dependencies = [
  "bh-account",
  "bh-authz",
  "bh-confidential-attestation",
+ "bh-confidential-channel",
  "bh-confidential-policy",
  "bh-core",
  "bh-crypto",
  "bh-data",
  "bh-device",
  "bh-event",
+ "bh-flags",
  "bh-storage",
  "bh-sync",
  "bh-sync-client",
@@ -4805,6 +4823,8 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
 dependencies = [
+ "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-foundation",
 ]

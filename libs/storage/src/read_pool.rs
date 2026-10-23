@@ -132,6 +132,37 @@ impl ReadPool {
         }
         Ok(bytes)
     }
+    /// Confirmed bounds at the same anchor, index epoch and cut as the view.
+    /// A missing row means legacy/unknown time, not permission to guess one.
+    pub fn account_confirmed_time(
+        &self,
+        anchor: [u8; 32],
+        epoch: u64,
+        cut: u64,
+        position: u64,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let conn = self.lease()?;
+        let (guard, earliest, latest, proof_len): (bool, Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_projection WHERE id=1 AND anchor=?1 AND epoch=?2 AND through_position>=?3),
+             c.earliest_ms,c.latest_ms,length(c.confirmation)
+             FROM (SELECT 1) LEFT JOIN account_confirmations c ON c.position=?4 AND c.position<=?3",
+            params![anchor.as_slice(),crate::account::sql(epoch)?,crate::account::sql(cut)?,crate::account::sql(position)?],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        )?;
+        if !guard {
+            return Err(StoreError::AuthorityChanged);
+        }
+        match (earliest, latest, proof_len) {
+            (None, None, None) => Ok(None),
+            (Some(earliest), Some(latest), Some(len))
+                if earliest >= 0 && latest >= earliest && len > 0 =>
+            {
+                Ok(Some((earliest as u64, latest as u64)))
+            }
+            _ => Err(StoreError::CorruptSecurity),
+        }
+    }
+
     /// Run one short typed-data query without holding the writer guard.
     pub fn read_data<T>(
         &self,

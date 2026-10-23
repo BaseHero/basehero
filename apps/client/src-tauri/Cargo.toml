@@ -39,6 +39,7 @@ basehero-models = { path = "../../../libs/models", features = ["near-route"] }
 bh-confidential-attestation.workspace = true
 bh-account.workspace = true
 bh-crypto.workspace = true
+bh-flags.workspace = true
 bh-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -71,6 +72,10 @@ url.workspace = true
 bh-mac-lifecycle.workspace = true
 security-framework.workspace = true
 rfd.workspace = true
+objc2-user-notifications.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+block2.workspace = true
 
 [lints]
 workspace = true

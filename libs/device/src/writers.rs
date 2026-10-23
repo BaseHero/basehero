@@ -226,8 +226,8 @@ impl Owner {
     /// Record a verified registration of `base` (its genesis receipt, or a
     /// joined base's bootstrap), pinning `hosting_root` from the base's
     /// authenticated hosting association (never an invented one) and
-    /// latching its writer phase Registered in the same transaction, and
-    /// install the production bindings reader.
+    /// latching its writer phase Registered in the same transaction. Install
+    /// the reader first so a concurrent save never sees Registered without it.
     pub fn record_registration(
         &self,
         id: ContainerId,
@@ -236,6 +236,7 @@ impl Owner {
         hosting_root: [u8; 32],
     ) -> Result<(), OwnerError> {
         let database = self.shared_database(id)?;
+        self.install_stored_bindings(id);
         database
             .lock()
             .expect("container writer lock")
@@ -244,7 +245,6 @@ impl Owner {
                 bh_storage::StoreError::RootConflict => OwnerError::Unavailable,
                 other => OwnerError::Store(other),
             })?;
-        self.install_stored_bindings(id);
         Ok(())
     }
     /// Native restore/import integration, never a page operation. Fence live

@@ -2,3 +2,4 @@
 pub(super) mod bridge;
 pub(super) mod kit;
 pub(super) mod macos;
+pub(super) mod notify;

@@ -106,6 +106,12 @@ impl EdgeReader for StorageEdge {
     fn read_log(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<bh_authz::LogItems, EdgeError>> {
         self.read.read_log(permit)
     }
+    fn read_log_with_receipt(
+        &self,
+        permit: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bh_authz::LogRead, EdgeError>> {
+        self.read.read_log_with_receipt(permit)
+    }
     fn read_bodies(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, EdgeError>> {
         self.read.read_bodies(permit)
     }
@@ -271,7 +277,7 @@ async fn objects_checked_against_retained_historical_signup_not_current_or_calle
 }
 
 #[tokio::test]
-async fn durable_matching_ack_required_and_private_bundle_not_in_authz_database() {
+async fn durable_matching_ack_required_and_only_recovery_objects_in_authz_database() {
     let h = Harness::new();
     let d = Device::new();
     let (a, request) = signup(&d);
@@ -299,18 +305,17 @@ async fn durable_matching_ack_required_and_private_bundle_not_in_authz_database(
             digest: expected_digest
         }
     );
-    // Disk cache contains signed public history only, not the private objects.
+    // Besides signed public history, the disk keeps only what recovery
+    // releases: the record and the recovery seal, never the device seal.
     drop(s);
-    for item in std::fs::read_dir(h.dir.path()).unwrap() {
-        let contents = std::fs::read(item.unwrap().path()).unwrap();
-        for object in [
-            home_objects::Bundle::decode(&bytes).unwrap().record,
-            home_objects::Bundle::decode(&bytes).unwrap().device_seal,
-            home_objects::Bundle::decode(&bytes).unwrap().recovery_seal,
-        ] {
-            assert!(!contents.windows(object.len()).any(|w| w == object));
-        }
-    }
+    let bundle = home_objects::Bundle::decode(&bytes).unwrap();
+    let contents: Vec<u8> = std::fs::read_dir(h.dir.path())
+        .unwrap()
+        .flat_map(|item| std::fs::read(item.unwrap().path()).unwrap())
+        .collect();
+    let holds = |object: &[u8]| contents.windows(object.len()).any(|w| w == object);
+    assert!(!holds(bundle.device_seal));
+    assert!(holds(bundle.record) && holds(bundle.recovery_seal));
 }
 
 #[tokio::test]

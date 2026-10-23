@@ -19,13 +19,13 @@ fn fixture() -> (GateState, bh_crypto::SigningKey) {
     let key = bh_crypto::SigningKey::from_seed(&seed);
     let genesis = event(1);
     let base = BaseId::from_genesis(&genesis);
-    let head = Commitment::order(base, Head::EMPTY, &genesis, Route::Control)
-        .unwrap()
-        .head();
+    let ordered = Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control).unwrap();
+    let head = ordered.head();
     (
         GateState {
             base,
             head,
+            order: ordered.after(),
             incarnation: [4; 32],
             sequence: 0,
             checker_key: key.public(),
@@ -106,7 +106,10 @@ fn append_and_read_each_consume_one_sequence() {
     let plan = plan_consumption(&state, &grant, &operation, time(), None).unwrap();
     assert_eq!(plan.next.sequence, 1);
     assert_eq!(plan.next.head.position, 2);
-    assert_eq!(plan.append.unwrap().event_id(), event(2).id());
+    assert_eq!(
+        plan.append.unwrap().event_id(),
+        event(2).publication_id(Route::Content)
+    );
     assert_eq!(
         plan_consumption(&plan.next, &grant, &operation, time(), None),
         Err(AccessError::Stale)
@@ -155,13 +158,13 @@ fn altered_operations_head_base_and_incarnation_refuse() {
     altered.base = BaseId([9; 32]);
     assert_eq!(
         plan_consumption(&altered, &grant, &op, time(), None),
-        Err(AccessError::Stale)
+        Err(AccessError::History)
     );
     altered = state;
     altered.head.hash = Digest([9; 32]);
     assert_eq!(
         plan_consumption(&altered, &grant, &op, time(), None),
-        Err(AccessError::Stale)
+        Err(AccessError::History)
     );
     altered = state;
     altered.incarnation = [9; 32];
@@ -226,7 +229,7 @@ fn fresh_authorization_of_lost_ack_returns_original_commitment() {
     assert_eq!(retry.next.sequence, 2);
     assert_eq!(retry.append, None);
     assert_eq!(retry.ack, Some(original));
-    let changed = Operation::Append(OpaqueEvent::new(event(2).id(), vec![3; 1024]).unwrap());
+    let changed = Operation::Append(OpaqueEvent::new(event(2).nonce(), vec![3; 1024]).unwrap());
     assert_eq!(
         plan_consumption(
             &first.next,
@@ -310,7 +313,10 @@ fn append_fails_closed_unless_the_referenced_body_is_staged() {
         Digest([6; 32]),
     )
     .unwrap();
-    assert_eq!(plan.append.unwrap().event_id(), event(2).id());
+    assert_eq!(
+        plan.append.unwrap().event_id(),
+        event(2).publication_id(Route::Content)
+    );
 }
 
 #[test]

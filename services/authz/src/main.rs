@@ -3,11 +3,12 @@
 //! on the command line; nothing secret is taken from argv itself or logged.
 use bh_authz::{
     Attestation, ChannelConfig, Clock, DstackAttestation, EdgeClient, MonotonicCounter, PermitKeys,
-    RoughtimeClock, Service,
+    RecoveryHomeKey, RoughtimeClock, Service,
 };
 use bh_confidential_host::TimeSampler;
-use bh_crypto::{Secret, SigningKey};
+use bh_crypto::{KemKey, Secret, SigningKey};
 use bh_qualified_time::{Config, ServerRoot};
+use bh_sync::evidence::RecoveryKeyCertificate;
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_tungstenite::tungstenite::{
@@ -18,11 +19,12 @@ use tokio_tungstenite::tungstenite::{
 
 const USAGE: &str = "usage: bh-authz --listen ADDR --db PATH --edge URL --hosting-root HEX
   --permit-key FILE --permit-cert FILE --app-root HEX --policy FILE --policy-signature FILE
+  --recovery-key FILE --recovery-cert FILE
   then either the hardware attestation and qualified time:
   --quote-socket PATH --collateral FILE --roughtime ADDR=KEYHEX --roughtime ADDR=KEYHEX
   --time-config HZ,DRIFT_PPM,SMEAR_US,MAX_AGE_TICKS,MAX_WIDTH_MS (HZ is 1000000000)
   or, in a build with the synthetic-attestation feature only, for local use:
-  --synthetic-attestation";
+  --synthetic-attestation (the recovery flags are then optional)";
 /// Concurrent device connections.
 const MAX_CONNECTIONS: usize = 1024;
 const EDGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,6 +47,8 @@ struct Args {
     app_root: Option<[u8; 32]>,
     policy: Option<PathBuf>,
     policy_signature: Option<PathBuf>,
+    recovery_key: Option<PathBuf>,
+    recovery_cert: Option<PathBuf>,
     quote_socket: Option<PathBuf>,
     collateral: Option<PathBuf>,
     roughtime: Vec<(SocketAddr, ServerRoot)>,
@@ -91,6 +95,8 @@ impl Args {
                 "--app-root" => parsed.app_root = Some(hex_array(&value, &flag)?),
                 "--policy" => parsed.policy = Some(path()),
                 "--policy-signature" => parsed.policy_signature = Some(path()),
+                "--recovery-key" => parsed.recovery_key = Some(path()),
+                "--recovery-cert" => parsed.recovery_cert = Some(path()),
                 "--quote-socket" => parsed.quote_socket = Some(path()),
                 "--collateral" => parsed.collateral = Some(path()),
                 "--roughtime" => {
@@ -135,6 +141,29 @@ impl Args {
 
 fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
     value.ok_or_else(|| format!("{flag} is required\n{USAGE}"))
+}
+
+/// The home's recovery key, read once from its file, and its certificate.
+/// A local synthetic service may run without one: it then refuses claims.
+fn recovery(args: &Args, root: &[u8; 32]) -> Result<Option<RecoveryHomeKey>, String> {
+    if args.synthetic && args.recovery_key.is_none() && args.recovery_cert.is_none() {
+        eprintln!("bh-authz: no --recovery-key: recovery claims are refused");
+        return Ok(None);
+    }
+    let seed = hex_file::<32>(
+        &required(args.recovery_key.clone(), "--recovery-key")?,
+        "--recovery-key",
+    )?;
+    let key = KemKey::from_seed(&Secret::from_slice(&seed).map_err(|_| "--recovery-key")?);
+    let certificate = hex_file::<{ RecoveryKeyCertificate::LEN }>(
+        &required(args.recovery_cert.clone(), "--recovery-cert")?,
+        "--recovery-cert",
+    )?;
+    let certificate = RecoveryKeyCertificate::decode(&certificate)
+        .map_err(|_| "--recovery-cert: not a recovery key certificate")?;
+    RecoveryHomeKey::new(key, certificate, root)
+        .map(Some)
+        .map_err(|_| "--recovery-cert does not name --recovery-key under --hosting-root".into())
 }
 
 struct Trust {
@@ -214,15 +243,15 @@ async fn run() -> Result<(), String> {
             "--policy-signature",
         )?,
     };
+    let recovery = recovery(&args, &keys.root())?;
     let Trust { attestation, clock } = trust(&args)?;
     let edge = EdgeClient::new(required(args.edge.clone(), "--edge")?, EDGE_TIMEOUT)
         .map_err(|_| "--edge: cannot configure TLS")?;
-    let service = Service::open(
-        &required(args.db.clone(), "--db")?,
-        keys,
-        clock,
-        Arc::new(edge),
-    )
+    let db = required(args.db.clone(), "--db")?;
+    let service = match recovery {
+        Some(recovery) => Service::open_with_recovery(&db, keys, recovery, clock, Arc::new(edge)),
+        None => Service::open(&db, keys, clock, Arc::new(edge)),
+    }
     .map_err(|e| e.to_string())?;
     let listen = required(args.listen, "--listen")?;
     let listener = TcpListener::bind(listen)

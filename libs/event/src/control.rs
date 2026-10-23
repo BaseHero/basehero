@@ -6,20 +6,26 @@
 //! sees content, so it judges an author's claim about what they had seen
 //! against the last control alone. Both run the same checks here, so for the
 //! same control they reach the same verdict and effect.
+use crate::account_run::{AccountCopy, judge_run};
 use crate::codec::{
-    ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, Error, EventSigningRequest,
-    GENESIS, NOTE, NOTE_PREFIX, OpenPayload, Payload, TYPED_DATA, body_committed, body_named,
-    key_id, open_binding, open_body, prepare_seal,
+    ACCOUNT_CHANGE, ACCOUNT_CHANGE_V2, ACCOUNT_REKEY, Binding, CLASS_CONTENT, CLASS_CONTROL,
+    Encoded, Error, EventSigningRequest, GENESIS, MODE_ORDINARY, NOTE, NOTE_PREFIX, OpenPayload,
+    Payload, SIGNED_DOMAIN, TYPED_DATA, body_committed, body_named, key_id, open_binding,
+    open_body, prepare_seal,
 };
 use crate::genesis::{VerifiedGenesis, judge_genesis};
 use crate::history::{History, Outcome, Seen};
+use crate::rekey::judge_rekey;
 use crate::writer::{DeviceWriterDeclaration, WriterDecodeError};
 use bh_account::{
     AccountEvent, AccountId, DeviceId, Error as AccountError, Head as AccountHead, VerifiedAccount,
 };
 use bh_crypto::{Secret, random, verify};
 use bh_sync::{
-    BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, Route, receipt, receipt::RECEIPT_LEN,
+    BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, OrderState, Route,
+    canonical::{ControlCoverage, RawControlChain},
+    receipt,
+    receipt::RECEIPT_LEN,
 };
 use std::sync::Arc;
 
@@ -29,6 +35,11 @@ use std::sync::Arc;
 const ACCOUNT_TAG: usize = b"BaseHero account event\0".len() + 2 + 2 + 8 + 32 + 32 + 32;
 const ADD_DEVICE: u8 = 1;
 const REMOVE_SELF: u8 = 2;
+/// Removal requests, immediate removals, cancellations, recovery-key
+/// replacement and personal-key rotation: known here, and never valid
+/// untimed.
+const FIRST_TRUST: u8 = 5;
+const LAST_TRUST: u8 = 9;
 
 /// What a follower knows when it judges the next event: the state its
 /// verified history reached, and what that history had at the positions an
@@ -52,6 +63,64 @@ pub(crate) trait SignedContext {
     fn saw(&self, claim: Seen) -> Result<bool, Outcome>;
 }
 
+/// Two different global Heads at the same position, one known to this
+/// follower and one authenticated by a receipt under its pinned hosting root.
+/// This is independent of the original author's own seen claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeenReceiptConflict {
+    pub base: BaseId,
+    pub root: [u8; 32],
+    pub known: Head,
+    pub observed: Head,
+    pub receipt: [u8; RECEIPT_LEN],
+}
+
+/// An original whose binding, seen claims and receipt verified. Its
+/// signature verified under `key`, the author's key before this event; a
+/// control whose author is not active before it has no key yet, and only a
+/// run can establish its author, once the run applies.
+pub(crate) struct Signed {
+    pub binding: Binding,
+    pub signature: [u8; 64],
+    binding_nonce: Option<[u8; 24]>,
+    pub key: Option<[u8; 32]>,
+}
+impl Signed {
+    /// Whether `key`, the author's key once this event applies, signed it.
+    pub(crate) fn signed_by(&self, key: &[u8; 32]) -> bool {
+        match self.key {
+            Some(checked) => checked == *key,
+            None => {
+                let mut bytes = SIGNED_DOMAIN.to_vec();
+                bytes.extend(self.binding.encode_for_verify(self.binding_nonce.as_ref()));
+                verify(key, &bytes, &self.signature).is_ok()
+            }
+        }
+    }
+}
+
+/// The key that signs this event, from the account before it: an active
+/// device's ordinary key for genesis, content and a rekey, its control key
+/// for any other control, or the recovery key for a control under the
+/// recovery author. `Ok(None)`: a control by an author not active before it.
+fn signer_key(
+    account: &VerifiedAccount,
+    signed: &Binding,
+    genesis: bool,
+) -> Result<Option<[u8; 32]>, ()> {
+    let device = account.active_device(signed.device).ok();
+    if genesis || signed.class == CLASS_CONTENT || signed.mode == MODE_ORDINARY {
+        return device.map(|d| Some(*d.signing())).ok_or(());
+    }
+    if let Some(device) = device {
+        return Ok(Some(*device.control()));
+    }
+    if account.recovery_author().ok() == Some(signed.device) {
+        return Ok(account.recovery_keys().ok().map(|keys| *keys.signing()));
+    }
+    Ok(None)
+}
+
 /// Verify an ordered original's binding, author, signature, version, receipt
 /// and seen claims, and that its sealed class matches the route it was
 /// ordered on, without opening its body. An invalid submission is
@@ -61,7 +130,7 @@ pub(crate) fn verify_signed(
     route: Route,
     event: &OpaqueEvent,
     metadata: &Secret<32>,
-) -> Result<Binding, Outcome> {
+) -> Result<Signed, Outcome> {
     let genesis = ctx.genesis();
     // The independently introduced base names its genesis, so an invalid
     // genesis contradicts that introduction. After it, an invalid
@@ -71,7 +140,7 @@ pub(crate) fn verify_signed(
     } else {
         Outcome::Rejected
     };
-    if ctx.id_used(event.id().0)? {
+    if ctx.id_used(event.publication_id(route).0)? {
         return Err(invalid);
     }
     // Genesis introduces M; every later original must use exactly that
@@ -80,7 +149,7 @@ pub(crate) fn verify_signed(
     if !genesis && ctx.metadata_id() != Some(metadata_key_id) {
         return Err(Outcome::UnavailablePause);
     }
-    let (signed, signature) = match open_binding(
+    let opened = match open_binding(
         event,
         metadata,
         if genesis { [0; 32] } else { ctx.base().0 },
@@ -91,30 +160,30 @@ pub(crate) fn verify_signed(
         Err(Error::Unavailable) => return Err(Outcome::UnavailablePause),
         Err(Error::Invalid) => return Err(invalid),
     };
+    let signed = opened.binding;
+    let signature = opened.signature;
     if !genesis {
         // A receipt the pinned hosting key signed for a head that differs
         // from the one verified at its position is the service
         // contradicting itself, whoever carries it: nothing a member signs
         // can make one. Anything else wrong with it is the author's.
         let root = ctx.hosting_root().ok_or(Outcome::UnavailablePause)?;
-        if let Ok(observed) = receipt::verify(&root, ctx.base(), &signed.seen_receipt) {
-            let head = observed.head();
-            if ctx
-                .known_head(head.position)?
-                .is_some_and(|known| known != head)
-            {
-                return Err(Outcome::IntegrityStop);
-            }
+        if rooted_seen_conflict(ctx, root, &signed.seen_receipt)?.is_some() {
+            return Err(Outcome::IntegrityStop);
         }
     }
     let account = ctx.account();
     if signed.account != account.id() || (genesis && signed.audience != [0; 32]) {
         return Err(invalid);
     }
+    if signed.mode == MODE_ORDINARY && signed.class != CLASS_CONTROL {
+        return Err(invalid);
+    }
     if genesis {
         if signed.class != CLASS_CONTROL
             || signed.seen != Head::EMPTY
             || signed.seen_control != [0; 32]
+            || signed.seen_receipt != [0; RECEIPT_LEN]
             || signed.account_head != account.head()
         {
             return Err(invalid);
@@ -134,40 +203,36 @@ pub(crate) fn verify_signed(
             return Err(invalid);
         }
     }
-    let device = match account.active_device(signed.device) {
-        Ok(v) => v,
-        Err(_) => return Err(invalid),
-    };
-    let key = if genesis || signed.class == CLASS_CONTENT {
-        device.signing()
-    } else {
-        device.control()
-    };
-    let mut signed_bytes = b"bh/original-envelope/v1\0".to_vec();
-    signed_bytes.extend(signed.encode_for_verify());
-    // Genesis is version 1 forever, so a remembered floor applies only to
-    // later events, which are version 2 and carry a receipt.
-    if verify(key, &signed_bytes, &signature).is_err()
+    let key = signer_key(account, &signed, genesis).map_err(|()| invalid)?;
+    let mut signed_bytes = SIGNED_DOMAIN.to_vec();
+    signed_bytes.extend(signed.encode_for_verify(opened.binding_nonce.as_ref()));
+    // Genesis is independently anchored; the remembered floor applies only
+    // to later events. Legacy genesis remains readable under a newer floor.
+    if key.is_some_and(|key| verify(&key, &signed_bytes, &signature).is_err())
         || signed.highest < signed.version
         || (!genesis && signed.version < ctx.floor())
     {
         return Err(invalid);
     }
-    if signed.version > 2 {
-        return Err(Outcome::UnsupportedPause);
+    // What this build cannot judge pauses only for an author it knows: an
+    // author not yet active is established by a run this build reads.
+    let unsupported = if key.is_some() {
+        Outcome::UnsupportedPause
+    } else {
+        invalid
+    };
+    if signed.version != 3 {
+        return Err(unsupported);
     }
     // Only the base's ordinary audience is known; another one's events
     // (and their epochs) are semantics this version cannot judge.
     if signed.audience != [0; 32] {
-        return Err(Outcome::UnsupportedPause);
+        return Err(unsupported);
     }
     // The sequencer committed which permit it ordered this under. A control
     // ordered as content, or content ordered as a control, is the author's
     // invalid submission; at genesis it stops.
     if (signed.class == CLASS_CONTROL) != (route == Route::Control) {
-        return Err(invalid);
-    }
-    if signed.version != if genesis { 1 } else { 2 } {
         return Err(invalid);
     }
     // S's epoch is class-specific.
@@ -186,7 +251,33 @@ pub(crate) fn verify_signed(
             _ => return Err(invalid),
         }
     }
-    Ok(signed)
+    Ok(Signed {
+        binding: signed,
+        signature,
+        binding_nonce: opened.binding_nonce,
+        key,
+    })
+}
+
+fn rooted_seen_conflict(
+    ctx: &impl SignedContext,
+    root: [u8; 32],
+    bytes: &[u8; RECEIPT_LEN],
+) -> Result<Option<SeenReceiptConflict>, Outcome> {
+    let Ok(receipt) = receipt::verify(&root, ctx.base(), bytes) else {
+        return Ok(None);
+    };
+    let observed = receipt.head();
+    Ok(ctx
+        .known_head(observed.position)?
+        .filter(|known| *known != observed)
+        .map(|known| SeenReceiptConflict {
+            base: ctx.base(),
+            root,
+            known,
+            observed,
+            receipt: *bytes,
+        }))
 }
 
 /// A verified event's effect, before any follower applies it.
@@ -205,21 +296,31 @@ pub(crate) enum Judged {
     Control {
         /// The account after an account change; None when unchanged.
         account: Option<Arc<VerifiedAccount>>,
-        change: Option<Vec<u8>>,
+        copy: Option<CopiedChange>,
         metadata_id: Option<[u8; 32]>,
         epoch_id: Option<[u8; 32]>,
     },
 }
 
+/// The account events a control copied into the base, and what kind of
+/// copy it was.
+pub(crate) struct CopiedChange {
+    pub change: ControlChange,
+    pub copies: Vec<AccountCopy>,
+    /// A rekey's seal-set commitment.
+    pub seal_set: Option<Digest>,
+}
+
 /// Open and judge the body of an original [`verify_signed`] accepted.
 pub(crate) fn judge(
     ctx: &impl SignedContext,
-    signed: &Binding,
+    verified: &Signed,
     event: &OpaqueEvent,
     body: &[u8],
     metadata: &Secret<32>,
     content: Option<&Secret<32>>,
 ) -> Result<Judged, Outcome> {
+    let signed = &verified.binding;
     let genesis = ctx.genesis();
     let invalid = if genesis {
         Outcome::IntegrityStop
@@ -245,6 +346,16 @@ pub(crate) fn judge(
         Error::Unsupported => Outcome::UnsupportedPause,
         Error::Invalid => invalid,
     })?;
+    if signed.class == CLASS_CONTROL {
+        // Only a rekey is signed with the ordinary key, and always.
+        if (signed.mode == MODE_ORDINARY) != (payload.kind == ACCOUNT_REKEY) {
+            return Err(invalid);
+        }
+        // Only a run can establish an author not active before it.
+        if verified.key.is_none() && payload.kind != ACCOUNT_CHANGE_V2 {
+            return Err(invalid);
+        }
+    }
     match (signed.class, payload.kind) {
         (CLASS_CONTROL, GENESIS) if genesis => {
             let data = payload.data();
@@ -259,29 +370,42 @@ pub(crate) fn judge(
             }
             Ok(Judged::Control {
                 account: None,
-                change: None,
+                copy: None,
                 metadata_id: Some(signed.epoch),
                 epoch_id: Some(data[104..136].try_into().expect("length checked")),
             })
         }
         (CLASS_CONTROL, ACCOUNT_CHANGE) if !genesis => {
+            // A legacy copy is by a device active before it.
+            if ctx.account().active_device(signed.device).is_err() {
+                return Err(invalid);
+            }
             let (account, change) = account_change(
                 ctx.account(),
                 payload.data(),
                 signed.account_head == ctx.account().head(),
             )?;
-            let epoch_id = if change[ACCOUNT_TAG] == REMOVE_SELF {
-                None
-            } else {
-                ctx.epoch_id()
-            };
+            let removed = change[ACCOUNT_TAG] == REMOVE_SELF;
             Ok(Judged::Control {
                 account: Some(Arc::new(account)),
-                change: Some(change),
+                copy: Some(CopiedChange {
+                    change: if removed {
+                        ControlChange::RemoveSelf
+                    } else {
+                        ControlChange::AddDevice
+                    },
+                    copies: vec![AccountCopy {
+                        original: change,
+                        confirmation: None,
+                    }],
+                    seal_set: None,
+                }),
                 metadata_id: ctx.metadata_id(),
-                epoch_id,
+                epoch_id: if removed { None } else { ctx.epoch_id() },
             })
         }
+        (CLASS_CONTROL, ACCOUNT_CHANGE_V2) if !genesis => judge_run(ctx, verified, payload.data()),
+        (CLASS_CONTROL, ACCOUNT_REKEY) if !genesis => judge_rekey(ctx, verified, payload.data()),
         (CLASS_CONTENT, NOTE) if !genesis => {
             // Note ID, then the producing writer's declaration, then the
             // update: a note event without both is malformed.
@@ -309,7 +433,7 @@ pub(crate) fn judge(
         (CLASS_CONTENT, TYPED_DATA) if !genesis => Ok(Judged::Typed { payload }),
         // Known kinds in the wrong class stay the author's invalid submission.
         (CLASS_CONTROL, GENESIS)
-        | (CLASS_CONTENT, GENESIS | ACCOUNT_CHANGE)
+        | (CLASS_CONTENT, GENESIS | ACCOUNT_CHANGE | ACCOUNT_REKEY | ACCOUNT_CHANGE_V2)
         | (CLASS_CONTROL, NOTE | TYPED_DATA) => Err(invalid),
         // Any other class-content kind is content this build retains without
         // applying: its exact bytes are kept, history continues past it, and
@@ -322,8 +446,10 @@ pub(crate) fn judge(
 
 /// The account after copying `data`, the next account event, into a base
 /// whose copy of the account is `account`; `at_head` is whether its author
-/// claimed that copy's head. Only AddDevice and RemoveSelf are judged here;
-/// any later event is invalid, as is anything but the next one.
+/// claimed that copy's head. A legacy copy has no confirmation, so it is
+/// applied untimed: AddDevice and RemoveSelf only where the account allows
+/// legacy history, and every trust change is invalid. Anything but the next
+/// event is invalid.
 fn account_change(
     account: &VerifiedAccount,
     data: &[u8],
@@ -333,7 +459,7 @@ fn account_change(
     let Some(tag) = data.get(ACCOUNT_TAG) else {
         return Err(invalid);
     };
-    if !matches!(*tag, ADD_DEVICE | REMOVE_SELF) {
+    if !matches!(*tag, ADD_DEVICE | REMOVE_SELF | FIRST_TRUST..=LAST_TRUST) {
         return Err(Outcome::UnsupportedPause);
     }
     let parsed = match AccountEvent::decode(data) {
@@ -360,8 +486,14 @@ fn account_change(
 /// What a base control did to the base's copy of the account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlChange {
+    /// A legacy copy of one device addition.
     AddDevice,
+    /// A legacy copy of one self-removal.
     RemoveSelf,
+    /// A run of confirmed account events.
+    AccountRun,
+    /// A personal-key rotation and the base's new content key.
+    Rekey,
 }
 
 /// A valid control's effect, judged against the spine before it applies.
@@ -375,8 +507,10 @@ pub struct ControlEffect {
     pub epoch_after: Option<[u8; 32]>,
     pub account_head_after: AccountHead,
     pub change: ControlChange,
-    /// The exact verified account event it copied.
-    pub account_event: Vec<u8>,
+    /// The exact verified account events it copied, in order.
+    pub account_copies: Vec<AccountCopy>,
+    /// A rekey's seal-set commitment: the body its append must also order.
+    pub seal_set: Option<Digest>,
     pub floor_after: u16,
     /// Position attested by the author's seen receipt.
     pub seen_position: u64,
@@ -402,10 +536,13 @@ pub struct ControlState {
     /// The last control-route event; the last valid control unless an
     /// invalid one was ordered after it.
     pub control_head: Head,
-    /// The base's copy of the account: its head, and the exact verified
-    /// account events copied after the head the genesis names, in order.
+    /// The order state that last control-route event left: its raw control
+    /// node, which every later control must extend. `order.head(base)` is
+    /// `control_head`. Structural progress, not acceptance.
+    pub order: OrderState,
+    /// The head of the base's copy of the account. The copied account events
+    /// themselves are each effect's `account_copies`, kept by the caller.
     pub account: AccountHead,
-    pub account_changes: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ControlState {
@@ -420,8 +557,8 @@ impl std::fmt::Debug for ControlState {
             .field("control", &self.control)
             .field("control_digest", &self.control_digest)
             .field("control_head", &self.control_head)
+            .field("order", &self.order)
             .field("account", &self.account)
-            .field("account_changes", &self.account_changes.len())
             .finish()
     }
 }
@@ -431,13 +568,18 @@ impl std::fmt::Debug for ControlState {
 /// judged against the last valid control, which every position after it
 /// shares, and the hosting receipt attests the head itself.
 ///
+/// Every raw control, rejected or repeated, must extend the last one's raw
+/// node: a control whose predecessor it has not seen waits. Coverage up to
+/// an endpoint exists only once [`ControlSpine::finish_coverage`] succeeds.
+/// The first use of each control-route ID is the caller's indexed record,
+/// which it consults through the `used` lookup it passes.
+///
 /// Known limits compared with `History`:
 /// - A verified receipt contradicting a *content* head stops `History`, but
 ///   this follower only knows control heads.
 /// - A control-route event that `History` would pause, but whose seen claim
 ///   predates the last control, is rejected here instead. Reaching this case
 ///   requires a dishonest DO to order such a submission on the control route.
-/// - Event IDs are not tracked; this relies on the DO's unique IDs.
 ///
 /// For controls it can judge, it gives `History`'s verdict and effect.
 #[derive(Clone)]
@@ -471,8 +613,8 @@ impl ControlSpine {
             control: ordered.head(),
             control_digest: ordered.event_digest().0,
             control_head: ordered.head(),
+            order: ordered.after(),
             account: view.head(),
-            account_changes: vec![],
         };
         Ok((Self { state }, genesis))
     }
@@ -487,7 +629,8 @@ impl ControlSpine {
     }
 
     /// Judge an ordered control. `view_at_base_head` is the creator's
-    /// verified account at the base's account head.
+    /// verified account at the base's account head; `used` whether a
+    /// control-route ID was first used before this spine's state.
     pub fn check(
         &self,
         view_at_base_head: &VerifiedAccount,
@@ -495,6 +638,7 @@ impl ControlSpine {
         body: &[u8],
         metadata: &Secret<32>,
         ordered: &Commitment,
+        used: &dyn Fn(EventId) -> Result<bool, Outcome>,
     ) -> Result<ControlEffect, Outcome> {
         self.continues(ordered)?;
         if ordered.verify_body(descriptor).is_err() {
@@ -507,7 +651,40 @@ impl ControlSpine {
             metadata,
             ordered.route(),
             Some(ordered.head().position),
+            used,
         )
+    }
+
+    /// Verify an ordered control without its body: its link, binding,
+    /// author, signature and seen claims, as `History::inspect` does. An
+    /// invalid submission is `Err(Rejected)` whatever its body would be;
+    /// `Ok` means only its body can decide it.
+    pub fn inspect(
+        &self,
+        view_at_base_head: &VerifiedAccount,
+        descriptor: &OpaqueEvent,
+        metadata: &Secret<32>,
+        ordered: &Commitment,
+        used: &dyn Fn(EventId) -> Result<bool, Outcome>,
+    ) -> Result<(), Outcome> {
+        self.continues(ordered)?;
+        if ordered.verify_body(descriptor).is_err() {
+            return Err(Outcome::IntegrityStop);
+        }
+        let state = &self.state;
+        if view_at_base_head.is_stopped()
+            || view_at_base_head.id() != state.creator
+            || view_at_base_head.head() != state.account
+        {
+            return Err(Outcome::UnavailablePause);
+        }
+        let ctx = SpineContext {
+            state,
+            account: view_at_base_head,
+            position: Some(ordered.head().position),
+            used,
+        };
+        verify_signed(&ctx, ordered.route(), descriptor, metadata).map(drop)
     }
 
     /// Judge a control submitted for ordering on the control route. Its
@@ -519,6 +696,7 @@ impl ControlSpine {
         descriptor: &OpaqueEvent,
         body: &[u8],
         metadata: &Secret<32>,
+        used: &dyn Fn(EventId) -> Result<bool, Outcome>,
     ) -> Result<ControlEffect, Outcome> {
         self.judge(
             view_at_base_head,
@@ -527,7 +705,64 @@ impl ControlSpine {
             metadata,
             Route::Control,
             None,
+            used,
         )
+    }
+
+    /// Identify only the rooted seen-receipt branch of a failed judgement.
+    /// Call after `check`/`check_submission` returned IntegrityStop; this
+    /// repeats the same metadata/binding and pinned-receipt checks, plus
+    /// structural/body prerequisites. Other IntegrityStops are not proof.
+    pub fn seen_receipt_conflict(
+        &self,
+        view: &VerifiedAccount,
+        descriptor: &OpaqueEvent,
+        body: &[u8],
+        metadata: &Secret<32>,
+        ordered: Option<&Commitment>,
+        used: &dyn Fn(EventId) -> Result<bool, Outcome>,
+    ) -> Option<SeenReceiptConflict> {
+        let state = &self.state;
+        if view.is_stopped()
+            || view.id() != state.creator
+            || view.head() != state.account
+            || key_id(metadata) != state.metadata_id
+            || !body_named(descriptor, body)
+        {
+            return None;
+        }
+        if let Some(ordered) = ordered {
+            self.continues(ordered).ok()?;
+            ordered.verify_body(descriptor).ok()?;
+        }
+        let ctx = SpineContext {
+            state,
+            account: view,
+            position: ordered.map(|c| c.head().position),
+            used,
+        };
+        let route = ordered.map_or(Route::Control, Commitment::route);
+        if ctx.id_used(descriptor.publication_id(route).0).ok()? {
+            return None;
+        }
+        let binding = open_binding(descriptor, metadata, state.base.0, false)
+            .ok()?
+            .binding;
+        rooted_seen_conflict(&ctx, state.hosting_root, &binding.seen_receipt).ok()?
+    }
+
+    /// The coverage this spine's controls give up to `endpoint`, an opening
+    /// whose head `authenticated` the caller verified independently. Missing
+    /// a control before it, or an opening that head does not name, is
+    /// missing evidence: it waits.
+    pub fn finish_coverage(
+        &self,
+        endpoint: OrderState,
+        authenticated: Head,
+    ) -> Result<ControlCoverage, Outcome> {
+        RawControlChain::resume(self.state.base, self.state.order.raw_control())
+            .finish(endpoint, authenticated)
+            .map_err(|_| Outcome::UnavailablePause)
     }
 
     /// Apply a checked control's effect at its ordered position.
@@ -547,8 +782,8 @@ impl ControlSpine {
         state.control = ordered.head();
         state.control_digest = effect.digest.0;
         state.control_head = ordered.head();
+        state.order = ordered.after();
         state.account = effect.account_head_after;
-        state.account_changes.push(effect.account_event);
         Ok(())
     }
 
@@ -560,24 +795,35 @@ impl ControlSpine {
             return Err(Outcome::IntegrityStop);
         }
         self.state.control_head = ordered.head();
+        self.state.order = ordered.after();
         Ok(())
     }
 
-    /// An ordered control must be a sound commitment in this base after the
-    /// control head; anything else is the sequencer contradicting itself.
+    /// An ordered control must extend this spine's last raw control node. A
+    /// predecessor node beyond it means a control this spine has not seen:
+    /// missing evidence, which waits. One at or before it that differs is
+    /// the sequencer contradicting the verified chain.
     fn continues(&self, ordered: &Commitment) -> Result<(), Outcome> {
-        let previous = ordered.previous();
+        let raw = ordered.before().raw_control();
+        let known = self.state.order.raw_control();
         if ordered.base() != self.state.base
-            || ordered.verify_next(self.state.base, previous).is_err()
-            || ordered.head().position <= self.state.control_head.position
-            || (previous.position == self.state.control_head.position
-                && previous != self.state.control_head)
+            || self.state.order.head(self.state.base) != self.state.control_head
         {
             return Err(Outcome::IntegrityStop);
         }
-        Ok(())
+        if raw == known {
+            return Ok(());
+        }
+        Err(if raw.position > known.position {
+            Outcome::UnavailablePause
+        } else {
+            Outcome::IntegrityStop
+        })
     }
 
+    // Ordered and submitted originals share one judgement; the lookup is
+    // external so first-use facts can stay indexed rather than in a blob.
+    #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
         view: &VerifiedAccount,
@@ -586,6 +832,7 @@ impl ControlSpine {
         metadata: &Secret<32>,
         route: Route,
         position: Option<u64>,
+        used: &dyn Fn(EventId) -> Result<bool, Outcome>,
     ) -> Result<ControlEffect, Outcome> {
         let state = &self.state;
         // The caller's account view must be this base's copy: anything else
@@ -597,26 +844,24 @@ impl ControlSpine {
             state,
             account: view,
             position,
+            used,
         };
         let signed = verify_signed(&ctx, route, descriptor, metadata)?;
         match judge(&ctx, &signed, descriptor, body, metadata, None)? {
             Judged::Control {
                 account: Some(account),
-                change: Some(change),
+                copy: Some(copy),
                 epoch_id,
                 ..
             } => Ok(ControlEffect {
                 digest: descriptor.digest(),
                 epoch_after: epoch_id,
                 account_head_after: account.head(),
-                change: if change[ACCOUNT_TAG] == REMOVE_SELF {
-                    ControlChange::RemoveSelf
-                } else {
-                    ControlChange::AddDevice
-                },
-                account_event: change,
-                floor_after: state.floor.max(signed.version),
-                seen_position: signed.seen.position,
+                change: copy.change,
+                account_copies: copy.copies,
+                seal_set: copy.seal_set,
+                floor_after: state.floor.max(signed.binding.version),
+                seen_position: signed.binding.seen.position,
                 judged_control_digest: state.control_digest,
                 judged_account_head: state.account,
             }),
@@ -633,6 +878,7 @@ struct SpineContext<'a> {
     state: &'a ControlState,
     account: &'a VerifiedAccount,
     position: Option<u64>,
+    used: &'a dyn Fn(EventId) -> Result<bool, Outcome>,
 }
 impl SignedContext for SpineContext<'_> {
     fn base(&self) -> BaseId {
@@ -659,8 +905,8 @@ impl SignedContext for SpineContext<'_> {
     fn last_control(&self) -> [u8; 32] {
         self.state.control_digest
     }
-    fn id_used(&self, _: [u8; 32]) -> Result<bool, Outcome> {
-        Ok(false)
+    fn id_used(&self, event_id: [u8; 32]) -> Result<bool, Outcome> {
+        (self.used)(EventId(event_id))
     }
     fn known_head(&self, position: u64) -> Result<Option<Head>, Outcome> {
         Ok([self.state.control, self.state.control_head]
@@ -683,10 +929,14 @@ impl SignedContext for SpineContext<'_> {
     }
 }
 
-/// A base control copying one account event into the base, for its
-/// author's control key to sign outside this library.
+/// A base control for its author's key to sign outside this library: the
+/// control key, the recovery key, or for a rekey the ordinary key, as
+/// [`ControlSigningRequest::expected_key`] names.
 pub struct ControlSigningRequest(EventSigningRequest);
 impl ControlSigningRequest {
+    pub(crate) fn new(request: EventSigningRequest) -> Self {
+        Self(request)
+    }
     pub fn signing_bytes(&self) -> &[u8] {
         self.0.signing_bytes()
     }
@@ -722,8 +972,8 @@ pub fn prepare_account_change(
     account_change(base_account, account_event, true).map_err(|_| Error::Invalid)?;
     Ok(ControlSigningRequest(prepare_seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: base.0,
             audience: [0; 32],

@@ -19,12 +19,14 @@
 //! account's genesis, the head after the addition, and its own base with the
 //! base's key package. A hint is not admission. The new device authenticates
 //! with its own key, reads the account log from genesis and verifies it from
-//! the code's account, requires an addition of exactly its keys carrying a
+//! the code's account, each event after the genesis with its confirmation
+//! verified under the hosting root, requires an addition of exactly its keys carrying a
 //! delivery to it, and reads the own base's genesis from its log; only then
-//! may the host commit it (`bh_device::join::admit`).
+//! may the host commit it, those confirmations with it
+//! (`bh_device::join::admit`).
 use crate::{
     AccountApplyError, Client, ClientError, ControlSignError, Endpoint, HomeSetup, Identity,
-    Shared, Signer, SignerError, SyncStatus,
+    Shared, Signer, SignerError, SyncStatus, TimedOriginal,
     backoff::Backoff,
     outbox::{Fail, Link},
     puller::{only, ordered_events, read_events_exclusive},
@@ -36,7 +38,8 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
 };
 use bh_account::{
-    AccountEvent, AccountId, DeviceId, DevicePublicKeys, Head as AccountHead, VerifiedAccount,
+    AccountEvent, AccountId, ConfirmedTime, DeviceId, DevicePublicKeys, Head as AccountHead,
+    VerifiedAccount,
     device_auth::{Context, Proof},
     journal::{AccountJournal, PendingSetupProtector},
     owner::{AccountCapability, AccountOwner, OwnerError},
@@ -44,11 +47,11 @@ use bh_account::{
     personal::{self, PersonalKey},
     platform::DeviceKeyStore,
 };
-use bh_authz_proto::{ToService, Want, account_log_id, account_log_unwrap, delivery_frame};
+use bh_authz_proto::{ToService, Want, account_log_id, delivery_frame};
 use bh_crypto::Secret;
 use bh_device::{ContainerId, Owner, join::Admission};
 use bh_sync::{
-    BaseId, BodyObject, Digest, Head, Route,
+    BaseId, BodyObject, Digest, Head, OrderState,
     permit::{LogId, LogKind},
     referenced_body,
     wire::{Request, Response},
@@ -355,7 +358,7 @@ impl ShowingPairing {
         P: PendingSetupProtector,
     {
         self.live()?;
-        let request = match self.session.prepare(account, capability) {
+        let request = match self.session.prepare_with_re_read(account, capability) {
             Ok(request) => request,
             Err(PairError::AlreadyAdded) => {
                 let candidate = self
@@ -630,6 +633,7 @@ impl JoiningPairing {
             self.code.account,
             &self.keys,
             hint,
+            crate::Tuning::default(),
         )
         .await
     }
@@ -644,6 +648,41 @@ pub async fn resume_admission(
     container: ContainerId,
     keys: &DevicePublicKeys,
     prover: Arc<dyn JoinProver>,
+) -> Result<Option<Admission>, PairingError> {
+    resume_admission_with(
+        endpoint,
+        connector,
+        owner,
+        container,
+        keys,
+        prover,
+        crate::Tuning::default(),
+    )
+    .await
+}
+
+/// As `resume_admission`, with test pacing: see `Tuning`.
+#[cfg(feature = "test-support")]
+pub async fn resume_admission_tuned(
+    endpoint: &Endpoint,
+    connector: Arc<dyn Connector>,
+    owner: Arc<Owner>,
+    container: ContainerId,
+    keys: &DevicePublicKeys,
+    prover: Arc<dyn JoinProver>,
+    tuning: crate::Tuning,
+) -> Result<Option<Admission>, PairingError> {
+    resume_admission_with(endpoint, connector, owner, container, keys, prover, tuning).await
+}
+
+async fn resume_admission_with(
+    endpoint: &Endpoint,
+    connector: Arc<dyn Connector>,
+    owner: Arc<Owner>,
+    container: ContainerId,
+    keys: &DevicePublicKeys,
+    prover: Arc<dyn JoinProver>,
+    tuning: crate::Tuning,
 ) -> Result<Option<Admission>, PairingError> {
     let joined = owner
         .joined(container)
@@ -662,6 +701,7 @@ pub async fn resume_admission(
         AccountId(joined.account),
         keys,
         hint,
+        tuning,
     )
     .await
     .map(Some)
@@ -699,7 +739,11 @@ impl Signer for Joining {
     fn initial_home_setup(&self) -> Result<Option<HomeSetup>, SignerError> {
         Ok(None)
     }
-    fn confirm_home_ordered(&self, _: &HomeSetup) -> Result<(), SignerError> {
+    fn confirm_home_ordered(
+        &self,
+        _: &HomeSetup,
+        _: [(ConfirmedTime, Vec<u8>); 2],
+    ) -> Result<(), SignerError> {
         Err(SignerError)
     }
     fn sign_event(&self, _: Vec<u8>) -> BoxFuture<'_, Result<[u8; 64], SignerError>> {
@@ -708,12 +752,20 @@ impl Signer for Joining {
     fn current_account(&self) -> Result<VerifiedAccount, SignerError> {
         Ok(self.anchor.clone())
     }
-    fn apply_account(
+    // Nothing is applied before the admission commits its verified history.
+    fn apply_account_timed(
         &self,
         _: AccountHead,
-        _: Vec<Vec<u8>>,
+        _: Vec<TimedOriginal>,
     ) -> BoxFuture<'_, Result<AccountHead, AccountApplyError>> {
         Box::pin(async { Err(AccountApplyError::Unavailable) })
+    }
+    fn observe_account_accepted(
+        &self,
+        _: AccountHead,
+        _: ConfirmedTime,
+    ) -> Result<(), SignerError> {
+        Err(SignerError)
     }
     fn sign_base_control(
         &self,
@@ -721,13 +773,78 @@ impl Signer for Joining {
     ) -> BoxFuture<'_, Result<[u8; 64], ControlSignError>> {
         Box::pin(async { Err(ControlSignError::Unavailable) })
     }
-    fn with_base_keys(
+    fn with_metadata_key(
         &self,
         _: BaseId,
-        _: &mut dyn FnMut(&Secret<32>, &Secret<32>),
+        _: &mut dyn FnMut(&Secret<32>),
     ) -> Result<(), SignerError> {
         Err(SignerError)
     }
+    fn with_epoch_keys(
+        &self,
+        _: BaseId,
+        _: Option<[u8; 32]>,
+        _: &mut dyn FnMut(&Secret<32>, Option<&Secret<32>>),
+    ) -> Result<(), SignerError> {
+        Err(SignerError)
+    }
+    fn install_epoch(
+        &self,
+        _: bh_device::control::SealWait,
+        _: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), bh_device::control::InstallError>> {
+        Box::pin(async { Err(bh_device::control::InstallError::Unavailable) })
+    }
+    // No account authority here: every trust and directory use is refused.
+    fn staged_control(&self) -> Result<Option<bh_account::journal::StagedControl>, SignerError> {
+        Err(SignerError)
+    }
+    fn stage_rotation(
+        &self,
+        _: u64,
+    ) -> BoxFuture<'_, Result<bh_account::journal::StagedControl, SignerError>> {
+        Box::pin(async { Err(SignerError) })
+    }
+    fn settle_staged(&self) -> Result<Option<bh_account::owner::staging::Settlement>, SignerError> {
+        Err(SignerError)
+    }
+    fn discard_staged(&self, _: &bh_account::journal::StagedControl) -> Result<(), SignerError> {
+        Err(SignerError)
+    }
+    fn accept_rotation(&self, _: u64, _: Vec<u8>) -> BoxFuture<'_, Result<(), SignerError>> {
+        Box::pin(async { Err(SignerError) })
+    }
+    fn prepare_base_entry(
+        &self,
+        _: BaseId,
+        _: [u8; 32],
+        _: String,
+        _: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SignerError>> {
+        Box::pin(async { Err(SignerError) })
+    }
+    fn open_directory_entries(
+        &self,
+        _: Vec<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<crate::OpenedEntries, SignerError>> {
+        Box::pin(async { Err(SignerError) })
+    }
+    fn directory_state(&self) -> Result<Option<(u64, bool)>, SignerError> {
+        Err(SignerError)
+    }
+    fn set_directory_state(&self, _: u64, _: bool) -> Result<(), SignerError> {
+        Err(SignerError)
+    }
+    fn own_entries(&self) -> BoxFuture<'_, Result<crate::OwnEntries, SignerError>> {
+        Box::pin(async { Err(SignerError) })
+    }
+    fn own_entry_held(&self, _: [u8; 32], _: u64) -> Result<(), SignerError> {
+        Err(SignerError)
+    }
+    fn directory_wanted(&self) -> bool {
+        false
+    }
+    fn directory_read(&self, _: crate::DirectoryRead) {}
 }
 
 /// Why verifying an admission stopped: retry the network, or give up.
@@ -755,6 +872,7 @@ async fn verify(
     account: AccountId,
     keys: &DevicePublicKeys,
     hint: AdmissionHint,
+    tuning: crate::Tuning,
 ) -> Result<Admission, PairingError> {
     let anchor =
         VerifiedAccount::from_genesis(account, &hint.genesis).map_err(|_| PairingError::Invalid)?;
@@ -774,7 +892,7 @@ async fn verify(
         container,
         signer,
         status,
-        crate::Tuning::default(),
+        tuning,
     );
     let mut link = Link::default();
     let mut backoff = Backoff::default();
@@ -791,7 +909,10 @@ async fn verify(
             }
             Err(Stop::Retry) => {
                 link.drop_data();
-                tokio::time::sleep(backoff.next()).await;
+                // The retry decision is unchanged; a test may only skip the
+                // shipped backoff's wall-clock wait (`Tuning::verify_retry`).
+                let wait = tuning.verify_retry.unwrap_or_else(|| backoff.next());
+                tokio::time::sleep(wait).await;
             }
         }
     }
@@ -800,20 +921,22 @@ async fn verify(
 }
 
 /// Where `events`, the account's original history from genesis verified
-/// from `account`, first adds exactly `keys`, which are still active at its
-/// end: that position, the body (the delivery) the addition carries, and the
-/// account just after it.
+/// from `account` with each confirmed time, first adds exactly `keys`,
+/// which are still active at its end: that position, the body (the
+/// delivery) the addition carries, and the account just after it.
 fn admitted_in(
     account: AccountId,
     keys: &DevicePublicKeys,
-    events: &[(Vec<u8>, Option<Digest>)],
+    events: &[(TimedOriginal, Option<Digest>)],
 ) -> Result<(u64, Digest, VerifiedAccount), PairingError> {
     let refused = PairingError::Refused;
     let (genesis, rest) = events.split_first().ok_or(refused)?;
-    let mut view = VerifiedAccount::from_genesis(account, &genesis.0).map_err(|_| refused)?;
+    let mut view = VerifiedAccount::from_genesis(account, &genesis.0.0).map_err(|_| refused)?;
     let mut added = None;
-    for (index, (original, body)) in rest.iter().enumerate() {
-        view.apply(original).map_err(|_| refused)?;
+    for (index, ((original, evidence), body)) in rest.iter().enumerate() {
+        let time = evidence.as_ref().map(|(time, _)| *time).ok_or(refused)?;
+        view.apply_timed(original, Some(time))
+            .map_err(|_| refused)?;
         if added.is_none() && view.active_device(keys.id()).is_ok() {
             added = Some((index as u64 + 2, *body, view.clone()));
         }
@@ -880,30 +1003,82 @@ async fn admission(
         kind: LogKind::Account,
         id: account_log_id(&hint.genesis).map_err(|_| Stop::Error(PairingError::Invalid))?,
     };
-    // The account log from genesis, in bounded reads, each continuing the
-    // one before it.
-    let mut events: Vec<(Vec<u8>, Option<Digest>)> = Vec::new();
-    let mut head = Head::EMPTY;
+    // Verify each bounded account page before treating its wrappers as an
+    // admission history. The service's head may be ahead of a page.
+    let genesis = AccountEvent::decode(&hint.genesis).map_err(|_| Stop::Retry)?;
+    if AccountId::of_genesis(&genesis).map_err(|_| Stop::Retry)? != account {
+        return Err(Stop::Error(PairingError::Refused));
+    }
+    // Keep each independently verified opening with its original and proof.
+    // A later challenged head can name any already-read position, including
+    // the last item of a full page when the next page is empty.
+    let mut events: Vec<crate::account_evidence::VerifiedEvent> = Vec::new();
+    let mut outer = OrderState::EMPTY;
+    let mut prior = None;
+    let mut pending = Vec::new();
     loop {
-        let first = events.len() as u64 + 1;
-        let (items, _) = read_events_exclusive(shared, link, log, first, first + 63).await?;
-        let count = items.len();
-        let ordered = ordered_events(BaseId(log.id), first, &items)?;
-        for (commitment, event) in &ordered {
-            head = commitment
-                .verify_next(BaseId(log.id), head)
-                .map_err(|_| Stop::Retry)?;
-            if commitment.route() != Route::Control {
-                return Err(Stop::Retry);
+        let last = outer.position().checked_add(64).ok_or(Stop::Retry)?;
+        let page = crate::account_evidence::read(
+            shared,
+            link,
+            &hint.genesis,
+            outer,
+            prior,
+            last,
+            crate::account_evidence::Session::Exclusive,
+        )
+        .await?;
+        let count = page.events.len();
+        crate::account_evidence::match_page_claims(&mut pending, &page.events, page.accepted)?;
+        let ahead = page.accepted.original_head.position
+            > page
+                .events
+                .last()
+                .map_or(outer.position(), |e| e.opening.position());
+        if let Some(last) = page.events.last() {
+            outer = last.opening;
+            prior = last.time.or(prior);
+        }
+        events.extend(page.events);
+        // A new response can challenge an already-read original (notably
+        // the empty terminal response after an exact 64-entry page). Index
+        // the collected history rather than replaying it on every page.
+        let mut i = 0;
+        while i < pending.len() {
+            let position = pending[i].original_head.position;
+            if position <= outer.position() {
+                let index = usize::try_from(position.checked_sub(1).ok_or(Stop::Retry)?)
+                    .map_err(|_| Stop::Retry)?;
+                let event = events.get(index).ok_or(Stop::Retry)?;
+                crate::account_evidence::match_accepted_event(pending[i], event)?;
+                pending.remove(i);
+            } else {
+                i += 1;
             }
-            let (original, body) = account_log_unwrap(event).map_err(|_| Stop::Retry)?;
-            events.push((original.to_vec(), body));
         }
         if count < 64 {
+            if ahead || !pending.is_empty() {
+                return Err(Stop::Retry);
+            }
             break;
         }
     }
-    if events.first().map(|(genesis, _)| genesis) != Some(&hint.genesis) {
+    let events: Vec<(TimedOriginal, Option<Digest>)> = events
+        .into_iter()
+        .map(|event| {
+            let evidence = event.time.zip(event.proof).map(|(time, proof)| {
+                (
+                    ConfirmedTime {
+                        earliest_ms: time.earliest_ms,
+                        latest_ms: time.latest_ms,
+                    },
+                    proof.encode().to_vec(),
+                )
+            });
+            ((event.original, evidence), event.body)
+        })
+        .collect();
+    if events.first().map(|((genesis, _), _)| genesis) != Some(&hint.genesis) {
         return Err(Stop::Error(PairingError::Refused));
     }
     let (added_at, body, at_addition) = admitted_in(account, keys, &events).map_err(Stop::Error)?;
@@ -939,7 +1114,7 @@ async fn admission(
     .await?;
     Ok(Admission {
         account,
-        history: events.into_iter().map(|(original, _)| original).collect(),
+        history: events.into_iter().map(|(timed, _)| timed).collect(),
         added_at,
         delivery: frame,
         base: hint.base,
@@ -989,8 +1164,21 @@ mod tests {
         }
         (account, events)
     }
-    fn with(events: &[Vec<u8>], body: Option<Digest>) -> Vec<(Vec<u8>, Option<Digest>)> {
-        events.iter().map(|e| (e.clone(), body)).collect()
+    /// Each event after the genesis with a verified confirmation.
+    fn with(events: &[Vec<u8>], body: Option<Digest>) -> Vec<(TimedOriginal, Option<Digest>)> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, e)| {
+                let at = index as u64 * 10;
+                let time = ConfirmedTime {
+                    earliest_ms: at,
+                    latest_ms: at + 2,
+                };
+                let evidence = (index > 0).then(|| (time, b"proof".to_vec()));
+                ((e.clone(), evidence), body)
+            })
+            .collect()
     }
 
     #[test]
@@ -1035,6 +1223,13 @@ mod tests {
         )
         .unwrap();
         assert!(admitted_in(account, &lookalike, &with(&events, delivery)).is_err());
+        // An event after the genesis without its confirmation.
+        let mut untimed = with(&events, delivery);
+        untimed[1].0.1 = None;
+        assert_eq!(
+            admitted_in(account, &joining.keys, &untimed).err(),
+            Some(PairingError::Refused)
+        );
     }
 
     #[test]

@@ -85,13 +85,13 @@ class ReleaseTests(unittest.TestCase):
                       'protected_mount': '/protected/authz',
                       'uid': 1000, 'gid': 1000, 'quote_socket': '/run/fixture.sock',
                       'files': {key: '/fixture/' + key for key in
-                                ('permit_key', 'permit_cert', 'policy', 'policy_signature', 'collateral')},
+                                ('permit_key', 'permit_cert', 'recovery_key', 'recovery_cert', 'policy', 'policy_signature', 'collateral')},
                       'roughtime': [{'address': '192.0.2.1:2002', 'key': '11' * 32},
                                    {'address': '192.0.2.2:2002', 'key': '22' * 32}],
                       'time_config': [1000000000, 100, 1000000, 120000000000, 1000]},
             'endpoint': {'edge_url': 'https://edge.invalid', 'hosting_root': '11' * 32,
                          'app_root': '22' * 32, 'policy': '01', 'policy_signature': '02',
-                         'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
+                         'recovery_key': '03', 'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
                          'build_floor': 1, 'appraisal': 'hardware'}}
 
     def test_explicit_inputs_and_negative_cases(self):
@@ -127,6 +127,22 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             m.validate_inputs(bad)
         self.assertNotIn('SECRET', str(raised.exception))
+
+    def test_missing_recovery_input_refused_before_startup(self):
+        m = self.module()
+        good = self.inputs()
+        good['authz']['image'] = 'registry.invalid/throwaway/authz@sha256:' + 'a' * 64
+        good['authz']['registry_manifest_file'] = '/fixture/registry.json'
+        m.validate_inputs(good, preparation=True)  # References only: none of these files exists.
+        for name in ('recovery_key', 'recovery_cert'):
+            bad = json.loads(json.dumps(good))
+            del bad['authz']['files'][name]
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'authz.files.' + name):
+                m.validate_inputs(bad, preparation=True)
+            bad = json.loads(json.dumps(good))
+            bad['authz']['files'][name] = None
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.validate_inputs(bad, preparation=True)
 
     def test_registry_reference_requires_matching_public_manifest_and_image_config(self):
         import hashlib

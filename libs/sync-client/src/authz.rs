@@ -84,6 +84,7 @@ pub(crate) struct Authz {
     gate: Arc<RwLock<()>>,
     admission: Arc<Semaphore>,
     stop_signal: watch::Sender<bool>,
+    not_active: watch::Sender<u64>,
     /// Set for good when the client stops: no session opens after it.
     stopped: AtomicBool,
 }
@@ -112,7 +113,8 @@ impl AuthzSession<'_> {
     /// One request and its answer. A transport or channel failure ends the
     /// session; the next use opens a new one.
     pub async fn ask(&mut self, message: ToService) -> Result<FromService, ClientError> {
-        self.authz
+        let result = self
+            .authz
             .until_stopped(async {
                 let admission = self
                     .authz
@@ -129,7 +131,9 @@ impl AuthzSession<'_> {
                     )
                     .await
             })
-            .await
+            .await;
+        self.authz.observe_not_active(&result);
+        result
     }
 }
 
@@ -193,7 +197,22 @@ impl Authz {
             gate: Arc::new(RwLock::new(())),
             admission: Arc::new(Semaphore::new(dispatcher::CAPACITY)),
             stop_signal: watch::Sender::new(false),
+            not_active: watch::Sender::new(0),
             stopped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn not_active(&self) -> watch::Receiver<u64> {
+        self.not_active.subscribe()
+    }
+    fn observe_not_active(&self, result: &Result<FromService, ClientError>) {
+        if matches!(
+            result,
+            Ok(FromService::Refused {
+                reason: bh_authz_proto::Refusal::NotActive
+            }) | Err(ClientError::Refused(bh_authz_proto::Refusal::NotActive))
+        ) {
+            self.not_active.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
 
@@ -244,21 +263,24 @@ impl Authz {
         shared: &Shared,
         message: ToService,
     ) -> Result<FromService, ClientError> {
-        self.until_stopped(async {
-            // Wait at the fair gate before reserving queue capacity: readers
-            // behind a public writer must not consume the capacity it needs.
-            let lease = self.gate.clone().read_owned().await;
-            let admission = self
-                .admission
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ClientError::Stopped)?;
-            let live = self.generation(shared, None).await?;
-            live.ask(message, admission, dispatcher::Lease::Normal(lease))
-                .await
-        })
-        .await
+        let result = self
+            .until_stopped(async {
+                // Wait at the fair gate before reserving queue capacity: readers
+                // behind a public writer must not consume the capacity it needs.
+                let lease = self.gate.clone().read_owned().await;
+                let admission = self
+                    .admission
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ClientError::Stopped)?;
+                let live = self.generation(shared, None).await?;
+                live.ask(message, admission, dispatcher::Lease::Normal(lease))
+                    .await
+            })
+            .await;
+        self.observe_not_active(&result);
+        result
     }
 
     pub(crate) async fn session<'a>(
@@ -324,6 +346,14 @@ impl Authz {
                     .map_err(|_| ClientError::Network)?
             })
             .await;
+        // Signal outside the slot lock: the public-evidence task must open a
+        // separate channel rather than recurse through this generation.
+        if matches!(
+            opened,
+            Err(ClientError::Refused(bh_authz_proto::Refusal::NotActive))
+        ) {
+            self.not_active.send_modify(|n| *n = n.wrapping_add(1));
+        }
         let mut slot = self.slot.lock().expect("authz slot");
         match opened {
             Ok(_) if self.is_stopped() => Err(ClientError::Stopped),
@@ -342,46 +372,31 @@ impl Authz {
         }
     }
 
+    /// A fresh attested connection for the public account-evidence route.
+    /// It never borrows the refused authenticated generation, its fair gate
+    /// or its dispatcher capacity. The service permits this route before
+    /// Authenticate, and the usual hosting-root checks still apply to data.
+    pub(crate) async fn public_evidence(
+        &self,
+        shared: &Shared,
+        request: ToService,
+    ) -> Result<FromService, ClientError> {
+        self.until_stopped(async {
+            let mut live = tokio::time::timeout(ANSWER_WAIT, self.open_channel(shared, None))
+                .await
+                .map_err(|_| ClientError::Network)??;
+            self.challenge(&mut live).await?;
+            live.ask(request).await
+        })
+        .await
+    }
+
     async fn open(&self, shared: &Shared, at: Option<AccountHead>) -> Result<Live, ClientError> {
-        let policy = self.policy.clone().ok_or(ClientError::Unsupported)?;
-        let mut socket = shared
-            .connector
-            .connect(Route::Authz)
-            .await
-            .map_err(|_| ClientError::Network)?;
-        let channel = |_| ClientError::Channel;
-        let hello = ClientHello::new(policy).map_err(channel)?;
-        send(&mut socket, hello.frame().to_vec()).await?;
-        let proof = receive(&mut socket).await?;
-        let checked = match self.appraisal {
-            Appraisal::Hardware => hello.accept_proof(&proof),
-            #[cfg(feature = "synthetic-attestation")]
-            Appraisal::Synthetic => hello.accept_synthetic_proof(&proof),
-        }
-        .map_err(channel)?;
-        let (encapsulation, pending) = checked.encapsulate().map_err(channel)?;
-        send(&mut socket, encapsulation).await?;
-        let finish = receive(&mut socket).await?;
-        let (confirm, session) = pending.accept_finish(&finish).map_err(channel)?;
-        send(&mut socket, confirm).await?;
-        let binding = session.binding().map_err(channel)?;
-        let mut live = Live {
-            socket,
-            session,
-            opened: Clock::now(),
-            head: AccountHead {
-                position: 0,
-                hash: [0; 32],
-            },
-            at,
-        };
-        let FromService::Challenge { challenge } = live.receive().await? else {
-            return Err(ClientError::Channel);
-        };
+        let mut live = self.open_channel(shared, at).await?;
         let identity = shared.signer.identity().map_err(|_| ClientError::Signer)?;
         let context = Context {
-            channel_binding: binding,
-            challenge,
+            channel_binding: live.session.binding().map_err(|_| ClientError::Channel)?,
+            challenge: self.challenge(&mut live).await?,
         };
         let proof = match at {
             None => shared.signer.device_proof(context).await,
@@ -405,5 +420,51 @@ impl Authz {
             FromService::Unavailable => Err(ClientError::Unavailable),
             _ => Err(ClientError::Channel),
         }
+    }
+
+    async fn challenge(&self, live: &mut Live) -> Result<[u8; 32], ClientError> {
+        match live.receive().await? {
+            FromService::Challenge { challenge } => Ok(challenge),
+            _ => Err(ClientError::Channel),
+        }
+    }
+
+    async fn open_channel(
+        &self,
+        shared: &Shared,
+        at: Option<AccountHead>,
+    ) -> Result<Live, ClientError> {
+        let policy = self.policy.clone().ok_or(ClientError::Unsupported)?;
+        let mut socket = shared
+            .connector
+            .connect(Route::Authz)
+            .await
+            .map_err(|_| ClientError::Network)?;
+        let channel = |_| ClientError::Channel;
+        let hello = ClientHello::new(policy).map_err(channel)?;
+        send(&mut socket, hello.frame().to_vec()).await?;
+        let proof = receive(&mut socket).await?;
+        let checked = match self.appraisal {
+            Appraisal::Hardware => hello.accept_proof(&proof),
+            #[cfg(feature = "synthetic-attestation")]
+            Appraisal::Synthetic => hello.accept_synthetic_proof(&proof),
+        }
+        .map_err(channel)?;
+        let (encapsulation, pending) = checked.encapsulate().map_err(channel)?;
+        send(&mut socket, encapsulation).await?;
+        let finish = receive(&mut socket).await?;
+        let (confirm, session) = pending.accept_finish(&finish).map_err(channel)?;
+        send(&mut socket, confirm).await?;
+        let live = Live {
+            socket,
+            session,
+            opened: Clock::now(),
+            head: AccountHead {
+                position: 0,
+                hash: [0; 32],
+            },
+            at,
+        };
+        Ok(live)
     }
 }

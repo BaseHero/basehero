@@ -189,6 +189,7 @@ export const cloudText = {
     : v.pending ? `Saved on this device · ${v.pending} not yet synced` : 'Saved on this device',
   syncing: v => v.pending ? `Syncing ${v.pending} ${v.pending === 1 ? 'note' : 'notes'}` : 'Syncing',
   synced: () => 'Synced',
+  protecting: () => 'Updating protection…',
   'update-needed': () => 'Some content needs an app update',
   'waiting-network': () => 'Saved on this device · Waiting for network',
   'waiting-authorization': v => v.confirm ? 'Waiting for your confirmation' : 'Waiting for authorization',
@@ -232,13 +233,17 @@ export function syncLine(cloud, invoke, changed = () => {}) {
   confirm.className = 'sync-confirm';
   confirm.hidden = true;
   cloud.setAttribute('aria-live', 'polite');
-  let shown = 0;
+  let shown = 0, wasProtecting = false;
   const render = view => {
     if (!view || typeof view.state !== 'string' || !cloudText[view.state]
         || !Number.isSafeInteger(view.revision) || view.revision < shown) return;
     shown = view.revision;
     cloud.dataset.sync = view.state;
-    text.textContent = cloudText[view.state](view);
+    text.textContent = view.state === 'synced' && wasProtecting
+      ? 'New changes are protected' : cloudText[view.state](view);
+    if (view.state === 'protecting') wasProtecting = true;
+    else if (view.state === 'synced' || ['stopped','unsupported','publishing-stopped','control-not-accepted'].includes(view.state)
+        || ['removed','stopped'].includes(view.account)) wasProtecting = false;
     const homeNow = homeText[view.home]?.(view);
     home.hidden = !homeNow;
     home.textContent = homeNow ?? '';
@@ -248,7 +253,7 @@ export function syncLine(cloud, invoke, changed = () => {}) {
     changed(view);
   };
   window.addEventListener('sync://status', event => render(event.detail));
-  const follow = () => { shown = 0; };
+  const follow = () => { shown = 0; wasProtecting = false; };
   return { nodes: [text, home, confirm], render, follow };
 }
 

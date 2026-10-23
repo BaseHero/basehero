@@ -36,6 +36,7 @@ impl PendingSetupProtector for PlainProtector {
 }
 
 type FakeKeyMap = HashMap<[u8; 32], (SigningKey, SigningKey, KemKey)>;
+type DuringErase = Arc<StdMutex<Option<Box<dyn FnOnce() + Send>>>>;
 #[derive(Clone, Default)]
 pub struct FakeStore {
     /// With a gate, control signatures behave as the Mac login route's:
@@ -48,6 +49,10 @@ pub struct FakeStore {
     pub cancel_next_load: Arc<std::sync::atomic::AtomicBool>,
     pub fail_next_load: Arc<std::sync::atomic::AtomicBool>,
     pub delayed_handle: Arc<StdMutex<Option<[u8; 32]>>>,
+    /// One-shot native erasure failure, then the next erasure succeeds.
+    pub fail_erase: Arc<std::sync::atomic::AtomicBool>,
+    /// Runs once inside the next key erasure: work racing a destructive step.
+    pub during_erase: DuringErase,
 }
 
 impl FakeStore {
@@ -174,6 +179,28 @@ impl FakeStore {
 
 impl crate::accounts::HostKeyStore for FakeStore {
     const JOIN_POLICY: ControlKeyPolicy = ControlKeyPolicy::AppEnforcedOwnerConfirmation;
+    fn erase_keys(
+        &mut self,
+        handle: KeyHandle,
+    ) -> impl std::future::Future<Output = Result<(), KeyStoreError>> {
+        if let Some(during) = self.during_erase.lock().unwrap().take() {
+            during();
+        }
+        // Idempotent: a resumed erasure finds the keys already gone.
+        let failed = self
+            .fail_erase
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if !failed {
+            self.keys.lock().unwrap().remove(&handle.0);
+        }
+        async move {
+            if failed {
+                Err(KeyStoreError::StorageFailure)
+            } else {
+                Ok(())
+            }
+        }
+    }
     fn action_gate(&self) -> Option<crate::confirm::ActionGate> {
         self.gate.clone()
     }

@@ -2,8 +2,8 @@
 //! Invoke only from local-stack.sh with a private, untracked directory.
 use bh_confidential_attestation::synthetic;
 use bh_confidential_policy::{Policy, Role};
-use bh_crypto::{Secret, SigningKey};
-use bh_sync::{permit, receipt};
+use bh_crypto::{KemKey, Secret, SigningKey};
+use bh_sync::{evidence::certify_recovery_key, permit, receipt};
 use std::{
     env, fs,
     path::Path,
@@ -55,6 +55,16 @@ fn main() {
             dir,
             "permit.cert",
             hex::encode(permit::certify(&root, permit_key.public())).as_bytes(),
+        );
+        // The home's recovery key: its seed for the service alone, its
+        // certificate for devices.
+        let recovery: [u8; 32] = bh_crypto::random();
+        save(dir, "recovery.seed", hex::encode(recovery).as_bytes());
+        let recovery = KemKey::from_seed(&Secret::from_slice(&recovery).unwrap());
+        save(
+            dir,
+            "recovery.cert",
+            hex::encode(certify_recovery_key(&root, &recovery.public()).encode()).as_bytes(),
         );
         let app = seed(dir, "app-root.seed");
         save(dir, "app-root.pub", hex::encode(app.public()).as_bytes());

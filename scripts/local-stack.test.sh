@@ -33,6 +33,14 @@ for private in "$LOCAL_STACK_DIR"/keys/* "$LOCAL_STACK_DIR"/bindings.json "$LOCA
 done
 # The native example performs the actual WebSocket upgrade and synthetic
 # channel handshake; it also publishes and reads an account log via permits.
+# Devices get the home's certified recovery key; its seed stays with the
+# service, and the service holds it.
+grep -qx "LOCAL_STACK_RECOVERY_KEY=$(<"$LOCAL_STACK_DIR/keys/recovery.cert")" "$LOCAL_STACK_DIR/env" ||
+  { echo 'env lacks the recovery key certificate' >&2; exit 1; }
+! grep -qF "$(<"$LOCAL_STACK_DIR/keys/recovery.seed")" "$LOCAL_STACK_DIR/env" ||
+  { echo 'the recovery seed reached the endpoint' >&2; exit 1; }
+! grep -q 'recovery claims are refused' "$LOCAL_STACK_DIR/authz.log" ||
+  { echo 'service started without the recovery key' >&2; exit 1; }
 "$CARGO_TARGET_DIR/debug/examples/local_probe" first "$LOCAL_STACK_DIR"
 bash "$stack" down
 # Make a correctly signed, already-expired policy from this app root and

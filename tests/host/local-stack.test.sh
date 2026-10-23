@@ -26,6 +26,7 @@ node -e '
     app_root: env.LOCAL_STACK_APP_ROOT,
     policy: fs.readFileSync(env.LOCAL_STACK_POLICY).toString("hex"),
     policy_signature: fs.readFileSync(`${dir}/keys/policy.sig`, "utf8").trim(),
+    recovery_key: env.LOCAL_STACK_RECOVERY_KEY,
     max_lifetime_secs: 86400,
     max_uncertainty_secs: 0,
     build_floor: 1,

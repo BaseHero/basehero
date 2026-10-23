@@ -4,7 +4,7 @@
 //! strictly decodes data-wire responses and verifies any receipt they carry.
 #[path = "support/home_objects.rs"]
 mod home_objects;
-use bh_crypto::{Secret, SigningKey};
+use bh_crypto::{Secret, SigningKey, hash};
 use bh_sync::permit::{self, AppendAck, LogId, LogKind, Permit, Scope};
 use bh_sync::wire::Response;
 use bh_sync::{BaseId, BodyObject, Commitment, EventId, Head, OpaqueEvent, Route, receipt};
@@ -88,12 +88,18 @@ fn fixtures(now: u64) {
     let c3 = event(4, Some(&b3), 0x41);
     let b4 = BodyObject::new(vec![0xb4; 1024 * 1024]).unwrap();
     let c4 = event(5, Some(&b4), 0x51);
-    let g = Commitment::order(BaseId(base.id), Head::EMPTY, &genesis, Route::Control).unwrap();
-    let k1 = Commitment::order(BaseId(base.id), g.head(), &c1, Route::Content).unwrap();
-    let k2 = Commitment::order(BaseId(base.id), k1.head(), &c2, Route::Content).unwrap();
+    let g = Commitment::order(
+        BaseId(base.id),
+        bh_sync::OrderState::EMPTY,
+        &genesis,
+        Route::Control,
+    )
+    .unwrap();
+    let k1 = Commitment::order(BaseId(base.id), g.after(), &c1, Route::Content).unwrap();
+    let k2 = Commitment::order(BaseId(base.id), k1.after(), &c2, Route::Content).unwrap();
     // A control ordered after c1, naming the control head (the genesis).
     let control = event(6, None, 0x61);
-    let kc = Commitment::order(BaseId(base.id), k1.head(), &control, Route::Control).unwrap();
+    let kc = Commitment::order(BaseId(base.id), k1.after(), &control, Route::Control).unwrap();
     let account_genesis = event(7, None, 0x71);
     let account = LogId {
         kind: LogKind::Account,
@@ -101,7 +107,7 @@ fn fixtures(now: u64) {
     };
     let ag = Commitment::order(
         BaseId(account.id),
-        Head::EMPTY,
+        bh_sync::OrderState::EMPTY,
         &account_genesis,
         Route::Control,
     )
@@ -129,6 +135,7 @@ fn fixtures(now: u64) {
             body: body.map(BodyObject::commitment),
             epoch,
             after,
+            attached: None,
         };
     let mut out: Map<String, Value> = [
         ("root", json!(hex(&root.public()))),
@@ -137,25 +144,40 @@ fn fixtures(now: u64) {
         ("base", json!(name(base))),
         ("account", json!(name(account))),
         ("genesis", json!(hex(&genesis.encode()))),
-        ("genesis_id", json!(hex(&genesis.id().0))),
+        (
+            "genesis_id",
+            json!(hex(&genesis.publication_id(Route::Control).0)),
+        ),
         ("genesis_commitment", json!(hex(&g.encode()))),
         ("genesis_head", head(g.head())),
+        ("genesis_order", json!(hex(&g.after().encode()))),
         ("b1", json!(hex(b1.bytes()))),
         ("b2", json!(hex(b2.bytes()))),
         ("b2_commitment", json!(hex(&b2.commitment().0))),
         ("c1", json!(hex(&c1.encode()))),
         ("c1_commitment", json!(hex(&k1.encode()))),
+        ("c1_id", json!(hex(&k1.event_id().0))),
         ("c1_head", head(k1.head())),
+        ("c1_order", json!(hex(&k1.after().encode()))),
         ("c2", json!(hex(&c2.encode()))),
         ("b3", json!(hex(b3.bytes()))),
         ("c3", json!(hex(&c3.encode()))),
         ("b4", json!(hex(b4.bytes()))),
         ("c4", json!(hex(&c4.encode()))),
+        ("c4_id", json!(hex(&c4.publication_id(Route::Content).0))),
         ("c2_head", head(k2.head())),
+        ("c2_id", json!(hex(&k2.event_id().0))),
+        ("c2_order", json!(hex(&k2.after().encode()))),
         ("control", json!(hex(&control.encode()))),
-        ("control_id", json!(hex(&control.id().0))),
+        (
+            "control_id",
+            json!(hex(&control.publication_id(Route::Control).0)),
+        ),
+        ("account_genesis_id", json!(hex(&ag.event_id().0))),
+        ("account_order", json!(hex(&ag.after().encode()))),
         ("control_commitment", json!(hex(&kc.encode()))),
         ("control_head", head(kc.head())),
+        ("control_order", json!(hex(&kc.after().encode()))),
         (
             "append_control",
             json!(signer.sign(append(base, &control, None, EPOCH, Some(g.head())), now)),
@@ -166,7 +188,41 @@ fn fixtures(now: u64) {
         ),
         ("read_controls_0", json!(signer.sign(controls(0), now))),
         ("read_controls_1", json!(signer.sign(controls(1), now))),
+        (
+            "read_control_range_1",
+            json!(signer.sign(
+                Scope::ReadControlRange {
+                    log: base,
+                    after: 0,
+                    through: 1
+                },
+                now
+            )),
+        ),
+        (
+            "read_control_range_3",
+            json!(signer.sign(
+                Scope::ReadControlRange {
+                    log: base,
+                    after: 0,
+                    through: 3
+                },
+                now
+            )),
+        ),
+        (
+            "read_account_control_range",
+            json!(signer.sign(
+                Scope::ReadControlRange {
+                    log: account,
+                    after: 0,
+                    through: 3
+                },
+                now
+            )),
+        ),
         ("account_genesis", json!(hex(&account_genesis.encode()))),
+        ("account_genesis_commitment", json!(hex(&ag.encode()))),
         ("account_head", head(ag.head())),
         (
             "append_genesis",
@@ -206,6 +262,27 @@ fn fixtures(now: u64) {
         ("read_expired", json!(signer.sign(read(1, 2), now - WINDOW))),
         ("read_other_root", json!(stranger.sign(read(1, 2), now))),
         ("read_bodies_b1", json!(signer.sign(bodies(&[&b1]), now))),
+        (
+            "stage_account_b1",
+            json!(signer.sign(
+                Scope::Stage {
+                    log: account,
+                    body: b1.commitment(),
+                    len: 1024
+                },
+                now
+            )),
+        ),
+        (
+            "read_bodies_account_b1",
+            json!(signer.sign(
+                Scope::ReadBodies {
+                    log: account,
+                    bodies: vec![b1.commitment()]
+                },
+                now
+            )),
+        ),
         (
             "read_bodies_b1_b2",
             json!(signer.sign(bodies(&[&b1, &b2]), now)),
@@ -273,6 +350,34 @@ fn fixtures(now: u64) {
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
+    let entry = [0x20; 32];
+    let directory = [0xa5; 1024];
+    let store = Scope::StoreDirectoryEntry {
+        log: account,
+        entry,
+        version: 1,
+        body: bh_sync::Digest(hash(&directory)),
+        len: 1024,
+    };
+    out.extend([
+        ("directory_body".into(), json!(hex(&directory))),
+        ("directory_entry".into(), json!(hex(&entry))),
+        (
+            "directory_read".into(),
+            json!(signer.sign(Scope::ReadDirectory { log: account }, now)),
+        ),
+        ("directory_store".into(), json!(signer.sign(store, now))),
+        (
+            "directory_retire".into(),
+            json!(signer.sign(
+                Scope::RetireHomeObjects {
+                    log: account,
+                    prefix_digest: bh_sync::Digest([6; 32]),
+                },
+                now
+            )),
+        ),
+    ]);
     out.extend(home_objects::fixtures(account, base, |scope| {
         signer.sign(scope, now)
     }));
@@ -294,14 +399,20 @@ fn frames(root: &str, base: &str, frames: &[String]) {
         .iter()
         .map(|frame| match Response::decode(&unhex(frame)) {
             Err(error) => json!({ "error": format!("{error:?}") }),
-            Ok(Response::Events { id, items, receipt }) => {
+            Ok(Response::Events { id, items, receipt, coverage }) => {
                 let tail = items.last().and_then(|(c, _)| Commitment::decode(c).ok()).map(|c| c.head());
-                json!({
+                let mut result = json!({
                     "type": "events", "id": id,
                     "items": items.iter().map(|(c, e)| json!({ "commitment": hex(c), "event": hex(e) })).collect::<Vec<_>>(),
                     "head": tail.map(head),
                     "receipt": receipt.map(|r| tail.map(|h| verified(&root, base, &r, h))),
-                })
+                });
+                if let Some(point) = coverage {
+                    let through = point.order.head(base);
+                    result["coverage"] = json!({ "order": hex(&point.order.encode()), "head": head(through),
+                        "receipt": point.receipt.map(|r| verified(&root, base, &r, through)) });
+                }
+                result
             },
             Ok(Response::Body {
                 id,
@@ -310,6 +421,11 @@ fn frames(root: &str, base: &str, frames: &[String]) {
                 bytes,
             }) => json!({ "type": "body", "id": id, "index": index, "last": last, "bytes": hex(&bytes) }),
             Ok(Response::Staged { id }) => json!({ "type": "staged", "id": id }),
+            Ok(Response::Directory { id, entries, more }) => json!({
+                "type": "directory", "id": id, "entries": entries.iter().map(|e| hex(e)).collect::<Vec<_>>(), "more": more,
+            }),
+            Ok(Response::DirectoryEntryStored { id }) => json!({ "type": "directory_entry_stored", "id": id }),
+            Ok(Response::HomeObjectsRetired { id }) => json!({ "type": "home_objects_retired", "id": id }),
             Ok(Response::Presence { id, from, sealed }) => {
                 json!({ "type": "presence", "id": id, "from": from, "sealed": hex(&sealed) })
             },

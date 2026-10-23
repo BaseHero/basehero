@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-devices-view"
+description = "Enables the devices_view command without any pre-configured scope."
+commands.allow = ["devices_view"]
+
+[[permission]]
+identifier = "deny-devices-view"
+description = "Denies the devices_view command without any pre-configured scope."
+commands.deny = ["devices_view"]

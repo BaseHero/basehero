@@ -12,6 +12,9 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+#[path = "support/confirmed.rs"]
+mod confirmed;
+
 #[path = "support/indexed_journal.rs"]
 mod indexed_journal;
 
@@ -42,7 +45,7 @@ fn retained_initial_bootstrap_opens_after_home_ack_and_later_controls() {
     let setup = begin(&mut owner);
     let originals = owner.pending_home_objects().unwrap();
     owner.confirm_kit_saved().unwrap();
-    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     assert!(h.journal().pending_setup().unwrap().is_none());
     drop(owner);
     let mut owner = h.owner();
@@ -79,13 +82,13 @@ fn retained_bootstrap_survives_failed_pending_clear_and_refuses_private_tamperin
     let cap = activate(&mut owner);
     let before = owner.initial_bootstrap(&cap).unwrap();
     h.raw().execute_batch("CREATE TRIGGER prevent_clear BEFORE DELETE ON account_pending_setup BEGIN SELECT RAISE(FAIL,'interrupted clear'); END;").unwrap();
-    assert!(owner.confirm_home_ordered(setup.head).is_err());
+    assert!(owner.confirm_home_ordered(setup.head, None).is_err());
     drop(owner);
     let mut owner = h.owner();
     let cap = activate(&mut owner);
     assert!(owner.initial_bootstrap(&cap).unwrap() == before);
     h.raw().execute_batch("DROP TRIGGER prevent_clear").unwrap();
-    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     for column in ["recovery_record", "device_seal", "recovery_seal"] {
         let raw = h.raw();
         let bytes: Vec<u8> = raw
@@ -143,7 +146,7 @@ fn retained_ciphertexts_are_not_overwritten_by_a_pending_retry() {
         [&bytes],
     )
     .unwrap();
-    assert!(owner.confirm_home_ordered(setup.head).is_err());
+    assert!(owner.confirm_home_ordered(setup.head, None).is_err());
     assert!(h.journal().pending_setup().unwrap().is_some());
     let after: Vec<u8> = raw
         .query_row(
@@ -364,12 +367,13 @@ fn ephemeral_journal_accepts_two_successors_without_projection_cursor() {
     let journal = DeviceJournal::from_shared(database.clone());
     let mut owner =
         bh_account::owner::AccountOwner::new(journal, store, PlainProtector, generation);
-    ready(owner.begin_first_device(
+    let setup = ready(owner.begin_first_device(
         ControlKeyPolicy::AppEnforcedOwnerConfirmation,
         &Password::new("ephemeral successor test").unwrap(),
     ))
     .unwrap();
     owner.confirm_kit_saved().unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     let cap = activate(&mut owner);
     for tag in [30, 40] {
         let keys =
@@ -1224,7 +1228,7 @@ fn qr_proof_for_another_account_cannot_prepare_this_owners_admission() {
     );
     assert_eq!(b.stored().head, b_setup.head, "nothing admitted in B");
     assert_eq!(
-        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, ()>(())),
+        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, PairError>(())),
         Err(PairError::NoReply)
     );
 }
@@ -1270,7 +1274,7 @@ fn qr_for_another_active_showing_device_cannot_prepare_local_owners_admission() 
     assert_eq!(h.store.state().sign_calls, before_signs);
     assert_eq!(h.stored().head, stored.head, "no second admission");
     assert_eq!(
-        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, ()>(())),
+        session.stage(b"unsigned", b"seal", |_, _| Ok::<_, PairError>(())),
         Err(PairError::NoReply)
     );
 }
@@ -1278,12 +1282,12 @@ fn qr_for_another_active_showing_device_cannot_prepare_local_owners_admission() 
 #[test]
 fn showing_owner_signs_add_and_seals_current_personal_before_any_ordering() {
     use bh_account::crypto::{KemKey, SigningKey};
-    use bh_account::pairing::{Reply, ShowingSession};
+    use bh_account::pairing::{PairError, Reply, ShowingSession};
     let h = Harness::new();
     let mut owner = h.owner();
     let status = begin(&mut owner);
     let initial_seal = owner.pending_home_objects().unwrap().device_seal;
-    owner.confirm_home_ordered(status.head).unwrap();
+    owner.confirm_home_ordered(status.head, None).unwrap();
     owner.confirm_kit_saved().unwrap();
     let state = bh_account::VerifiedAccount::replay(
         status.anchor,
@@ -1330,7 +1334,7 @@ fn showing_owner_signs_add_and_seals_current_personal_before_any_ordering() {
     session
         .stage(admission.as_bytes(), &delivery, |add, seal| {
             staged = Some((add.to_vec(), seal.to_vec()));
-            Ok::<_, ()>(())
+            Ok::<_, PairError>(())
         })
         .unwrap();
     assert_eq!(staged.unwrap(), (admission.as_bytes().to_vec(), delivery));
@@ -1366,11 +1370,15 @@ fn pairing_approval_uses_the_real_owner_and_cancellation_fences_late_native_sign
     let last = forged.len() - 1;
     forged[last] ^= 1;
     assert_eq!(
-        session.stage(&forged, b"fixture seal", |_, _| Ok::<_, ()>(())),
+        session.stage(&forged, b"fixture seal", |_, _| Ok::<_, PairError>(())),
         Err(PairError::ChangedRequest)
     );
     assert_eq!(
-        session.stage(event.as_bytes(), b"fixture seal", |_, _| Err::<(), _>(())),
+        session.stage(
+            event.as_bytes(),
+            b"fixture seal",
+            |_, _| Err::<(), PairError>(PairError::StageFailed)
+        ),
         Err(PairError::StageFailed),
         "a failed durable stage leaves the session live for retry"
     );
@@ -1378,13 +1386,17 @@ fn pairing_approval_uses_the_real_owner_and_cancellation_fences_late_native_sign
     session
         .stage(event.as_bytes(), b"fixture seal", |add, seal| {
             captured = [add, seal].concat();
-            Ok::<_, ()>(())
+            Ok::<_, PairError>(())
         })
         .unwrap();
     assert!(captured.starts_with(event.as_bytes()));
     assert_eq!(h.stored().head, status.head, "only staging, not ordering");
     assert_eq!(
-        session.stage(event.as_bytes(), b"fixture seal", |_, _| Ok::<_, ()>(())),
+        session.stage(
+            event.as_bytes(),
+            b"fixture seal",
+            |_, _| Ok::<_, PairError>(())
+        ),
         Err(PairError::Ended)
     );
 
@@ -1402,9 +1414,178 @@ fn pairing_approval_uses_the_real_owner_and_cancellation_fences_late_native_sign
         "cancel is not account-wide lock"
     );
     assert_eq!(
-        session.stage(late.as_bytes(), b"seal", |_, _| Ok::<_, ()>(())),
+        session.stage(late.as_bytes(), b"seal", |_, _| Ok::<_, PairError>(())),
         Err(PairError::Ended)
     );
+}
+
+/// A real owner's live approval, signed and sealed for one scanner but not
+/// yet staged. A fresh projection rewrite may happen from here on.
+fn prepared_approval(
+    h: &Harness,
+) -> (
+    Owner,
+    AccountCapability,
+    bh_account::pairing::ShowingSession,
+    AccountEvent,
+    Vec<u8>,
+) {
+    use bh_account::{
+        crypto::{KemKey, SigningKey},
+        pairing::{Reply, ShowingSession},
+        platform::StoredDevice,
+    };
+    let mut owner = h.owner();
+    let setup = begin(&mut owner);
+    let seal = owner.pending_home_objects().unwrap().device_seal;
+    owner.confirm_home_ordered(setup.head, None).unwrap();
+    owner.confirm_kit_saved().unwrap();
+    let native = h.journal().device().unwrap().unwrap();
+    let state = bh_account::VerifiedAccount::replay(
+        setup.anchor,
+        &setup
+            .submission
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>(),
+        setup.head,
+    )
+    .unwrap();
+    let personal = ready(bh_account::personal::open_for_receiver(
+        &state,
+        &seal,
+        &StoredDevice {
+            handle: native.handle,
+            keys: native.keys.clone(),
+            policy: native.policy,
+            kind: native.kind,
+        },
+        &mut h.store.clone(),
+    ))
+    .unwrap();
+    let capability = activate(&mut owner);
+    let session = ShowingSession::new(setup.anchor, native.keys.id());
+    let scanner = bh_account::DevicePublicKeys::new(
+        SigningKey::generate().public(),
+        SigningKey::generate().public(),
+        KemKey::generate().public(),
+    )
+    .unwrap();
+    session
+        .receive(&Reply::make(&session.qr().unwrap(), scanner.clone(), b"Fold").unwrap())
+        .unwrap();
+    let request = session.prepare(&owner, &capability).unwrap();
+    let signed = ready(owner.sign_control(&capability, &request)).unwrap();
+    let delivery =
+        ready(owner.seal_personal_for_device(&capability, &personal, &scanner, &signed)).unwrap();
+    (owner, capability, session, signed, delivery)
+}
+
+#[test]
+fn staging_refreshes_the_loaded_view_when_the_projection_is_rewritten_at_the_same_head() {
+    let h = Harness::new();
+    let (mut owner, capability, session, signed, delivery) = prepared_approval(&h);
+    // The same device's next setup commit replaces the projection at a fresh
+    // epoch over the same verified head (position 3), leaving the loaded
+    // view's index unanswerable.
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    session
+        .stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery)
+        .expect("a stale view over an unchanged head must refresh and stage");
+    let row = h.journal().staged_admission().unwrap().unwrap();
+    assert_eq!(row.event, signed.as_bytes(), "the exact signed bytes");
+    assert_eq!(row.delivery, delivery);
+    assert_eq!(h.stored().head.position, 3, "staging never orders");
+}
+
+#[test]
+fn staging_refresh_keeps_the_observed_floor() {
+    let h = Harness::new();
+    let (mut owner, capability, session, signed, delivery) = prepared_approval(&h);
+    let head = owner.verified(&capability).unwrap().head();
+    let floor = 2_000_000;
+    owner
+        .observe_accepted_alerts(
+            &capability,
+            head,
+            bh_account::ConfirmedTime {
+                earliest_ms: floor,
+                latest_ms: floor,
+            },
+        )
+        .unwrap();
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    session
+        .stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery)
+        .unwrap();
+    // The refreshed view keeps the accepted-head observation: a confirmation
+    // older than it is refused without waiting for a reactivation.
+    let mut view = owner.verified(&capability).unwrap().clone();
+    assert_eq!(
+        view.apply_timed(
+            signed.as_bytes(),
+            Some(bh_account::ConfirmedTime {
+                earliest_ms: floor - 1,
+                latest_ms: floor + 1,
+            }),
+        ),
+        Err(bh_account::Error::TimeRegressed)
+    );
+}
+
+#[test]
+fn staging_refuses_a_stale_view_once_the_verified_head_has_advanced() {
+    use bh_account::pairing::PairError;
+    let h = Harness::new();
+    let (mut owner, capability, session, signed, delivery) = prepared_approval(&h);
+    // Another holder of the same journal appends one verified add, then the
+    // projection is rewritten, so the approval prepared at position 3 no
+    // longer applies at the verified head.
+    let mut other = h.owner();
+    let other_capability = activate(&mut other);
+    append_devices(&mut other, &other_capability, 1);
+    assert_eq!(h.stored().head.position, 4);
+    h.raw()
+        .execute("DELETE FROM account_projection", [])
+        .unwrap();
+    assert_eq!(
+        session.stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery),
+        Err(PairError::StageFailed),
+        "a moved head is refused, not retryable: these bytes can never apply"
+    );
+    assert!(h.journal().staged_admission().unwrap().is_none());
+    assert_eq!(h.stored().head.position, 4, "nothing applied");
+}
+
+#[test]
+fn staging_keeps_the_session_live_when_local_evidence_stays_unavailable() {
+    use bh_account::pairing::PairError;
+    let h = Harness::new();
+    let (mut owner, capability, session, signed, delivery) = prepared_approval(&h);
+    // Local evidence stays unreadable through the one refresh, and reads
+    // again once the device index is back.
+    h.raw()
+        .execute("ALTER TABLE account_key_use RENAME TO hidden_keys", [])
+        .unwrap();
+    assert_eq!(
+        session.stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery),
+        Err(PairError::Unavailable),
+        "a persistent local read failure is retryable, not a staging failure"
+    );
+    assert!(h.journal().staged_admission().unwrap().is_none());
+    h.raw()
+        .execute("ALTER TABLE hidden_keys RENAME TO account_key_use", [])
+        .unwrap();
+    session
+        .stage_journal(&mut owner, &capability, signed.as_bytes(), &delivery)
+        .expect("the same live session stages once the index answers");
+    let row = h.journal().staged_admission().unwrap().unwrap();
+    assert_eq!(row.event, signed.as_bytes());
+    assert_eq!(row.delivery, delivery);
 }
 
 fn stage_pairing(h: &Harness) -> (Vec<u8>, Vec<u8>, bh_account::DevicePublicKeys) {
@@ -1415,7 +1596,7 @@ fn stage_pairing(h: &Harness) -> (Vec<u8>, Vec<u8>, bh_account::DevicePublicKeys
     let mut owner = h.owner();
     let setup = begin(&mut owner);
     let seal = owner.pending_home_objects().unwrap().device_seal;
-    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     owner.confirm_kit_saved().unwrap();
     let native = h.journal().device().unwrap().unwrap();
     let state = bh_account::VerifiedAccount::replay(
@@ -1758,7 +1939,7 @@ fn complete(h: &Harness) -> SetupStatus {
     let mut owner = h.owner();
     let status = begin(&mut owner);
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("home ordered");
     owner.confirm_kit_saved().expect("kit saved");
     status
@@ -1821,7 +2002,7 @@ fn setup_resumes_at_each_stage_without_duplicate_genesis() {
     );
     assert!(h.journal().load().unwrap().is_none());
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("home ordered");
     assert_eq!(h.stored().head, status.head);
 
@@ -1849,11 +2030,11 @@ fn home_order_is_idempotent_over_real_storage() {
     let status = begin(&mut owner);
     owner.mark_home_pending().unwrap();
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("home ordered");
     // A resumed/retried confirmation must not append the same bytes twice.
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("idempotent retry");
     let stored = h.stored();
     assert_eq!(stored.history.len(), 3, "no duplicate events");
@@ -1901,7 +2082,7 @@ fn kit_saved_before_ordering_survives_restart_and_deletes_after_ordering() {
         Err(SetupError::NotStarted)
     ));
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("home ordered");
     assert!(owner.setup_status().unwrap().is_none());
     assert!(h.journal().pending_setup().unwrap().is_none());
@@ -1986,10 +2167,10 @@ fn home_ack_retries_retirement_before_clearing_its_only_reference() {
     protector.fail_next_retirement();
     assert!(owner.confirm_kit_saved().is_err());
     protector.fail_next_retirement();
-    assert!(owner.confirm_home_ordered(status.head).is_err());
+    assert!(owner.confirm_home_ordered(status.head, None).is_err());
     assert!(h.journal().pending_setup().unwrap().is_some());
     assert!(protector.clone().open(&old.blob).is_ok());
-    owner.confirm_home_ordered(status.head).unwrap();
+    owner.confirm_home_ordered(status.head, None).unwrap();
     assert!(h.journal().pending_setup().unwrap().is_none());
     assert!(protector.clone().open(&old.blob).is_err());
     assert_eq!(h.stored().history, status.submission);
@@ -2108,7 +2289,7 @@ fn kit_confirmation_is_explicit_and_order_alone_keeps_the_code() {
 
     // Ordering alone deletes nothing: the person has not confirmed a save.
     owner
-        .confirm_home_ordered(status.head)
+        .confirm_home_ordered(status.head, None)
         .expect("home ordered");
     assert!(h.journal().pending_setup().unwrap().is_some());
     let status = owner.setup_status().unwrap().unwrap();
@@ -2157,7 +2338,7 @@ fn uncertain_home_head_does_not_advance_or_bless_bytes() {
         hash: [9; 32],
     };
     assert!(matches!(
-        owner.confirm_home_ordered(wrong),
+        owner.confirm_home_ordered(wrong, None),
         Err(SetupError::HomeMismatch)
     ));
     assert_eq!(
@@ -2171,7 +2352,7 @@ fn uncertain_home_head_does_not_advance_or_bless_bytes() {
 
     owner.mark_home_pending().unwrap();
     assert!(matches!(
-        owner.confirm_home_ordered(wrong),
+        owner.confirm_home_ordered(wrong, None),
         Err(SetupError::HomeMismatch)
     ));
     assert_eq!(
@@ -2221,10 +2402,10 @@ fn unauthenticated_or_unsupported_history_is_refused_without_a_stop() {
     *bad_signature.last_mut().unwrap() ^= 1;
     // Version and supported version follow the 23-byte domain.
     let mut newer = valid.clone();
-    newer[23..27].copy_from_slice(&[0, 2, 0, 2]);
+    newer[23..27].copy_from_slice(&[0, 3, 0, 3]);
     // The control tag ends the fixed header.
     let mut unknown_control = valid.clone();
-    unknown_control[23 + 2 + 2 + 8 + 32 + 32 + 32] = 9;
+    unknown_control[23 + 2 + 2 + 8 + 32 + 32 + 32] = 200;
     // A signed event of this account, but not the next one.
     let replayed = before.history[1].clone();
 
@@ -2543,6 +2724,33 @@ fn removed_device_denies_the_old_capability() {
 }
 
 #[test]
+fn a_removed_device_keeps_only_its_last_member_view() {
+    let h = Harness::new();
+    let _ = complete(&h);
+    let mut owner = h.owner();
+    let capability = activate(&mut owner);
+    assert!(
+        owner.last_member_view().unwrap().is_none(),
+        "an active device was not removed"
+    );
+    let member = owner.verified(&capability).unwrap().head();
+    let device = capability.device_id();
+    let request = owner.prepare_remove_self(&capability).unwrap();
+    let event = ready(owner.sign_control(&capability, &request)).unwrap();
+    owner.apply_incoming(&[event.as_bytes()]).unwrap();
+    drop(owner);
+    let mut owner = h.owner();
+    assert!(matches!(
+        ready(owner.activate()).unwrap(),
+        AccountLoad::AdmissionRequired(AdmissionReason::DeviceNotActive)
+    ));
+    let (id, view) = owner.last_member_view().unwrap().expect("a member once");
+    assert!(id == device, "this device");
+    assert!(view.head() == member, "the view just before its removal");
+    assert!(view.active_device(device).is_ok());
+}
+
+#[test]
 fn stale_generation_after_await_is_rejected() {
     let h = Harness::new();
     let _ = complete(&h);
@@ -2619,7 +2827,7 @@ fn base_control_signing_uses_the_control_key_for_base_originals_only() {
     let mut owner = h.owner();
     let setup = begin(&mut owner);
     owner.confirm_kit_saved().unwrap();
-    owner.confirm_home_ordered(setup.head).unwrap();
+    owner.confirm_home_ordered(setup.head, None).unwrap();
     let cap = activate(&mut owner);
     let message = b"bh/original-envelope/v1\0a base copy".to_vec();
     let expected = *owner

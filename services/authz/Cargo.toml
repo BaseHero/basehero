@@ -55,5 +55,9 @@ required-features = ["synthetic-attestation"]
 name = "local_probe"
 required-features = ["synthetic-attestation"]
 
+[[example]]
+name = "forged_account_change"
+required-features = ["synthetic-attestation"]
+
 [lints]
 workspace = true

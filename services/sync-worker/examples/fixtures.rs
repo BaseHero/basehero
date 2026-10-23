@@ -2,7 +2,7 @@
 use bh_crypto::{Secret, SigningKey};
 use bh_sync::{
     Approval, BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent,
-    Operation, Route, SignedApproval,
+    Operation, OrderState, Route, SignedApproval,
 };
 use serde_json::json;
 fn hex(bytes: &[u8]) -> String {
@@ -45,33 +45,37 @@ fn main() {
     let base = BaseId::from_genesis(&event);
     let gate = GateState {
         base,
+        order: OrderState::EMPTY,
         head: Head::EMPTY,
         incarnation: [5; 32],
         sequence: 0,
         checker_key: key.public(),
     };
-    let commitment = Commitment::order(base, Head::EMPTY, &event, Route::Control).unwrap();
+    let commitment = Commitment::order(base, OrderState::EMPTY, &event, Route::Control).unwrap();
     let append = Operation::Append(event.clone());
     let read = Operation::read(vec![event.digest()]).unwrap();
     let after = GateState {
         head: commitment.head(),
+        order: commitment.after(),
         sequence: 1,
         ..gate
     };
-    let conflicting = descriptor(event.id().0, body_a.commitment().0, 0x3c);
+    let conflicting = descriptor(event.nonce().0, body_a.commitment().0, 0x3c);
     let second = descriptor([4; 32], body_b.commitment().0, 0x4c);
     let second_commitment =
-        Commitment::order(base, commitment.head(), &second, Route::Content).unwrap();
+        Commitment::order(base, commitment.after(), &second, Route::Content).unwrap();
     let third = descriptor([6; 32], body_c.commitment().0, 0x6d);
     let third_commitment =
-        Commitment::order(base, second_commitment.head(), &third, Route::Content).unwrap();
+        Commitment::order(base, second_commitment.after(), &third, Route::Content).unwrap();
     let after_second = GateState {
         head: second_commitment.head(),
+        order: second_commitment.after(),
         sequence: 2,
         ..after
     };
     let after_third = GateState {
         head: third_commitment.head(),
+        order: third_commitment.after(),
         sequence: 3,
         ..after
     };
@@ -97,7 +101,7 @@ fn main() {
     let staged = body(0xb4);
     let staged_event = descriptor([8; 32], staged.commitment().0, 0x8e);
     let staged_commitment =
-        Commitment::order(base, commitment.head(), &staged_event, Route::Content).unwrap();
+        Commitment::order(base, commitment.after(), &staged_event, Route::Content).unwrap();
     let missing = body(0xb5);
     let missing_event = descriptor([9; 32], missing.commitment().0, 0x9f);
     let stage_op = Operation::stage_body(staged.clone());
@@ -108,6 +112,7 @@ fn main() {
     };
     let after_body_append = GateState {
         head: staged_commitment.head(),
+        order: staged_commitment.after(),
         sequence: 3,
         ..after
     };
@@ -120,7 +125,7 @@ fn main() {
         ..gate
     };
     let printed = json!({
-        "gate": { "base":hex(&base.0),"position":0,"hash":hex(&Head::EMPTY.hash.0),
+        "gate": { "base":hex(&base.0),"order_format":2,"order":hex(&gate.order.encode()),"position":0,"hash":hex(&Head::EMPTY.hash.0),
             "incarnation":hex(&gate.incarnation),"sequence":0,"checker_key":hex(&key.public()) },
         "event":hex(&event.encode()), "digest":hex(&event.digest().0), "commitment":hex(&commitment.encode()),
         "append":grant(&key, gate, &append, 1),

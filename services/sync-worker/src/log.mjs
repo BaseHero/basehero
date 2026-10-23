@@ -13,7 +13,10 @@ const SWEEP = 1000; // R2 deletes at most 1000 keys per call
 const MAX_PERMIT = 4096;
 const MAX_BODIES = 64;
 const MAX_CONTROLS = 64;
+// Shared with the SQLite query-plan fixture so it explains the exact read.
+const BOUNDED_CONTROL_QUERY = 'SELECT commitment,envelope FROM events WHERE control=1 AND position>? AND position<=? ORDER BY position LIMIT ?';
 const EMPTY = { position: 0, hash: '00'.repeat(32) };
+const EMPTY_OPENING = '0002' + '00'.repeat(80);
 // The epoch a removal leaves the log in: no content is admitted under it.
 const CLOSED = '00'.repeat(32);
 // Presence: opaque sealed frames of at most this many bytes, and per-base
@@ -55,8 +58,11 @@ function trySend(socket, message) {
 }
 
 export class LogObject extends DurableObject {
+  // The fixture explains precisely the query used by this object.
+  static boundedControlQuery = BOUNDED_CONTROL_QUERY;
   #instance;
   #hooks;
+  #directoryWrites = new Map();
   // The log's current epoch, in memory for the presence path, which touches
   // no storage. Loaded once here and moved only when a control is ordered.
   #epoch;
@@ -68,13 +74,21 @@ export class LogObject extends DurableObject {
   #ended = new WeakSet();
   constructor(ctx, env, hooks = {}) {
     super(ctx, env);
-    this.#instance = instantiate();
+    this.#instance = instantiate().then(instance => {
+      // Establish the per-log format before any RPC may serve reads, change
+      // epoch or order rows. Empty private home objects are not log history.
+      this.ctx.storage.transactionSync(() => this.#assertOrder(instance));
+      return instance;
+    });
     this.#hooks = {
       now: () => Date.now(),
       sync: () => ctx.storage.sync(),
       afterHead: async () => {},
       afterMark: async () => {},
+      afterDelete: async () => {},
       beforePut: async () => {},
+      afterDirectoryRows: async () => {},
+      afterControlRows: async () => {},
       ...hooks,
     };
     const sql = ctx.storage.sql;
@@ -92,7 +106,42 @@ export class LogObject extends DurableObject {
     // No read RPC, expiry or reclaim path exists for these acknowledged bytes.
     sql.exec(`CREATE TABLE IF NOT EXISTS private_home_objects(
       prefix_digest TEXT PRIMARY KEY, bundle_digest TEXT NOT NULL, bundle BLOB NOT NULL)`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS private_directory(
+      entry TEXT PRIMARY KEY, version INTEGER NOT NULL, digest TEXT NOT NULL, len INTEGER NOT NULL)`);
     this.#epoch = maybe(sql, "SELECT value FROM meta WHERE key='epoch'")?.value ?? null;
+  }
+
+  #assertOrder(instance) {
+    const sql = this.ctx.storage.sql;
+    const marker = maybe(sql, "SELECT value FROM meta WHERE key='order_format'")?.value;
+    const opening = maybe(sql, "SELECT value FROM meta WHERE key='opening'")?.value;
+    const head = maybe(sql, "SELECT value FROM meta WHERE key='head'")?.value;
+    const tail = maybe(sql, 'SELECT position,commitment FROM events ORDER BY position DESC LIMIT 1');
+    if (marker === undefined && opening === undefined && head === undefined && !tail &&
+        !maybe(sql, "SELECT value FROM meta WHERE key='control'") &&
+        !maybe(sql, "SELECT value FROM meta WHERE key='epoch'")) {
+      sql.exec("INSERT INTO meta(key,value) VALUES('order_format','2')");
+      sql.exec("INSERT INTO meta(key,value) VALUES('opening',?)", EMPTY_OPENING);
+      return;
+    }
+    if (marker !== '2' || typeof opening !== 'string' || !/^[0-9a-f]{164}$/.test(opening))
+      throw new Error('unsupported order format');
+    if (!tail) {
+      if (head !== undefined || opening !== EMPTY_OPENING) throw new Error('empty order mismatch');
+      return;
+    }
+    const log = maybe(sql, "SELECT value FROM meta WHERE key='log'")?.value;
+    if (!log || !/^[0-9a-f]{66}$/.test(log) || !head) throw new Error('missing order gate');
+    const state = call(instance, 'commitment_state', [unhex(log.slice(2)), new Uint8Array(tail.commitment)]);
+    const storedHead = JSON.parse(head);
+    if (state.order !== opening || state.position !== tail.position ||
+        state.position !== storedHead.position || state.hash !== storedHead.hash) throw new Error('order tail mismatch');
+    const lastControl = maybe(sql, 'SELECT commitment FROM events WHERE control=1 ORDER BY position DESC LIMIT 1');
+    const control = maybe(sql, "SELECT value FROM meta WHERE key='control'")?.value;
+    if (!lastControl || !control) throw new Error('missing control gate');
+    const controlState = call(instance, 'commitment_state', [unhex(log.slice(2)), new Uint8Array(lastControl.commitment)]);
+    if (JSON.parse(control).position !== controlState.position || JSON.parse(control).hash !== controlState.hash)
+      throw new Error('control tail mismatch');
   }
 
   // Immutable private signup objects: not staged content, not an append.
@@ -120,6 +169,100 @@ export class LogObject extends DurableObject {
       // A retry awaits durability too; a prior write may have lost its response.
       await this.#hooks.sync();
       return { prefixDigest: scope.prefix_digest, bundleDigest: scope.bundle_digest };
+    });
+  }
+
+  // The digest suffix makes each revision immutable: an interrupted R2 put
+  // cannot replace the bytes still named by the previous durable SQL row.
+  #directoryKey(log, entry, digest) { return `d/${log}/${entry}/${digest}`; }
+
+  // Serialize writes for the same opaque entry across awaits without blocking
+  // unrelated entries or reads; SQLite mutations still take short transactions.
+  async #directoryWrite(entry, run) {
+    const prior = this.#directoryWrites.get(entry) ?? Promise.resolve();
+    const next = prior.catch(() => {}).then(run);
+    this.#directoryWrites.set(entry, next);
+    try { return await next; } finally {
+      if (this.#directoryWrites.get(entry) === next) this.#directoryWrites.delete(entry);
+    }
+  }
+
+  async storeDirectoryEntry(permit, body) {
+    return this.#guard(async () => {
+      const instance = await this.#instance;
+      body = bytes(body);
+      const scope = this.#verify(instance, permit, body, 'store_directory_entry');
+      return this.#directoryWrite(scope.entry, async () => {
+        const sql = this.ctx.storage.sql;
+        const current = maybe(sql, 'SELECT version,digest FROM private_directory WHERE entry=?', scope.entry);
+        if (current && (current.version > scope.version ||
+            (current.version === scope.version && current.digest !== scope.body))) refuse('Conflict');
+        if (!current || current.version < scope.version) {
+          // R2 first, row second. On failure the old row still names its old
+          // immutable object. A crash before the row update may leave an
+          // unreferenced R2 object; there is no orphan sweep.
+          await this.env.BODIES.put(this.#directoryKey(scope.log, scope.entry, scope.body), body);
+          this.ctx.storage.transactionSync(() => {
+            const now = this.#now();
+            if (now < scope.issued_ms || now >= scope.deadline_ms) refuse('Expired');
+            this.#bind(scope.log);
+            const row = maybe(sql, 'SELECT version,digest FROM private_directory WHERE entry=?', scope.entry);
+            if (row && row.version >= scope.version) refuse('Conflict');
+            sql.exec('INSERT OR REPLACE INTO private_directory(entry,version,digest,len) VALUES(?,?,?,?)',
+              scope.entry, scope.version, scope.body, scope.len);
+          });
+        } else {
+          const now = this.#now();
+          if (now < scope.issued_ms || now >= scope.deadline_ms) refuse('Expired');
+          this.ctx.storage.transactionSync(() => this.#bind(scope.log));
+        }
+        await this.#hooks.sync();
+        // Delete only after the replacement row is durable. A concurrent
+        // reader holding the old row may see Missing and re-read the page.
+        if (current && current.version < scope.version && current.digest !== scope.body) {
+          try {
+            await this.env.BODIES.delete(this.#directoryKey(scope.log, scope.entry, current.digest));
+          } catch (error) {
+            console.error(`directory cleanup: ${error instanceof Error ? error.constructor.name : 'Error'}`);
+          }
+        }
+        return { ok: true };
+      });
+    });
+  }
+
+  async readDirectory(permit, after) {
+    return this.#guard(async () => {
+      const instance = await this.#instance;
+      const scope = this.#verify(instance, permit, new Uint8Array(0), 'read_directory');
+      if (after !== null && (typeof after !== 'string' || !/^[0-9a-f]{64}$/.test(after))) refuse('Malformed');
+      const sql = this.ctx.storage.sql;
+      const rows = sql.exec('SELECT entry,digest,len FROM private_directory WHERE entry>? ORDER BY entry LIMIT 65', after ?? '').toArray();
+      await this.#hooks.sync();
+      await this.#hooks.afterDirectoryRows();
+      const entries = [];
+      for (const row of rows.slice(0, 64)) {
+        const object = await this.env.BODIES.get(this.#directoryKey(scope.log, row.entry, row.digest));
+        if (!object || object.size !== row.len) refuse('Missing');
+        const body = new Uint8Array(await object.arrayBuffer());
+        entries.push({ entry: row.entry, body });
+      }
+      return { entries, more: rows.length > 64 };
+    });
+  }
+
+  async retireHomeObjects(permit) {
+    return this.#guard(async () => {
+      const instance = await this.#instance;
+      const scope = this.#verify(instance, permit, new Uint8Array(0), 'retire_home_objects');
+      this.ctx.storage.transactionSync(() => {
+        const now = this.#now();
+        if (now < scope.issued_ms || now >= scope.deadline_ms) refuse('Expired');
+        this.#bind(scope.log);
+        this.ctx.storage.sql.exec('DELETE FROM private_home_objects WHERE prefix_digest=?', scope.prefix_digest);
+      });
+      await this.#hooks.sync();
+      return { ok: true };
     });
   }
 
@@ -173,20 +316,24 @@ export class LogObject extends DurableObject {
       const instance = await this.#instance;
       event = bytes(event);
       const scope = this.#verify(instance, permit, event, 'append');
-      const first = this.ctx.storage.transactionSync(() => this.#admit(scope));
+      const first = this.ctx.storage.transactionSync(() => this.#admit(instance, scope));
       let control = null;
       if (!first.ack && scope.body !== null) {
-        const object = await this.env.BODIES.head(this.#key(scope.log, scope.body));
-        if (!object || object.size !== first.len) refuse('NotStaged');
+        for (const [body, len] of this.#bodies(scope, first)) {
+          const object = await this.env.BODIES.head(this.#key(scope.log, body));
+          if (!object || object.size !== len) refuse('NotStaged');
+        }
         await this.#hooks.afterHead();
       }
       // Recheck everything after the await. A reclaim marks its row before it
       // deletes, and any restage takes a new generation before its put, so a
       // body still `staging` in the same generation was in R2 at the HEAD above.
       const result = first.ack ?? this.ctx.storage.transactionSync(() => {
-        const again = this.#admit(scope);
+        const again = this.#admit(instance, scope);
         if (again.ack) return again.ack;
-        if (again.len !== first.len || again.gen !== first.gen) refuse('NotStaged');
+        if (again.len !== first.len || again.gen !== first.gen ||
+            again.attached?.len !== first.attached?.len || again.attached?.gen !== first.attached?.gen)
+          refuse('NotStaged');
         const ordered = this.#order(instance, scope, event);
         if (scope.after) control = scope.epoch;
         return ordered;
@@ -218,16 +365,26 @@ export class LogObject extends DurableObject {
 
   // Internal RPC: up to 64 control-route events after position `after`, in
   // order; 0 reads from the start. Read-only, like `read`.
-  async controls(after) {
+  async controls(after, through = null) {
     return this.#guard(async () => {
-      if (!safe(after)) refuse('Malformed');
-      const items = this.ctx.storage.sql.exec(
-        'SELECT commitment,envelope FROM events WHERE control=1 AND position>? ORDER BY position LIMIT ?',
-        after, MAX_CONTROLS)
-        .toArray().map(row => ({ commitment: new Uint8Array(row.commitment), event: new Uint8Array(row.envelope) }));
-      // As for read(), only durable captured rows can leave this object.
+      if (!safe(after) || (through !== null && (!safe(through) || through < after))) refuse('Malformed');
+      // Capture the indexed page AND its endpoint in one synchronous SQL read
+      // section, before the durability barrier. The endpoint is the exact
+      // requested position, not the final returned control.
+      const page = this.ctx.storage.transactionSync(() => {
+        const sql = this.ctx.storage.sql;
+        const items = (through === null
+          ? sql.exec('SELECT commitment,envelope FROM events WHERE control=1 AND position>? ORDER BY position LIMIT ?', after, MAX_CONTROLS)
+          : sql.exec(BOUNDED_CONTROL_QUERY, after, through, MAX_CONTROLS))
+          .toArray().map(row => ({ commitment: new Uint8Array(row.commitment), event: new Uint8Array(row.envelope) }));
+        const target = through ?? this.#head().position;
+        const endpoint = target === 0 ? null : maybe(sql, 'SELECT commitment FROM events WHERE position=?', target);
+        if (target !== 0 && !endpoint) refuse('Missing');
+        return { items, endpoint: endpoint ? new Uint8Array(endpoint.commitment) : null };
+      });
+      await this.#hooks.afterControlRows();
       await this.#hooks.sync();
-      return items;
+      return page;
     });
   }
 
@@ -236,16 +393,20 @@ export class LogObject extends DurableObject {
   }
 
   // Internal RPC: for each of 1-64 body commitments, its stored length if the
-  // body is ordered, else null. The edge serves only ordered bodies; a staging
-  // object is never served. Read-only.
+  // edge may serve it, else null. A base log serves only ordered bodies. An
+  // account-home log also serves a `staging` one: the service reads a
+  // rotation's body back before it permits the append, and only the service
+  // is granted a read of an account body that is not ordered. A `reclaiming`
+  // body is never served. Read-only.
   async orderedBodies(commitments) {
     return this.#guard(async () => {
       if (!Array.isArray(commitments) || commitments.length < 1 || commitments.length > MAX_BODIES ||
           !commitments.every(c => typeof c === 'string' && /^[0-9a-f]{64}$/.test(c))) refuse('Malformed');
       const sql = this.ctx.storage.sql;
+      const account = maybe(sql, "SELECT value FROM meta WHERE key='log'")?.value.startsWith('02') ?? false;
       return commitments.map(c => {
         const row = maybe(sql, 'SELECT state,len FROM bodies WHERE commitment=?', c);
-        return row?.state === 'ordered' ? row.len : null;
+        return row?.state === 'ordered' || (account && row?.state === 'staging') ? row.len : null;
       });
     });
   }
@@ -255,6 +416,7 @@ export class LogObject extends DurableObject {
   // Internal presence: a hibernating socket tagged `presence` at the epoch the
   // edge verified, carrying only that epoch and a random slot.
   async fetch(request) {
+    try { await this.#instance; } catch { return new Response(null, { status: 503 }); }
     const path = new URL(request.url).pathname;
     if ((path !== '/subscribe' && path !== '/presence') || request.headers.get('Upgrade') !== 'websocket')
       return new Response(null, { status: 404 });
@@ -264,7 +426,11 @@ export class LogObject extends DurableObject {
     server.send(this.#notice());
     return new Response(null, { status: 101, webSocket: client });
   }
-  webSocketMessage(socket, message) {
+  async webSocketMessage(socket, message) {
+    try { await this.#instance; } catch {
+      tryClose(socket, 1003, 'unsupported order');
+      return;
+    }
     if (this.#isPresence(socket)) this.#relay(socket, message);
     else socket.close(1003, 'send-only');
   }
@@ -275,8 +441,11 @@ export class LogObject extends DurableObject {
 
   // Reclaim sweep: staging rows older than a day are marked `reclaiming`,
   // durably, before their R2 objects are deleted; then the rows are dropped.
-  // Rows already `reclaiming` (an interrupted sweep) are resumed first.
+  // So no reclaimed object outlives its row. Rows already `reclaiming` (an
+  // interrupted sweep) are resumed first.
   async alarm() {
+    // A hibernated alarm cannot mutate a markerless legacy order store.
+    try { await this.#instance; } catch { return; }
     const now = this.#now();
     const sql = this.ctx.storage.sql;
     const log = maybe(sql, "SELECT value FROM meta WHERE key='log'")?.value;
@@ -292,6 +461,7 @@ export class LogObject extends DurableObject {
     await this.#hooks.afterMark();
     if (doomed.length) {
       await this.env.BODIES.delete(doomed.map(commitment => this.#key(log, commitment)));
+      await this.#hooks.afterDelete();
       this.ctx.storage.transactionSync(() => {
         for (const commitment of doomed)
           sql.exec("DELETE FROM bodies WHERE commitment=? AND state='reclaiming'", commitment);
@@ -310,7 +480,12 @@ export class LogObject extends DurableObject {
     return now;
   }
   async #guard(run) {
-    try { return await run(); } catch (error) {
+    try {
+      // All RPCs, including body-free reads and head notices, must wait for
+      // the canonical opening/tail check completed at activation.
+      await this.#instance;
+      return await run();
+    } catch (error) {
       if (error instanceof Refused) return { refused: error.reason };
       // Class and message only, with any hex run (a key or identifier) elided:
       // never permit, body or identifier bytes.
@@ -350,7 +525,7 @@ export class LogObject extends DurableObject {
   // then the body row. Returns the original result for an exact retry on the
   // same route. A control's predecessor is the control head, so content
   // ordered since the last control never holds a control back.
-  #admit(scope) {
+  #admit(instance, scope) {
     const now = this.#now();
     if (now < scope.issued_ms || now >= scope.deadline_ms) refuse('Expired');
     this.#bind(scope.log);
@@ -358,9 +533,12 @@ export class LogObject extends DurableObject {
     const prior = maybe(sql, 'SELECT position,digest,control,commitment FROM events WHERE event_id=?', scope.event_id);
     if (prior) {
       if (prior.digest !== scope.digest || prior.control !== (scope.after ? 1 : 0)) refuse('Conflict');
-      // The assigned chain hash is the canonical commitment's last 32 bytes.
-      return { ack: { position: prior.position, hash: hex(new Uint8Array(prior.commitment).slice(-32)), eventId: scope.event_id,
-        commitment: hex(new Uint8Array(prior.commitment)) } };
+      const commitment = new Uint8Array(prior.commitment);
+      const state = call(instance, 'commitment_state', [unhex(scope.log.slice(2)), commitment]);
+      if (state.position !== prior.position || state.event_id !== scope.event_id || state.digest !== prior.digest)
+        throw new Error('retry row mismatch');
+      return { ack: { position: state.position, hash: state.hash, eventId: state.event_id,
+        commitment: state.commitment } };
     }
     if (scope.after) {
       const control = this.#head('control');
@@ -373,7 +551,22 @@ export class LogObject extends DurableObject {
     // Only a `staging` body can be ordered, so a body that is already `ordered`
     // never belongs to a second event.
     if (row?.state !== 'staging') refuse('NotStaged');
-    return { len: row.len, gen: row.gen };
+    // A control's attached body (a rekey's seal set) is staged and fenced
+    // exactly like its own.
+    let attached = null;
+    if (scope.attached !== null) {
+      const extra = maybe(sql, 'SELECT state,len,gen FROM bodies WHERE commitment=?', scope.attached);
+      if (extra?.state !== 'staging') refuse('NotStaged');
+      attached = { len: extra.len, gen: extra.gen };
+    }
+    return { len: row.len, gen: row.gen, attached };
+  }
+  // The bodies an append orders and their staged lengths: its own, then any
+  // attached one.
+  #bodies(scope, admitted) {
+    const bodies = [[scope.body, admitted.len]];
+    if (scope.attached !== null) bodies.push([scope.attached, admitted.attached.len]);
+    return bodies;
   }
   // Inside a transaction: the next body generation from a durable counter.
   #nextGen() {
@@ -389,16 +582,22 @@ export class LogObject extends DurableObject {
     const head = this.#head();
     // A permit with a predecessor orders a control; the route is committed in the chain.
     const control = scope.after ? 1 : 0;
+    const before = maybe(sql, "SELECT value FROM meta WHERE key='opening'")?.value;
+    if (typeof before !== 'string') throw new Error('missing opening');
     const next = call(instance, 'order_commitment',
-      [unhex(scope.log.slice(2)), be(head.position, 8), unhex(head.hash), Uint8Array.of(control), event]);
-    if (next.position !== head.position + 1 || next.event_id !== scope.event_id || next.digest !== scope.digest)
+      [unhex(scope.log.slice(2)), unhex(before), Uint8Array.of(control), event]);
+    if (next.position !== head.position + 1 || next.event_id !== scope.event_id || next.digest !== scope.digest ||
+        (head.position && before === EMPTY_OPENING))
       throw new Error('order plan');
     sql.exec('INSERT INTO events(position,event_id,digest,control,commitment,envelope) VALUES(?,?,?,?,?,?)',
       next.position, next.event_id, next.digest, control, unhex(next.commitment).buffer, event.slice().buffer);
     // rowsWritten also counts index rows; zero means the row was not staging.
-    if (scope.body !== null &&
-        sql.exec("UPDATE bodies SET state='ordered' WHERE commitment=? AND state='staging'", scope.body).rowsWritten === 0)
-      throw new Error('body state');
+    // An attached body is ordered with the event, so it is never reclaimed.
+    for (const body of [scope.body, scope.attached]) {
+      if (body !== null &&
+          sql.exec("UPDATE bodies SET state='ordered' WHERE commitment=? AND state='staging'", body).rowsWritten === 0)
+        throw new Error('body state');
+    }
     const ordered = JSON.stringify({ position: next.position, hash: next.hash });
     // A control carries the epoch the log is in once it is ordered, all zeros
     // once closed; content must match an open one. It is the next control's
@@ -408,6 +607,7 @@ export class LogObject extends DurableObject {
       sql.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('control',?)", ordered);
     }
     sql.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('head',?)", ordered);
+    sql.exec("INSERT OR REPLACE INTO meta(key,value) VALUES('opening',?)", next.order);
     return { position: next.position, hash: next.hash, eventId: next.event_id, commitment: next.commitment };
   }
   #key(log, commitment) { return `b/${log}/${commitment}`; }

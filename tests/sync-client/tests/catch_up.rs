@@ -46,6 +46,52 @@ async fn new_account_catches_up_then_registers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_home_follow_verifies_outer_prefix_even_when_inner_signup_is_ahead() {
+    let hosted = Hosted::new();
+    let device = Device::new();
+    let database = device.owner.shared_database(device.id).unwrap();
+    assert_eq!(
+        database
+            .lock()
+            .unwrap()
+            .account_state()
+            .unwrap()
+            .unwrap()
+            .head_position,
+        3
+    );
+    let (client, _) = device.start(&hosted);
+    // Home setup reads the three-event prefix as 1..=3, possibly more
+    // than once. Identify the follower by its 64-position page instead of
+    // depending on the relative scheduling of those setup reads.
+    let follower_page = || {
+        hosted
+            .edge
+            .reads(device.account_log)
+            .into_iter()
+            .find(|(first, last)| last.checked_sub(*first) == Some(63))
+    };
+    until(20, "home follower batch", || follower_page().is_some()).await;
+    assert_eq!(
+        follower_page().unwrap().0,
+        1,
+        "an uncheckpointed outer log must start at EMPTY, not the inner head"
+    );
+    until(20, "durable outer prefix", || {
+        database
+            .lock()
+            .unwrap()
+            .account_outer_progress(device.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 3
+    })
+    .await;
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_resumes_after_lost_answer() {
     let hosted = Hosted::new();
     let device = Device::new();

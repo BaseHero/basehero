@@ -19,9 +19,14 @@ use bh_device::{
     join::{Admission, JoinError},
     own_base::{OwnBaseError, create_or_open},
 };
-use bh_sync_client::{SignerError, pairing::JoinProver};
+use bh_sync_client::{
+    Client, SignerError,
+    bootstrap::{self, Progress},
+    pairing::{JoinProver, JoiningPairing, ShowingPairing, Side},
+};
 use futures_util::future::BoxFuture;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
+use tokio::sync::watch;
 
 pub struct Joiner {
     pub dir: tempfile::TempDir,
@@ -121,6 +126,74 @@ impl Joiner {
     pub fn into_device(self) -> Device {
         Device::joined(self.dir, self.owner, self.id, self.generation, self.seeds)
     }
+}
+
+/// Pair a new device to `mac` through the real QR flow, end to end, and
+/// commit its verified admission. Returns the joined device (not started and
+/// not yet bootstrapped) and the ordered addition's head.
+pub async fn paired(
+    hosted: &Arc<super::fake::Hosted>,
+    mac: &Device,
+    mac_client: &Client,
+) -> (Device, AccountHead) {
+    // The base copies controls only under the approval the person gives.
+    mac.signer.approve_controls.store(false, Ordering::SeqCst);
+    let (mut showing, qr) = ShowingPairing::start(
+        mac.signer.identity_account(),
+        mac.signer.device_id(),
+        hosted.relay(),
+    );
+    let joiner = Joiner::new();
+    let mut joining = JoiningPairing::join(&qr, joiner.keys.clone(), b"Fold", hosted.relay())
+        .await
+        .unwrap();
+    // The relay holds sealed bytes only: neither the joining device's keys
+    // nor its label.
+    for held in hosted.relay_held(Side::Join) {
+        let contains = |part: &[u8]| held.windows(part.len()).any(|w| w == part);
+        assert!(!contains(joiner.keys.signing()) && !contains(b"Fold"));
+    }
+    let candidate = showing.candidate().await.unwrap();
+    assert_eq!(candidate.keys, joiner.keys);
+    assert_eq!(candidate.label, b"Fold");
+    {
+        let (mut account, capability, _) = mac.signer.account_owner();
+        let personal = account.open_personal(&capability).await.unwrap();
+        showing
+            .stage(&mut account, &capability, &personal, &mac.signer.approvals)
+            .await
+            .unwrap();
+    }
+    let endpoint = mac.endpoint(hosted);
+    let (head, admission) = tokio::join!(
+        showing.finish(mac_client),
+        joining.wait_admitted(
+            &endpoint,
+            hosted.connector(),
+            joiner.owner.clone(),
+            joiner.id,
+            joiner.prover(),
+        )
+    );
+    let head = head.unwrap();
+    let admission = admission.unwrap();
+    joiner.admit(&admission).await;
+    (joiner.into_device(), head)
+}
+
+/// Bootstrap a joined device to the base's tail through the receiver.
+pub async fn bootstrapped(hosted: &Arc<super::fake::Hosted>, fold: &Device) {
+    let (progress, _) = watch::channel(Progress::default());
+    bootstrap::run(
+        fold.endpoint(hosted),
+        hosted.connector(),
+        fold.owner.clone(),
+        fold.id,
+        fold.signer.clone(),
+        progress,
+    )
+    .await
+    .unwrap();
 }
 
 struct Prover {

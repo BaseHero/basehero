@@ -56,6 +56,8 @@ fn endpoint(hosted: &Hosted) -> Endpoint {
         },
         build_floor: 1,
         appraisal: Appraisal::Synthetic,
+        device_clock: std::sync::Arc::new(bh_sync_client::SystemDeviceClock),
+        recovery_key: hosted.edge.recovery_certificate(),
     }
 }
 

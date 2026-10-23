@@ -75,6 +75,20 @@ pub enum Want {
         after: Head,
         max_events: u16,
     },
+    ReadDirectory {
+        log: LogId,
+    },
+    StoreDirectoryEntry {
+        log: LogId,
+        entry: [u8; 32],
+        version: u64,
+        body: Digest,
+        len: u32,
+    },
+    ReadControls {
+        log: LogId,
+        after: u64,
+    },
 }
 
 /// A base's metadata root M, which the service needs for one request to verify
@@ -114,6 +128,40 @@ pub struct Delivery {
     pub frame: Vec<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum RecoverPurpose {
+    AddDevice = 1,
+    Sign = 2,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecoveryAttachment {
+    pub record: Option<Vec<u8>>,
+    pub recovery_seal: Vec<u8>,
+    /// The transport commitment of a rotation's padded purpose-2 body,
+    /// staged on the account log before this control is submitted. The
+    /// service reads that body back and judges the exact raw frame inside.
+    pub rotation_body: Option<Digest>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum RecoveryAnswer {
+    NotRecognised,
+    PasswordMismatch {
+        tries_left: u8,
+        next_try_ms: Option<u64>,
+    },
+    Wait {
+        next_try_ms: u64,
+    },
+    Released {
+        genesis: Vec<u8>,
+        record: Vec<u8>,
+        recovery_seal: Vec<u8>,
+    },
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum ToService {
     /// Exact encrypted initial signup objects. The authenticated account, not
@@ -141,11 +189,31 @@ pub enum ToService {
     /// One original account event for the session's account log, checked
     /// against the account's current verified history before an append permit.
     /// A device addition may carry the personal-key delivery to the added
-    /// device, which is then staged and ordered as the event's body.
+    /// device, which is then staged and ordered as the event's body. A
+    /// rotation's attachment names the body the device already staged.
     SubmitControl {
         log: LogId,
         event: Vec<u8>,
         delivery: Option<Box<Delivery>>,
+        attachment: Option<Box<RecoveryAttachment>>,
+    },
+    Recover {
+        sealed: Vec<u8>,
+        purpose: RecoverPurpose,
+    },
+    ReadNotices {
+        after_ms: u64,
+    },
+    ConfirmControl {
+        log: LogId,
+        event: Digest,
+        challenge: [u8; 32],
+    },
+    ReadAccountEvidence {
+        genesis: Vec<u8>,
+        first: u64,
+        last: u64,
+        challenge: [u8; 32],
     },
     /// Registers a base the session's account created: its exact genesis
     /// descriptor (an encoded log event) and body, the creator account head
@@ -185,15 +253,34 @@ pub enum FromService {
         digest: [u8; 32],
     },
     /// The session's single-use authentication challenge, sent first.
-    Challenge { challenge: [u8; 32] },
+    Challenge {
+        challenge: [u8; 32],
+    },
     /// The account head the service verified for this session.
-    Authenticated { account_head: AccountHead },
+    Authenticated {
+        account_head: AccountHead,
+    },
     /// Signed permits, or a refusal, in request order.
     Permits {
         items: Vec<Result<Vec<u8>, Refusal>>,
     },
     /// The whole request was refused.
-    Refused { reason: Refusal },
+    Refused {
+        reason: Refusal,
+    },
+    Confirmed {
+        confirmation: Vec<u8>,
+        head: Vec<u8>,
+    },
+    AccountEvidence {
+        events_permit: Vec<u8>,
+        confirmations: Vec<Vec<u8>>,
+        head: Vec<u8>,
+    },
+    Recovery(RecoveryAnswer),
+    Notices {
+        kit_used_ms: Vec<u64>,
+    },
     /// Current authority could not be established; nothing was issued.
     Unavailable,
     /// Committed descriptors on the attested channel; bodies stay on the edge.
@@ -242,8 +329,10 @@ pub enum Refusal {
     /// The service does not know the base's latest controls; send
     /// `RegisterBase` with M, then retry.
     Resync,
+    NotOrdered,
+    Lapsed,
 }
-const REFUSALS: [Refusal; 10] = [
+const REFUSALS: [Refusal; 12] = [
     Refusal::Malformed,
     Refusal::Unauthenticated,
     Refusal::NotActive,
@@ -254,6 +343,8 @@ const REFUSALS: [Refusal; 10] = [
     Refusal::Unsupported,
     Refusal::AccountChangePending,
     Refusal::Resync,
+    Refusal::NotOrdered,
+    Refusal::Lapsed,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -279,6 +370,9 @@ impl fmt::Debug for Want {
             Self::Subscribe { .. } => "Subscribe",
             Self::Presence { .. } => "Presence",
             Self::ReadBatch { .. } => "ReadBatch",
+            Self::ReadDirectory { .. } => "ReadDirectory",
+            Self::StoreDirectoryEntry { .. } => "StoreDirectoryEntry",
+            Self::ReadControls { .. } => "ReadControls",
         })
     }
 }
@@ -292,6 +386,10 @@ impl fmt::Debug for ToService {
             Self::SubmitBaseControl { .. } => "SubmitBaseControl",
             Self::StoreHomeObjects { .. } => "StoreHomeObjects",
             Self::ReadBatch { .. } => "ReadBatch",
+            Self::Recover { .. } => "Recover",
+            Self::ReadNotices { .. } => "ReadNotices",
+            Self::ConfirmControl { .. } => "ConfirmControl",
+            Self::ReadAccountEvidence { .. } => "ReadAccountEvidence",
         })
     }
 }
@@ -307,6 +405,10 @@ impl fmt::Debug for FromService {
             Self::Refused { reason } => f.debug_struct("Refused").field("reason", reason).finish(),
             Self::Unavailable => f.write_str("Unavailable"),
             Self::HomeObjectsStored { .. } => f.write_str("HomeObjectsStored"),
+            Self::Confirmed { .. } => f.write_str("Confirmed"),
+            Self::AccountEvidence { .. } => f.write_str("AccountEvidence"),
+            Self::Recovery(_) => f.write_str("Recovery"),
+            Self::Notices { .. } => f.write_str("Notices"),
             Self::ReadBatch { result, .. } => f.write_str(match result {
                 ReadBatchResult::Selected { .. } => "ReadBatch(Selected)",
                 ReadBatchResult::Repair { .. } => "ReadBatch(Repair)",
@@ -339,6 +441,22 @@ impl Output {
         self.bytes(&len.to_be_bytes());
         self.bytes(bytes);
         Ok(())
+    }
+    fn option<T>(
+        &mut self,
+        value: Option<T>,
+        mut write: impl FnMut(&mut Self, T) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        match value {
+            Some(value) => {
+                self.bytes(&[1]);
+                write(self, value)
+            }
+            None => {
+                self.bytes(&[0]);
+                Ok(())
+            }
+        }
     }
     fn count(&mut self, n: usize) -> Result<(), Error> {
         self.bytes(&u16::try_from(n).map_err(|_| Error::Size)?.to_be_bytes());
@@ -463,6 +581,14 @@ fn check_items(items: &[Want]) -> Result<(), Error> {
                 return Err(Error::Size);
             }
             Want::ReadBatch { .. } => return Err(Error::Encoding),
+            Want::ReadControls { after, .. } if *after > MAX_SAFE_POSITION => {
+                return Err(Error::Size);
+            }
+            Want::ReadDirectory { log } | Want::StoreDirectoryEntry { log, .. }
+                if log.kind != LogKind::Account =>
+            {
+                return Err(Error::Encoding);
+            }
             Want::ReadBodies { bodies: list, .. } => {
                 if list.is_empty() || list.len() as u64 > MAX_READ {
                     return Err(Error::Size);
@@ -473,6 +599,16 @@ fn check_items(items: &[Want]) -> Result<(), Error> {
         }
     }
     if bodies > MAX_BODIES {
+        return Err(Error::Size);
+    }
+    Ok(())
+}
+
+fn check_evidence_range(first: u64, last: u64) -> Result<(), Error> {
+    if first == 0
+        || last.checked_sub(first).is_none_or(|n| n >= MAX_READ)
+        || last > MAX_SAFE_POSITION
+    {
         return Err(Error::Size);
     }
     Ok(())
@@ -578,6 +714,29 @@ impl ToService {
                             out.bytes(epoch);
                         }
                         Want::ReadBatch { .. } => return Err(Error::Encoding),
+                        Want::ReadControls { log, after } => {
+                            out.bytes(&[12]);
+                            out.log(*log);
+                            out.bytes(&after.to_be_bytes());
+                        }
+                        Want::ReadDirectory { log } => {
+                            out.bytes(&[8]);
+                            out.log(*log);
+                        }
+                        Want::StoreDirectoryEntry {
+                            log,
+                            entry,
+                            version,
+                            body,
+                            len,
+                        } => {
+                            out.bytes(&[9]);
+                            out.log(*log);
+                            out.bytes(entry);
+                            out.bytes(&version.to_be_bytes());
+                            out.bytes(&body.0);
+                            out.bytes(&len.to_be_bytes());
+                        }
                     }
                 }
             }
@@ -585,6 +744,7 @@ impl ToService {
                 log,
                 event,
                 delivery,
+                attachment,
             } => {
                 out = Output::new(3);
                 out.log(*log);
@@ -600,6 +760,49 @@ impl ToService {
                         out.blob(frame)?;
                     }
                 }
+                out.option(attachment.as_ref(), |out, attachment| {
+                    out.option(attachment.record.as_ref(), |out, record| out.blob(record))?;
+                    out.blob(&attachment.recovery_seal)?;
+                    out.option(attachment.rotation_body, |out, body| {
+                        out.bytes(&body.0);
+                        Ok(())
+                    })
+                })?;
+            }
+            Self::Recover { sealed, purpose } => {
+                out = Output::new(7);
+                out.bytes(&[*purpose as u8]);
+                out.blob(sealed)?;
+            }
+            Self::ReadNotices { after_ms } => {
+                out = Output::new(8);
+                out.bytes(&after_ms.to_be_bytes());
+            }
+            Self::ConfirmControl {
+                log,
+                event,
+                challenge,
+            } => {
+                if log.kind != LogKind::Account {
+                    return Err(Error::Encoding);
+                }
+                out = Output::new(9);
+                out.log(*log);
+                out.bytes(&event.0);
+                out.bytes(challenge);
+            }
+            Self::ReadAccountEvidence {
+                genesis,
+                first,
+                last,
+                challenge,
+            } => {
+                check_evidence_range(*first, *last)?;
+                out = Output::new(10);
+                out.blob(genesis)?;
+                out.bytes(&first.to_be_bytes());
+                out.bytes(&last.to_be_bytes());
+                out.bytes(challenge);
             }
             Self::RegisterBase {
                 descriptor,
@@ -715,6 +918,18 @@ impl ToService {
                             log: input.log()?,
                             epoch: input.array()?,
                         },
+                        8 => Want::ReadDirectory { log: input.log()? },
+                        12 => Want::ReadControls {
+                            log: input.log()?,
+                            after: input.u64()?,
+                        },
+                        9 => Want::StoreDirectoryEntry {
+                            log: input.log()?,
+                            entry: input.array()?,
+                            version: input.u64()?,
+                            body: Digest(input.array()?),
+                            len: input.u32()?,
+                        },
                         _ => return Err(Error::Encoding),
                     });
                 }
@@ -730,7 +945,48 @@ impl ToService {
                         frame: input.blob()?,
                     }))
                 })?,
+                attachment: input.option(|input| {
+                    Ok(Box::new(RecoveryAttachment {
+                        record: input.option(Input::blob)?,
+                        recovery_seal: input.blob()?,
+                        rotation_body: input.option(|input| Ok(Digest(input.array()?)))?,
+                    }))
+                })?,
             },
+            7 => Self::Recover {
+                purpose: match input.u8()? {
+                    1 => RecoverPurpose::AddDevice,
+                    2 => RecoverPurpose::Sign,
+                    _ => return Err(Error::Encoding),
+                },
+                sealed: input.blob()?,
+            },
+            8 => Self::ReadNotices {
+                after_ms: input.u64()?,
+            },
+            9 => {
+                let log = input.log()?;
+                if log.kind != LogKind::Account {
+                    return Err(Error::Encoding);
+                }
+                Self::ConfirmControl {
+                    log,
+                    event: Digest(input.array()?),
+                    challenge: input.array()?,
+                }
+            }
+            10 => {
+                let genesis = input.blob()?;
+                let first = input.u64()?;
+                let last = input.u64()?;
+                check_evidence_range(first, last)?;
+                Self::ReadAccountEvidence {
+                    genesis,
+                    first,
+                    last,
+                    challenge: input.array()?,
+                }
+            }
             4 => Self::RegisterBase {
                 descriptor: input.blob()?,
                 body: input.blob()?,
@@ -787,6 +1043,64 @@ impl FromService {
             Self::Refused { reason } => {
                 out = Output::new(4);
                 out.bytes(&[*reason as u8]);
+            }
+            Self::Confirmed { confirmation, head } => {
+                out = Output::new(7);
+                out.blob(confirmation)?;
+                out.blob(head)?;
+            }
+            Self::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            } => {
+                if confirmations.len() > MAX_READ as usize {
+                    return Err(Error::Size);
+                }
+                out = Output::new(8);
+                out.blob(events_permit)?;
+                out.count(confirmations.len())?;
+                for item in confirmations {
+                    out.blob(item)?;
+                }
+                out.blob(head)?;
+            }
+            Self::Recovery(answer) => {
+                out = Output::new(9);
+                match answer {
+                    RecoveryAnswer::NotRecognised => out.bytes(&[1]),
+                    RecoveryAnswer::PasswordMismatch {
+                        tries_left,
+                        next_try_ms,
+                    } => {
+                        out.bytes(&[2, *tries_left]);
+                        out.option(*next_try_ms, |out, ms| {
+                            out.bytes(&ms.to_be_bytes());
+                            Ok(())
+                        })?;
+                    }
+                    RecoveryAnswer::Wait { next_try_ms } => {
+                        out.bytes(&[3]);
+                        out.bytes(&next_try_ms.to_be_bytes());
+                    }
+                    RecoveryAnswer::Released {
+                        genesis,
+                        record,
+                        recovery_seal,
+                    } => {
+                        out.bytes(&[4]);
+                        out.blob(genesis)?;
+                        out.blob(record)?;
+                        out.blob(recovery_seal)?;
+                    }
+                }
+            }
+            Self::Notices { kit_used_ms } => {
+                out = Output::new(10);
+                out.count(kit_used_ms.len())?;
+                for ms in kit_used_ms {
+                    out.bytes(&ms.to_be_bytes());
+                }
             }
             Self::Unavailable => out = Output::new(5),
             Self::HomeObjectsStored { prefix, digest } => {
@@ -991,6 +1305,53 @@ impl FromService {
             4 => Self::Refused {
                 reason: refusal(&mut input)?,
             },
+            7 => Self::Confirmed {
+                confirmation: input.blob()?,
+                head: input.blob()?,
+            },
+            8 => {
+                let events_permit = input.blob()?;
+                let count = input.u16()? as usize;
+                if count > MAX_READ as usize {
+                    return Err(Error::Size);
+                }
+                let mut confirmations = Vec::with_capacity(count);
+                for _ in 0..count {
+                    confirmations.push(input.blob()?);
+                }
+                Self::AccountEvidence {
+                    events_permit,
+                    confirmations,
+                    head: input.blob()?,
+                }
+            }
+            9 => Self::Recovery(match input.u8()? {
+                1 => RecoveryAnswer::NotRecognised,
+                2 => RecoveryAnswer::PasswordMismatch {
+                    tries_left: input.u8()?,
+                    next_try_ms: input.option(Input::u64)?,
+                },
+                3 => RecoveryAnswer::Wait {
+                    next_try_ms: input.u64()?,
+                },
+                4 => RecoveryAnswer::Released {
+                    genesis: input.blob()?,
+                    record: input.blob()?,
+                    recovery_seal: input.blob()?,
+                },
+                _ => return Err(Error::Encoding),
+            }),
+            10 => {
+                let count = input.u16()? as usize;
+                if count > (MAX_MESSAGE - 5) / 8 {
+                    return Err(Error::Size);
+                }
+                let mut kit_used_ms = Vec::with_capacity(count);
+                for _ in 0..count {
+                    kit_used_ms.push(input.u64()?);
+                }
+                Self::Notices { kit_used_ms }
+            }
             5 => Self::Unavailable,
             6 => Self::HomeObjectsStored {
                 prefix: input.head()?,
@@ -1096,13 +1457,29 @@ const DELIVERY_HEADER: usize = 1 + 4;
 /// The body object carrying a signed personal-key delivery frame: `purpose:u8
 /// = 1 || length:u32 || frame || zeros` in the smallest body size that fits.
 pub fn delivery_body(frame: &[u8]) -> Result<BodyObject, WrapError> {
+    framed_body(DELIVERY_PURPOSE, frame)
+}
+
+/// Canonical transport for an exact signed rotation frame (purpose 2).
+/// The transport commitment is distinct from the signed raw-frame digest.
+/// The largest body, 4 MiB, carries a frame sealed to at most 3,151 devices.
+pub fn rotation_body(frame: &[u8]) -> Result<BodyObject, WrapError> {
+    framed_body(2, frame)
+}
+
+/// Extract a raw rotation frame, rejecting noncanonical transport bytes.
+pub fn rotation_frame(body: &[u8]) -> Result<&[u8], WrapError> {
+    framed_payload(2, body)
+}
+
+fn framed_body(purpose: u8, frame: &[u8]) -> Result<BodyObject, WrapError> {
     if frame.is_empty() {
         return Err(WrapError::Size);
     }
     let len = u32::try_from(frame.len()).map_err(|_| WrapError::Size)?;
     let size = smallest(BODY_SIZES, DELIVERY_HEADER + frame.len())?;
     let mut bytes = Vec::with_capacity(size);
-    bytes.push(DELIVERY_PURPOSE);
+    bytes.push(purpose);
     bytes.extend(len.to_be_bytes());
     bytes.extend_from_slice(frame);
     bytes.resize(size, 0);
@@ -1112,15 +1489,19 @@ pub fn delivery_body(frame: &[u8]) -> Result<BodyObject, WrapError> {
 /// The delivery frame inside a body, only if `body` is exactly its canonical
 /// delivery body.
 pub fn delivery_frame(body: &[u8]) -> Result<&[u8], WrapError> {
+    framed_payload(DELIVERY_PURPOSE, body)
+}
+
+fn framed_payload(purpose: u8, body: &[u8]) -> Result<&[u8], WrapError> {
     let header = body.get(..DELIVERY_HEADER).ok_or(WrapError::Encoding)?;
-    if header[0] != DELIVERY_PURPOSE {
+    if header[0] != purpose {
         return Err(WrapError::Encoding);
     }
     let len = u32::from_be_bytes(header[1..].try_into().map_err(|_| WrapError::Encoding)?) as usize;
     let frame = body
         .get(DELIVERY_HEADER..DELIVERY_HEADER + len)
         .ok_or(WrapError::Encoding)?;
-    if delivery_body(frame)
+    if framed_body(purpose, frame)
         .map_err(|_| WrapError::Encoding)?
         .bytes()
         != body

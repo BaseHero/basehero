@@ -73,9 +73,18 @@ fn hint_admission_and_activation_commit_in_order() {
     assert!(!db.joined().unwrap().unwrap().activated);
     drop(db);
     let raw = rusqlite::Connection::open(&path).unwrap();
+    // Model an already verified canonical genesis rather than constructing an
+    // opening from the visible Head or relabelling markerless progress.
+    let genesis = bh_sync::canonical::CanonicalCommitment::order(
+        bh_sync::BaseId([5; 32]),
+        bh_sync::OrderState::EMPTY,
+        bh_sync::Digest([5; 32]),
+        bh_sync::Route::Control,
+    )
+    .unwrap();
     raw.execute(
-        "UPDATE log_progress SET position=1, account_position=3, account_hash=zeroblob(32), metadata_id=zeroblob(32)",
-        [],
+        "UPDATE log_progress SET position=1, head_hash=?1, opening=?2, account_position=3, account_hash=zeroblob(32), metadata_id=zeroblob(32)",
+        rusqlite::params![genesis.head().hash.0.as_slice(), genesis.after().encode().as_slice()],
     )
     .unwrap();
     let mut db = DeviceDatabase::open(&path).unwrap();

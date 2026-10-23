@@ -87,7 +87,7 @@ impl<S: PolicyStore> PolicyContext<S> {
     }
     /// The root is not supplied by the untrusted handshake caller.
     pub fn root_hash(&self) -> Result<[u8; 32], Error> {
-        Ok(bh_crypto::hash(&self.lock()?.root))
+        Ok(bh_crypto::hash(&bh_flags::bind_root(self.lock()?.root)))
     }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner<S>>, Error> {
         self.0.lock().map_err(|_| Error::Unavailable)

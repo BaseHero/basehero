@@ -144,8 +144,12 @@ pub struct Mac {
     pub ordered: VerifiedAccount,
     pub originals: Vec<Vec<u8>>,
     pub log: LogId,
+    pub home_objects: ToService,
     receipts: (CertifiedReceiptKey, SigningKey),
     root: [u8; 32],
+    evidence_keys: (SigningKey, [u8; bh_sync::receipt::CERTIFICATE_LEN]),
+    clock: Arc<bh_authz::FixedClock>,
+    edge: Arc<super::FakeEdge>,
 }
 
 impl Mac {
@@ -169,7 +173,14 @@ impl Mac {
             &Password::new("correct horse battery staple").unwrap(),
         ))
         .unwrap();
-        account.confirm_home_ordered(status.head).unwrap();
+        let objects = account.pending_home_objects().unwrap();
+        let home_objects = ToService::StoreHomeObjects {
+            prefix: status.head,
+            record: objects.record,
+            device_seal: objects.device_seal,
+            recovery_seal: objects.recovery_seal,
+        };
+        account.confirm_home_ordered(status.head, None).unwrap();
         account.confirm_kit_saved().unwrap();
         let record = DeviceJournal::from_shared(db.clone())
             .load()
@@ -208,6 +219,8 @@ impl Mac {
             kind: LogKind::Account,
             id: account_log_id(&originals[0]).unwrap(),
         };
+        let evidence_key = SigningKey::generate();
+        let evidence_certificate = bh_sync::permit::certify(&harness.root, evidence_key.public());
         let mac = Self {
             _dir: dir,
             owner,
@@ -224,8 +237,12 @@ impl Mac {
             anchor,
             originals,
             log,
+            home_objects,
             receipts: (certificate, key),
             root,
+            evidence_keys: (evidence_key, evidence_certificate),
+            clock: harness.clock.clone(),
+            edge: harness.edge.clone(),
         };
         mac.owner
             .record_registration(mac.id, mac.base.0, Some(mac.receipt(Head::EMPTY)), mac.root)
@@ -351,8 +368,8 @@ impl Mac {
         let state = self.store.state();
         seal(
             Binding {
-                version: 2,
-                highest: 2,
+                version: 3,
+                highest: 3,
                 mode: 0,
                 base: self.base.0,
                 audience: [0; 32],
@@ -403,6 +420,7 @@ impl Mac {
                 log: self.log,
                 event: event.as_bytes().to_vec(),
                 delivery: None,
+                attachment: None,
             })
             .await;
         let FromService::Permits { items } = answer else {
@@ -419,11 +437,14 @@ impl Mac {
     /// The base copy of an account event, from the native producer and
     /// signed with this Mac's control key.
     pub fn copy(&mut self, account_event: &[u8]) -> Result<Encoded, OwnerError> {
-        let request = self.owner.prepare_account_change_copy(
+        let event = AccountEvent::decode(account_event).unwrap();
+        let confirmation = self.confirm_at(&event, bh_authz::Clock::now_ms(&*self.clock).unwrap());
+        let request = self.owner.prepare_account_run_copy(
             self.id,
             &self.anchor,
             &self.metadata,
-            account_event,
+            &[(account_event.to_vec(), confirmation)],
+            bh_event::Copier::Device(self.device()),
         )?;
         let signature = ready(self.account.sign_base_control(
             &self.cap,
@@ -433,6 +454,39 @@ impl Mac {
         .unwrap();
         Ok(request.finish(signature).unwrap())
     }
+    /// A validly signed copy carrying an independently signed seen receipt
+    /// supplied by a potentially equivocating hosting authority.
+    pub fn copy_with_seen_receipt(
+        &mut self,
+        account_event: &[u8],
+        seen: Head,
+        seen_receipt: [u8; RECEIPT_LEN],
+    ) -> Encoded {
+        let event = AccountEvent::decode(account_event).unwrap();
+        let confirmation = self.confirm_at(&event, bh_authz::Clock::now_ms(&*self.clock).unwrap());
+        let request = bh_event::account_run::prepare_account_run(
+            self.base,
+            &self.anchor,
+            bh_event::Copier::Device(self.device()),
+            &self.metadata,
+            Seen {
+                head: seen,
+                control: self.history_control(),
+                account: self.anchor.head(),
+            },
+            seen_receipt,
+            &[(account_event.to_vec(), confirmation)],
+        )
+        .unwrap();
+        let signature = ready(self.account.sign_base_control(
+            &self.cap,
+            request.expected_key(),
+            request.signing_bytes(),
+        ))
+        .unwrap();
+        request.finish(signature).unwrap()
+    }
+
     /// A copy the device producer refuses to make: it claims `base_account`
     /// is the base's copy of the account. For copies of the wrong account
     /// event only.
@@ -442,10 +496,14 @@ impl Mac {
         account_event: &[u8],
     ) -> Encoded {
         let head = self.history.head();
-        let request = bh_event::prepare_account_change(
+        let confirmation = self.confirm_at(
+            &AccountEvent::decode(account_event).unwrap(),
+            bh_authz::Clock::now_ms(&*self.clock).unwrap(),
+        );
+        let request = bh_event::account_run::prepare_account_run(
             self.base,
             base_account,
-            self.device(),
+            bh_event::Copier::Device(self.device()),
             &self.metadata,
             Seen {
                 head,
@@ -453,7 +511,7 @@ impl Mac {
                 account: base_account.head(),
             },
             self.receipt(head),
-            account_event,
+            &[(account_event.to_vec(), confirmation)],
         )
         .unwrap();
         let signature = ready(self.account.sign_base_control(
@@ -492,6 +550,128 @@ impl Mac {
         order(harness, &answer, &copy).unwrap();
         assert_eq!(self.pull(harness), vec![Outcome::Accepted]);
         answer
+    }
+    /// The ordering confirmation the account's checker signs at the
+    /// fixture clock, under the harness's hosting root.
+    pub fn confirm(&self, event: &AccountEvent) -> Vec<u8> {
+        self.confirm_at(event, bh_authz::Clock::now_ms(&*self.clock).unwrap())
+    }
+
+    fn confirm_at(&self, event: &AccountEvent, at: u64) -> Vec<u8> {
+        use bh_sync::evidence::{
+            ConfirmationClaim, OrderingConfirmation, TimeBounds, original_digest,
+        };
+        let head = |h: bh_account::Head| Head {
+            position: h.position,
+            hash: bh_sync::Digest(h.hash),
+        };
+        // The predecessor's head is its own original's hash: no replay, so
+        // timed trust events (never valid untimed) can be confirmed too.
+        let position = event.head().position;
+        let before = bh_account::Head {
+            position: position - 1,
+            hash: bh_crypto::hash(&self.originals[position as usize - 2]),
+        };
+        let claim = ConfirmationClaim {
+            log: self.log,
+            original: original_digest(event.as_bytes()),
+            original_previous: head(before),
+            original_head: head(event.head()),
+            body: None,
+            ordered: self.edge.head(self.log),
+            bounds: TimeBounds {
+                earliest_ms: at,
+                latest_ms: at,
+            },
+        };
+        OrderingConfirmation::sign(&self.evidence_keys.0, &self.evidence_keys.1, claim)
+            .encode()
+            .to_vec()
+    }
+    /// The base copy of a run of confirmed account events, from the native
+    /// producer and signed with this Mac's control key.
+    pub fn copy_run(&mut self, run: &[(Vec<u8>, Vec<u8>)]) -> Encoded {
+        let request = self
+            .owner
+            .prepare_account_run_copy(
+                self.id,
+                &self.anchor,
+                &self.metadata,
+                run,
+                bh_event::Copier::Device(self.device()),
+            )
+            .unwrap();
+        let signature = ready(self.account.sign_base_control(
+            &self.cap,
+            request.expected_key(),
+            request.signing_bytes(),
+        ))
+        .unwrap();
+        request.finish(signature).unwrap()
+    }
+    /// Sign a personal-key rotation without advancing the local fixture's
+    /// untimed legacy view; the home returns its real timed confirmation.
+    pub fn sign_rotation(
+        &mut self,
+        reason: u64,
+        prepared: &bh_account::personal::PreparedRotation,
+    ) -> AccountEvent {
+        let request = self
+            .ordered
+            .rotate_personal(
+                self.device(),
+                reason,
+                prepared.public,
+                prepared.device_seals_digest,
+                prepared.recovery_seal_digest,
+            )
+            .unwrap();
+        request
+            .finish(
+                self.store
+                    .state()
+                    .ordinary
+                    .as_ref()
+                    .unwrap()
+                    .sign(request.signing_bytes()),
+            )
+            .unwrap()
+    }
+    /// Sign a base rekey carrying the home's exact verified rotation proof.
+    pub fn signed_rekey(
+        &self,
+        rotation: &AccountEvent,
+        confirmation: &[u8],
+        next: &Secret<32>,
+    ) -> (Encoded, bh_sync::BodyObject) {
+        let seen = Seen {
+            head: self.history.head(),
+            control: self.history_control(),
+            account: self.ordered.head(),
+        };
+        let prepared = bh_event::rekey::prepare_rekey(
+            self.base,
+            &self.ordered,
+            self.device(),
+            &self.metadata,
+            seen,
+            self.receipt(seen.head),
+            rotation.as_bytes(),
+            confirmation,
+            next,
+            &[vec![17; 1499]],
+        )
+        .unwrap();
+        let state = self.store.state();
+        let signature = state
+            .ordinary
+            .as_ref()
+            .unwrap()
+            .sign(prepared.control.signing_bytes());
+        (
+            prepared.control.finish(signature).unwrap(),
+            prepared.seal_set,
+        )
     }
     /// The account at an earlier position, as an older device holds it.
     pub fn at(&self, position: usize) -> VerifiedAccount {

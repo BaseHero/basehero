@@ -89,4 +89,8 @@ footer [data-status="failed"] + .note-retry { margin-left: -2px; box-shadow: -6p
   #update-chip span + span { display: none; }
   .trail { margin-left: 0; }
   main:not(.note-workspace) { padding: 32px 20px; }
+  footer.status { height: auto; flex-wrap: wrap; white-space: normal; }
+  footer.status .local, footer [data-status] { height: auto; min-height: 26px; }
+  footer.status .cloud { width: 100%; margin-left: 0; padding: 4px 14px; }
+  footer.status .cloud .sync-text, footer.status .cloud .home { overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
 }

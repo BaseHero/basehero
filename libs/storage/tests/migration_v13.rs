@@ -9,7 +9,7 @@ use bh_data::{
 };
 use bh_event::{Binding, CLASS_CONTENT, NOTE, Payload, key_id, seal};
 use bh_storage::{
-    DeviceDatabase, NoteKey, PackagePreparation,
+    DeviceDatabase, NoteKey, StoreError,
     sync_state::{LOG_BASE, PackageOutcome},
 };
 use bh_sync::{BodyObject, EventId};
@@ -262,9 +262,8 @@ fn genuine_v12_upgrade_preserves_rows_and_package_outcomes() {
 
     let db = DeviceDatabase::open(&path).unwrap();
     assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
-    assert_eq!(LOCAL_DATA_VERSION, 13);
     let raw = Connection::open(&path).unwrap();
-    assert_eq!(legacy::version(&raw), 13);
+    assert_eq!(legacy::version(&raw), LOCAL_DATA_VERSION);
     assert_eq!(snapshot(&raw, &tables), before, "every v12 row survives");
     for table in [
         "note_outbox",
@@ -277,14 +276,14 @@ fn genuine_v12_upgrade_preserves_rows_and_package_outcomes() {
         assert!(legacy::table_exists(&raw, table), "{table}");
     }
 
-    // Outcome lookup is unchanged for every member, before and after reopen.
-    for (member, package) in [(2, 3), (3, 3), (4, 5), (5, 5), (8, 8), (9, 9)] {
-        for attempt in 0..2 {
-            let PackagePreparation::Existing(stored) = db.prepare_note_package(member).unwrap()
-            else {
-                panic!("member {member} lost its package on attempt {attempt}")
-            };
-            assert_eq!(stored.event_id.0, [(package + 20) as u8; 32]);
+    // Historical sealed rows retain their exact bytes, but nonce-keyed
+    // packages must not be reinterpreted as routed canonical publications.
+    for member in [2, 3, 4, 5, 8, 9] {
+        for _ in 0..2 {
+            assert!(matches!(
+                db.prepare_note_package(member),
+                Err(StoreError::CorruptOutbox)
+            ));
         }
     }
     assert_eq!(
@@ -318,7 +317,13 @@ fn genuine_v12_upgrade_preserves_rows_and_package_outcomes() {
         );
     }
     assert_eq!(db.writer_reservations(key(NOTES[0])).unwrap().len(), 1);
-    assert!(db.log_progress(LOG_BASE, BASE).unwrap().is_some());
+    assert!(
+        matches!(
+            db.log_progress(LOG_BASE, BASE),
+            Err(StoreError::CorruptSyncState)
+        ),
+        "a populated markerless log cannot be relabelled canonical"
+    );
 
     assert_eq!(
         raw.query_row("SELECT count(*) FROM data_record", [], |r| r
@@ -488,18 +493,18 @@ fn genuine_v12_upgrade_preserves_rows_and_package_outcomes() {
 
     drop(db);
     let db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 13);
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
         snapshot(&raw, &tables),
         before,
         "ordinary reopen rewrites no v12 row"
     );
-    for (member, package) in [(2, 3), (3, 3), (4, 5), (5, 5), (8, 8), (9, 9)] {
-        let PackagePreparation::Existing(stored) = db.prepare_note_package(member).unwrap() else {
-            panic!("member {member} lost its package after reopen")
-        };
-        assert_eq!(stored.event_id.0, [(package + 20) as u8; 32]);
+    for member in [2, 3, 4, 5, 8, 9] {
+        assert!(matches!(
+            db.prepare_note_package(member),
+            Err(StoreError::CorruptOutbox)
+        ));
     }
     assert_eq!(
         raw.query_row("SELECT count(*) FROM data_record", [], |r| r
@@ -574,7 +579,7 @@ fn earlier_v12_without_held_layout_gains_it_after_v13() {
     drop(raw);
 
     let db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 13);
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     let raw = Connection::open(&path).unwrap();
     assert_eq!(snapshot(&raw, &tables), before, "v12 rows survive");
     assert!(legacy::table_exists(&raw, "held_note_event"));
@@ -605,7 +610,7 @@ fn earlier_v12_without_held_layout_gains_it_after_v13() {
     );
     drop(db);
     let db = DeviceDatabase::open(&path).unwrap();
-    assert_eq!(db.data_version(), 13);
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
     assert_eq!(
         db.package_progress(5).unwrap().unwrap().outcome,
         Some(PackageOutcome::Accepted)

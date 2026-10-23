@@ -16,7 +16,7 @@ use bh_account::{
     crypto::Secret,
     platform::{ControlKeyPolicy, DeviceKeyStore, KeyHandle, KeyStoreError, StoredDevice},
 };
-use bh_device_keys::AndroidKeyStore;
+pub(crate) use bh_device_keys::AndroidKeyStore;
 pub(crate) use bh_device_keys::AndroidPendingSetupProtector;
 
 #[derive(Clone, Copy, Default)]
@@ -165,7 +165,7 @@ mod fixture {
     Object.assign(bar.style, {
       position: 'fixed', left: '0', right: '0', bottom: '0', zIndex: '2147483647',
       display: 'flex', gap: '8px', alignItems: 'center', justifyContent: 'center',
-      padding: '6px 8px', background: '#b00020', color: '#fff',
+      padding: '6px 8px 28px', background: '#b00020', color: '#fff',
       font: '600 12px/1.4 system-ui, sans-serif',
     });
     const label = document.createElement('span');
@@ -176,31 +176,72 @@ mod fixture {
     Object.assign(button.style, {
       background: '#fff', color: '#b00020', border: '0', padding: '4px 8px', font: 'inherit',
     });
+    const showKit = document.createElement('button');
+    showKit.type = 'button';
+    showKit.textContent = 'Create test account and show kit';
+    Object.assign(showKit.style, {
+      background: '#fff', color: '#b00020', border: '0', padding: '4px 8px', font: 'inherit',
+    });
+    const continueButton = document.createElement('button');
+    continueButton.type = 'button';
+    continueButton.textContent = 'Continue';
+    continueButton.hidden = true;
+    continueButton.style.display = 'none';
     const status = document.createElement('span');
-    bar.append(label, button, status);
+    Object.assign(status.style, { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' });
+    bar.style.flexWrap = 'wrap';
+    bar.append(label, button, showKit, status, continueButton);
     document.body.append(bar);
     const sync = () => {
       const welcome = document.querySelector('main .label')?.textContent === 'WELCOME';
       button.hidden = !welcome;
-      button.style.display = welcome ? '' : 'none';
+      button.style.display = welcome && continueButton.hidden ? '' : 'none';
+      showKit.style.display = welcome && continueButton.hidden ? '' : 'none';
     };
     new MutationObserver(sync).observe(document.body, { childList: true, subtree: true, characterData: true });
     sync();
-    button.addEventListener('click', async () => {
-      button.disabled = true;
-      status.textContent = 'creating test account';
+    const confirm = async () => {
+      continueButton.disabled = true;
       try {
-        const { suggested } = await invoke('account_suggest_password');
-        const kit = await invoke('account_create', { password: suggested });
-        if (kit?.screen !== 'kit') throw new Error('create: ' + kit?.screen);
         const ready = await invoke('account_confirm_kit');
         if (ready?.screen !== 'ready') throw new Error('confirm: ' + ready?.screen);
         location.reload();
       } catch (error) {
         status.textContent = String(error);
-        button.disabled = false;
+        button.hidden = true;
+        showKit.hidden = true;
+        button.style.display = 'none';
+        showKit.style.display = 'none';
+        continueButton.hidden = false;
+        continueButton.style.display = '';
+        continueButton.disabled = false;
       }
-    });
+    };
+    const create = async (keepKit) => {
+      button.disabled = true;
+      showKit.disabled = true;
+      status.textContent = 'creating test account';
+      try {
+        const { suggested } = await invoke('account_suggest_password');
+        const kit = await invoke('account_create', { password: suggested });
+        if (kit?.screen !== 'kit' || typeof kit.code !== 'string') throw new Error('create: ' + kit?.screen);
+        if (!keepKit) return await confirm();
+        status.textContent = 'TEST ONLY — Password: ' + suggested + '\nRecovery code: ' + kit.code;
+        button.hidden = true;
+        showKit.hidden = true;
+        button.style.display = 'none';
+        showKit.style.display = 'none';
+        continueButton.hidden = false;
+        continueButton.style.display = '';
+      } catch (error) {
+        status.textContent = String(error);
+        button.disabled = false;
+        showKit.disabled = false;
+      }
+    };
+    button.addEventListener('click', () => create(false));
+    showKit.addEventListener('click', () => create(true));
+    continueButton.addEventListener('click', confirm);
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();

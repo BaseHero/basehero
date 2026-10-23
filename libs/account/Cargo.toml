@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 bh-crypto.workspace = true
+bh-flags.workspace = true
 bh-storage.workspace = true
 
 [dev-dependencies]

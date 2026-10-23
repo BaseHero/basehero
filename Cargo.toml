@@ -21,6 +21,7 @@ bh-core = { path = "libs/core" }
 bh-device = { path = "libs/device" }
 bh-device-keys = { path = "apps/client/plugins/device-keys" }
 bh-crypto = { path = "libs/crypto" }
+bh-flags = { path = "libs/flags" }
 bh-data = { path = "libs/data" }
 bh-data-fixtures = { path = "tests/data-fixtures" }
 bh-note-engine-artifact = { path = "libs/note-engine/artifact" }
@@ -60,6 +61,7 @@ objc2 = "=0.6.5"
 objc2-foundation = "=0.3.2"
 # Already locked through Tao and muda; the app's Quit hook and save sheet.
 objc2-app-kit = { version = "=0.3.2", default-features = false }
+objc2-user-notifications = { version = "=0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationTrigger"] }
 raw-window-handle = "=0.6.2"
 objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAPublicDefines", "block2"] }
 pkg-config = "=0.3.32"

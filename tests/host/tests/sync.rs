@@ -63,6 +63,8 @@ fn endpoint(hosted: &Hosted) -> Endpoint {
         },
         build_floor: 1,
         appraisal: Appraisal::Synthetic,
+        device_clock: std::sync::Arc::new(bh_sync_client::SystemDeviceClock),
+        recovery_key: hosted.edge.recovery_certificate(),
     }
 }
 
@@ -112,6 +114,62 @@ async fn until(seconds: u64, what: &str, mut done: impl FnMut() -> bool) {
         assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn sign_self_removal(r: &Ready) -> Vec<u8> {
+    let (id, cap) = r.host.ready_authority().unwrap();
+    r.host
+        .run_lent(id, &cap, |owner, cap| {
+            Box::pin(async move {
+                let request = owner.prepare_remove_self(&cap).unwrap();
+                owner
+                    .sign_control(&cap, &request)
+                    .await
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec()
+            })
+        })
+        .await
+        .unwrap()
+}
+
+/// An endpoint file's recovery key is used only if its own hosting root
+/// signed it.
+#[test]
+fn an_endpoint_whose_recovery_key_its_root_did_not_sign_is_invalid() {
+    use bh_crypto::{KemKey, SigningKey};
+    use bh_sync::evidence::certify_recovery_key;
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let root = SigningKey::generate();
+    let key = KemKey::generate().public();
+    let text = |certificate: &[u8]| {
+        serde_json::json!({
+            "edge_url": "http://edge.invalid",
+            "hosting_root": hex(&root.public()),
+            "app_root": hex(&[1; 32]),
+            "policy": "",
+            "policy_signature": "",
+            "max_lifetime_secs": 86400,
+            "max_uncertainty_secs": 0,
+            "build_floor": 1,
+            "appraisal": "synthetic",
+            "recovery_key": hex(certificate),
+        })
+        .to_string()
+    };
+    let genuine = certify_recovery_key(&root, &key).encode();
+    assert!(matches!(
+        Configured::from_text(&text(&genuine)),
+        Configured::Ready(_)
+    ));
+    // Another root's signature, naming this root.
+    let mut forged = certify_recovery_key(&SigningKey::generate(), &key).encode();
+    forged[2..34].copy_from_slice(&root.public());
+    assert!(matches!(
+        Configured::from_text(&text(&forged)),
+        Configured::Invalid
+    ));
 }
 
 #[test]
@@ -328,6 +386,396 @@ async fn a_locked_account_stops_its_client_and_cannot_restart_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_device_stops_its_client_and_ends_its_windows() {
     let hosted = Hosted::new();
+    let store = FakeStore::default();
+    let r = ready(store.clone()).await;
+    let seen = Arc::new(Seen::default());
+    let sync = SyncHost::with_transport(
+        Configured::Ready(endpoint(&hosted)),
+        r.owner.clone(),
+        hosted.connector(),
+        hosted.relay(),
+    );
+    sync.set_erase({
+        let accounts = r.host.clone();
+        Arc::new(move |id| {
+            let accounts = accounts.clone();
+            Box::pin(async move {
+                let _ = accounts.erase_removed(id).await;
+            })
+        })
+    });
+    sync.ensure_started(&r.host, r.id, seen.clone()).await;
+    save(&r.owner, r.id, "main", "before removal", 1);
+    sync.wake(r.id);
+    until(60, "synced and home done", || {
+        seen.last()
+            .is_some_and(|v| v.state == "synced" && v.home == Some("done"))
+    })
+    .await;
+    // This device's own removal, ordered at the account home.
+    let id = r.id;
+    let removal = sign_self_removal(&r).await;
+    let signer = sync.signer(id).unwrap();
+    let genesis = signer.identity().unwrap().genesis;
+    let log = bh_sync::permit::LogId {
+        kind: bh_sync::permit::LogKind::Account,
+        id: bh_authz::proto::account_log_id(&genesis).unwrap(),
+    };
+    let verdict = sync.client(id).unwrap().removal_verdict();
+    let position = hosted.edge.order_account(log, &removal);
+    // The home's exact confirmation, as the follow reads and keeps it.
+    let confirmed = {
+        let client = sync.client(id).unwrap();
+        let mut session = client.authz().await.unwrap();
+        let answer = session
+            .ask(bh_authz::proto::ToService::ReadAccountEvidence {
+                genesis: genesis.clone(),
+                first: position,
+                last: position,
+                challenge: [7; 32],
+            })
+            .await
+            .unwrap();
+        let bh_authz::proto::FromService::AccountEvidence { confirmations, .. } = answer else {
+            panic!("account evidence: {answer:?}");
+        };
+        let bytes = confirmations.last().unwrap().clone();
+        let bounds = bh_sync::evidence::OrderingConfirmation::decode(&bytes)
+            .unwrap()
+            .claim()
+            .bounds;
+        let time = bh_account::ConfirmedTime {
+            earliest_ms: bounds.earliest_ms,
+            latest_ms: bounds.latest_ms,
+        };
+        (time, bytes)
+    };
+    // The account follow moves its checkpoint past its own removal and
+    // applies it with the home's confirmation, as the client's follow does
+    // (driven here; the client's own follow may win the race). The checkpoint
+    // moves first so the check finds the owner's view behind it.
+    let name = r.host.container_name(id).unwrap();
+    let database = r.owner.shared_database(id).unwrap();
+    let before = database
+        .lock()
+        .unwrap()
+        .account_outer_progress(log.id, hosted.edge.root())
+        .unwrap()
+        .order;
+    let after = hosted.edge.entries(log).last().unwrap().0.after();
+    let _ =
+        database
+            .lock()
+            .unwrap()
+            .advance_account_outer(log.id, hosted.edge.root(), before, after);
+    if let Ok(account) = signer.current_account() {
+        let _ = signer
+            .apply_account_timed(account.head(), vec![(removal, Some(confirmed))])
+            .await;
+    }
+    until(60, "ended", || seen.ended.lock().unwrap().contains(&id)).await;
+    until(10, "stopped", || !sync.running(id)).await;
+    assert_eq!(seen.last().unwrap().account, "removed");
+    assert!(r.owner.bound_container("main").is_none(), "windows unbound");
+    // The owner's notice did not erase: the client's own verification of
+    // the public evidence did.
+    assert!(
+        matches!(
+            *verdict.borrow(),
+            bh_sync_client::RemovalVerdict::Removed { .. }
+        ),
+        "erased through the verified verdict: {:?}",
+        *verdict.borrow()
+    );
+    // The detached erasure runs to the end even though stopping this client
+    // aborts the task that reported the removal.
+    let accounts = r._dir.path().join("accounts");
+    until(20, "keys erased", || store.keys.lock().unwrap().is_empty()).await;
+    until(20, "container and sidecars gone", || {
+        !accounts.join(format!("{name}.sqlite")).exists()
+            && !accounts.join(format!("{name}.sqlite-wal")).exists()
+            && !accounts.join(format!("{name}.sqlite-shm")).exists()
+    })
+    .await;
+    assert!(!accounts.join(format!("{name}.erasing")).exists());
+    until(20, "erased screen kept", || r.host.screen().is_some()).await;
+    assert_eq!(r.host.screen(), Some(Screen::Erased { unsent: 0 }));
+}
+
+/// The erase hook the app installs: the registry erases and keeps its screen.
+fn erase_through(sync: &SyncHost, accounts: &Host) {
+    let accounts = accounts.clone();
+    sync.set_erase(Arc::new(move |id| {
+        let accounts = accounts.clone();
+        Box::pin(async move {
+            let _ = accounts.erase_removed(id).await;
+        })
+    }));
+}
+
+/// The home orders this device's removal while its client is stopped. On
+/// the next start the service refuses the device, so the owner never follows
+/// the removal and no notice reports it: only the running client's own
+/// verification of the public evidence does, and that verdict alone must
+/// carry the erasure through to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_clients_removal_verdict_erases_the_account() {
+    let hosted = Hosted::new();
+    let store = FakeStore::default();
+    let r = ready(store.clone()).await;
+    let seen = Arc::new(Seen::default());
+    let sync = SyncHost::with_transport(
+        Configured::Ready(endpoint(&hosted)),
+        r.owner.clone(),
+        hosted.connector(),
+        hosted.relay(),
+    );
+    erase_through(&sync, &r.host);
+    sync.ensure_started(&r.host, r.id, seen.clone()).await;
+    save(&r.owner, r.id, "main", "before removal", 1);
+    sync.wake(r.id);
+    until(60, "synced and home done", || {
+        seen.last()
+            .is_some_and(|v| v.state == "synced" && v.home == Some("done"))
+    })
+    .await;
+    let id = r.id;
+    let name = r.host.container_name(id).unwrap();
+    let genesis = sync.signer(id).unwrap().identity().unwrap().genesis;
+    let log = bh_sync::permit::LogId {
+        kind: bh_sync::permit::LogKind::Account,
+        id: bh_authz::proto::account_log_id(&genesis).unwrap(),
+    };
+    let removal = sign_self_removal(&r).await;
+    sync.shutdown_all().await;
+    // Two edits saved meanwhile are never ordered.
+    save(&r.owner, id, "main", "after removal", 2);
+    save(&r.owner, id, "main", "and another", 3);
+    hosted.edge.order_account(log, &removal);
+    sync.ensure_started(&r.host, id, seen.clone()).await;
+    assert!(sync.running(id), "the client runs until it verifies");
+    let verdict = sync.client(id).unwrap().removal_verdict();
+    until(60, "stopped", || !sync.running(id)).await;
+    assert!(
+        matches!(
+            *verdict.borrow(),
+            bh_sync_client::RemovalVerdict::Removed { .. }
+        ),
+        "the client's own verification reported the removal: {:?}",
+        *verdict.borrow()
+    );
+    assert_eq!(
+        seen.last().unwrap().account,
+        "active",
+        "the owner never applied the removal, so no notice reported it"
+    );
+    let accounts = r._dir.path().join("accounts");
+    until(20, "keys erased", || store.keys.lock().unwrap().is_empty()).await;
+    until(20, "container and sidecars gone", || {
+        !accounts.join(format!("{name}.sqlite")).exists()
+            && !accounts.join(format!("{name}.sqlite-wal")).exists()
+            && !accounts.join(format!("{name}.sqlite-shm")).exists()
+    })
+    .await;
+    until(20, "marker cleared", || {
+        !accounts.join(format!("{name}.erasing")).exists()
+    })
+    .await;
+    // Three saved edits, one acknowledged: the two the home never ordered
+    // are counted, not silently lost.
+    until(20, "erased screen kept", || r.host.screen().is_some()).await;
+    assert_eq!(r.host.screen(), Some(Screen::Erased { unsent: 2 }));
+    until(20, "windows ended", || {
+        seen.ended.lock().unwrap().contains(&id)
+    })
+    .await;
+}
+
+/// The home orders this device's removal while its client runs and syncs.
+/// Whichever reports it first, the account follow or the client's own
+/// verification, the erasure runs to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_ordered_while_running_erases_the_account() {
+    let hosted = Hosted::new();
+    let store = FakeStore::default();
+    let r = ready(store.clone()).await;
+    let seen = Arc::new(Seen::default());
+    let sync = SyncHost::with_transport(
+        Configured::Ready(endpoint(&hosted)),
+        r.owner.clone(),
+        hosted.connector(),
+        hosted.relay(),
+    );
+    erase_through(&sync, &r.host);
+    sync.ensure_started(&r.host, r.id, seen.clone()).await;
+    save(&r.owner, r.id, "main", "before removal", 1);
+    sync.wake(r.id);
+    until(60, "synced and home done", || {
+        seen.last()
+            .is_some_and(|v| v.state == "synced" && v.home == Some("done"))
+    })
+    .await;
+    let id = r.id;
+    let name = r.host.container_name(id).unwrap();
+    let genesis = sync.signer(id).unwrap().identity().unwrap().genesis;
+    let log = bh_sync::permit::LogId {
+        kind: bh_sync::permit::LogKind::Account,
+        id: bh_authz::proto::account_log_id(&genesis).unwrap(),
+    };
+    hosted.edge.order_account(log, &sign_self_removal(&r).await);
+    // The next edit asks for permits mid-session.
+    save(&r.owner, id, "main", "after removal", 2);
+    sync.wake(id);
+    until(60, "stopped", || !sync.running(id)).await;
+    let accounts = r._dir.path().join("accounts");
+    until(20, "erasure finished", || {
+        matches!(
+            r.host.screen(),
+            Some(Screen::Erased { .. } | Screen::EraseIncomplete { .. })
+        )
+    })
+    .await;
+    assert_eq!(r.host.screen(), Some(Screen::Erased { unsent: 1 }));
+    assert!(store.keys.lock().unwrap().is_empty(), "keys erased");
+    assert!(!accounts.join(format!("{name}.sqlite")).exists());
+    assert!(!accounts.join(format!("{name}.erasing")).exists());
+}
+
+/// A device whose owner applied its own self-removal while its client was
+/// stopped, before any check answered, then restarted: what startup shows.
+struct Restarted {
+    dir: tempfile::TempDir,
+    store: FakeStore,
+    name: String,
+    first: Screen,
+    screen: Result<Screen, &'static str>,
+}
+
+/// The removal is ordered at the home only when `ordered`; otherwise the
+/// owner holds it with a confirmation the public evidence does not carry.
+async fn removed_then_restarted(ordered: bool) -> Restarted {
+    let hosted = Hosted::new();
+    let store = FakeStore::default();
+    let r = ready(store.clone()).await;
+    let seen = Arc::new(Seen::default());
+    let sync = SyncHost::with_transport(
+        Configured::Ready(endpoint(&hosted)),
+        r.owner.clone(),
+        hosted.connector(),
+        hosted.relay(),
+    );
+    erase_through(&sync, &r.host);
+    sync.ensure_started(&r.host, r.id, seen.clone()).await;
+    save(&r.owner, r.id, "main", "before removal", 1);
+    sync.wake(r.id);
+    until(60, "synced and home done", || {
+        seen.last()
+            .is_some_and(|v| v.state == "synced" && v.home == Some("done"))
+    })
+    .await;
+    let id = r.id;
+    let name = r.host.container_name(id).unwrap();
+    let genesis = sync.signer(id).unwrap().identity().unwrap().genesis;
+    let log = bh_sync::permit::LogId {
+        kind: bh_sync::permit::LogKind::Account,
+        id: bh_authz::proto::account_log_id(&genesis).unwrap(),
+    };
+    let removal = sign_self_removal(&r).await;
+    // The client stops before it could answer any check.
+    sync.shutdown_all().await;
+    let evidence = if ordered {
+        hosted.edge.order_account(log, &removal);
+        hosted.confirmed_account(log).await.pop().unwrap().1
+    } else {
+        let now = hosted.edge.clock.now();
+        let time = bh_account::ConfirmedTime {
+            earliest_ms: now,
+            latest_ms: now,
+        };
+        Some((time, b"confirmed".to_vec()))
+    };
+    let (_, cap) = r.host.ready_authority().unwrap();
+    r.host
+        .run_lent(id, &cap, move |owner, _| {
+            Box::pin(async move { owner.apply_incoming_timed(&[(removal.as_slice(), evidence)]) })
+        })
+        .await
+        .unwrap()
+        .expect("the owner applied this device's removal");
+    // Restart: a new container owner, registry and sync host on the same
+    // files and keys.
+    drop(sync);
+    let Ready {
+        _dir: dir,
+        owner,
+        host,
+        ..
+    } = r;
+    drop((host, owner));
+    let owner = Arc::new(bh_device::Owner::default());
+    let (host, first) = bh_host::accounts::fresh_test_host(&owner, dir.path(), store.clone()).await;
+    let sync = SyncHost::with_transport(
+        Configured::Ready(endpoint(&hosted)),
+        owner.clone(),
+        hosted.connector(),
+        hosted.relay(),
+    );
+    erase_through(&sync, &host);
+    let screen = tokio::time::timeout(
+        Duration::from_secs(60),
+        bh_host::pairing::PairingHost::default().setup_screen(
+            "main",
+            &host,
+            &sync,
+            AccountOperation::Startup,
+        ),
+    )
+    .await
+    .expect("startup answered");
+    sync.shutdown_all().await;
+    Restarted {
+        dir,
+        store,
+        name,
+        first,
+        screen,
+    }
+}
+
+/// The owner applied this device's removal, and the client stopped before
+/// its check answered. On the next start the owner no longer activates the
+/// device; checking the public evidence from its last member view verifies
+/// the removal, and the account is erased.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_applied_before_a_restart_is_erased_on_the_next_start() {
+    let r = removed_then_restarted(true).await;
+    assert_eq!(r.first, Screen::Return, "the device is no longer active");
+    assert_eq!(r.screen, Ok(Screen::Erased { unsent: 0 }));
+    let accounts = r.dir.path().join("accounts");
+    assert!(r.store.keys.lock().unwrap().is_empty(), "keys erased");
+    assert!(!accounts.join(format!("{}.sqlite", r.name)).exists());
+    assert!(!accounts.join(format!("{}.erasing", r.name)).exists());
+}
+
+/// The owner holds a removal of this device that the public evidence does
+/// not carry. Not being active is not proof of removal: nothing is erased.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_the_public_evidence_does_not_verify_erases_nothing() {
+    let r = removed_then_restarted(false).await;
+    assert_eq!(r.first, Screen::Return, "the device is no longer active");
+    assert_eq!(r.screen, Ok(Screen::Return));
+    let accounts = r.dir.path().join("accounts");
+    assert!(!r.store.keys.lock().unwrap().is_empty(), "keys kept");
+    assert!(accounts.join(format!("{}.sqlite", r.name)).exists());
+    assert!(!accounts.join(format!("{}.erasing", r.name)).exists());
+}
+
+/// Note sync can finish before first-device home setup. The owner must not
+/// accept a successor until the home has supplied the setup's verified times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_waits_for_home_setup_even_when_notes_are_synced() {
+    let hosted = Hosted::new();
+    let hold = hosted.edge.hold_next_home_store();
     let r = ready(FakeStore::default()).await;
     let seen = Arc::new(Seen::default());
     let sync = SyncHost::with_transport(
@@ -337,34 +785,74 @@ async fn a_removed_device_stops_its_client_and_ends_its_windows() {
         hosted.relay(),
     );
     sync.ensure_started(&r.host, r.id, seen.clone()).await;
+    tokio::time::timeout(Duration::from_secs(60), hold.arrived)
+        .await
+        .expect("home store arrived")
+        .unwrap();
     save(&r.owner, r.id, "main", "before removal", 1);
     sync.wake(r.id);
-    until(60, "synced", || {
-        seen.last().is_some_and(|v| v.state == "synced")
+    until(60, "notes synced while home pending", || {
+        seen.last()
+            .is_some_and(|v| v.state == "synced" && v.home == Some("pending"))
     })
     .await;
-    // This device's own removal, ordered at the account home.
+
+    let removal = sign_self_removal(&r).await;
+    let signer = sync.signer(r.id).unwrap();
+    let head = signer.current_account().unwrap().head();
+    let now = hosted.edge.clock.now();
+    let time = bh_account::ConfirmedTime {
+        earliest_ms: now,
+        latest_ms: now,
+    };
+    // Diagnose the owner's precise rejection, not just the host's coarser
+    // Unavailable result (which also covers a stale head or failed lend).
     let (id, cap) = r.host.ready_authority().unwrap();
-    let removal = r
+    let for_owner = removal.clone();
+    let owner_error = r
         .host
-        .run_lent(id, &cap, |owner, cap| {
+        .run_lent(id, &cap, move |owner, _| {
             Box::pin(async move {
-                let request = owner.prepare_remove_self(&cap).unwrap();
-                owner
-                    .sign_control(&cap, &request)
-                    .await
-                    .unwrap()
-                    .as_bytes()
-                    .to_vec()
+                owner.apply_incoming_timed(&[(
+                    for_owner.as_slice(),
+                    Some((time, b"confirmed".to_vec())),
+                )])
             })
         })
         .await
         .unwrap();
-    // The client follows the account to its own removal (a service
-    // refuses this device's new sessions, so the follow is driven here).
-    let signer = sync.signer(id).unwrap();
-    let head = signer.current_account().unwrap().head();
-    signer.apply_account(head, vec![removal]).await.unwrap();
+    assert!(matches!(
+        owner_error,
+        Err(bh_account::owner::OwnerError::Invalid(
+            bh_account::Error::Unavailable
+        ))
+    ));
+    assert_eq!(
+        signer
+            .apply_account_timed(
+                head,
+                vec![(removal.clone(), Some((time, b"confirmed".to_vec())))]
+            )
+            .await,
+        Err(bh_sync_client::AccountApplyError::Unavailable)
+    );
+    assert_eq!(signer.current_account().unwrap().head(), head);
+    assert!(sync.running(id));
+
+    hold.release.send(()).unwrap();
+    until(60, "home done", || {
+        seen.last().is_some_and(|v| v.home == Some("done"))
+    })
+    .await;
+    let now = hosted.edge.clock.now();
+    let time = bh_account::ConfirmedTime {
+        earliest_ms: now,
+        latest_ms: now,
+    };
+    signer
+        .apply_account_timed(head, vec![(removal, Some((time, b"confirmed".to_vec())))])
+        .await
+        .unwrap();
     until(60, "ended", || seen.ended.lock().unwrap().contains(&id)).await;
     until(10, "stopped", || !sync.running(id)).await;
     assert_eq!(seen.last().unwrap().account, "removed");
@@ -630,4 +1118,16 @@ async fn a_cancelled_or_fenced_start_installs_no_client() {
     start.await;
     assert!(!sync.running(r.id));
     assert_eq!(Arc::strong_count(&seen), 1, "no client left running");
+}
+
+/// The count the final screen shows is the one read after the client stopped,
+/// not a stale snapshot published while work could still move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erasure_freezes_the_unsent_count_at_the_destructive_step() {
+    let r = ready(FakeStore::default()).await;
+    save(&r.owner, r.id, "main", "an edit no server acknowledged", 1);
+    assert_eq!(
+        r.host.erase_removed(r.id).await,
+        Some(Screen::Erased { unsent: 1 })
+    );
 }

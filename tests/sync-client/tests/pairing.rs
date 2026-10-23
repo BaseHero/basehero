@@ -14,11 +14,11 @@ use bh_account::{Head as AccountHead, pairing::PairError};
 use bh_authz::proto::{account_log_unwrap, account_log_wrap, delivery_body};
 use bh_device::join::JoinError;
 use bh_sync_client::{
-    Client, SyncStatus,
+    Client, SyncStatus, Tuning,
     bootstrap::{self, BootstrapError, Progress},
     pairing::{
         AdmissionHint, Approvals, JoiningPairing, PairingError, ShowingPairing, Side,
-        parse_qr_text, resume_admission,
+        parse_qr_text, resume_admission, resume_admission_tuned,
     },
 };
 use std::{
@@ -29,7 +29,7 @@ use std::{
 use support::{
     device::{Device, store, until},
     fake::{Hook, Hosted},
-    pair::Joiner,
+    pair::{Joiner, bootstrapped, paired as pair},
 };
 use tokio::sync::watch;
 
@@ -80,56 +80,6 @@ fn account_originals(hosted: &Hosted, mac: &Device) -> Vec<Vec<u8>> {
         .iter()
         .map(|(_, event)| account_log_unwrap(event).unwrap().0.to_vec())
         .collect()
-}
-
-/// Pair a new device to `mac` end to end and bootstrap it. Returns the
-/// joined device (not started) and the ordered addition's head.
-async fn pair(hosted: &Arc<Hosted>, mac: &Device, mac_client: &Client) -> (Device, AccountHead) {
-    let (mut showing, qr) = show(hosted, mac);
-    let joiner = Joiner::new();
-    let mut joining = JoiningPairing::join(&qr, joiner.keys.clone(), b"Fold", hosted.relay())
-        .await
-        .unwrap();
-    // The relay holds sealed bytes only: neither the joining device's keys
-    // nor its label.
-    for held in hosted.relay_held(Side::Join) {
-        let contains = |part: &[u8]| held.windows(part.len()).any(|w| w == part);
-        assert!(!contains(joiner.keys.signing()) && !contains(b"Fold"));
-    }
-    let candidate = showing.candidate().await.unwrap();
-    assert_eq!(candidate.keys, joiner.keys);
-    assert_eq!(candidate.label, b"Fold");
-    approve(mac, &mut showing).await.unwrap();
-    let endpoint = mac.endpoint(hosted);
-    let (head, admission) = tokio::join!(
-        showing.finish(mac_client),
-        joining.wait_admitted(
-            &endpoint,
-            hosted.connector(),
-            joiner.owner.clone(),
-            joiner.id,
-            joiner.prover(),
-        )
-    );
-    let head = head.unwrap();
-    let admission = admission.unwrap();
-    joiner.admit(&admission).await;
-    (joiner.into_device(), head)
-}
-
-/// Bootstrap a joined device to the base's tail through the receiver.
-async fn bootstrapped(hosted: &Arc<Hosted>, fold: &Device) {
-    let (progress, _) = watch::channel(Progress::default());
-    bootstrap::run(
-        fold.endpoint(hosted),
-        hosted.connector(),
-        fold.owner.clone(),
-        fold.id,
-        fold.signer.clone(),
-        progress,
-    )
-    .await
-    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -725,6 +675,13 @@ async fn bootstrap_confirms_the_tail_without_idling_after_a_committed_pass() {
     );
     // The batch's events and bodies, then one empty read that proves the tail.
     assert_eq!((counts.read_events, counts.read_batches), (1, 1));
+    // One metadata-only control read judged the base's controls first.
+    assert_eq!(counts.read_controls, 1);
+    let tail = fold.progress().position;
+    assert_eq!(
+        fold.owner.control_coverage(fold.id, fold.log()).unwrap(),
+        Some(tail)
+    );
     // The receiver's wait for news is a second; a committed pass skips it.
     assert!(took < Duration::from_millis(500), "{took:?}");
     mac_client.0.shutdown().await;
@@ -850,6 +807,164 @@ async fn admission_resumes_from_the_kept_hint() {
     bootstrapped(&hosted, &fold).await;
     assert!(fold.usable());
     mac_client.0.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qr_rejects_a_prior_page_ahead_claim_even_when_the_final_page_is_honest() {
+    for bad_hash in [true, false] {
+        let hosted = Hosted::new();
+        let mac = Device::new();
+        let (client, _) = registered(&hosted, &mac).await;
+        let (mut showing, qr) = show(&hosted, &mac);
+        let joiner = Joiner::new();
+        let mut joining = JoiningPairing::join(&qr, joiner.keys.clone(), b"Fold", hosted.relay())
+            .await
+            .unwrap();
+        showing.candidate().await.unwrap();
+        approve(&mac, &mut showing).await.unwrap();
+        let endpoint = mac.endpoint(&hosted);
+        let (head, admission) = tokio::join!(
+            showing.finish(&client),
+            joining.wait_admitted(
+                &endpoint,
+                hosted.connector(),
+                joiner.owner.clone(),
+                joiner.id,
+                joiner.prover()
+            )
+        );
+        assert_eq!(head.unwrap().position, 4);
+        drop(admission.unwrap());
+        client.shutdown().await;
+        assert!(!joiner.has_account());
+        for original in mac.signer.signed_additions(61, hosted.edge.clock.now()) {
+            hosted.edge.order_account(mac.account_log, &original);
+        }
+        assert_eq!(hosted.edge.head(mac.account_log).position, 65);
+        hosted.corrupt_ahead_account_claim(mac.account_log, 65, bad_hash);
+        // The refusal is decided by the pages, not by the wait between the
+        // shipped retries: skip only that wall-clock backoff here.
+        let failed = resume_admission_tuned(
+            &mac.endpoint(&hosted),
+            hosted.connector(),
+            joiner.owner.clone(),
+            joiner.id,
+            &joiner.keys,
+            joiner.prover(),
+            Tuning {
+                verify_retry: Some(Duration::ZERO),
+                ..Tuning::default()
+            },
+        )
+        .await;
+        assert!(matches!(failed, Err(PairingError::Network)));
+        assert!(!joiner.has_account());
+        assert!(!joiner.has_own_base());
+        let database = joiner.owner.shared_database(joiner.id).unwrap();
+        assert!(database.lock().unwrap().confirmation(65).unwrap().is_none());
+        hosted.restore_account_confirmations();
+        let honest = resume_admission(
+            &mac.endpoint(&hosted),
+            hosted.connector(),
+            joiner.owner.clone(),
+            joiner.id,
+            &joiner.keys,
+            joiner.prover(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(honest.history.len(), 65);
+        joiner.admit(&honest).await;
+        assert!(joiner.has_account());
+    }
+}
+
+// These histories include the joining device's real addition at position 4.
+// A full last page requires one more empty read to establish the tail.
+async fn pending_boundary_admission(total: u8) -> (Arc<Hosted>, Device, Joiner) {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let (mut showing, qr) = show(&hosted, &mac);
+    let joiner = Joiner::new();
+    let mut joining = JoiningPairing::join(&qr, joiner.keys.clone(), b"Fold", hosted.relay())
+        .await
+        .unwrap();
+    showing.candidate().await.unwrap();
+    approve(&mac, &mut showing).await.unwrap();
+    let endpoint = mac.endpoint(&hosted);
+    let (head, admission) = tokio::join!(
+        showing.finish(&client),
+        joining.wait_admitted(
+            &endpoint,
+            hosted.connector(),
+            joiner.owner.clone(),
+            joiner.id,
+            joiner.prover()
+        )
+    );
+    assert_eq!(head.unwrap().position, 4);
+    drop(admission.unwrap());
+    client.shutdown().await;
+    assert!(!joiner.has_account());
+    for original in mac
+        .signer
+        .signed_additions(total - 4, hosted.edge.clock.now())
+    {
+        hosted.edge.order_account(mac.account_log, &original);
+    }
+    assert_eq!(hosted.edge.head(mac.account_log).position, u64::from(total));
+    (hosted, mac, joiner)
+}
+
+async fn boundary_admission(
+    hosted: &Arc<Hosted>,
+    mac: &Device,
+    joiner: &Joiner,
+) -> Result<bh_device::join::Admission, PairingError> {
+    resume_admission(
+        &mac.endpoint(hosted),
+        hosted.connector(),
+        joiner.owner.clone(),
+        joiner.id,
+        &joiner.keys,
+        joiner.prover(),
+    )
+    .await
+    .map(Option::unwrap)
+}
+
+#[tokio::test(start_paused = true)]
+async fn qr_admits_exact_64_and_128_account_originals_after_the_empty_tail() {
+    for total in [64, 128] {
+        let (hosted, mac, joiner) = pending_boundary_admission(total).await;
+        let admitted = boundary_admission(&hosted, &mac, &joiner).await.unwrap();
+        assert_eq!(admitted.history.len(), total as usize);
+        assert_eq!(admitted.added_at, 4);
+        joiner.admit(&admitted).await;
+        assert!(joiner.has_account());
+        assert!(joiner.has_own_base());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn qr_terminal_claim_must_match_the_verified_original_and_proof() {
+    for bad_hash in [true, false] {
+        let (hosted, mac, joiner) = pending_boundary_admission(64).await;
+        hosted.corrupt_terminal_account_claim(mac.account_log, 64, bad_hash);
+        let failed = boundary_admission(&hosted, &mac, &joiner).await;
+        assert!(matches!(failed, Err(PairingError::Network)));
+        assert!(!joiner.has_account());
+        assert!(!joiner.has_own_base());
+        let database = joiner.owner.shared_database(joiner.id).unwrap();
+        assert!(database.lock().unwrap().confirmation(64).unwrap().is_none());
+        hosted.restore_account_confirmations();
+        let admitted = boundary_admission(&hosted, &mac, &joiner).await.unwrap();
+        assert_eq!(admitted.history.len(), 64);
+        joiner.admit(&admitted).await;
+        assert!(joiner.has_account());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1218,12 +1333,66 @@ async fn restart_after_account_commit_resumes_admission() {
     let admission = admission.unwrap();
     // `admit` commits the account history, then stops before the admission
     // transaction.
-    let history: Vec<&[u8]> = admission.history.iter().map(Vec::as_slice).collect();
+    let history: Vec<_> = admission
+        .history
+        .iter()
+        .map(|(original, evidence)| (original.as_slice(), evidence.clone()))
+        .collect();
     joiner
         .account()
-        .adopt_joined(admission.account, &history)
+        .adopt_joined_timed(admission.account, &history)
         .unwrap();
     assert!(joiner.has_account());
+    // Timed from its first commit: every event after the genesis keeps the
+    // home's exact confirmation.
+    assert!(admission.history[0].1.is_none());
+    let database = joiner.owner.shared_database(joiner.id).unwrap();
+    // A different certified signer can make another valid proof of the same
+    // original/claim/time. A retry must retain the bytes first committed.
+    let mut alternate_history = admission.history.clone();
+    let (_, original_proof) = alternate_history[3].1.clone().unwrap();
+    let replacement = hosted.edge.resign_account_confirmation(&original_proof);
+    let original = &admission.history[3].0;
+    let old = bh_sync::evidence::OrderingConfirmation::decode(&original_proof).unwrap();
+    let new = bh_sync::evidence::OrderingConfirmation::decode(&replacement).unwrap();
+    assert_eq!(
+        new.verify_for(&hosted.edge.root(), original, old.claim().body)
+            .unwrap(),
+        old.claim()
+    );
+    assert_ne!(replacement, original_proof);
+    alternate_history[3].1.as_mut().unwrap().1 = replacement;
+    let offered: Vec<_> = alternate_history
+        .iter()
+        .map(|(original, evidence)| (original.as_slice(), evidence.clone()))
+        .collect();
+    joiner
+        .account()
+        .adopt_joined_timed(admission.account, &offered)
+        .unwrap();
+    assert_eq!(
+        database
+            .lock()
+            .unwrap()
+            .confirmation(4)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        original_proof
+    );
+    for (position, (_, evidence)) in admission.history.iter().enumerate().skip(1) {
+        let (time, proof) = evidence.clone().expect("confirmed");
+        let row = database
+            .lock()
+            .unwrap()
+            .confirmation(position as u64 + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.earliest_ms, row.latest_ms, row.bytes),
+            (time.earliest_ms, time.latest_ms, proof)
+        );
+    }
     assert!(
         !joiner
             .owner

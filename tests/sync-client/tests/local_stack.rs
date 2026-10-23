@@ -225,6 +225,11 @@ fn endpoint(dir: &Path) -> Endpoint {
         },
         build_floor: 1,
         appraisal: Appraisal::Synthetic,
+        device_clock: std::sync::Arc::new(bh_sync_client::SystemDeviceClock),
+        recovery_key: bh_sync::evidence::RecoveryKeyCertificate::decode(&unhex::<1314>(&value(
+            "LOCAL_STACK_RECOVERY_KEY",
+        )))
+        .unwrap(),
     }
 }
 

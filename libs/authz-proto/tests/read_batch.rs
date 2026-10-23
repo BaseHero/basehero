@@ -22,8 +22,13 @@ fn bounded_reply_is_encoded_or_rejected_without_truncating_a_tail() {
         kind: LogKind::Base,
         id: BaseId::from_genesis(&event).0,
     };
-    let commitment =
-        Commitment::order(BaseId(log.id), Head::EMPTY, &event, Route::Control).unwrap();
+    let commitment = Commitment::order(
+        BaseId(log.id),
+        bh_sync::OrderState::EMPTY,
+        &event,
+        Route::Control,
+    )
+    .unwrap();
     let pair = (commitment.encode(), event.encode());
     let reply = |n| FromService::ReadBatch {
         log,

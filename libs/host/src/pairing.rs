@@ -11,7 +11,9 @@
 //! admission, commits it, then bootstraps before any note opens; an
 //! interrupted join resumes from what it kept.
 use crate::{
-    accounts::{AccountOperation, HostKeyStore, JoinLease, JoinRefused, Screen, SharedAccountHost},
+    accounts::{
+        AccountOperation, HostKeyStore, JoinLease, JoinRefused, Owner, Screen, SharedAccountHost,
+    },
     sync::{HostSigner, SyncHandle, SyncHost, Transport},
 };
 use bh_account::{
@@ -20,11 +22,12 @@ use bh_account::{
     journal::{AccountJournal, PendingSetupProtector},
     owner::{AccountCapability, AccountLoad, OwnerError},
     platform::KeyStoreError,
+    recovery::{Password, RecoveryCode},
     storage::DeviceJournal,
 };
 use bh_device::{ContainerId, join::Admission, own_base::OwnBase};
 use bh_sync_client::{
-    SignerError,
+    RecoverError, RecoverStage, SignerError,
     bootstrap::{self, BootstrapError, Progress},
     pairing::{JoinProver, JoiningPairing, PairingError, ShowingPairing, parse_qr_text},
 };
@@ -210,6 +213,8 @@ struct Joining {
 struct Inner {
     showing: Mutex<HashMap<String, Showing>>,
     joining: Mutex<HashMap<String, Joining>>,
+    /// Each window's last recovery, as `recovery_status` shows it.
+    recovering: Mutex<HashMap<String, Arc<Mutex<Option<JoinStatus>>>>>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -363,6 +368,10 @@ impl PairingHost {
         if let Some(ticket) = self.live_join(window) {
             return Ok(Screen::Joining { ticket });
         }
+        if let AccountOperation::Recover { password, code } = operation {
+            // Boxed: a recovery's future is too large for a thread's stack.
+            return Box::pin(self.recover(window, accounts, sync, &password, &code)).await;
+        }
         Ok(match accounts.run(operation).await? {
             Screen::Joining { .. } => match self.resume_join(window, accounts, sync) {
                 Ok(ticket) => Screen::Joining {
@@ -370,6 +379,17 @@ impl PairingHost {
                 },
                 Err(_) => Screen::Unavailable,
             },
+            // No usable account. One whose own history removed this device
+            // is erased if the public evidence verifies that removal.
+            Screen::Return => {
+                sync.check_removed(accounts).await;
+                match accounts.screen() {
+                    Some(screen @ (Screen::Erased { .. } | Screen::EraseIncomplete { .. })) => {
+                        screen
+                    }
+                    _ => Screen::Return,
+                }
+            }
             other => other,
         })
     }
@@ -482,6 +502,64 @@ impl PairingHost {
         Ticket { ticket }
     }
 
+    /// How far `window`'s recovery has come, in a join's stages once the
+    /// account is open here: `admitted`, then `bootstrapping` with counts
+    /// while its own base downloads, then `ready` once it answered
+    /// `Recovered`. None before the account opens, and after a recovery
+    /// that did not finish.
+    pub fn recovery_status(&self, window: &str) -> Option<JoinStatus> {
+        let recovering = self.0.recovering.lock().expect("recovering");
+        recovering
+            .get(window)?
+            .lock()
+            .expect("recovery status")
+            .clone()
+    }
+
+    /// `window`'s recovery, its stages followed for `recovery_status`.
+    async fn recover<S, P>(
+        &self,
+        window: &str,
+        accounts: &SharedAccountHost<S, P>,
+        sync: &SyncHost,
+        password: &str,
+        code: &str,
+    ) -> Result<Screen, &'static str>
+    where
+        S: HostKeyStore,
+        P: PendingSetupProtector + Clone + Send + Sync + 'static,
+    {
+        let status = Arc::new(Mutex::new(None));
+        self.0
+            .recovering
+            .lock()
+            .expect("recovering")
+            .insert(window.to_owned(), status.clone());
+        let (stages, mut watching) = watch::channel(RecoverStage::default());
+        let shown = status.clone();
+        let forward = tokio::spawn(async move {
+            loop {
+                let stage = *watching.borrow_and_update();
+                set(&shown, recovery_shown(stage));
+                if watching.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        let screen = recover(accounts, sync, password, code, stages).await;
+        forward.abort();
+        let _ = forward.await;
+        let mut shown = status.lock().expect("recovery status");
+        *shown = match (&screen, shown.take()) {
+            (Ok(Screen::Recovered), current) => Some(JoinStatus {
+                state: "ready",
+                ..current.unwrap_or(JoinStatus::of("ready"))
+            }),
+            _ => None,
+        };
+        screen
+    }
+
     pub fn join_status(&self, window: &str, ticket: &str) -> Result<JoinStatus, Refusal> {
         let joining = self.0.joining.lock().expect("joining");
         let found = joining.get(ticket).ok_or(Refusal::Session)?;
@@ -489,6 +567,146 @@ impl PairingHost {
             return Err(Refusal::Session);
         }
         Ok(found.status.lock().expect("join status").clone())
+    }
+}
+
+/// "Use password and recovery kit": recover the account onto this device,
+/// from Welcome or an unfinished recovery's `Recover`. The home checks the
+/// password and kit; the recovery key adds this device, which downloads its
+/// own base, each stage told to `stages`; the account is then Ready
+/// (`Recovered`). A refusal shows the home's answer
+/// (`devices::recover_refused`); what recovery kept stays, and asking
+/// again resumes it. The password and code are never kept.
+async fn recover<S, P>(
+    accounts: &SharedAccountHost<S, P>,
+    sync: &SyncHost,
+    password: &str,
+    code: &str,
+    stages: watch::Sender<RecoverStage>,
+) -> Result<Screen, &'static str>
+where
+    S: HostKeyStore,
+    P: PendingSetupProtector + Clone + Send + Sync + 'static,
+{
+    let password = Password::new(password).map_err(|_| "invalid password")?;
+    let Ok(code) = RecoveryCode::from_kit_text(code) else {
+        return crate::devices::recover_refused(RecoverError::NotRecognised);
+    };
+    let Transport {
+        endpoint,
+        connector,
+        owner,
+        ..
+    } = sync.transport().ok_or("sync unavailable")?;
+    let lease = accounts
+        .begin_recovery()
+        .map_err(|error| refused(error).message())?;
+    let id = lease.id;
+    let slot = Arc::new(JoinSlot {
+        lease: Mutex::new(Some(lease)),
+        accounts: accounts.clone(),
+    });
+    let keys = slot.with(|lease| Box::pin(scanner_keys(lease))).await;
+    let Some(prover) = keys.flatten().and_then(|_| accounts.proving_owner(id)) else {
+        slot.give_back();
+        return Err("account unavailable");
+    };
+    let prover: Arc<dyn JoinProver> = Arc::new(OwnerProver(Arc::new(Mutex::new(prover))));
+    let recovered = slot
+        .with(move |lease| {
+            Box::pin(async move {
+                let capability = bh_sync_client::recover_reporting(
+                    &endpoint,
+                    connector,
+                    owner,
+                    lease.id,
+                    &mut lease.owner,
+                    prover,
+                    &password,
+                    &code,
+                    &stages,
+                )
+                .await?;
+                // Recovered: a base that does not open here is this
+                // device's own failure, not the home's.
+                let base = bh_device::own_base::create_or_open(
+                    &mut lease.owner,
+                    capability.clone(),
+                    lease.database.clone(),
+                )
+                .await
+                .ok();
+                Ok::<_, RecoverError>(base.map(|base| (capability, Arc::new(base))))
+            })
+        })
+        .await;
+    match recovered {
+        Some(Ok(Some((capability, base)))) => {
+            let lease = slot.take().ok_or("account unavailable")?;
+            if accounts.finish_recovery(lease, capability, base) {
+                Ok(Screen::Recovered)
+            } else {
+                Err("account unavailable")
+            }
+        }
+        Some(Err(error)) => {
+            slot.give_back();
+            accounts.recovery_left(id);
+            crate::devices::recover_refused(error)
+        }
+        Some(Ok(None)) | None => {
+            slot.give_back();
+            accounts.recovery_left(id);
+            Err("account unavailable")
+        }
+    }
+}
+
+/// A recovery's stage as a join's status shows it.
+fn recovery_shown(stage: RecoverStage) -> Option<JoinStatus> {
+    match stage {
+        RecoverStage::Checking => None,
+        RecoverStage::Open => Some(JoinStatus::of("admitted")),
+        RecoverStage::Downloading(Progress { done, total }) => Some(JoinStatus {
+            done: Some(done),
+            total: Some(total),
+            ..JoinStatus::of("bootstrapping")
+        }),
+    }
+}
+
+/// Possession proofs by a second owner of the recovering container, each on
+/// its own native worker: the lease's owner is busy recovering.
+struct OwnerProver<S, P>(Arc<Mutex<Owner<S, P>>>)
+where
+    S: HostKeyStore,
+    P: PendingSetupProtector + Clone + Send + Sync + 'static;
+impl<S, P> JoinProver for OwnerProver<S, P>
+where
+    S: HostKeyStore,
+    P: PendingSetupProtector + Clone + Send + Sync + 'static,
+{
+    fn joining_proof(
+        &self,
+        account: AccountId,
+        head: AccountHead,
+        context: Context,
+    ) -> BoxFuture<'_, Result<Proof, SignerError>> {
+        let owner = self.0.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| SignerError)?;
+                let mut owner = owner.lock().map_err(|_| SignerError)?;
+                runtime
+                    .block_on(owner.prove_joining(account, head, context))
+                    .map_err(|_| SignerError)
+            })
+            .await
+            .map_err(|_| SignerError)?
+        })
     }
 }
 

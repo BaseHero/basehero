@@ -33,7 +33,7 @@ use bh_event::{
     writer::{DeviceWriterDeclaration, WriterScope},
 };
 use bh_storage::{
-    NoteKey, StoreError,
+    NoteKey, PackagePreparation, StoreError,
     retained::RetainedContent,
     sync_state::{PackageOutcome, SyncAlarm},
     typed_outbox::TypedPackagePreparation,
@@ -52,6 +52,20 @@ mod protector;
 mod store;
 
 type Account = AccountOwner<DeviceJournal, store::FakeStore, protector::PlainProtector>;
+
+// A deliberately untrusted far-ahead opening for Ack-mismatch tests. It is
+// not derived from a Head and never becomes this device's verified history.
+fn forged_ack_before() -> bh_sync::OrderState {
+    bh_sync::OrderState::new(
+        bh_sync::RawControlHead {
+            position: 1,
+            node_hash: Digest([3; 32]),
+        },
+        39,
+        Digest([4; 32]),
+    )
+    .unwrap()
+}
 
 /// The Note specialisation these tests bind a Note to: a shipped fixture
 /// definition extending the core Note, with an optional `/mood` string.
@@ -203,7 +217,7 @@ impl Fixture {
             &Password::new("correct horse battery staple").unwrap(),
         ))
         .unwrap();
-        account.confirm_home_ordered(status.head).unwrap();
+        account.confirm_home_ordered(status.head, None).unwrap();
         account.confirm_kit_saved().unwrap();
         let record = DeviceJournal::from_shared(db.clone())
             .load()
@@ -259,10 +273,15 @@ impl Fixture {
                 fixture.hosting.root.public(),
             )
             .unwrap();
-        fixture.control = Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control)
-            .unwrap()
-            .event_digest()
-            .0;
+        fixture.control = Commitment::order(
+            base,
+            bh_sync::OrderState::EMPTY,
+            &genesis.descriptor,
+            Route::Control,
+        )
+        .unwrap()
+        .event_digest()
+        .0;
         assert!(fixture.apply(&[&genesis]).is_empty());
         fixture
     }
@@ -329,8 +348,8 @@ impl Fixture {
         receipt: [u8; RECEIPT_LEN],
     ) -> Binding {
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: self.base.0,
             audience: [0; 32],
@@ -411,7 +430,7 @@ impl Fixture {
     fn apply_control(&mut self, control: &Encoded) {
         let ordered = Commitment::order(
             self.base,
-            self.history.head(),
+            self.history.order_state(),
             &control.descriptor,
             Route::Control,
         )
@@ -697,7 +716,8 @@ impl Fixture {
         for event in events {
             let route = self.route(history.head(), &event.descriptor);
             let ordered =
-                Commitment::order(self.base, history.head(), &event.descriptor, route).unwrap();
+                Commitment::order(self.base, history.order_state(), &event.descriptor, route)
+                    .unwrap();
             let prepared = history
                 .prepare(
                     &ordered,
@@ -1412,21 +1432,26 @@ fn release_failure_keeps_hold_pending_and_all_note_tables() {
 }
 
 #[test]
-fn own_clash_still_stops_publishing_under_a_hold() {
+fn same_nonce_under_a_hold_does_not_conflict_with_the_package() {
     let mut f = Fixture::new();
     let (note, id) = f.own_work();
     let own = f.package(id);
-    let clash = f.seal(own.descriptor.id(), note, f.writer([99; 32]), &[255, 255]);
+    let clash = f.seal(
+        own.descriptor.nonce(),
+        note,
+        f.writer([99; 32]),
+        &[255, 255],
+    );
     let batch = f.batch(&[&clash]);
     let result =
         bh_core::contained::with_fuel(0, || f.owner.apply_remote_batch(f.id, batch)).unwrap();
     assert_eq!(result, vec![(f.key(note), NoteOutcome::Waiting)]);
-    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Conflicted)]);
-    assert!(
-        f.alarms()
-            .iter()
-            .any(|a| matches!(a,SyncAlarm::PublishingStopped {update_id} if *update_id==id))
+    assert_ne!(
+        clash.descriptor.publication_id(Route::Content),
+        own.descriptor.publication_id(Route::Content)
     );
+    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Sealed)]);
+    assert!(f.alarms().is_empty());
     assert_eq!(f.pending(), 1);
     assert!(f.progress().stopped.is_none());
 }
@@ -1813,16 +1838,8 @@ fn atomic_failure_leaves_no_partial_state() {
     // and an account change: their rows share the transaction too.
     let (mine, id) = f.own_work();
     let own = f.package(id);
-    let lie = Commitment::order(
-        f.base,
-        Head {
-            position: 40,
-            hash: Digest([4; 32]),
-        },
-        &own.descriptor,
-        Route::Content,
-    )
-    .unwrap();
+    let lie =
+        Commitment::order(f.base, forged_ack_before(), &own.descriptor, Route::Content).unwrap();
     f.ack(id, &lie);
     let (change, _, _) = f.add_device(EventId(bh_crypto::random()));
     let before = f.dump();
@@ -1926,21 +1943,22 @@ fn another_bases_package_replayed_here_is_an_ordinary_event() {
 }
 
 #[test]
-fn a_control_under_this_devices_id_conflicts_its_package() {
+fn a_control_with_the_same_nonce_does_not_conflict_with_a_content_package() {
     let mut f = Fixture::new();
     let (note, id) = f.own_work();
     let honest = f.package(id);
-    // This device's own key signed an account change under its package's
-    // ID: judged as the control it is, and the package conflicts.
-    let (change, _, _) = f.add_device(honest.descriptor.id());
+    // Even this device's signed control with the same nonce is a distinct
+    // route-derived publication and cannot reserve the content package ID.
+    let (change, _, _) = f.add_device(honest.descriptor.nonce());
     f.apply_control(&change);
-    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Conflicted)]);
-    assert_eq!(f.pending(), 1);
-    assert!(
-        f.alarms()
-            .iter()
-            .any(|a| matches!(a, SyncAlarm::PublishingStopped { update_id } if *update_id == id))
+    assert_eq!(change.descriptor.nonce(), honest.descriptor.nonce());
+    assert_ne!(
+        change.descriptor.publication_id(Route::Control),
+        honest.descriptor.publication_id(Route::Content)
     );
+    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Sealed)]);
+    assert_eq!(f.pending(), 1);
+    assert!(f.alarms().is_empty());
     let progress = f.progress();
     assert_eq!(progress.stopped, None);
     assert_eq!(progress.position, f.history.head().position);
@@ -1948,21 +1966,20 @@ fn a_control_under_this_devices_id_conflicts_its_package() {
 }
 
 #[test]
-fn another_devices_event_under_this_devices_id_conflicts_its_package() {
+fn another_devices_content_with_the_same_nonce_does_not_conflict() {
     let mut f = Fixture::new();
     let (note, id) = f.own_work();
     let honest = f.package(id);
     let (change, device, signing) = f.add_device(EventId(bh_crypto::random()));
     f.apply_control(&change);
-    // The account's other device, valid in every respect, takes this
-    // package's event ID: an ordinary event, and no alarm.
+    // The account's other device reuses the nonce, not the publication ID.
     let writer = DeviceWriterDeclaration {
         account: f.cap.account_id().0,
         device: device.0,
         nonce: [5; 32],
     };
     let binding = f.binding(
-        honest.descriptor.id(),
+        honest.descriptor.nonce(),
         device,
         CLASS_CONTENT,
         f.hosting.receipt(f.base, f.history.head()),
@@ -1977,7 +1994,11 @@ fn another_devices_event_under_this_devices_id_conflicts_its_package() {
         f.apply(&[&taken]),
         vec![(f.key(note), NoteOutcome::Accepted)]
     );
-    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Conflicted)]);
+    assert_ne!(
+        taken.descriptor.publication_id(Route::Content),
+        honest.descriptor.publication_id(Route::Content)
+    );
+    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Sealed)]);
     assert!(f.alarms().is_empty());
     assert!(
         !f.owner
@@ -2043,14 +2064,12 @@ fn own_event_attaches_and_retires_outbox() {
         .commit_leased("w", opened.generation, lease.token, [2; 16], &next)
         .unwrap();
 
-    // Other bytes under one of this device's event IDs, authored by its own
-    // key: a clone or a local bug, not evidence against the log. The event
-    // is judged like any other and the log goes on; this device's package
-    // is conflicted, its work kept, and its publishing stops with an alarm.
+    // Other bytes with this device's nonce are a separate publication.
+    // The local package remains sealed and can still be sent unchanged.
     let ids = f.pending_ids();
     let honest = f.package(ids[0]);
     let forged = f.seal(
-        honest.descriptor.id(),
+        honest.descriptor.nonce(),
         note,
         f.writer([5; 32]),
         &item(
@@ -2066,13 +2085,9 @@ fn own_event_attaches_and_retires_outbox() {
         vec![(f.key(note), NoteOutcome::Accepted)]
     );
     assert_eq!(f.pending(), 1, "the local work is kept");
-    assert_eq!(f.unaccepted(note), vec![(ids[0], Unaccepted::Conflicted)]);
+    assert_eq!(f.unaccepted(note), vec![(ids[0], Unaccepted::Sealed)]);
     assert!(f.working(note).title_preview().unwrap().starts_with("mine"));
-    assert!(
-        f.alarms().iter().any(
-            |a| matches!(a, SyncAlarm::PublishingStopped { update_id } if *update_id == ids[0])
-        )
-    );
+    assert!(f.alarms().is_empty());
     let db = f.owner.shared_database(f.id).unwrap();
     let progress = db
         .lock()
@@ -2084,12 +2099,12 @@ fn own_event_attaches_and_retires_outbox() {
     assert_eq!(progress.position, f.history.head().position);
     assert!(matches!(
         db.lock().unwrap().prepare_note_package(ids[0]),
-        Err(StoreError::PublishingStopped)
+        Ok(PackagePreparation::Existing(_))
     ));
 }
 
 #[test]
-fn an_invalid_event_under_this_devices_id_conflicts_its_package() {
+fn an_invalid_event_with_the_same_nonce_does_not_conflict() {
     let mut f = Fixture::new();
     let note = f.owner.create_note(f.id).unwrap();
     f.owner.show_note("w", f.id, note).unwrap();
@@ -2104,11 +2119,10 @@ fn an_invalid_event_under_this_devices_id_conflicts_its_package() {
         .unwrap();
     let id = f.pending_ids()[0];
     let honest = f.package(id);
-    // Someone else's invalid submission takes this package's event ID: it
-    // holds that position with no effect, so this package cannot be
-    // ordered under its ID. Resealing is a later, deliberate step.
+    // The invalid submission consumes its distinct routed ID; its matching
+    // nonce cannot consume the pending package's publication identity.
     let taken = f.seal_with_receipt(
-        honest.descriptor.id(),
+        honest.descriptor.nonce(),
         note,
         f.writer([5; 32]),
         &seed(f.client(note, f.writer([5; 32]))),
@@ -2116,11 +2130,8 @@ fn an_invalid_event_under_this_devices_id_conflicts_its_package() {
     );
     assert!(f.apply(&[&taken]).is_empty());
     assert_eq!(f.pending(), 1);
-    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Conflicted)]);
-    assert!(
-        f.alarms().is_empty(),
-        "no evidence it was this device's key"
-    );
+    assert_eq!(f.unaccepted(note), vec![(id, Unaccepted::Sealed)]);
+    assert!(f.alarms().is_empty());
     assert_eq!(f.working(note).title_preview().unwrap(), "mine");
 }
 
@@ -2148,8 +2159,13 @@ fn rejected_and_refused_own_packages_keep_local_work() {
         .unwrap();
     let id_b = f.pending_ids()[0];
     let pb = f.package_with_receipt(id_b, [0; RECEIPT_LEN]);
-    let order_b =
-        Commitment::order(f.base, f.history.head(), &pb.descriptor, Route::Content).unwrap();
+    let order_b = Commitment::order(
+        f.base,
+        f.history.order_state(),
+        &pb.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     // The append's Ack arrives before the puller's echo.
     f.ack(id_b, &order_b);
 
@@ -2162,7 +2178,7 @@ fn rejected_and_refused_own_packages_keep_local_work() {
     assert_ne!(id_b, id_c);
     let pc = f.package(id_c);
     let order_c =
-        Commitment::order(f.base, order_b.head(), &pc.descriptor, Route::Content).unwrap();
+        Commitment::order(f.base, order_b.after(), &pc.descriptor, Route::Content).unwrap();
     f.ack(id_c, &order_c);
     assert_eq!(f.pending(), 2, "an ordered Ack is not acceptance");
     assert_eq!(
@@ -2278,16 +2294,8 @@ fn a_lying_ack_is_overwritten_by_the_verified_echo() {
         .unwrap();
     let id = f.pending_ids()[0];
     let own = f.package(id);
-    let lie = Commitment::order(
-        f.base,
-        Head {
-            position: 40,
-            hash: Digest([4; 32]),
-        },
-        &own.descriptor,
-        Route::Content,
-    )
-    .unwrap();
+    let lie =
+        Commitment::order(f.base, forged_ack_before(), &own.descriptor, Route::Content).unwrap();
     f.ack(id, &lie);
     assert_eq!(f.apply(&[&own]), vec![(f.key(note), NoteOutcome::Accepted)]);
     assert_eq!(f.pending(), 0);
@@ -2382,8 +2390,9 @@ fn resume_continues_without_replay_and_judges_alike() {
     assert_eq!(resumed.metadata_id(), live.metadata_id());
     assert_eq!(resumed.epoch_id(), live.epoch_id());
 
-    // A K2 batch and a reused event ID reach the same outcomes from the
-    // resumed History as from the live one.
+    // K2 work and a fresh publication reusing a nonce are accepted; an
+    // exact original already stored before the restart is rejected by its
+    // routed ID while structural history still advances.
     let (ns, np, nh, nl) = k2_nonces(&f, note);
     let [s, p, h, l] = [ns, np, nh, nl].map(|x| f.client(note, f.writer(x)));
     let mut events: Vec<Encoded> = [ns, np, nh, nl]
@@ -2391,12 +2400,25 @@ fn resume_continues_without_replay_and_judges_alike() {
         .zip(k2_updates(s, p, h, l))
         .map(|(n, u)| f.remote(note, *n, &u))
         .collect();
+    let reused_nonce_update = item(l, 6, (l, 5), None, "?");
     events.push(f.seal(
-        first.descriptor.id(),
+        first.descriptor.nonce(),
         note,
         f.writer(nl),
-        &item(l, 6, (l, 5), None, "?"),
+        &reused_nonce_update,
     ));
+    assert_ne!(
+        events
+            .last()
+            .unwrap()
+            .descriptor
+            .publication_id(Route::Content),
+        first.descriptor.publication_id(Route::Content)
+    );
+    events.push(Encoded {
+        descriptor: first.descriptor.clone(),
+        body: first.body.clone(),
+    });
     let refs: Vec<&Encoded> = events.iter().collect();
     let mut from_live = live.clone();
     let expected: Vec<_> = f
@@ -2409,8 +2431,17 @@ fn resume_continues_without_replay_and_judges_alike() {
     let batch = f.batch_from(&mut from_resumed, &refs);
     let outcomes: Vec<_> = batch.events.iter().map(|e| e.outcome()).collect();
     assert_eq!(outcomes, expected);
+    assert_eq!(outcomes[outcomes.len() - 2], bh_event::Outcome::Accepted);
     assert_eq!(*outcomes.last().unwrap(), bh_event::Outcome::Rejected);
+    assert_eq!(
+        batch.events.last().unwrap().commitment().event_id(),
+        first.descriptor.publication_id(Route::Content)
+    );
     assert_eq!(from_resumed.head(), from_live.head());
+    assert_eq!(
+        from_resumed.order_state(),
+        batch.events.last().unwrap().commitment().after()
+    );
     assert!(
         f.owner
             .apply_remote_batch(f.id, batch)
@@ -2423,6 +2454,7 @@ fn resume_continues_without_replay_and_judges_alike() {
     let seeded = seed(f.client(note, f.writer([9; 32])));
     refs.push(&seeded);
     refs.extend(updates.iter().map(Vec::as_slice));
+    refs.push(&reused_nonce_update);
     assert_eq!(f.accepted(note).digest().unwrap(), digest_of(&refs).0);
     // The next resume continues from the batch just committed.
     let again = f
@@ -2430,10 +2462,11 @@ fn resume_continues_without_replay_and_judges_alike() {
         .history(f.id, f.log(), &f.anchor, f.hosting.root.public(), 1)
         .unwrap();
     assert_eq!(again.head(), from_live.head());
+    assert_eq!(again.order_state(), from_live.order_state());
 }
 
 #[test]
-fn a_floor_rise_is_stored_at_its_position() {
+fn canonical_genesis_floor_is_stored_at_its_position() {
     let mut f = Fixture::new();
     let note = [7; 32];
     let s = f.client(note, f.writer([1; 32]));
@@ -2442,37 +2475,42 @@ fn a_floor_rise_is_stored_at_its_position() {
     let db = f.owner.shared_database(f.id).unwrap();
     assert_eq!(
         db.lock().unwrap().floor_rises(1, f.base.0).unwrap(),
-        vec![(2, 2)]
+        vec![(1, 3)]
     );
-    // This device learns floor 3 and resumes under it: events from here on
-    // are judged under it, events before it stay as they were judged.
+    // After the first v3 event was accepted at floor 3, a remembered
+    // rise above v3 must reject the next v3 event and persist at position 2.
     f.history = f
         .owner
-        .history(f.id, f.log(), &f.anchor, f.hosting.root.public(), 3)
+        .history(f.id, f.log(), &f.anchor, f.hosting.root.public(), 4)
         .unwrap();
     let later = f.remote(note, [1; 32], &item(s, 7, (s, 6), None, "!"));
-    assert!(f.apply(&[&later]).is_empty(), "a v2 event under floor 3");
+    assert!(f.apply(&[&later]).is_empty(), "v3 after a floor rise to 4");
     assert_eq!(
         db.lock().unwrap().floor_rises(1, f.base.0).unwrap(),
-        vec![(2, 3)]
+        vec![(1, 3), (2, 4)]
     );
-    assert_eq!(f.accepted(note).title_preview().unwrap(), "hello");
+    assert!(
+        f.accepted(note)
+            .title_preview()
+            .unwrap()
+            .starts_with("hello")
+    );
     let resumed = f
         .owner
         .history(f.id, f.log(), &f.anchor, f.hosting.root.public(), 1)
         .unwrap();
-    assert_eq!(resumed.floor(), 3);
+    assert_eq!(resumed.floor(), 4);
     // Replaying the originals with the stored rises judges each event under
     // the floor in force at its position, as live verification did.
     let stored = db.lock().unwrap().own_base().unwrap().unwrap();
     let genesis = OpaqueEvent::decode(&stored.genesis_descriptor).unwrap();
     let mut records = vec![(
-        Commitment::order(f.base, Head::EMPTY, &genesis, Route::Control).unwrap(),
+        Commitment::order(f.base, bh_sync::OrderState::EMPTY, &genesis, Route::Control).unwrap(),
         stored.genesis_descriptor.clone(),
         stored.genesis_body.clone(),
     )];
     for event in [&first, &later] {
-        let previous = records.last().unwrap().0.head();
+        let previous = records.last().unwrap().0.after();
         records.push((
             Commitment::order(f.base, previous, &event.descriptor, Route::Content).unwrap(),
             event.descriptor.encode(),
@@ -2490,7 +2528,8 @@ fn a_floor_rise_is_stored_at_its_position() {
     )
     .unwrap();
     assert_eq!(replayed.head(), resumed.head());
-    assert_eq!(replayed.floor(), 3);
+    assert_eq!(replayed.floor(), 4);
+    assert_eq!(replayed.account_head(), resumed.account_head());
 }
 
 #[test]
@@ -2968,7 +3007,7 @@ fn native_note_seal_is_accepted_as_this_devices_package() {
         .unwrap()
         .sign(request.signing_bytes());
     let encoded = request.finish(signature).unwrap();
-    assert_eq!(encoded.descriptor.id(), candidate.event_id);
+    assert_eq!(encoded.descriptor.nonce(), candidate.event_id);
     db.lock()
         .unwrap()
         .publish_note_package(
@@ -3677,13 +3716,13 @@ fn parked_own_typed_edit_rejected_on_replay_stays_visible() {
     let phantom = f.note_event([183; 32], [24; 32]);
     let extra = Commitment::order(
         f.base,
-        f.history.head(),
+        f.history.order_state(),
         &phantom.descriptor,
         Route::Content,
     )
     .unwrap();
     let wrong_ack =
-        Commitment::order(f.base, extra.head(), &edit.descriptor, Route::Content).unwrap();
+        Commitment::order(f.base, extra.after(), &edit.descriptor, Route::Content).unwrap();
     f.owner
         .shared_database(f.id)
         .unwrap()
@@ -3768,13 +3807,13 @@ fn incoming_typed_echo_alarms_a_mismatched_ack() {
     let phantom = f.note_event([190; 32], [35; 32]);
     let extra = Commitment::order(
         f.base,
-        f.history.head(),
+        f.history.order_state(),
         &phantom.descriptor,
         Route::Content,
     )
     .unwrap();
     let wrong_ack =
-        Commitment::order(f.base, extra.head(), &echo.descriptor, Route::Content).unwrap();
+        Commitment::order(f.base, extra.after(), &echo.descriptor, Route::Content).unwrap();
     f.owner
         .shared_database(f.id)
         .unwrap()
@@ -3794,7 +3833,7 @@ fn incoming_typed_echo_alarms_a_mismatched_ack() {
 }
 
 #[test]
-fn incoming_own_key_conflict_stops_typed_publishing() {
+fn incoming_same_nonce_preserves_pending_typed_package() {
     let mut f = Fixture::new();
     f.seed_types(&[Recipe::address(), Recipe::bytes()]);
     let fillers: Vec<_> = (0..3)
@@ -3803,7 +3842,7 @@ fn incoming_own_key_conflict_stops_typed_publishing() {
     assert_eq!(f.apply(&[&fillers[0], &fillers[1], &fillers[2]]).len(), 3);
     let (own, package, _) = f.own_typed_package(Recipe::create([141; 32], "Soup"));
     let binding = f.binding(
-        own.descriptor.id(),
+        own.descriptor.nonce(),
         f.cap.device_id(),
         CLASS_CONTENT,
         f.hosting.receipt(f.base, f.history.head()),
@@ -3815,14 +3854,12 @@ fn incoming_own_key_conflict_stops_typed_publishing() {
         f.store.state().ordinary.as_ref().unwrap(),
     );
     assert!(f.apply(&[&conflict]).is_empty());
-    assert_eq!(
-        f.typed_package_outcome(package),
-        Some(PackageOutcome::Conflicted)
+    assert_ne!(
+        conflict.descriptor.publication_id(Route::Content),
+        own.descriptor.publication_id(Route::Content)
     );
-    assert!(
-        f.alarms()
-            .contains(&SyncAlarm::TypedPublishingStopped { package })
-    );
+    assert_eq!(f.typed_package_outcome(package), None);
+    assert!(f.alarms().is_empty());
 }
 
 /// A failure part-way through a batch leaves progress, the notes, the typed

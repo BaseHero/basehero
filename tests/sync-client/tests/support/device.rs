@@ -5,11 +5,12 @@
 
 use super::fake::Hosted;
 use bh_account::{
-    AccountId, DeviceId, DevicePublicKeys, Head as AccountHead, VerifiedAccount,
+    AccountId, ConfirmedTime, DeviceId, DevicePublicKeys, Head as AccountHead, VerifiedAccount,
     device_auth::{self, Context, Proof},
-    journal::{AccountJournal, InitialBootstrapRecord, StagedAdmission},
+    journal::{AccountJournal, InitialBootstrapRecord, StagedAdmission, StagedControl},
     owner::{
         AccountCapability, AccountGeneration, AccountLoad, AccountOwner, OwnerError, SetupError,
+        staging::Settlement,
     },
     pairing,
     platform::ControlKeyPolicy,
@@ -25,7 +26,11 @@ use bh_data::{
     catalogue::Shipped,
     mutation::ops::Operation,
 };
-use bh_device::{ContainerId, Owner, own_base::create_or_open};
+use bh_device::{
+    ContainerId, Owner,
+    control::{InstallError, SealWait, install_sealed_epoch, open_seal_set},
+    own_base::create_or_open,
+};
 use bh_storage::{
     DeviceDatabase, NoteKey, PackagePreparation, StoredNotePackage, TypedPackagePreparation,
     TypedPackageProgress,
@@ -36,10 +41,12 @@ use bh_sync::{
 };
 use bh_sync_client::{
     AccountApplyError, Appraisal, BaseControlRequest, Client, ControlSignError, Endpoint,
-    HomeSetup, Identity, Signer, SignerError, SyncStatus, Tuning, pairing::Approvals,
+    HomeSetup, Identity, Signer, SignerError, SyncStatus, TimedOriginal, Tuning,
+    pairing::Approvals,
 };
 use futures_util::future::BoxFuture;
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{
         Arc, Mutex,
@@ -112,21 +119,35 @@ impl Seeds {
 pub struct TestSigner {
     ordinary: SigningKey,
     seeds: Seeds,
-    /// The account at the head the base genesis names.
-    anchor: VerifiedAccount,
+    /// The account at the head the base genesis names; read again at that
+    /// head once setup keeps the home's times, as the host does.
+    anchor: Mutex<VerifiedAccount>,
     /// The account at its current verified head.
     current: Mutex<VerifiedAccount>,
     account: AccountId,
     device: DeviceId,
     genesis: Vec<u8>,
     metadata: Secret<32>,
+    /// The genesis epoch's content root.
     content: Secret<32>,
+    /// Every epoch's content root this device holds, by key id, as the
+    /// host's own base keeps them in memory: the genesis one, those in its
+    /// keyring when it opened, and each installed since.
+    epochs: Mutex<BTreeMap<[u8; 32], Secret<32>>>,
+    /// The epoch each `with_epoch_keys` call asked for, in order.
+    pub epoch_asks: Mutex<Vec<Option<[u8; 32]>>>,
+    /// Seal sets the client asked to install, and those installed.
+    pub install_attempts: AtomicUsize,
+    pub installs: AtomicUsize,
     /// A wrong content root handed out as this device's, to prove the client
     /// ties the key to the stored epoch.
     content_override: Mutex<Option<Secret<32>>>,
     database: Arc<Mutex<DeviceDatabase>>,
     generation: AccountGeneration,
     base: BaseId,
+    /// This device came from `Device::join`, whose fixture copies no
+    /// personal-key delivery: its keyring cannot open P.
+    fixture_join: bool,
     /// The client asked for another base's keys.
     pub wrong_base: AtomicBool,
     /// The client held the container's writer lock while asking for keys.
@@ -142,6 +163,9 @@ pub struct TestSigner {
     pub tamper: Mutex<Option<Tamper>>,
     /// Models a later device for which the signer has no original-home obligation.
     pub no_home_obligation: AtomicBool,
+    /// Prove possession only while the account owner still holds this
+    /// device active, as the host's signer does once its authority ended.
+    pub proofs_need_membership: AtomicBool,
     /// The person has approved base controls: without it a control is
     /// `ConfirmationNeeded`, never prompted for, unless `approvals` covers it.
     pub approve_controls: AtomicBool,
@@ -164,6 +188,63 @@ pub struct TestSigner {
     /// When each event signature was asked for: the package's run was
     /// captured just before.
     pub sign_asked: Mutex<Vec<tokio::time::Instant>>,
+    /// Rotations the client asked to accept, and those accepted.
+    pub accept_attempts: AtomicUsize,
+    pub accepts: AtomicUsize,
+    /// Rotations staged at the client's request.
+    pub rotations_staged: AtomicUsize,
+    /// Refuse to stage a rotation, as a signer that cannot act now.
+    pub refuse_rotation: AtomicBool,
+    /// The account owner is lent elsewhere, as a host's publisher holds it
+    /// while it signs: settling or discarding a stage cannot use it now.
+    pub owner_lent: AtomicBool,
+    /// This device's own directory entries and what its reads found.
+    pub own: OwnDirectory,
+}
+
+/// This device's name and what directory reads found, as the host keeps
+/// them in memory.
+#[derive(Default)]
+pub struct OwnDirectory {
+    /// The model name the host gives this device, if any.
+    pub label: Mutex<Option<String>>,
+    /// The host asks for a directory read.
+    pub wanted: AtomicBool,
+    /// The names each read found, in order.
+    pub reads: Mutex<Vec<Vec<(DeviceId, String)>>>,
+    /// Whether each read found a password check.
+    pub checks: Mutex<Vec<bool>>,
+    /// Preparing own entries fails, as an owner that cannot open its key.
+    pub fail_own: AtomicBool,
+    /// Opening a directory read fails.
+    pub fail_reads: AtomicBool,
+    /// Reads reported failed.
+    pub unread: AtomicUsize,
+}
+
+/// The content roots `own` holds in memory for its base, by key id: every
+/// one in its keyring.
+fn held_epochs(
+    own: &bh_device::own_base::OwnBase,
+    db: &Mutex<DeviceDatabase>,
+) -> BTreeMap<[u8; 32], Secret<32>> {
+    let rows = db.lock().unwrap().epoch_keys(own.id().0).unwrap();
+    rows.iter()
+        .filter(|row| row.purpose == bh_account::local_seal::LocalKeyPurpose::Content as i64)
+        .filter_map(|row| {
+            own.with_epoch_key(Some(row.epoch_id), |_, k| {
+                k.map(|k| (row.epoch_id, Secret::from_slice(k.expose()).unwrap()))
+            })
+            .unwrap()
+        })
+        .collect()
+}
+/// Only the genesis epoch's root, as the joining fixture delivers it.
+fn genesis_epoch(content: &Secret<32>) -> BTreeMap<[u8; 32], Secret<32>> {
+    BTreeMap::from([(
+        bh_crypto::committed_key_id(content),
+        Secret::from_slice(content.expose()).unwrap(),
+    )])
 }
 
 /// Public keys of a device that exists only in the account log.
@@ -208,14 +289,6 @@ impl TestSigner {
             .collect();
         VerifiedAccount::replay(record.anchor, &events, head).ok()
     }
-    /// The journal's account at its current head.
-    fn journaled(&self) -> Option<VerifiedAccount> {
-        let record = DeviceJournal::from_shared(self.database.clone())
-            .load()
-            .ok()??;
-        let events: Vec<&[u8]> = record.history.iter().map(Vec::as_slice).collect();
-        VerifiedAccount::replay(record.anchor, &events, record.head).ok()
-    }
     /// Hold the next event signature until released.
     pub fn hold_next_sign(&self) -> super::fake::HomeHold {
         let (arrived, arrived_rx) = oneshot::channel();
@@ -240,11 +313,40 @@ impl TestSigner {
             _ => Err(SignerError),
         }
     }
+    /// Whether this signer may still prove possession (`proofs_need_membership`).
+    fn still_member(&self) -> Result<(), SignerError> {
+        if self.proofs_need_membership.load(Ordering::SeqCst) {
+            self.activated()?;
+        }
+        Ok(())
+    }
+    /// `Device::join`'s fixture holds no delivered personal key: the keyring
+    /// reads the device as the signup device and opening P fails as
+    /// `Corrupt`. Say what is actually wrong instead.
+    fn delivered_personal(&self) {
+        assert!(
+            !self.fixture_join,
+            "this device came from Device::join, whose fixture holds no \
+             delivered personal key; pair it through the real QR flow \
+             (support::pair::paired) before accepting a rotation or opening \
+             the personal key"
+        );
+    }
     /// The account owner as the host loads it, activated over the journal.
     fn owner(&self) -> Option<(Account, AccountCapability)> {
         self.activated()
             .ok()
             .map(|(account, cap, _)| (account, cap))
+    }
+    /// Cache a freshly read owner view without moving the cache backwards: a
+    /// concurrent apply may have committed past the head this read saw. The
+    /// host signer needs no such guard, as its read-then-write is serialized
+    /// by the owner lend.
+    fn cache_current(&self, fresh: VerifiedAccount) {
+        let mut current = self.current.lock().unwrap();
+        if fresh.head().position >= current.head().position {
+            *current = fresh;
+        }
     }
     /// Whether this device is active in the account's original three-event
     /// signup prefix, from the journal's verified history.
@@ -263,7 +365,7 @@ impl TestSigner {
     fn apply_now(
         &self,
         after: AccountHead,
-        originals: &[Vec<u8>],
+        originals: &[TimedOriginal],
     ) -> Result<AccountHead, AccountApplyError> {
         self.apply_attempts.fetch_add(1, Ordering::SeqCst);
         let (mut account, cap) = match self.activated() {
@@ -279,15 +381,27 @@ impl TestSigner {
         {
             return Err(AccountApplyError::Unavailable);
         }
-        let refs: Vec<&[u8]> = originals.iter().map(Vec::as_slice).collect();
-        let head = account.apply_incoming(&refs).map_err(|error| match error {
-            OwnerError::Refused(_) => AccountApplyError::Refused,
-            OwnerError::Unsupported(_) => AccountApplyError::Unsupported,
-            OwnerError::Invalid(bh_account::Error::Unavailable) => AccountApplyError::Unavailable,
-            OwnerError::Invalid(_) | OwnerError::Stopped => AccountApplyError::Stopped,
-            _ => AccountApplyError::Unavailable,
-        })?;
-        *self.current.lock().unwrap() = self.journaled().ok_or(AccountApplyError::Unavailable)?;
+        let timed: Vec<_> = originals
+            .iter()
+            .map(|(original, evidence)| (original.as_slice(), evidence.clone()))
+            .collect();
+        let head = account
+            .apply_incoming_timed(&timed)
+            .map_err(|error| match error {
+                OwnerError::Refused(_) => AccountApplyError::Refused,
+                OwnerError::Unsupported(_) => AccountApplyError::Unsupported,
+                OwnerError::Invalid(bh_account::Error::Unavailable) => {
+                    AccountApplyError::Unavailable
+                }
+                OwnerError::Invalid(_) | OwnerError::Stopped => AccountApplyError::Stopped,
+                _ => AccountApplyError::Unavailable,
+            })?;
+        self.cache_current(
+            account
+                .verified(&cap)
+                .map_err(|_| AccountApplyError::Unavailable)?
+                .clone(),
+        );
         // A staged addition the applied history resolves is settled, as the
         // host's adapter does after each apply; a failure is retried then.
         if account.staged_admission().is_ok_and(|row| row.is_some()) {
@@ -323,8 +437,14 @@ impl TestSigner {
                 .finish(control.sign(request.signing_bytes()))
                 .unwrap()
         };
-        let mut branch = self.anchor.clone();
-        branch.apply(sign(&branch, 91).as_bytes()).unwrap();
+        let mut branch = self.anchor.lock().unwrap().clone();
+        let time = ConfirmedTime {
+            earliest_ms: u64::MAX / 2,
+            latest_ms: u64::MAX / 2,
+        };
+        branch
+            .apply_timed(sign(&branch, 91).as_bytes(), Some(time))
+            .unwrap();
         sign(&branch, 101).as_bytes().to_vec()
     }
     fn sign_control_now(
@@ -352,6 +472,104 @@ impl TestSigner {
         let event = ready(account.sign_control(&cap, &request)).unwrap();
         event.as_bytes().to_vec()
     }
+    pub fn request_removal(&self, target: DeviceId) -> Vec<u8> {
+        let (mut owner, cap) = self.owner().expect("active account");
+        let request = owner
+            .verified(&cap)
+            .unwrap()
+            .request_removal(self.device, target)
+            .unwrap();
+        ready(owner.sign_control(&cap, &request))
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+    /// This device's cancellation of removal request `request`, signed with
+    /// its control key: not applied here; the account home orders it.
+    pub fn cancel_removal(&self, _target: DeviceId, request: u64) -> Option<Vec<u8>> {
+        let (mut account, cap) = self.owner()?;
+        let request = account
+            .verified(&cap)
+            .unwrap()
+            .cancel_removal(self.device, request)
+            .ok()?;
+        Some(
+            ready(account.sign_control(&cap, &request))
+                .ok()?
+                .as_bytes()
+                .to_vec(),
+        )
+    }
+
+    /// Detached signed chain for a full-page hostile-home fixture. Does not
+    /// change this owner's durable account or its cached current view.
+    pub fn signed_additions(&self, count: u8, at: u64) -> Vec<Vec<u8>> {
+        let control = SigningKey::from_seed(&self.seeds.control);
+        let mut view = self.current.lock().unwrap().clone();
+        (0..count)
+            .map(|index| {
+                let keys = if index < 81 {
+                    test_keys(10 + index * 3)
+                } else {
+                    // The compact one-byte fixture seeds run out past 81
+                    // additions. Keep the long-history keys distinct.
+                    let mut signing = [0xa1; 32];
+                    signing[0] = index;
+                    let mut control = [0xb2; 32];
+                    control[0] = index;
+                    let mut receiving = [0xc3; 1216];
+                    receiving[0] = index;
+                    DevicePublicKeys::new(signing, control, receiving).unwrap()
+                };
+                let request = view.add_device(self.device, keys).unwrap();
+                let event = request
+                    .finish(control.sign(request.signing_bytes()))
+                    .unwrap();
+                view.apply_timed(
+                    event.as_bytes(),
+                    Some(ConfirmedTime {
+                        earliest_ms: at,
+                        latest_ms: at,
+                    }),
+                )
+                .unwrap();
+                event.as_bytes().to_vec()
+            })
+            .collect()
+    }
+    /// `signed_additions` followed by this device's removal of itself,
+    /// signed on that detached chain: a long history ending in removal.
+    pub fn signed_additions_then_removal(&self, count: u8, at: u64) -> Vec<Vec<u8>> {
+        let mut chain = self.signed_additions(count, at);
+        let control = SigningKey::from_seed(&self.seeds.control);
+        let mut view = self.current.lock().unwrap().clone();
+        for event in &chain {
+            view.apply_timed(
+                event,
+                Some(ConfirmedTime {
+                    earliest_ms: at,
+                    latest_ms: at,
+                }),
+            )
+            .unwrap();
+        }
+        let request = view.remove_self(self.device).unwrap();
+        let removal = request
+            .finish(control.sign(request.signing_bytes()))
+            .unwrap();
+        chain.push(removal.as_bytes().to_vec());
+        chain
+    }
+    /// This device's removal of itself, signed with its ordinary key rather
+    /// than the control key the account names for it: a wrong signer.
+    pub fn remove_self_signed_by_ordinary_key(&self) -> Vec<u8> {
+        let view = self.current.lock().unwrap().clone();
+        let request = view.remove_self(self.device).unwrap();
+        let ordinary = SigningKey::from_seed(&self.seeds.ordinary);
+        let mut event = request.signing_bytes().to_vec();
+        event.extend(ordinary.sign(request.signing_bytes()));
+        event
+    }
     /// This device's removal of itself, signed with its control key: not
     /// applied here; the account home orders it.
     pub fn remove_self(&self) -> Vec<u8> {
@@ -359,6 +577,152 @@ impl TestSigner {
         let request = account.prepare_remove_self(&cap).unwrap();
         let event = ready(account.sign_control(&cap, &request)).unwrap();
         event.as_bytes().to_vec()
+    }
+    /// This device's rotation of the personal key for the removal at
+    /// `removal`, signed with its ordinary key: not applied here; the
+    /// account home orders it. Also its prepared seals (each member
+    /// device's and the recovery key's) and the new key.
+    pub fn rotate_personal(
+        &self,
+        removal: u64,
+        at: u64,
+    ) -> (
+        Vec<u8>,
+        bh_account::personal::PreparedRotation,
+        bh_account::personal::PersonalKey,
+    ) {
+        let (account, cap) = self.owner().expect("active account");
+        let view = account.verified(&cap).unwrap().clone();
+        let next = bh_account::personal::PersonalKey::generate();
+        let prepared = bh_account::personal::prepare_rotation(&view.advanced(at), &next).unwrap();
+        let request = view
+            .rotate_personal(
+                self.device,
+                removal,
+                prepared.public,
+                prepared.device_seals_digest,
+                prepared.recovery_seal_digest,
+            )
+            .unwrap();
+        let signature = self.ordinary.sign(request.signing_bytes());
+        let rotation = request.finish(signature).unwrap();
+        (rotation.as_bytes().to_vec(), prepared, next)
+    }
+    /// Accept the rotation at `position` with its ordered `body`, as the
+    /// host does once the account history holding it is applied: the
+    /// keyring is re-sealed to the new key.
+    pub fn accept_rotation(&self, position: u64, body: &[u8]) {
+        self.delivered_personal();
+        let (mut account, cap) = self.owner().expect("active account");
+        let cap = Arc::new(cap);
+        ready(bh_device::own_base::ensure_keyring(
+            &mut account,
+            cap.clone(),
+            self.database.clone(),
+        ))
+        .unwrap();
+        ready(account.accept_rotation(&cap, position, body)).unwrap();
+    }
+    /// `root` sealed as a base content key of `base` to the personal key
+    /// `to`, sent by this device at its account's current verified head.
+    pub fn seal_content_key(
+        &self,
+        base: BaseId,
+        root: &Secret<32>,
+        to: &bh_account::personal::PersonalKey,
+    ) -> Vec<u8> {
+        use bh_device::base_keys::{BaseKeyPurpose, SealHeader, prepare_seal};
+        let (account, cap) = self.owner().expect("active account");
+        let history = account.verified(&cap).unwrap().clone();
+        let header = SealHeader {
+            purpose: BaseKeyPurpose::Content,
+            base,
+            audience: [0; 32],
+            key_id: bh_crypto::committed_key_id(root),
+            recipient: bh_crypto::hash(&to.public()),
+            sender: history.id(),
+            device: self.device,
+            head: history.head(),
+        };
+        let unsigned = prepare_seal(&history, header, &to.public(), root).unwrap();
+        let signature = self.ordinary.sign(unsigned.signing_bytes());
+        unsigned.finish(signature).unwrap()
+    }
+    /// `root` sealed as a base content key of `base` to the personal public
+    /// key `to`, as `seal_content_key` does for a key this test holds.
+    pub fn seal_content_key_to(&self, base: BaseId, root: &Secret<32>, to: &[u8; 1216]) -> Vec<u8> {
+        use bh_device::base_keys::{BaseKeyPurpose, SealHeader, prepare_seal};
+        let (account, cap) = self.owner().expect("active account");
+        let history = account.verified(&cap).unwrap().clone();
+        let header = SealHeader {
+            purpose: BaseKeyPurpose::Content,
+            base,
+            audience: [0; 32],
+            key_id: bh_crypto::committed_key_id(root),
+            recipient: bh_crypto::hash(to),
+            sender: history.id(),
+            device: self.device,
+            head: history.head(),
+        };
+        let unsigned = prepare_seal(&history, header, to, root).unwrap();
+        let signature = self.ordinary.sign(unsigned.signing_bytes());
+        unsigned.finish(signature).unwrap()
+    }
+    /// Stage an already-signed trust control, as the host does once the
+    /// person confirms it (`AccountOwner::stage_control`).
+    pub fn stage(&self, event: &[u8]) -> StagedControl {
+        let (mut account, cap) = self.owner().expect("active account");
+        account
+            .stage_control(&cap, event, None, None, None)
+            .unwrap()
+    }
+    /// What this device has staged and not yet settled.
+    pub fn staged(&self) -> Option<StagedControl> {
+        DeviceJournal::from_shared(self.database.clone())
+            .staged_control()
+            .unwrap()
+    }
+    /// The personal public key this device holds accepted.
+    pub fn accepted_personal(&self) -> [u8; 1216] {
+        self.delivered_personal();
+        let (mut account, cap) = self.owner().expect("active account");
+        ready(account.open_current_personal(&cap)).unwrap().public()
+    }
+    /// Keep `content` in memory as the epoch key it commits to, as the
+    /// host's own base does once a key is installed.
+    pub fn hold_epoch(&self, content: Secret<32>) {
+        self.epochs
+            .lock()
+            .unwrap()
+            .entry(bh_crypto::committed_key_id(&content))
+            .or_insert(content);
+    }
+    /// Whether this signer holds the key of `epoch` in memory.
+    pub fn holds_epoch(&self, epoch: [u8; 32]) -> bool {
+        self.epochs.lock().unwrap().contains_key(&epoch)
+    }
+    /// Refuse another base's keys, and a client that holds the container's
+    /// writer lock while it asks for keys.
+    fn key_lock_free(&self, base: BaseId) -> Result<(), SignerError> {
+        if base != self.base {
+            self.wrong_base.store(true, Ordering::SeqCst);
+            return Err(SignerError);
+        }
+        // A host signer may take the container's writer lock to reach its
+        // keys. The client must not hold it here: with a plain lock this
+        // would deadlock, so it is tried for a while and reported instead.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.database.try_lock() {
+                Ok(guard) => break drop(guard),
+                Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                Err(_) => {
+                    self.owner_lock_held.store(true, Ordering::SeqCst);
+                    return Err(SignerError);
+                }
+            }
+        }
+        Ok(())
     }
     /// The base roots, as the joining bootstrap will deliver them.
     fn roots(&self) -> (Secret<32>, Secret<32>) {
@@ -374,11 +738,13 @@ impl Signer for TestSigner {
             account: self.account,
             device: self.device,
             genesis: self.genesis.clone(),
-            anchor: self.anchor.clone(),
+            anchor: self.anchor.lock().unwrap().clone(),
         })
     }
     fn device_proof(&self, context: Context) -> BoxFuture<'_, Result<Proof, SignerError>> {
+        let member = self.still_member();
         Box::pin(async move {
+            member?;
             let current = self.current.lock().unwrap().clone();
             let request =
                 device_auth::prepare(&current, self.device, context).map_err(|_| SignerError)?;
@@ -391,7 +757,9 @@ impl Signer for TestSigner {
         head: AccountHead,
         context: Context,
     ) -> BoxFuture<'_, Result<Proof, SignerError>> {
+        let member = self.still_member();
         Box::pin(async move {
+            member?;
             let view = self.view_at(head).ok_or(SignerError)?;
             let request =
                 device_auth::prepare(&view, self.device, context).map_err(|_| SignerError)?;
@@ -427,7 +795,11 @@ impl Signer for TestSigner {
         }
         Ok(Some(setup))
     }
-    fn confirm_home_ordered(&self, setup: &HomeSetup) -> Result<(), SignerError> {
+    fn confirm_home_ordered(
+        &self,
+        setup: &HomeSetup,
+        evidence: [(ConfirmedTime, Vec<u8>); 2],
+    ) -> Result<(), SignerError> {
         self.confirm_attempts.fetch_add(1, Ordering::SeqCst);
         if self.refuse_confirm.load(Ordering::SeqCst) {
             return Err(SignerError);
@@ -439,16 +811,26 @@ impl Signer for TestSigner {
         }
         // A setup whose pending record is already gone (an earlier client
         // cleared it) is complete once its home holds the objects.
-        match account.confirm_home_ordered(setup.prefix.head) {
-            Ok(()) | Err(SetupError::NotStarted) => {
-                self.home_ordered
-                    .lock()
-                    .unwrap()
-                    .push((setup.prefix.head, generation));
-                Ok(())
-            }
-            Err(_) => Err(SignerError),
+        match account.confirm_home_ordered(setup.prefix.head, Some(evidence)) {
+            Ok(()) | Err(SetupError::NotStarted) => {}
+            Err(_) => return Err(SignerError),
         }
+        // Both the current account and the creator anchor now carry the
+        // setup's times.
+        let head = self.anchor.lock().unwrap().head();
+        let anchor = account
+            .verified_at(&cap, head.position)
+            .map_err(|_| SignerError)?;
+        if anchor.head() != head {
+            return Err(SignerError);
+        }
+        self.cache_current(account.verified(&cap).map_err(|_| SignerError)?.clone());
+        *self.anchor.lock().unwrap() = anchor;
+        self.home_ordered
+            .lock()
+            .unwrap()
+            .push((setup.prefix.head, generation));
+        Ok(())
     }
     fn sign_event(&self, message: Vec<u8>) -> BoxFuture<'_, Result<[u8; 64], SignerError>> {
         let hold = self.sign_hold.lock().unwrap().take();
@@ -472,14 +854,31 @@ impl Signer for TestSigner {
     fn current_account(&self) -> Result<VerifiedAccount, SignerError> {
         Ok(self.current.lock().unwrap().clone())
     }
-    fn apply_account(
+    fn apply_account_timed(
         &self,
         after: AccountHead,
-        originals: Vec<Vec<u8>>,
+        originals: Vec<TimedOriginal>,
     ) -> BoxFuture<'_, Result<AccountHead, AccountApplyError>> {
         // The test key store is not Send: the work is done before the future.
         let result = self.apply_now(after, &originals);
         Box::pin(async move { result })
+    }
+    fn observe_account_accepted(
+        &self,
+        head: AccountHead,
+        time: ConfirmedTime,
+    ) -> Result<(), SignerError> {
+        let (mut owner, cap, _) = self.activated()?;
+        owner
+            .observe_accepted_alerts(&cap, head, time)
+            .map_err(|_| SignerError)?;
+        let current = owner.verified(&cap).map_err(|_| SignerError)?.clone();
+        self.cache_current(current.clone());
+        let mut anchor = self.anchor.lock().unwrap();
+        if anchor.head() == head {
+            *anchor = current;
+        }
+        Ok(())
     }
     fn sign_base_control(
         &self,
@@ -493,37 +892,289 @@ impl Signer for TestSigner {
             .staged_admission()
             .map_err(|_| SignerError)
     }
-    fn with_base_keys(
-        &self,
-        base: BaseId,
-        use_keys: &mut dyn FnMut(&Secret<32>, &Secret<32>),
-    ) -> Result<(), SignerError> {
-        if base != self.base {
-            self.wrong_base.store(true, Ordering::SeqCst);
+    fn staged_control(&self) -> Result<Option<StagedControl>, SignerError> {
+        DeviceJournal::from_shared(self.database.clone())
+            .staged_control()
+            .map_err(|_| SignerError)
+    }
+    fn stage_rotation(&self, at_ms: u64) -> BoxFuture<'_, Result<StagedControl, SignerError>> {
+        // The test key store is not Send: the work is done before the future.
+        let result = (|| {
+            if self.refuse_rotation.load(Ordering::SeqCst) {
+                return Err(SignerError);
+            }
+            let (mut account, cap, _) = self.activated()?;
+            ready(account.stage_rotation(&cap, at_ms)).map_err(|_| SignerError)
+        })();
+        if result.is_ok() {
+            self.rotations_staged.fetch_add(1, Ordering::SeqCst);
+        }
+        Box::pin(async move { result })
+    }
+    fn settle_staged(&self) -> Result<Option<Settlement>, SignerError> {
+        if self.owner_lent.load(Ordering::SeqCst) {
             return Err(SignerError);
         }
-        // A host signer may take the container's writer lock to reach its
-        // keys. The client must not hold it here: with a plain lock this
-        // would deadlock, so it is tried for a while and reported instead.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.database.try_lock() {
-                Ok(guard) => break drop(guard),
-                Err(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
-                Err(_) => {
-                    self.owner_lock_held.store(true, Ordering::SeqCst);
-                    return Err(SignerError);
-                }
-            }
+        let (mut account, _, _) = self.activated()?;
+        account.settle_staged().map_err(|_| SignerError)
+    }
+    fn discard_staged(&self, expected: &StagedControl) -> Result<(), SignerError> {
+        if self.owner_lent.load(Ordering::SeqCst) {
+            return Err(SignerError);
         }
-        // The closure calls into the Owner, which takes its own locks: none
-        // of the signer's may be held across it.
-        let content = match self.content_override.lock().unwrap().as_ref() {
-            Some(key) => Secret::from_slice(key.expose()).expect("32 bytes"),
-            None => Secret::from_slice(self.content.expose()).expect("32 bytes"),
-        };
-        use_keys(&self.metadata, &content);
+        let (mut account, _, _) = self.activated()?;
+        account.discard_staged(expected).map_err(|_| SignerError)
+    }
+    fn accept_rotation(
+        &self,
+        position: u64,
+        raw: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), SignerError>> {
+        // As the host does: the keyring made ready, the rotation accepted,
+        // then the current account and creator anchor read again.
+        self.delivered_personal();
+        self.accept_attempts.fetch_add(1, Ordering::SeqCst);
+        let result = (|| {
+            let (mut account, cap, _) = self.activated()?;
+            let cap = Arc::new(cap);
+            ready(bh_device::own_base::ensure_keyring(
+                &mut account,
+                cap.clone(),
+                self.database.clone(),
+            ))
+            .map_err(|_| SignerError)?;
+            ready(account.accept_rotation(&cap, position, &raw)).map_err(|_| SignerError)?;
+            self.cache_current(account.verified(&cap).map_err(|_| SignerError)?.clone());
+            let head = self.anchor.lock().unwrap().head();
+            let anchor = account
+                .verified_at(&cap, head.position)
+                .map_err(|_| SignerError)?;
+            if anchor.head() == head {
+                *self.anchor.lock().unwrap() = anchor;
+            }
+            self.accepts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })();
+        Box::pin(async move { result })
+    }
+    fn prepare_base_entry(
+        &self,
+        base: BaseId,
+        epoch: [u8; 32],
+        server: String,
+        version: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SignerError>> {
+        let result = (|| {
+            if base != self.base {
+                return Err(SignerError);
+            }
+            let root = self
+                .epochs
+                .lock()
+                .unwrap()
+                .get(&epoch)
+                .map(|key| Secret::from_slice(key.expose()).unwrap())
+                .ok_or(SignerError)?;
+            let (mut account, cap, _) = self.activated()?;
+            let history = account.verified(&cap).map_err(|_| SignerError)?.clone();
+            let recipient = *history.personal_public().map_err(|_| SignerError)?;
+            use bh_device::base_keys::{
+                BaseKeyPurpose, InitialBaseKeyPackage, SealHeader, prepare_seal,
+            };
+            // As the host does: the base's original seals while they are this
+            // epoch's and sealed to the current personal key, else fresh ones.
+            let package = self
+                .database
+                .lock()
+                .unwrap()
+                .own_base()
+                .unwrap()
+                .ok_or(SignerError)?
+                .initial_key_package;
+            let package = InitialBaseKeyPackage::decode(&package).map_err(|_| SignerError)?;
+            let (metadata_seal, current_key_seal) = match SealHeader::decode(package.content_seal())
+            {
+                Ok(header)
+                    if header.key_id == epoch
+                        && header.recipient == bh_crypto::hash(&recipient) =>
+                {
+                    (
+                        package.metadata_seal().to_vec(),
+                        package.content_seal().to_vec(),
+                    )
+                }
+                _ => {
+                    let header = SealHeader {
+                        purpose: BaseKeyPurpose::Metadata,
+                        base,
+                        audience: [0; 32],
+                        key_id: bh_event::key_id(&self.metadata),
+                        recipient: bh_crypto::hash(&recipient),
+                        sender: history.id(),
+                        device: self.device,
+                        head: history.head(),
+                    };
+                    let seal = |header: SealHeader, key: &Secret<32>| {
+                        let unsigned = prepare_seal(&history, header, &recipient, key)
+                            .map_err(|_| SignerError)?;
+                        let signature = self.ordinary.sign(unsigned.signing_bytes());
+                        unsigned.finish(signature).map_err(|_| SignerError)
+                    };
+                    (
+                        seal(header, &self.metadata)?,
+                        seal(
+                            SealHeader {
+                                purpose: BaseKeyPurpose::Content,
+                                key_id: epoch,
+                                ..header
+                            },
+                            &root,
+                        )?,
+                    )
+                }
+            };
+            let entry = bh_account::directory::DirectoryEntry::Base {
+                base: base.0,
+                server,
+                epoch_id: epoch,
+                current_key_seal,
+                metadata_seal,
+                own: true,
+            };
+            ready(account.prepare_directory_entry(&cap, &entry, version)).map_err(|_| SignerError)
+        })();
+        Box::pin(async move { result })
+    }
+    fn open_directory_entries(
+        &self,
+        entries: Vec<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<bh_sync_client::OpenedEntries, SignerError>> {
+        let result = (|| {
+            if self.own.fail_reads.load(Ordering::SeqCst) && !entries.is_empty() {
+                return Err(SignerError);
+            }
+            let (mut account, cap, _) = self.activated()?;
+            let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+            ready(account.open_directory_entries(&cap, &refs)).map_err(|_| SignerError)
+        })();
+        Box::pin(async move { result })
+    }
+    fn directory_state(&self) -> Result<Option<(u64, bool)>, SignerError> {
+        self.database
+            .lock()
+            .unwrap()
+            .directory_state()
+            .map_err(|_| SignerError)
+    }
+    fn set_directory_state(&self, version: u64, written: bool) -> Result<(), SignerError> {
+        self.database
+            .lock()
+            .unwrap()
+            .set_directory_state(version, written)
+            .map_err(|_| SignerError)
+    }
+    fn own_entries(&self) -> BoxFuture<'_, Result<bh_sync_client::OwnEntries, SignerError>> {
+        // As the host does: only the name it was given, once.
+        let result = (|| {
+            if self.own.fail_own.load(Ordering::SeqCst) {
+                return Err(SignerError);
+            }
+            let Some(name) = self.own.label.lock().unwrap().clone() else {
+                return Ok(Vec::new());
+            };
+            let (mut account, cap, _) = self.activated()?;
+            let entry = bh_account::directory::DirectoryEntry::DeviceName {
+                device: cap.device_id(),
+                name,
+            };
+            Ok(ready(account.prepare_own_entry(&cap, &entry, 1))
+                .map_err(|_| SignerError)?
+                .map(|(_, bytes)| (1, bytes))
+                .into_iter()
+                .collect())
+        })();
+        Box::pin(async move { result })
+    }
+    fn own_entry_held(&self, entry: [u8; 32], version: u64) -> Result<(), SignerError> {
+        let (mut account, _, _) = self.activated()?;
+        account
+            .own_entry_held(entry, version)
+            .map_err(|_| SignerError)
+    }
+    fn directory_wanted(&self) -> bool {
+        self.own.wanted.swap(false, Ordering::SeqCst)
+    }
+    fn directory_read(&self, read: bh_sync_client::DirectoryRead) {
+        self.own.reads.lock().unwrap().push(read.names);
+        self.own
+            .checks
+            .lock()
+            .unwrap()
+            .push(read.password_check.is_some());
+    }
+    fn directory_unread(&self) {
+        self.own.unread.fetch_add(1, Ordering::SeqCst);
+    }
+    fn with_metadata_key(
+        &self,
+        base: BaseId,
+        use_key: &mut dyn FnMut(&Secret<32>),
+    ) -> Result<(), SignerError> {
+        self.key_lock_free(base)?;
+        use_key(&self.metadata);
         Ok(())
+    }
+    fn with_epoch_keys(
+        &self,
+        base: BaseId,
+        epoch: Option<[u8; 32]>,
+        use_keys: &mut dyn FnMut(&Secret<32>, Option<&Secret<32>>),
+    ) -> Result<(), SignerError> {
+        self.key_lock_free(base)?;
+        self.epoch_asks.lock().unwrap().push(epoch);
+        // Only roots already in memory, and only the epoch's own; the
+        // closure calls into the Owner, which takes its own locks: none of
+        // the signer's may be held across it.
+        let content = match self.content_override.lock().unwrap().as_ref() {
+            Some(key) => Some(Secret::from_slice(key.expose()).expect("32 bytes")),
+            None => epoch.and_then(|epoch| {
+                self.epochs
+                    .lock()
+                    .unwrap()
+                    .get(&epoch)
+                    .map(|key| Secret::from_slice(key.expose()).expect("32 bytes"))
+            }),
+        };
+        use_keys(&self.metadata, content.as_ref());
+        Ok(())
+    }
+    fn install_epoch(
+        &self,
+        wait: SealWait,
+        set: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), InstallError>> {
+        // As the host does: the set opened with M, then the account owner
+        // opens P and installs this account's seal; the test key store is
+        // not Send, so the work is done before the future.
+        self.install_attempts.fetch_add(1, Ordering::SeqCst);
+        let result = (|| {
+            if wait.base != self.base.0 {
+                return Err(InstallError::Invalid);
+            }
+            let opened = open_seal_set(&wait, &self.metadata, &set)?;
+            let (mut account, cap, _) = self.activated().map_err(|_| InstallError::Unavailable)?;
+            let content = ready(install_sealed_epoch(
+                &mut account,
+                Arc::new(cap),
+                self.database.clone(),
+                &wait,
+                &opened,
+            ))?;
+            self.hold_epoch(content);
+            self.installs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })();
+        Box::pin(async move { result })
     }
 }
 
@@ -560,6 +1211,8 @@ pub struct Device {
     pub signer: Arc<TestSigner>,
     pub account_log: LogId,
     pub originals: Vec<Vec<u8>>,
+    /// The recovery kit's code as signup printed it, on the signup device.
+    pub kit: Option<String>,
     fixture_join: bool,
     windows: Mutex<u32>,
     /// The label and colour presence uses when this device's client starts.
@@ -595,6 +1248,7 @@ impl Device {
             &Password::new("correct horse battery staple").unwrap(),
         ))
         .unwrap();
+        let kit = account.pending_kit_code().unwrap().to_kit_text();
         // As the app's signup leaves it: the kit saved, the account home not
         // yet known to have ordered the signup history.
         account.confirm_kit_saved().unwrap();
@@ -619,6 +1273,7 @@ impl Device {
                 )
             })
             .unwrap();
+        let epochs = held_epochs(&own, &db);
         owner.authorize(id, cap.clone(), base.0).unwrap();
         let seeds = Self::seeds(&store);
         let ordinary = SigningKey::from_seed(&seeds.ordinary);
@@ -627,16 +1282,21 @@ impl Device {
             ordinary,
             seeds,
             current: Mutex::new(verified.clone()),
-            anchor: verified,
+            anchor: Mutex::new(verified),
             account: cap.account_id(),
             device: cap.device_id(),
             genesis: genesis.clone(),
             metadata,
             content,
+            epochs: Mutex::new(epochs),
             content_override: Mutex::default(),
+            epoch_asks: Mutex::default(),
+            install_attempts: AtomicUsize::new(0),
+            installs: AtomicUsize::new(0),
             database: db.clone(),
             generation: generation_for_signer,
             base,
+            fixture_join: false,
             wrong_base: AtomicBool::new(false),
             owner_lock_held: AtomicBool::new(false),
             home_ordered: Mutex::default(),
@@ -645,6 +1305,7 @@ impl Device {
             confirm_attempts: AtomicUsize::new(0),
             tamper: Mutex::default(),
             no_home_obligation: AtomicBool::new(false),
+            proofs_need_membership: AtomicBool::new(false),
             approve_controls: AtomicBool::new(true),
             approvals: Approvals::default(),
             control_requests: AtomicUsize::new(0),
@@ -655,6 +1316,12 @@ impl Device {
             signed: AtomicUsize::new(0),
             sign_time: Mutex::default(),
             sign_asked: Mutex::default(),
+            accept_attempts: AtomicUsize::new(0),
+            accepts: AtomicUsize::new(0),
+            rotations_staged: AtomicUsize::new(0),
+            refuse_rotation: AtomicBool::new(false),
+            owner_lent: AtomicBool::new(false),
+            own: OwnDirectory::default(),
         });
         Self {
             dir,
@@ -667,6 +1334,7 @@ impl Device {
                 id: account_log_id(&genesis).unwrap(),
             },
             originals: record.history,
+            kit: Some(kit),
             fixture_join: false,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
@@ -684,11 +1352,11 @@ impl Device {
     /// account history, the base's genesis record and its roots M and K by
     /// copy, as the joining bootstrap will deliver them. The base itself
     /// knows of this device only once `first` copies the addition into it.
-    pub fn join(first: &Device, hosted: &Hosted) -> Self {
-        Self::join_with_maintenance(first, hosted, true)
+    pub async fn join(first: &Device, hosted: &Hosted) -> Self {
+        Self::join_with_maintenance(first, hosted, true).await
     }
 
-    pub fn join_with_maintenance(first: &Device, hosted: &Hosted, enabled: bool) -> Self {
+    pub async fn join_with_maintenance(first: &Device, hosted: &Hosted, enabled: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let owner = Arc::new(if enabled {
             Owner::default()
@@ -708,32 +1376,29 @@ impl Device {
         .unwrap();
         let addition = first.signer.add_device(identity.keys.clone());
         hosted.edge.order_account(first.account_log, &addition);
-        let mut history =
-            DeviceJournal::from_shared(first.owner.shared_database(first.id).unwrap())
-                .load()
-                .unwrap()
-                .unwrap()
-                .history;
-        history.push(addition);
-        let refs: Vec<&[u8]> = history.iter().map(Vec::as_slice).collect();
+        let timed = hosted.confirmed_account(first.account_log).await;
+        let refs: Vec<_> = timed
+            .iter()
+            .map(|(original, evidence)| (original.as_slice(), evidence.clone()))
+            .collect();
+        let history = timed.iter().map(|(original, _)| original.clone()).collect();
         let anchor_id = first.signer.account;
-        let current = VerifiedAccount::from_genesis(anchor_id, refs[0])
-            .and_then(|mut view| view.apply_batch(&refs[1..]).map(|()| view))
-            .unwrap();
-        journal
-            .commit_verified(anchor_id, &refs, current.head(), false)
-            .unwrap();
-        owner.anchor(id, &current).unwrap();
         let mut account = Account::new(
             DeviceJournal::from_shared(db.clone()),
             store.clone(),
             protector::PlainProtector,
             generation.clone(),
         );
+        account.adopt_joined_timed(anchor_id, &refs).unwrap();
         let cap = match ready(account.activate()).unwrap() {
             AccountLoad::Active(c) => Arc::new(c),
             other => panic!("joined device not active: {other:?}"),
         };
+        let current = account.verified(&cap).unwrap().clone();
+        let anchor_head = first.signer.anchor.lock().unwrap().head();
+        let anchor = account.verified_at(&cap, anchor_head.position).unwrap();
+        assert_eq!(anchor.head(), anchor_head);
+        owner.anchor(id, &current).unwrap();
         let record = first
             .owner
             .shared_database(first.id)
@@ -754,20 +1419,26 @@ impl Device {
         let seeds = Self::seeds(&store);
         let ordinary = store.state_mut().ordinary.take().unwrap();
         let (metadata, content) = first.signer.roots();
+        let epochs = genesis_epoch(&content);
         let signer = Arc::new(TestSigner {
             ordinary,
             seeds,
-            anchor: first.signer.anchor.clone(),
+            anchor: Mutex::new(anchor),
             current: Mutex::new(current),
             account: anchor_id,
             device: identity.keys.id(),
             genesis: first.signer.genesis.clone(),
             metadata,
             content,
+            epochs: Mutex::new(epochs),
             content_override: Mutex::default(),
+            epoch_asks: Mutex::default(),
+            install_attempts: AtomicUsize::new(0),
+            installs: AtomicUsize::new(0),
             database: db.clone(),
             generation,
             base: first.base,
+            fixture_join: true,
             wrong_base: AtomicBool::new(false),
             owner_lock_held: AtomicBool::new(false),
             home_ordered: Mutex::default(),
@@ -776,6 +1447,7 @@ impl Device {
             confirm_attempts: AtomicUsize::new(0),
             tamper: Mutex::default(),
             no_home_obligation: AtomicBool::new(false),
+            proofs_need_membership: AtomicBool::new(false),
             approve_controls: AtomicBool::new(true),
             approvals: Approvals::default(),
             control_requests: AtomicUsize::new(0),
@@ -786,6 +1458,12 @@ impl Device {
             signed: AtomicUsize::new(0),
             sign_time: Mutex::default(),
             sign_asked: Mutex::default(),
+            accept_attempts: AtomicUsize::new(0),
+            accepts: AtomicUsize::new(0),
+            rotations_staged: AtomicUsize::new(0),
+            refuse_rotation: AtomicBool::new(false),
+            owner_lent: AtomicBool::new(false),
+            own: OwnDirectory::default(),
         });
         Self {
             dir,
@@ -795,6 +1473,7 @@ impl Device {
             signer,
             account_log: first.account_log,
             originals: history,
+            kit: None,
             fixture_join: true,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
@@ -824,14 +1503,17 @@ impl Device {
         };
         let own = ready(create_or_open(&mut account, cap.clone(), db.clone())).unwrap();
         let base = own.id();
-        let (metadata, content) = own
-            .with_keys(|m, k| {
-                (
-                    Secret::from_slice(m.expose()).unwrap(),
-                    Secret::from_slice(k.expose()).unwrap(),
-                )
-            })
+        let metadata = own
+            .with_metadata_key(|m| Secret::from_slice(m.expose()).unwrap())
             .unwrap();
+        // The genesis epoch's root, which the original package names.
+        let genesis_id = bh_device::base_keys::SealHeader::decode(
+            own.initial_key_package().unwrap().content_seal(),
+        )
+        .unwrap()
+        .key_id;
+        let epochs = held_epochs(&own, &db);
+        let content = Secret::from_slice(epochs[&genesis_id].expose()).unwrap();
         let current = account.verified(&cap).unwrap().clone();
         let anchor = account.verified_at(&cap, 3).unwrap();
         let record = DeviceJournal::from_shared(db.clone())
@@ -842,17 +1524,22 @@ impl Device {
         let signer = Arc::new(TestSigner {
             ordinary: SigningKey::from_seed(&seeds.ordinary),
             seeds,
-            anchor,
+            anchor: Mutex::new(anchor),
             current: Mutex::new(current),
             account: cap.account_id(),
             device: cap.device_id(),
             genesis: genesis.clone(),
             metadata,
             content,
+            epochs: Mutex::new(epochs),
             content_override: Mutex::default(),
+            epoch_asks: Mutex::default(),
+            install_attempts: AtomicUsize::new(0),
+            installs: AtomicUsize::new(0),
             database: db.clone(),
             generation,
             base,
+            fixture_join: false,
             wrong_base: AtomicBool::new(false),
             owner_lock_held: AtomicBool::new(false),
             home_ordered: Mutex::default(),
@@ -861,6 +1548,7 @@ impl Device {
             confirm_attempts: AtomicUsize::new(0),
             tamper: Mutex::default(),
             no_home_obligation: AtomicBool::new(false),
+            proofs_need_membership: AtomicBool::new(false),
             approve_controls: AtomicBool::new(false),
             approvals: Approvals::default(),
             control_requests: AtomicUsize::new(0),
@@ -871,6 +1559,12 @@ impl Device {
             signed: AtomicUsize::new(0),
             sign_time: Mutex::default(),
             sign_asked: Mutex::default(),
+            accept_attempts: AtomicUsize::new(0),
+            accepts: AtomicUsize::new(0),
+            rotations_staged: AtomicUsize::new(0),
+            refuse_rotation: AtomicBool::new(false),
+            owner_lent: AtomicBool::new(false),
+            own: OwnDirectory::default(),
         });
         Self {
             dir,
@@ -883,6 +1577,7 @@ impl Device {
                 id: account_log_id(&genesis).unwrap(),
             },
             originals: record.history,
+            kit: None,
             fixture_join: false,
             windows: Mutex::new(0),
             presence: Mutex::new(None),
@@ -902,8 +1597,8 @@ impl Device {
             nonce: [71; 32],
         };
         let binding = bh_event::Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: self.log().id,
             audience: [0; 32],
@@ -931,6 +1626,102 @@ impl Device {
             &self.signer.ordinary,
             &self.signer.metadata,
             Some(&self.signer.content),
+        )
+        .unwrap();
+        hosted.edge.order(
+            self.log(),
+            &encoded.descriptor,
+            Some(encoded.body),
+            bh_sync::Route::Content,
+        )
+    }
+
+    /// This device's `ACCOUNT_REKEY` installing `root` as its base's new
+    /// content key, carrying `rotation` with its ordering `confirmation`,
+    /// signed with its ordinary key, and the seal set it commits to.
+    pub fn prepare_rekey(
+        &self,
+        rotation: &[u8],
+        confirmation: &[u8],
+        root: &Secret<32>,
+        seals: Vec<Vec<u8>>,
+    ) -> (bh_event::Encoded, bh_sync::BodyObject) {
+        let anchor = self.signer.anchor.lock().unwrap().clone();
+        let prepared = self
+            .owner
+            .prepare_rekey(
+                self.id,
+                &anchor,
+                &self.signer.metadata,
+                rotation,
+                confirmation,
+                root,
+                seals,
+            )
+            .unwrap();
+        let signature = self.signer.ordinary.sign(prepared.control.signing_bytes());
+        let control = prepared.control.finish(signature).unwrap();
+        (control, prepared.seal_set)
+    }
+    /// This device's base metadata root, as the client hands it to the
+    /// service for a base control.
+    pub fn metadata_key(&self) -> bh_authz::proto::MetadataKey {
+        bh_authz::proto::MetadataKey::new(&self.signer.metadata)
+    }
+    /// As `remote_note`, a first paragraph `text` sealed under `root`, the
+    /// content key of the epoch this device's verified history is in.
+    pub fn remote_note_under(
+        &self,
+        hosted: &Hosted,
+        root: &Secret<32>,
+        note: [u8; 32],
+        text: &str,
+    ) -> u64 {
+        let progress = self.progress();
+        let (position, hash) = progress.account.unwrap();
+        let writer = bh_event::writer::DeviceWriterDeclaration {
+            account: self.signer.account.0,
+            device: self.signer.device.0,
+            nonce: [72; 32],
+        };
+        let delta = Note::with_writer(writer.client_id(bh_event::writer::WriterScope {
+            base: self.log().id,
+            audience: [0; 32],
+            note,
+        }))
+        .unwrap()
+        .try_append_paragraph(text)
+        .unwrap();
+        let binding = bh_event::Binding {
+            version: 3,
+            highest: 3,
+            mode: 0,
+            base: self.log().id,
+            audience: [0; 32],
+            epoch: bh_event::key_id(root),
+            event_id: bh_sync::EventId(bh_crypto::random()),
+            account: self.signer.account,
+            device: self.signer.device,
+            account_head: AccountHead { position, hash },
+            seen: bh_sync::Head {
+                position: progress.position,
+                hash: bh_sync::Digest(progress.head_hash),
+            },
+            seen_control: progress.control_digest,
+            class: bh_event::CLASS_CONTENT,
+            padded: 0,
+            commitment: [0; 32],
+            seen_receipt: progress.receipt.unwrap(),
+        };
+        let encoded = bh_event::seal(
+            binding,
+            bh_event::Payload {
+                kind: bh_event::NOTE,
+                data: &bh_event::note_payload(note, writer, &delta),
+            },
+            &self.signer.ordinary,
+            &self.signer.metadata,
+            Some(root),
         )
         .unwrap();
         hosted.edge.order(
@@ -1022,7 +1813,9 @@ impl Device {
     /// client did, leaving only the retained initial bootstrap.
     pub fn clear_pending_as_earlier_client(&self) {
         let (mut account, _, _) = self.signer.activated().unwrap();
-        account.confirm_home_ordered(self.retained().head).unwrap();
+        account
+            .confirm_home_ordered(self.retained().head, None)
+            .unwrap();
     }
     /// Whether the first-device setup still waits for the account home.
     pub fn home_pending(&self) -> bool {
@@ -1043,7 +1836,7 @@ impl Device {
     pub fn label_presence(&self, label: &str, colour: u8) {
         *self.presence.lock().unwrap() = Some((label.to_owned(), colour));
     }
-    /// This device's content root, as `with_base_keys` gives the client.
+    /// This device's genesis epoch content root.
     pub fn content_key(&self) -> Secret<32> {
         Secret::from_slice(self.signer.content.expose()).unwrap()
     }
@@ -1085,6 +1878,8 @@ impl Device {
             },
             build_floor: 1,
             appraisal: Appraisal::Synthetic,
+            device_clock: hosted.edge.clock.clone(),
+            recovery_key: hosted.edge.recovery_certificate(),
         }
     }
 
@@ -1139,6 +1934,8 @@ impl Device {
             Tuning {
                 pacing: hosted.edge.pacing(),
                 commit_delay: costs.commit,
+                seen_window: *hosted.edge.seen_window.lock().unwrap(),
+                ..Tuning::default()
             },
         );
         if let Some((label, colour)) = self.presence.lock().unwrap().clone() {
@@ -1346,7 +2143,7 @@ impl Device {
         // its saved native seeds and base roots after opening the database.
         let fixture = if self.fixture_join {
             Some((
-                self.signer.anchor.clone(),
+                self.signer.anchor.lock().unwrap().clone(),
                 self.signer.current.lock().unwrap().clone(),
                 self.signer.account,
                 self.signer.device,
@@ -1377,22 +2174,28 @@ impl Device {
             .1
             .unwrap();
         if let Some((anchor, current, account, identity, genesis, (metadata, content))) = fixture {
+            let epochs = genesis_epoch(&content);
             let generation = AccountGeneration::new();
             let db = owner.shared_database(id).unwrap();
             let signer = Arc::new(TestSigner {
                 ordinary: SigningKey::from_seed(&seeds.ordinary),
                 seeds,
-                anchor,
-                current: Mutex::new(current.clone()),
+                anchor: Mutex::new(anchor),
+                current: Mutex::new(current),
                 account,
                 device: identity,
                 genesis,
                 metadata,
                 content,
+                epochs: Mutex::new(epochs),
                 content_override: Mutex::default(),
+                epoch_asks: Mutex::default(),
+                install_attempts: AtomicUsize::new(0),
+                installs: AtomicUsize::new(0),
                 database: db,
                 generation,
                 base: BaseId(self.base.0),
+                fixture_join: true,
                 wrong_base: AtomicBool::new(false),
                 owner_lock_held: AtomicBool::new(false),
                 home_ordered: Mutex::default(),
@@ -1401,6 +2204,7 @@ impl Device {
                 confirm_attempts: AtomicUsize::new(0),
                 tamper: Mutex::default(),
                 no_home_obligation: AtomicBool::new(false),
+                proofs_need_membership: AtomicBool::new(false),
                 approve_controls: AtomicBool::new(true),
                 approvals: Approvals::default(),
                 control_requests: AtomicUsize::new(0),
@@ -1411,6 +2215,12 @@ impl Device {
                 signed: AtomicUsize::new(0),
                 sign_time: Mutex::default(),
                 sign_asked: Mutex::default(),
+                accept_attempts: AtomicUsize::new(0),
+                accepts: AtomicUsize::new(0),
+                rotations_staged: AtomicUsize::new(0),
+                refuse_rotation: AtomicBool::new(false),
+                owner_lent: AtomicBool::new(false),
+                own: OwnDirectory::default(),
             });
             let device = Self {
                 dir,
@@ -1420,10 +2230,17 @@ impl Device {
                 signer,
                 account_log,
                 originals,
+                kit: None,
                 fixture_join: true,
                 windows: Mutex::new(0),
                 presence: Mutex::new(None),
             };
+            // The account as the reopened owner verifies it, with its times.
+            let (account, cap, _) = device.signer.account_owner();
+            let current = account.verified(&cap).unwrap().clone();
+            let at = device.signer.anchor.lock().unwrap().head().position;
+            *device.signer.anchor.lock().unwrap() = account.verified_at(&cap, at).unwrap();
+            *device.signer.current.lock().unwrap() = current.clone();
             device.owner.anchor(id, &current).unwrap();
             device.authorize().unwrap();
             device

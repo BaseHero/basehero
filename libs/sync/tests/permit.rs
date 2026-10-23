@@ -6,12 +6,14 @@ use bh_sync::{Digest, EventId, Head};
 
 #[test]
 fn published_ordering_proof_requires_root_route_descriptor_receipt_and_exact_head() {
-    use bh_sync::{BaseId, Commitment, OpaqueEvent, Route};
+    use bh_sync::{BaseId, Commitment, OpaqueEvent, OrderState, Route};
     let genesis = OpaqueEvent::new(EventId([1; 32]), vec![2; 1024]).unwrap();
     let base = BaseId(genesis.digest().0);
-    let genesis_order = Commitment::order(base, Head::EMPTY, &genesis, Route::Control).unwrap();
+    let genesis_order =
+        Commitment::order(base, OrderState::EMPTY, &genesis, Route::Control).unwrap();
     let event = OpaqueEvent::new(EventId([2; 32]), vec![3; 1024]).unwrap();
-    let commitment = Commitment::order(base, genesis_order.head(), &event, Route::Content).unwrap();
+    let commitment =
+        Commitment::order(base, genesis_order.after(), &event, Route::Content).unwrap();
     let cert = receipt::verify_certificate(
         &key(1).public(),
         &receipt::certify(&key(1), key(2).public()),
@@ -24,7 +26,7 @@ fn published_ordering_proof_requires_root_route_descriptor_receipt_and_exact_hea
     };
     let ack = AppendAck {
         log,
-        event: event.id(),
+        event: event.publication_id(Route::Content),
         head: commitment.head(),
         receipt: Some(signed),
     };
@@ -90,6 +92,108 @@ fn published_ordering_proof_requires_root_route_descriptor_receipt_and_exact_hea
     let mut noncanonical = commitment.encode();
     noncanonical.push(0);
     assert!(check(&ack, &event, &noncanonical).is_err());
+}
+
+#[test]
+fn directory_and_retire_scopes_round_trip_and_refuse_base_logs() {
+    let account = LogId {
+        kind: LogKind::Account,
+        id: [3; 32],
+    };
+    for scope in [
+        Scope::ReadDirectory { log: account },
+        Scope::StoreDirectoryEntry {
+            log: account,
+            entry: [4; 32],
+            version: 7,
+            body: Digest([5; 32]),
+            len: 1024,
+        },
+        Scope::RetireHomeObjects {
+            log: account,
+            prefix_digest: Digest([6; 32]),
+        },
+    ] {
+        let p = permit(scope.clone());
+        assert_eq!(permit::verify(key(1).public(), &signed(&p), 1000), Ok(p));
+        let base_scope = match scope {
+            Scope::ReadDirectory { .. } => Scope::ReadDirectory { log: log() },
+            Scope::StoreDirectoryEntry {
+                entry,
+                version,
+                body,
+                len,
+                ..
+            } => Scope::StoreDirectoryEntry {
+                log: log(),
+                entry,
+                version,
+                body,
+                len,
+            },
+            Scope::RetireHomeObjects { prefix_digest, .. } => Scope::RetireHomeObjects {
+                log: log(),
+                prefix_digest,
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            permit::verify(key(1).public(), &signed(&permit(base_scope)), 1000),
+            Err(PermitError::Bounds)
+        );
+    }
+}
+
+#[test]
+fn bounded_control_scope_roundtrip_and_strict_decoding() {
+    let p = permit(Scope::ReadControlRange {
+        log: log(),
+        after: 1,
+        through: (1 << 53) - 1,
+    });
+    let bytes = signed(&p);
+    assert_eq!(bytes[132], 14);
+    assert_eq!(permit::verify(key(1).public(), &bytes, 1000), Ok(p));
+    let internal = permit(Scope::ReadControls {
+        log: log(),
+        after: 1,
+    });
+    assert_eq!(signed(&internal)[132], 6);
+    for invalid in [
+        Scope::ReadControlRange {
+            log: log(),
+            after: 2,
+            through: 1,
+        },
+        Scope::ReadControlRange {
+            log: log(),
+            after: 0,
+            through: 1 << 53,
+        },
+        Scope::ReadControlRange {
+            log: log(),
+            after: 1 << 53,
+            through: 1 << 53,
+        },
+    ] {
+        assert_eq!(
+            permit::verify(key(1).public(), &signed(&permit(invalid)), 1000),
+            Err(PermitError::Bounds)
+        );
+    }
+    let body_end = bytes.len() - 64;
+    let mut trailing = bytes.clone();
+    trailing.insert(body_end, 0);
+    assert_eq!(
+        permit::verify(key(1).public(), &trailing, 1000),
+        Err(PermitError::Encoding)
+    );
+    let mut truncated = bytes.clone();
+    truncated.remove(body_end - 1);
+    assert_eq!(
+        permit::verify(key(1).public(), &truncated, 1000),
+        Err(PermitError::Encoding)
+    );
 }
 
 fn key(byte: u8) -> SigningKey {
@@ -165,12 +269,13 @@ fn permit_roundtrip_and_verify() {
             position: 8,
             hash: Digest([9; 32]),
         }),
+        attached: None,
     });
     let bytes = signed(&p);
     assert_eq!(permit::verify(key(1).public(), &bytes, p.issued_ms), Ok(p));
     assert_eq!(
         bytes.len(),
-        130 + 2 + 1 + 33 + 32 + 1 + 32 + 32 + 1 + 40 + 8 + 8 + 16 + 64
+        130 + 2 + 1 + 33 + 32 + 1 + 32 + 32 + 1 + 40 + 1 + 8 + 8 + 16 + 64
     );
     let cert = permit::certify(&key(1), key(2).public());
     assert_eq!(&bytes[..130], &cert);
@@ -372,6 +477,7 @@ fn debug_redacts_log_id_batch_and_digests() {
                 position: 1,
                 hash: Digest([0xef; 32]),
             }),
+            attached: None,
         },
         Scope::Subscribe { log },
     ];
@@ -447,4 +553,40 @@ fn issued_time_is_read_without_trusting_it() {
     let mut longer = bytes.clone();
     longer.insert(140, 0);
     assert!(permit::issued_ms(&longer).is_err());
+}
+
+#[test]
+fn attached_body_only_on_a_control_with_another_body() {
+    let append = |body, after, attached| Scope::Append {
+        log: log(),
+        event: Digest([5; 32]),
+        body,
+        epoch: [7; 32],
+        after,
+        attached,
+    };
+    let head = Some(Head {
+        position: 8,
+        hash: Digest([9; 32]),
+    });
+    let (own, set) = (Some(Digest([6; 32])), Some(Digest([10; 32])));
+    let p = permit(append(own, head, set));
+    let bytes = signed(&p);
+    assert_eq!(permit::verify(key(1).public(), &bytes, p.issued_ms), Ok(p));
+    assert_eq!(
+        bytes.len(),
+        130 + 2 + 1 + 33 + 32 + 1 + 32 + 32 + 1 + 40 + 1 + 32 + 8 + 8 + 16 + 64
+    );
+    for (name, scope) in [
+        ("content", append(own, None, set)),
+        ("no body of its own", append(None, head, set)),
+        ("its own body again", append(own, head, own)),
+    ] {
+        let p = permit(scope);
+        assert_eq!(
+            permit::verify(key(1).public(), &signed(&p), p.issued_ms),
+            Err(PermitError::Bounds),
+            "{name}"
+        );
+    }
 }

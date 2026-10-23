@@ -44,7 +44,7 @@ fn copied(device: &Device) -> u64 {
 /// Two devices of one account on the first one's base, both caught up.
 async fn two(hosted: &Arc<Hosted>) -> (Device, Started, Device, Started) {
     let (mac, mac_client) = one(hosted).await;
-    let fold = Device::join(&mac, hosted);
+    let fold = Device::join(&mac, hosted).await;
     until(60, "addition copied", || copied(&mac) == 4).await;
     let fold_client = fold.start(hosted);
     until(60, "joined device caught up", || {
@@ -697,7 +697,7 @@ async fn a_control_between_seal_and_enqueue_sends_nothing_under_the_old_fence() 
     let sealed = mac.package(a).expect("sealed before connecting");
     let control = mac.progress().control_digest;
     // Another device joins: this one copies the addition into its base.
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     until(30, "addition copied", || copied(&mac) == 4).await;
     assert_ne!(mac.progress().control_digest, control, "a control applied");
     let control_at = mac.progress().position;

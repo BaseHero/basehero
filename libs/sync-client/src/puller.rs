@@ -23,16 +23,19 @@
 //! authority is still current.
 use crate::{
     ClientError, Shared,
+    account_evidence::{self, Session},
     backoff::Backoff,
+    controls,
     copier::{self, Copier},
     data::Answers,
+    directory,
     outbox::{self, Fail, Link, usable_until},
     register,
+    rekey::{self, SealRetries},
     scheduler::{PublishFacts, Readiness, ReceiveFacts},
+    trust,
 };
-use bh_authz_proto::{
-    FromService, ReadBatchResult, Refusal, ToService, Want, account_log_id, account_log_unwrap,
-};
+use bh_authz_proto::{FromService, ReadBatchResult, Refusal, ToService, Want, account_log_id};
 use bh_device::{
     OwnerError,
     incoming::{StopReason, VerifiedBatch},
@@ -40,7 +43,7 @@ use bh_device::{
 use bh_event::Outcome;
 use bh_storage::sync_state::LogProgress;
 use bh_sync::{
-    BaseId, BodyObject, Commitment, Digest, Head, OpaqueEvent,
+    BaseId, BodyObject, Commitment, Digest, Head, OpaqueEvent, Route,
     permit::{self, LogId, LogKind, Scope},
     receipt::{self, RECEIPT_LEN},
     referenced_body,
@@ -81,16 +84,7 @@ struct HeldRetries {
 }
 impl HeldRetries {
     fn permit(&mut self, key: bh_storage::NoteKey, now: Instant) -> bool {
-        let entry = self
-            .notes
-            .entry(key)
-            .or_insert((now, Duration::from_secs(1)));
-        if now < entry.0 {
-            return false;
-        }
-        entry.0 = now + entry.1;
-        entry.1 = (entry.1 * 2).min(Duration::from_secs(60));
-        true
+        crate::backoff::permit(&mut self.notes, key, now)
     }
     fn retry(&mut self, shared: &Shared) -> Result<bool, Fail> {
         let database = local(shared.owner.shared_database(shared.container))?;
@@ -166,6 +160,8 @@ struct Subscription {
 pub(crate) struct Receiver {
     log: Option<LogId>,
     retries: HeldRetries,
+    /// When each rekey's seal set is read again.
+    seals: SealRetries,
     base: Option<Subscription>,
     account: Option<Subscription>,
     /// The highest base head known to exist, proven by a hosting receipt.
@@ -179,6 +175,10 @@ pub(crate) struct Receiver {
     /// it moved on.
     pub(crate) tail_known: bool,
     pub(crate) held: Held,
+    /// The control feed's scan in this pass reached the control head the
+    /// service verified: its covered state is the base's current control
+    /// state.
+    pub(crate) controls_current: bool,
     /// The highest account-log position a notice mentioned.
     pub(crate) account_hint: u64,
     /// Told each committed batch's head, while a joined device bootstraps.
@@ -481,6 +481,18 @@ pub(crate) async fn pull(
     }
     let mut committed = receiver.retries.retry(shared)?;
     subscribe(shared, link, receiver, log, start.position).await?;
+    // The metadata-only control feed runs ahead of content when it is due;
+    // content below never passes a control it has not judged.
+    let mut scans = 0;
+    let mut scan_failed = None;
+    receiver.controls_current = false;
+    if controls::due(shared, log, receiver)? {
+        scans += 1;
+        scan_failed = controls::follow(shared, link, log).await.err();
+        receiver.controls_current = scan_failed.is_none();
+    }
+    // A key content waits for may have arrived since: install it first.
+    committed |= rekey::install_waiting(shared, link, log, &mut receiver.seals).await?;
     for _ in 0..PASS {
         let progress = progress(shared, log)?;
         if progress.stopped.is_some() || receiver.caught_up(progress.position) {
@@ -505,6 +517,13 @@ pub(crate) async fn pull(
                     break;
                 }
             }
+            Batch::Held(Held::Missing)
+                if rekey::install_waiting(shared, link, log, &mut receiver.seals).await? =>
+            {
+                // The key this content waited for, from a rekey judged in
+                // this pass: read on with it.
+                committed = true;
+            }
             Batch::Held(held) => {
                 receiver.held = held;
                 // Whatever committed before the wait is kept; try again later.
@@ -513,9 +532,27 @@ pub(crate) async fn pull(
                     _ => Err(Fail::Missing),
                 };
             }
+            Batch::Unjudged { committed: moved } => {
+                committed |= moved;
+                // Scan the controls for it, and once more in a pass whose
+                // earlier scan succeeded: the control may have come after
+                // that scan's endpoint. Until one judges it, content waits.
+                if scan_failed.is_none() && scans < 2 {
+                    scans += 1;
+                    scan_failed = controls::follow(shared, link, log).await.err();
+                    receiver.controls_current = scan_failed.is_none();
+                } else {
+                    scan_failed.get_or_insert(Fail::Missing);
+                }
+                if let Some(fail) = scan_failed {
+                    receiver.held = Held::Missing;
+                    return Err(fail);
+                }
+            }
             Batch::Stopped => break,
         }
     }
+    // A scan that failed before content needed it is tried again when due.
     Ok(committed)
 }
 
@@ -527,6 +564,11 @@ enum Batch {
         more: bool,
     },
     Held(Held),
+    /// Content reached a control the control feed has not judged;
+    /// `committed` if content before it committed.
+    Unjudged {
+        committed: bool,
+    },
     Stopped,
 }
 
@@ -584,7 +626,12 @@ async fn read_events_with_permit(
         .await
         .map_err(|_| Fail::Network)?;
     match response {
-        Response::Events { items, receipt, .. } => Ok((items, receipt)),
+        Response::Events {
+            items,
+            receipt,
+            coverage: None,
+            ..
+        } => Ok((items, receipt)),
         other => Err(Fail::from_response(&other)),
     }
 }
@@ -770,7 +817,7 @@ pub(crate) fn ordered_events(
 /// The bodies of a prefix of `events`, in order: `None` for an event that
 /// names no readable body (History judges it without one). Stops at the
 /// byte budget, and at a body the log says is missing (`true`).
-async fn read_bodies(
+pub(crate) async fn read_bodies(
     shared: &Shared,
     link: &mut Link,
     log: LogId,
@@ -992,12 +1039,54 @@ async fn batch(
     let mut events = Vec::with_capacity(bodies.len());
     let mut stop = false;
     let mut held = missing.then_some(Held::Missing);
+    let mut unjudged = false;
+    // The feed has facts only up to its control cursor, and its verified
+    // coverage proves there is no other control up to `covered`.
+    let judged = local(shared.owner.control_after(shared.container, log))?;
+    let covered = local(shared.owner.control_coverage(shared.container, log))?.unwrap_or(0);
     for ((ordered, event), body) in ordered.iter().zip(&bodies) {
+        // Content passes a control only once the control feed judged that
+        // very control. Another event at a judged control's position, or
+        // content there, is a second head at it, and so is a control where
+        // the feed's coverage proved none: each proven under the pinned
+        // root.
+        let head = ordered.head();
+        let fact = if head.position <= judged {
+            local(
+                shared
+                    .owner
+                    .control_fact(shared.container, log, head.position),
+            )?
+        } else {
+            None
+        };
+        match (ordered.route(), fact) {
+            (Route::Control, Some(f))
+                if f.head_hash == head.hash.0 && f.digest == ordered.event_digest().0 => {}
+            (_, Some(_)) => {
+                stop = true;
+                break;
+            }
+            (Route::Control, None) if head.position <= covered => {
+                stop = true;
+                break;
+            }
+            (Route::Control, None) => {
+                unjudged = true;
+                break;
+            }
+            (Route::Content, None) => {}
+        }
+        // Each event opens with its own epoch's key, as the host holds it:
+        // none for a closed epoch or one whose key is missing, never another.
+        // History judges a control with M alone, and waits at content whose
+        // key it lacks.
         let mut prepared = None;
+        let epoch = history.epoch_id();
         shared
             .signer
-            .with_base_keys(base, &mut |m, k| {
-                prepared = Some(history.prepare(ordered, event, body.as_deref(), m, Some(k)));
+            .with_epoch_keys(base, epoch, &mut |m, k| {
+                prepared = Some(history.prepare(ordered, event, body.as_deref(), m, k));
             })
             .map_err(|_| Fail::Authorization)?;
         match prepared.ok_or(Fail::Authorization)? {
@@ -1065,6 +1154,11 @@ async fn batch(
         )?;
         return Ok(Batch::Stopped);
     }
+    if unjudged {
+        return Ok(Batch::Unjudged {
+            committed: reached.is_some(),
+        });
+    }
     if let Some(held) = held {
         return Ok(Batch::Held(held));
     }
@@ -1076,27 +1170,49 @@ async fn batch(
     }
 }
 
-/// The account originals the account log orders from position `first`, at
-/// most one read's worth, each the exact canonical wrapping its commitment
-/// names; and whether the read was full. The account owner verifies them.
+/// One verified account outer page. Its first opening must equal the durable
+/// checkpoint, independently of the inner signed account history; `prior`
+/// is the verified time of the entry at that checkpoint, when it has one.
+/// Returns the page, whether it was full, and whether the accepted head is
+/// past it.
 pub(crate) async fn read_account(
     shared: &Shared,
     link: &mut Link,
     log: LogId,
-    first: u64,
-) -> Result<(Vec<Vec<u8>>, bool), Fail> {
-    let (items, _) = read_events(shared, link, log, first, first + BATCH - 1).await?;
-    let full = items.len() as u64 == BATCH;
-    let ordered = ordered_events(BaseId(log.id), first, &items)?;
-    let mut originals = Vec::with_capacity(ordered.len());
-    for (commitment, event) in &ordered {
-        if commitment.route() != bh_sync::Route::Control {
-            return Err(Fail::Network);
-        }
-        let (original, _) = account_log_unwrap(event).map_err(|_| Fail::Network)?;
-        originals.push(original.to_vec());
+    before: bh_sync::OrderState,
+    prior: Option<bh_sync::evidence::TimeBounds>,
+) -> Result<
+    (
+        Vec<account_evidence::VerifiedEvent>,
+        bh_sync::evidence::AcceptedHead,
+        bool,
+        bool,
+    ),
+    Fail,
+> {
+    let identity = shared.signer.identity().map_err(|_| Fail::Authorization)?;
+    let first = before.position().checked_add(1).ok_or(Fail::Network)?;
+    let last = first.checked_add(BATCH - 1).ok_or(Fail::Network)?;
+    if log.id != account_log_id(&identity.genesis).map_err(|_| Fail::Network)? {
+        return Err(Fail::Network);
     }
-    Ok((originals, full))
+    let page = account_evidence::read(
+        shared,
+        link,
+        &identity.genesis,
+        before,
+        prior,
+        last,
+        Session::Normal,
+    )
+    .await?;
+    let full = page.events.len() as u64 == BATCH;
+    let ahead = page.accepted.original_head.position
+        > page
+            .events
+            .last()
+            .map_or(before.position(), |e| e.opening.position());
+    Ok((page.events, page.accepted, full, ahead))
 }
 
 /// How often the receiver passes without a wake, notice or other reason.
@@ -1129,6 +1245,9 @@ async fn receive(
     let mut receiver = Receiver::default();
     receiver.watch(shared, Some(publish));
     let mut copier = Copier::default();
+    let mut trust = trust::Trust::default();
+    let mut directory = directory::Directory::default();
+    let mut notices = crate::notices::Notices::default();
     let mut ready = Readiness::new(facts);
     let mut backoff = Backoff::default();
     loop {
@@ -1153,6 +1272,22 @@ async fn receive(
             }
             copier.follow |= receiver.take_follow_account();
             match copier::step(shared, link, &mut copier, &mut receiver, log, &mut ready).await {
+                Ok(moved) => progressed |= moved,
+                Err(fail) => waiting = outbox::worse(waiting, fail),
+            }
+            // The account's trust lane, then the directory: both follow the
+            // account only through the copier's next step.
+            match trust::step(shared, link, &mut trust, &mut copier, &mut ready).await {
+                Ok(moved) => progressed |= moved,
+                Err(fail) => waiting = outbox::worse(waiting, fail),
+            }
+            // The home's kit-used notices, at start and after each followed
+            // account entry.
+            match crate::notices::step(shared, &mut notices).await {
+                Ok(moved) => progressed |= moved,
+                Err(fail) => waiting = outbox::worse(waiting, fail),
+            }
+            match directory::step(shared, link, &mut directory, &mut copier, log).await {
                 Ok(moved) => progressed |= moved,
                 Err(fail) => waiting = outbox::worse(waiting, fail),
             }

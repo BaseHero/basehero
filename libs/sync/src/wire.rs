@@ -2,7 +2,7 @@
 //! authenticates nothing: consumers verify the permit and original event bytes.
 use std::fmt;
 
-use crate::{Commitment, Digest, Head, receipt::RECEIPT_LEN};
+use crate::{Commitment, Digest, Head, OrderState, receipt::RECEIPT_LEN};
 
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024 + 64 * 1024;
 /// Maximum length of one opaque sealed presence frame.
@@ -11,12 +11,30 @@ const PRESENCE_JOIN_TAG: u8 = 33;
 const PRESENCE_REQUEST_TAG: u8 = 34;
 const PRESENCE_RESPONSE_TAG: u8 = 35;
 const PEERS_TAG: u8 = 36;
-const VERSION: u16 = 1;
-const COMPOUND_VERSION: u16 = 2;
+const DIRECTORY_READ_TAG: u8 = 37;
+const DIRECTORY_STORE_TAG: u8 = 38;
+const HOME_RETIRE_TAG: u8 = 39;
+const DIRECTORY_MAX_BODY: usize = 65536;
+/// Data transport version; independent of the opaque event framing version.
+const VERSION: u16 = 3;
 const COMPOUND_TAG: u8 = 32;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Request {
+    ReadDirectory {
+        id: u32,
+        permit: Vec<u8>,
+        after: Option<[u8; 32]>,
+    },
+    StoreDirectoryEntry {
+        id: u32,
+        permit: Vec<u8>,
+        body: Vec<u8>,
+    },
+    RetireHomeObjects {
+        id: u32,
+        permit: Vec<u8>,
+    },
     StoreHomeObjects {
         id: u32,
         permit: Vec<u8>,
@@ -36,7 +54,7 @@ pub enum Request {
         permit: Vec<u8>,
         event: Vec<u8>,
     },
-    /// Version 2/tag 32: four length-prefixed blobs in field order. Both
+    /// Version 3/tag 32: four length-prefixed blobs in field order. Both
     /// existing grants bind the immutable descriptor and body separately.
     Publish {
         id: u32,
@@ -64,11 +82,29 @@ pub enum Request {
         sealed: Vec<u8>,
     },
 }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CoverageEndpoint {
+    pub order: OrderState,
+    /// None only for the genuinely empty log.
+    pub receipt: Option<[u8; RECEIPT_LEN]>,
+}
+
 // Keep the fixed receipt inline (336-byte enum) rather than allocating for
 // every bounded read. DataSocket queues encoded frames, not these enums.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq)]
 pub enum Response {
+    Directory {
+        id: u32,
+        entries: Vec<Vec<u8>>,
+        more: bool,
+    },
+    DirectoryEntryStored {
+        id: u32,
+    },
+    HomeObjectsRetired {
+        id: u32,
+    },
     HomeObjectsStored {
         id: u32,
         prefix_digest: Digest,
@@ -82,6 +118,8 @@ pub enum Response {
         /// Encoding: after count, flag 0/1 and exactly RECEIPT_LEN bytes if 1,
         /// then the count's commitment/descriptor pairs.
         receipt: Option<[u8; RECEIPT_LEN]>,
+        /// Distinct sparse endpoint. Absent on full and account reads.
+        coverage: Option<CoverageEndpoint>,
     },
     Body {
         id: u32,
@@ -96,8 +134,8 @@ pub enum Response {
         id: u32,
         ack: Vec<u8>,
     },
-    /// Version 2/tag 32: one length-prefixed legacy AppendAck, then exactly
-    /// 179 canonical commitment bytes. Ordering proof, not author acceptance.
+    /// Version 3/tag 32: one length-prefixed AppendAck, then exactly
+    /// 149 canonical commitment bytes. Ordering proof, not author acceptance.
     Published {
         id: u32,
         ack: Vec<u8>,
@@ -129,6 +167,9 @@ impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (name, id) = match self {
             Self::Read { id, .. } => ("Read", id),
+            Self::ReadDirectory { id, .. } => ("ReadDirectory", id),
+            Self::StoreDirectoryEntry { id, .. } => ("StoreDirectoryEntry", id),
+            Self::RetireHomeObjects { id, .. } => ("RetireHomeObjects", id),
             Self::StoreHomeObjects { id, .. } => ("StoreHomeObjects", id),
             Self::Stage { id, .. } => ("Stage", id),
             Self::Append { id, .. } => ("Append", id),
@@ -147,6 +188,9 @@ impl fmt::Debug for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (name, id) = match self {
             Self::Events { id, .. } => ("Events", id),
+            Self::Directory { id, .. } => ("Directory", id),
+            Self::DirectoryEntryStored { id } => ("DirectoryEntryStored", id),
+            Self::HomeObjectsRetired { id } => ("HomeObjectsRetired", id),
             Self::HomeObjectsStored { id, .. } => ("HomeObjectsStored", id),
             Self::Body { id, .. } => ("Body", id),
             Self::Staged { id } => ("Staged", id),
@@ -223,14 +267,7 @@ impl Input<'_> {
 }
 fn header(tag: u8, id: u32, capacity: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(capacity);
-    out.extend(
-        (if (COMPOUND_TAG..=PEERS_TAG).contains(&tag) {
-            COMPOUND_VERSION
-        } else {
-            VERSION
-        })
-        .to_be_bytes(),
-    );
+    out.extend(VERSION.to_be_bytes());
     out.push(tag);
     out.extend(id.to_be_bytes());
     out
@@ -261,10 +298,7 @@ fn decode_header(bytes: &[u8]) -> Result<(u8, u32, Input<'_>), Error> {
     let mut input = Input(bytes);
     let version = u16::from_be_bytes(input.array()?);
     let tag = input.array::<1>()?[0];
-    if !matches!(
-        (version, tag),
-        (VERSION, 1..=7) | (COMPOUND_VERSION, COMPOUND_TAG..=PEERS_TAG)
-    ) {
+    if version != VERSION || !matches!(tag, 1..=7 | COMPOUND_TAG..=HOME_RETIRE_TAG) {
         return Err(Error::Version);
     }
     let id = u32::from_be_bytes(input.array()?);
@@ -275,6 +309,9 @@ impl Request {
     pub fn encoded_len(&self) -> Result<usize, Error> {
         let permit = match self {
             Self::Read { permit, .. }
+            | Self::ReadDirectory { permit, .. }
+            | Self::StoreDirectoryEntry { permit, .. }
+            | Self::RetireHomeObjects { permit, .. }
             | Self::Stage { permit, .. }
             | Self::Append { permit, .. }
             | Self::Subscribe { permit, .. }
@@ -304,10 +341,18 @@ impl Request {
         let size = checked_blob(7, permit)?;
         match self {
             Self::Read { .. }
+            | Self::RetireHomeObjects { .. }
             | Self::Credit { .. }
             | Self::Publish { .. }
             | Self::PresenceJoin { .. }
             | Self::Presence { .. } => Ok(size),
+            Self::ReadDirectory { after, .. } => {
+                checked_size(size, 1 + if after.is_some() { 32 } else { 0 })
+            }
+            Self::StoreDirectoryEntry { body, .. } if body.len() <= DIRECTORY_MAX_BODY => {
+                checked_blob(size, body)
+            }
+            Self::StoreDirectoryEntry { .. } => Err(Error::Size),
             Self::Stage { body, .. } => checked_blob(size, body),
             Self::Append { event, .. } => checked_blob(size, event),
             Self::Subscribe { .. } => checked_size(size, 8),
@@ -321,6 +366,9 @@ impl Request {
         let length = self.encoded_len()?;
         let (tag, id, permit) = match self {
             Self::Read { id, permit } => (1, *id, permit),
+            Self::ReadDirectory { id, permit, .. } => (DIRECTORY_READ_TAG, *id, permit),
+            Self::StoreDirectoryEntry { id, permit, .. } => (DIRECTORY_STORE_TAG, *id, permit),
+            Self::RetireHomeObjects { id, permit } => (HOME_RETIRE_TAG, *id, permit),
             Self::Stage { id, permit, .. } => (2, *id, permit),
             Self::Append { id, permit, .. } => (3, *id, permit),
             Self::Subscribe { id, permit, .. } => (4, *id, permit),
@@ -353,11 +401,19 @@ impl Request {
         let mut out = header(tag, id, length);
         blob(&mut out, permit);
         match self {
+            Self::ReadDirectory { after, .. } => {
+                out.push(u8::from(after.is_some()));
+                if let Some(after) = after {
+                    out.extend(after);
+                }
+            }
+            Self::StoreDirectoryEntry { body, .. } => blob(&mut out, body),
             Self::Stage { body, .. } => blob(&mut out, body),
             Self::StoreHomeObjects { bundle, .. } => blob(&mut out, bundle),
             Self::Append { event, .. } => blob(&mut out, event),
             Self::Subscribe { after, .. } => out.extend(after.to_be_bytes()),
             Self::Read { .. }
+            | Self::RetireHomeObjects { .. }
             | Self::Credit { .. }
             | Self::Publish { .. }
             | Self::PresenceJoin { .. }
@@ -397,6 +453,21 @@ impl Request {
         let permit = input.blob()?;
         let result = match tag {
             1 => Self::Read { id, permit },
+            DIRECTORY_READ_TAG => Self::ReadDirectory {
+                id,
+                permit,
+                after: match input.array::<1>()?[0] {
+                    0 => None,
+                    1 => Some(input.array()?),
+                    _ => return Err(Error::Encoding),
+                },
+            },
+            DIRECTORY_STORE_TAG => Self::StoreDirectoryEntry {
+                id,
+                permit,
+                body: input.bounded_blob(DIRECTORY_MAX_BODY)?,
+            },
+            HOME_RETIRE_TAG => Self::RetireHomeObjects { id, permit },
             PRESENCE_JOIN_TAG => Self::PresenceJoin { id, permit },
             2 => Self::Stage {
                 id,
@@ -428,13 +499,54 @@ impl Response {
     /// Preflight every field before allocating or copying any payload.
     pub fn encoded_len(&self) -> Result<usize, Error> {
         match self {
-            Self::Events { items, receipt, .. } => {
+            Self::Directory { entries, .. } => {
+                if entries.len() > 64 {
+                    return Err(Error::Size);
+                }
+                let mut size = 10;
+                for entry in entries {
+                    if entry.len() > DIRECTORY_MAX_BODY {
+                        return Err(Error::Size);
+                    }
+                    size = checked_blob(size, entry)?;
+                }
+                Ok(size)
+            }
+            Self::DirectoryEntryStored { .. } | Self::HomeObjectsRetired { .. } => Ok(7),
+            Self::Events {
+                items,
+                receipt,
+                coverage,
+                ..
+            } => {
                 if items.len() > 64 {
                     return Err(Error::Size);
                 }
-                let mut size =
-                    checked_size(7 + 2 + 1, if receipt.is_some() { RECEIPT_LEN } else { 0 })?;
+                if receipt.is_some() && (items.is_empty() || coverage.is_some()) {
+                    return Err(Error::Encoding);
+                }
+                let endpoint_len = match coverage {
+                    None => 0,
+                    Some(endpoint)
+                        if endpoint.order == OrderState::EMPTY && endpoint.receipt.is_none() =>
+                    {
+                        OrderState::LEN
+                    }
+                    Some(endpoint)
+                        if endpoint.order != OrderState::EMPTY && endpoint.receipt.is_some() =>
+                    {
+                        OrderState::LEN + RECEIPT_LEN
+                    }
+                    _ => return Err(Error::Encoding),
+                };
+                let mut size = checked_size(
+                    7 + 2 + 1 + 1,
+                    if receipt.is_some() { RECEIPT_LEN } else { 0 } + endpoint_len,
+                )?;
                 for (commitment, event) in items {
+                    if commitment.len() != Commitment::LEN {
+                        return Err(Error::Encoding);
+                    }
                     size = checked_blob(size, commitment)?;
                     size = checked_blob(size, event)?;
                 }
@@ -482,6 +594,9 @@ impl Response {
         let length = self.encoded_len()?;
         let (tag, id) = match self {
             Self::Events { id, .. } => (1, *id),
+            Self::Directory { id, .. } => (DIRECTORY_READ_TAG, *id),
+            Self::DirectoryEntryStored { id } => (DIRECTORY_STORE_TAG, *id),
+            Self::HomeObjectsRetired { id } => (HOME_RETIRE_TAG, *id),
             Self::Body { id, .. } => (2, *id),
             Self::Staged { id } => (3, *id),
             Self::Acked { id, .. } => (4, *id),
@@ -494,11 +609,34 @@ impl Response {
         };
         let mut out = header(tag, id, length);
         match self {
-            Self::Events { items, receipt, .. } => {
+            Self::Directory { entries, more, .. } => {
+                out.extend((entries.len() as u16).to_be_bytes());
+                out.push(u8::from(*more));
+                for entry in entries {
+                    blob(&mut out, entry);
+                }
+            }
+            Self::DirectoryEntryStored { .. } | Self::HomeObjectsRetired { .. } => {}
+            Self::Events {
+                items,
+                receipt,
+                coverage,
+                ..
+            } => {
                 out.extend((items.len() as u16).to_be_bytes());
                 out.push(u8::from(receipt.is_some()));
                 if let Some(receipt) = receipt {
                     out.extend(receipt);
+                }
+                match coverage {
+                    None => out.push(0),
+                    Some(endpoint) => {
+                        out.push(if endpoint.receipt.is_some() { 2 } else { 1 });
+                        out.extend(endpoint.order.encode());
+                        if let Some(receipt) = endpoint.receipt {
+                            out.extend(receipt);
+                        }
+                    }
                 }
                 for (commitment, event) in items {
                     blob(&mut out, commitment);
@@ -562,6 +700,24 @@ impl Response {
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let (tag, id, mut input) = decode_header(bytes)?;
         let result = match tag {
+            DIRECTORY_READ_TAG => {
+                let count = u16::from_be_bytes(input.array()?) as usize;
+                if count > 64 {
+                    return Err(Error::Size);
+                }
+                let more = match input.array::<1>()?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Encoding),
+                };
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    entries.push(input.bounded_blob(DIRECTORY_MAX_BODY)?);
+                }
+                Self::Directory { id, entries, more }
+            }
+            DIRECTORY_STORE_TAG => Self::DirectoryEntryStored { id },
+            HOME_RETIRE_TAG => Self::HomeObjectsRetired { id },
             1 => {
                 let count = u16::from_be_bytes(input.array()?) as usize;
                 if count > 64 {
@@ -572,11 +728,37 @@ impl Response {
                     1 => Some(input.array()?),
                     _ => return Err(Error::Encoding),
                 };
+                let coverage_tag = input.array::<1>()?[0];
+                let coverage = match coverage_tag {
+                    0 => None,
+                    1 | 2 => {
+                        let order = OrderState::decode(input.take(OrderState::LEN)?)
+                            .map_err(|_| Error::Encoding)?;
+                        let receipt = if coverage_tag == 2 {
+                            Some(input.array()?)
+                        } else {
+                            None
+                        };
+                        Some(CoverageEndpoint { order, receipt })
+                    }
+                    _ => return Err(Error::Encoding),
+                };
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
-                    items.push((input.blob()?, input.blob()?));
+                    let commitment = input.blob()?;
+                    if commitment.len() != Commitment::LEN {
+                        return Err(Error::Encoding);
+                    }
+                    items.push((commitment, input.blob()?));
                 }
-                Self::Events { id, items, receipt }
+                let result = Self::Events {
+                    id,
+                    items,
+                    receipt,
+                    coverage,
+                };
+                result.encoded_len()?;
+                result
             }
             2 => {
                 let index = input.array::<1>()?[0];

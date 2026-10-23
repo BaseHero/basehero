@@ -50,6 +50,10 @@ pub enum Scope {
         /// control-route event, or `Head::EMPTY` before genesis. `None` makes
         /// it content.
         after: Option<Head>,
+        /// A second staged body a control commits to inside its own body (a
+        /// rekey's seal set), ordered with it so it is kept as long as the
+        /// event's own body. Only a control with a body may attach one.
+        attached: Option<Digest>,
     },
     Subscribe {
         log: LogId,
@@ -70,6 +74,26 @@ pub enum Scope {
     Presence {
         log: LogId,
         epoch: [u8; 32],
+    },
+    ReadDirectory {
+        log: LogId,
+    },
+    StoreDirectoryEntry {
+        log: LogId,
+        entry: [u8; 32],
+        version: u64,
+        body: Digest,
+        len: u32,
+    },
+    RetireHomeObjects {
+        log: LogId,
+        prefix_digest: Digest,
+    },
+    /// Authenticated device read, capped at the verified ordered head at issue.
+    ReadControlRange {
+        log: LogId,
+        after: u64,
+        through: u64,
     },
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -141,6 +165,10 @@ impl fmt::Debug for Scope {
             Self::ReadControls { .. } => "ReadControls",
             Self::StoreHomeObjects { .. } => "StoreHomeObjects",
             Self::Presence { .. } => "Presence",
+            Self::ReadDirectory { .. } => "ReadDirectory",
+            Self::StoreDirectoryEntry { .. } => "StoreDirectoryEntry",
+            Self::RetireHomeObjects { .. } => "RetireHomeObjects",
+            Self::ReadControlRange { .. } => "ReadControlRange",
         })
     }
 }
@@ -228,6 +256,11 @@ fn valid_scope(scope: &Scope) -> Result<(), PermitError> {
         {
             Err(PermitError::Bounds)
         }
+        Scope::ReadControlRange { after, through, .. }
+            if after > through || *through > (1 << 53) - 1 =>
+        {
+            Err(PermitError::Bounds)
+        }
         Scope::ReadBodies { bodies, .. } if !(1..=64).contains(&bodies.len()) => {
             Err(PermitError::Bounds)
         }
@@ -235,6 +268,21 @@ fn valid_scope(scope: &Scope) -> Result<(), PermitError> {
             Err(PermitError::Bounds)
         }
         Scope::Presence { log, .. } if log.kind != LogKind::Base => Err(PermitError::Bounds),
+        Scope::Append {
+            body,
+            after,
+            attached: Some(attached),
+            ..
+        } if after.is_none() || body.is_none_or(|body| body == *attached) => {
+            Err(PermitError::Bounds)
+        }
+        Scope::ReadDirectory { log }
+        | Scope::StoreDirectoryEntry { log, .. }
+        | Scope::RetireHomeObjects { log, .. }
+            if log.kind != LogKind::Account =>
+        {
+            Err(PermitError::Bounds)
+        }
         _ => Ok(()),
     }
 }
@@ -274,6 +322,22 @@ fn encode_permit(permit: &Permit) -> Vec<u8> {
             out.push(8);
             *log
         }
+        Scope::ReadDirectory { log } => {
+            out.push(9);
+            *log
+        }
+        Scope::StoreDirectoryEntry { log, .. } => {
+            out.push(10);
+            *log
+        }
+        Scope::RetireHomeObjects { log, .. } => {
+            out.push(11);
+            *log
+        }
+        Scope::ReadControlRange { log, .. } => {
+            out.push(14);
+            *log
+        }
     };
     put_log(&mut out, log);
     match &permit.scope {
@@ -296,12 +360,14 @@ fn encode_permit(permit: &Permit) -> Vec<u8> {
             body,
             epoch,
             after,
+            attached,
             ..
         } => {
             out.extend(event.0);
             put_option(&mut out, *body, |out, body| out.extend(body.0));
             out.extend(epoch);
             put_option(&mut out, *after, put_head);
+            put_option(&mut out, *attached, |out, body| out.extend(body.0));
         }
         Scope::Subscribe { .. } => {}
         Scope::ReadControls { after, .. } => out.extend(after.to_be_bytes()),
@@ -314,6 +380,24 @@ fn encode_permit(permit: &Permit) -> Vec<u8> {
             out.extend(bundle_digest.0);
         }
         Scope::Presence { epoch, .. } => out.extend(epoch),
+        Scope::ReadDirectory { .. } => {}
+        Scope::StoreDirectoryEntry {
+            entry,
+            version,
+            body,
+            len,
+            ..
+        } => {
+            out.extend(entry);
+            out.extend(version.to_be_bytes());
+            out.extend(body.0);
+            out.extend(len.to_be_bytes());
+        }
+        Scope::RetireHomeObjects { prefix_digest, .. } => out.extend(prefix_digest.0),
+        Scope::ReadControlRange { after, through, .. } => {
+            out.extend(after.to_be_bytes());
+            out.extend(through.to_be_bytes());
+        }
     }
     out.extend(permit.issued_ms.to_be_bytes());
     out.extend(permit.deadline_ms.to_be_bytes());
@@ -353,6 +437,7 @@ fn decode_permit(bytes: &[u8]) -> Result<Permit, PermitError> {
             body: input.option(|i| Ok(Digest(i.take()?)))?,
             epoch: input.take()?,
             after: input.option(Input::head)?,
+            attached: input.option(|i| Ok(Digest(i.take()?)))?,
         },
         5 => Scope::Subscribe { log },
         6 => Scope::ReadControls {
@@ -367,6 +452,23 @@ fn decode_permit(bytes: &[u8]) -> Result<Permit, PermitError> {
         8 => Scope::Presence {
             log,
             epoch: input.take()?,
+        },
+        9 => Scope::ReadDirectory { log },
+        10 => Scope::StoreDirectoryEntry {
+            log,
+            entry: input.take()?,
+            version: u64::from_be_bytes(input.take()?),
+            body: Digest(input.take()?),
+            len: u32::from_be_bytes(input.take()?),
+        },
+        11 => Scope::RetireHomeObjects {
+            log,
+            prefix_digest: Digest(input.take()?),
+        },
+        14 => Scope::ReadControlRange {
+            log,
+            after: u64::from_be_bytes(input.take()?),
+            through: u64::from_be_bytes(input.take()?),
         },
         _ => return Err(PermitError::Encoding),
     };
@@ -489,7 +591,7 @@ pub fn verify_published_ordering(
         || ack.log != expected_log
         || commitment.base() != BaseId(expected_log.id)
         || commitment.route() != Route::Content
-        || ack.event != expected_event.id()
+        || ack.event != expected_event.publication_id(Route::Content)
         || commitment.verify_body(expected_event).is_err()
         || commitment
             .verify_next(BaseId(expected_log.id), commitment.previous())

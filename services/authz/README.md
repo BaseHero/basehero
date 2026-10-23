@@ -89,11 +89,50 @@ connection. Then:
   control head, whose epoch is the epoch once the control applies, all zeros
   once a removal closes it.
 
-Every request first reads the account's log from the edge past the last
-verified position, under a read permit the service issues itself, and verifies
+- `Recover { sealed, purpose }` carries a recovery claim
+  (`bh_account::recovery::seal_claim`): the code's proof and the password-and-code
+  check token, sealed to the home's recovery X-Wing key (`--recovery-key`, whose
+  certificate under the hosting root devices check) for this connection's
+  challenge as its nonce and for `purpose`. The first `Recover` on a connection
+  spends that nonce, separately from authentication; another is
+  `Unauthenticated`. A claim that is not a sealed claim is `Malformed`; one that
+  does not open for this nonce, was sealed for another purpose, or whose proof
+  names no current record answers `Recovery(NotRecognised)` and costs nothing.
+  For a known record, a try is allowed once the earliest bound of qualified
+  time has reached the record's next try; otherwise `Recovery(Wait
+  { next_try_ms })`, which counts nothing. A wrong token is a failure, counted
+  at the latest bound: `Recovery(PasswordMismatch { tries_left, next_try_ms })`.
+  Five failures are free; the fifth and each later one set the next try an
+  hour on until a day after the fifth, then a day on. The next try never moves
+  earlier, so a clock that steps back reopens nothing. With both right the
+  answer is `Recovery(Released { genesis, record, recovery_seal })`, the
+  account's genesis and stored recovery record and the personal key's
+  recovery seal; the record's tries reset and the account's devices get a
+  notice. `AddDevice` needs no session; a release on an unauthenticated
+  connection makes it that account's recovery connection. That connection
+  can submit exactly one recovery-signed addition with its recovery-sender
+  delivery, then confirm only that event, including exact confirmation retries.
+  Every recognised claim refreshes the account before checking the current
+  record and tries under that account's lock.
+  `Sign` is for an authenticated device checking its own account's password
+  and kit, as a password change does without a local password check: it
+  refreshes the account first, is `Unauthenticated` without a session, and a
+  claim for another account is `NotRecognised`. A service started without a
+  recovery key answers `Unsupported`. Release checks both the current signed
+  record and recovery-seal digests. A confirmed replacement atomically retires
+  the old proof index and tries, and queues an idempotent retirement of the
+  initial home bundle; network failure retries at the next refresh. Deployment
+  still needs to supply the recovery key.
+- `ReadNotices { after_ms }` on an authenticated session answers `Notices
+  { kit_used_ms }`: up to 64 times after `after_ms`, oldest first, at which
+  the account's recovery record was released. Each account keeps its latest
+  64, with strictly increasing times.
+
+Every current-authority request for an account first
+reads the account's log from the edge past the last verified position, under a read permit the service issues itself, and verifies
 the chain and each original. That read is the head lookup: its start time is
-the issued time of every permit the request yields, and each deadline is 30 s
-later. If the read or its verification fails, the answer is `Unavailable` and
+the issued time of every permit the request yields. Its deadline is at most
+30 s later, capped by the requesting device's pending removal deadline. If the read or its verification fails, the answer is `Unavailable` and
 nothing is issued. A device removed since its session began is refused
 `NotActive` on its next request. Requests for one account wait for each other;
 other accounts do not wait.
@@ -107,7 +146,25 @@ id is `H("bh/account-log-event/v2\0" || body:32 || length:u32 || original)`.
 only that exact wrapping. `account_log_id(genesis)` is the digest of the
 wrapped genesis, which carries no body. `delivery_body(frame)` is the body
 object `purpose:u8 = 1 || length:u32 || frame || zeros` in the smallest body
-size; `delivery_frame` accepts only that exact encoding.
+size; `delivery_frame` accepts only that exact encoding. `rotation_body` and
+`rotation_frame` use purpose 2 with the same canonical framing. The raw rotation
+frame's signed digest is unchanged; the padded object's commitment is what the
+account wrapper and confirmation bind.
+
+Newly read account positions after genesis receive ordering confirmations sampled
+after read-back. Original events and confirmations commit atomically. Confirmation
+retries return the stored bytes, including after restart; accepted-head bounds
+are retained per account as a floor for subsequent evidence. `ReadAccountEvidence`
+serves challenge-bound accepted heads and confirmations without body access.
+Lapsed controls still advance this history but activate no delivery body or
+recovery attachment. Replacement requires a complete record and recovery seal
+matching the signed publication, even if the initial objects were never
+uploaded. Rotation requires a matching stored current recovery row before its
+append permit, plus the raw signed seal set and its recovery seal. The service
+stages rotation in a purpose-two body, reads it back
+and checks both commitments before activating the new recovery seal. Confirmed
+wrapped events have an account-local durable index, so exact confirmation
+retries do not scan account history.
 
 ## Base control records
 
@@ -127,9 +184,10 @@ repairs.
 
 Known limits:
 
-- A removal copy closes the base's epoch, and no control reopens it yet, so a
-  base takes no content after a removal until a later version adds epoch
-  replacement.
+- A removal copy closes the base's epoch. A confirmed personal-key rotation
+  can rekey it, but the epoch stays closed while another established removal
+  effect remains due: the earlier rotation's personal key may still be held
+  by that removed recipient.
 - The service relies on the log object to list a base's controls completely;
   withholding them is within its power.
 - The version floor follows the versions of controls only.
@@ -141,20 +199,36 @@ Known limits:
 ## Storage and restart
 
 SQLite at `--db` holds `accounts` (log and verified head), `account_events`
-(verified originals and the body each carries), `bases` (the verified
+(verified originals and the body each carries), `account_confirmations` (the
+ordering confirmation signed for an event, by position), `bases` (the verified
 genesis's account and content epoch), and each base's control record:
-`base_controls`, `base_account_changes` and `base_pending`; `meta` names the
-schema, 3. A disk with another schema is refused. Account history is a cache:
-after a restart nothing is issued until the request's own read from the edge
-has refreshed the account, and an unreachable edge means `Unavailable`. The
-base registry and control records are the only state the edge cannot rebuild,
-and a control record can be rebuilt from the log with M.
+`base_controls`, `base_account_changes` (each copied event with its
+confirmation, none for a legacy copy) and `base_pending`. For recovery it
+holds `recovery_records` (each account's current recovery record and recovery
+seal, with their digests), `recovery_index` (the record's proof check, the
+hash of the code's proof, to the account and record), `recovery_tries`
+(failures per record, when the fifth was and the next try), `recovery_notices`
+(account and time only), `pending_attachments` (a submitted recovery
+attachment until its event is confirmed), `confirmed_events` (the derived
+wrapped-digest confirmation lookup), and `retire_home` (pending edge bundle
+retirement after durable replacement). A record is indexed when its
+account's initial home objects are stored while it is the account's current
+record. Nothing maps an account to a person, address or device. `meta` names
+the schema, 4; a schema-3 disk is upgraded in one transaction, its stored
+events and copies kept as legacy, with no confirmation. A disk with another
+schema is refused. Account history is a cache: after a restart nothing is
+issued until the request's own read from the edge has refreshed the account,
+and an unreachable edge means `Unavailable`, including recognised recovery
+claims. Confirmations, the base registry,
+control records and recovery state are the state the edge cannot rebuild; a
+control record can be rebuilt from the log with M.
 
 ## Running
 
 ```
 bh-authz --listen ADDR --db PATH --edge wss://…/v1/data --hosting-root HEX
   --permit-key FILE --permit-cert FILE --app-root HEX --policy FILE --policy-signature FILE
+  --recovery-key FILE --recovery-cert FILE
   --quote-socket PATH --collateral FILE
   --roughtime ADDR=KEYHEX --roughtime ADDR=KEYHEX
   --time-config HZ,DRIFT_PPM,SMEAR_US,MAX_AGE_TICKS,MAX_WIDTH_MS
@@ -162,7 +236,11 @@ bh-authz --listen ADDR --db PATH --edge wss://…/v1/data --hosting-root HEX
 
 The permit key file holds a 32-byte hex seed and the certificate file the
 130-byte hex certificate from `bh_sync::permit::certify` under the hosting
-root. The policy file is the signed confidential policy devices check, with
+root. The recovery key file holds the 32-byte hex seed of the home's
+recovery X-Wing key, read once at start and never written or logged; the
+certificate file holds the hex `RecoveryKeyCertificate`
+(`bh_sync::evidence::certify_recovery_key`) naming it under the hosting root.
+The policy file is the signed confidential policy devices check, with
 its hex signature and the hex root that signs it. Evidence is the dstack
 guest agent's quote over each handshake's report data, with collateral the
 operator keeps current in `--collateral`. Time is the earliest bound of two
@@ -188,7 +266,10 @@ A build with the `synthetic-attestation` feature also accepts
 `--synthetic-attestation` in place of the hardware and time flags, for local
 use: the service presents a labelled synthetic quote that only a device's
 synthetic appraisal (`accept_synthetic_proof`) accepts, and uses the local
-wall clock. Release builds never enable the feature, and
+wall clock, with `Bounds` of zero width. The recovery flags are then optional;
+without them recovery claims are refused. The local stack's `local_keys`
+example writes `recovery.seed` and `recovery.cert` for them. Release builds
+never enable the feature, and
 `bash scripts/check.sh` checks that no release dependency graph does.
 
 ## Tests

@@ -7,7 +7,9 @@ use crate::codec::{
 use crate::history::{History, Outcome};
 use bh_account::{AccountId, DeviceId, Head as AccountHead, VerifiedAccount};
 use bh_crypto::{Secret, random};
-use bh_sync::{BaseId, Commitment, EventId, Head, OpaqueEvent, Route, receipt::RECEIPT_LEN};
+use bh_sync::{
+    BaseId, Commitment, EventId, Head, OpaqueEvent, OrderState, Route, receipt::RECEIPT_LEN,
+};
 
 pub struct GenesisSigningRequest(EventSigningRequest);
 impl GenesisSigningRequest {
@@ -46,8 +48,8 @@ pub fn prepare_genesis(
     data.extend(metadata_id);
     Ok(GenesisSigningRequest(prepare_seal(
         Binding {
-            version: 1,
-            highest: 1,
+            version: 3,
+            highest: 3,
             mode: 1,
             base: [0; 32],
             audience: [0; 32],
@@ -96,7 +98,7 @@ pub fn verify_genesis(
     let base = BaseId::from_genesis(descriptor);
     let mut history = History::anchored(creator, base, None, remembered_floor)
         .map_err(|_| Outcome::IntegrityStop)?;
-    let ordered = Commitment::order(base, Head::EMPTY, descriptor, Route::Control)
+    let ordered = Commitment::order(base, OrderState::EMPTY, descriptor, Route::Control)
         .map_err(|_| Outcome::IntegrityStop)?;
     judge_genesis(&mut history, &ordered, descriptor, body, metadata)
 }

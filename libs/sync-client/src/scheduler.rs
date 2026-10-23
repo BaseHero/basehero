@@ -172,7 +172,10 @@ async fn write_status(
     loop {
         wake.borrow_and_update();
         let inputs = merge(&publish.borrow_and_update(), &receive.borrow_and_update());
-        if let Some(status) = status::derive(&shared.owner, shared.container, inputs) {
+        let account = shared.signer.current_account().ok();
+        if let Some(status) =
+            status::derive(&shared.owner, shared.container, account.as_ref(), inputs)
+        {
             shared.status.send_if_modified(|current| {
                 let changed = *current != status;
                 *current = status;

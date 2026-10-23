@@ -166,6 +166,7 @@ async fn edge_unreachable_means_unavailable() {
             log: account.log,
             event: account.genesis.clone(),
             delivery: None,
+            attachment: None,
         },
     ] {
         assert!(matches!(
@@ -228,6 +229,7 @@ async fn append_permit_binds_the_body_its_event_references() {
         body,
         epoch: permitted,
         after,
+        attached: None,
     } = harness.permit(&signed).scope
     else {
         panic!("append scope")
@@ -322,6 +324,189 @@ async fn a_proof_at_an_older_verified_head_authenticates_at_the_current_one() {
             .await,
         FromService::Refused {
             reason: Refusal::Unauthenticated
+        }
+    ));
+}
+
+#[tokio::test]
+async fn control_reads_are_bounded_by_verified_heads_and_membership() {
+    let harness = Harness::new();
+    let mine = Device::new();
+    let theirs = Device::new();
+    let account = Account::create_full(&mine);
+    let other = Account::create(&theirs);
+    harness.publish(&account);
+    harness.publish(&other);
+    let service = harness.service();
+    let mut connection = session(&service, &account, &mine).await;
+    let mut foreign = session(&service, &other, &theirs).await;
+    let other_genesis = other.base_genesis(&theirs);
+    let other_base = other_genesis.log();
+    order_genesis(
+        &harness,
+        &foreign.handle(other_genesis.register()).await,
+        &other_genesis,
+    );
+    let genesis = account.base_genesis(&mine);
+    let base = genesis.log();
+    let answer = connection.handle(genesis.register()).await;
+    order_genesis(&harness, &answer, &genesis);
+    let signed = single_permit(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::ReadControls {
+                    log: base,
+                    after: 0,
+                }],
+            })
+            .await,
+    );
+    assert_eq!(
+        harness.permit(&signed).scope,
+        Scope::ReadControlRange {
+            log: base,
+            after: 0,
+            through: 1
+        }
+    );
+    let signed = single_permit(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::ReadControls {
+                    log: account.log,
+                    after: 0,
+                }],
+            })
+            .await,
+    );
+    assert_eq!(
+        harness.permit(&signed).scope,
+        Scope::ReadControlRange {
+            log: account.log,
+            after: 0,
+            through: 3
+        }
+    );
+    let FromService::Permits { items } = connection
+        .handle(ToService::Permits {
+            items: vec![
+                Want::ReadControls {
+                    log: other.log,
+                    after: 0,
+                },
+                Want::ReadControls {
+                    log: other_base,
+                    after: 0,
+                },
+                Want::ReadControls {
+                    log: base,
+                    after: 2,
+                },
+                Want::ReadEvents {
+                    log: base,
+                    first: 1,
+                    last: 64,
+                },
+            ],
+        })
+        .await
+    else {
+        panic!("permit response")
+    };
+    assert_eq!(items[0].as_ref().err(), Some(&Refusal::Unknown));
+    assert_eq!(items[1].as_ref().err(), Some(&Refusal::Unknown));
+    assert_eq!(items[2].as_ref().err(), Some(&Refusal::Malformed));
+    assert!(matches!(
+        harness.permit(items[3].as_ref().unwrap()).scope,
+        Scope::ReadEvents { .. }
+    ));
+}
+
+#[tokio::test]
+async fn newly_added_device_reads_base_controls_before_its_account_copy_arrives() {
+    let harness = Harness::new();
+    let first = Device::new();
+    let newcomer = Device::new();
+    let mut account = Account::create_full(&first);
+    harness.publish(&account);
+    let service = harness.service();
+    let mut creator = session(&service, &account, &first).await;
+    let genesis = account.base_genesis(&first);
+    let base = genesis.log();
+    order_genesis(
+        &harness,
+        &creator.handle(genesis.register()).await,
+        &genesis,
+    );
+    account.add_device(&first, &newcomer);
+    harness.publish(&account);
+    let mut joined = session(&service, &account, &newcomer).await;
+    let FromService::Permits { items } = joined
+        .handle(ToService::Permits {
+            items: vec![
+                Want::ReadControls {
+                    log: base,
+                    after: 0,
+                },
+                Want::ReadEvents {
+                    log: base,
+                    first: 1,
+                    last: 1,
+                },
+            ],
+        })
+        .await
+    else {
+        panic!("expected itemized permits")
+    };
+    assert_eq!(
+        harness.permit(items[0].as_ref().unwrap()).scope,
+        Scope::ReadControlRange {
+            log: base,
+            after: 0,
+            through: 1
+        }
+    );
+    assert!(matches!(
+        harness.permit(items[1].as_ref().unwrap()).scope,
+        Scope::ReadEvents { .. }
+    ));
+}
+
+#[tokio::test]
+async fn removed_device_cannot_obtain_control_read() {
+    let harness = Harness::new();
+    let owner = Device::new();
+    let leaving = Device::new();
+    let mut account = Account::create(&owner);
+    account.add_device(&owner, &leaving);
+    harness.publish(&account);
+    let service = harness.service();
+    let mut connection = session(&service, &account, &leaving).await;
+    assert!(matches!(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::ReadControls {
+                    log: account.log,
+                    after: 0
+                }],
+            })
+            .await,
+        FromService::Permits { .. }
+    ));
+    account.remove_self(&leaving);
+    harness.publish(&account);
+    assert!(matches!(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::ReadControls {
+                    log: account.log,
+                    after: 0
+                }],
+            })
+            .await,
+        FromService::Refused {
+            reason: Refusal::NotActive
         }
     ));
 }

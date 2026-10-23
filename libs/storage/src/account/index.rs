@@ -4,6 +4,9 @@ use super::{AccountStateRecord, fixed};
 use crate::{DeviceDatabase, StoreError};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+/// The account layer's summary: fixed fields, then open membership changes.
+const MIN_SUMMARY: usize = 2602;
+const MAX_SUMMARY: usize = 1 << 20;
 pub struct AccountProjectionRecord {
     pub anchor: [u8; 32],
     pub epoch: u64,
@@ -105,7 +108,7 @@ fn state(conn: &Connection) -> Result<Option<AccountStateRecord>, StoreError> {
 fn projection(conn: &Connection) -> Result<Option<AccountProjectionRecord>, StoreError> {
     Ok(conn.query_row("SELECT anchor,epoch,through_position,through_hash,summary FROM account_projection WHERE id=1", [], |r| {
         Ok(AccountProjectionRecord { anchor: fixed(r,0,"anchor")?, epoch: number(r,1)?,
-            through_position: number(r,2)?, through_hash: fixed(r,3,"hash")?, summary: bounded_blob(r,4,2602)? })
+            through_position: number(r,2)?, through_hash: fixed(r,3,"hash")?, summary: bounded_blob(r,4,MAX_SUMMARY)? })
     }).optional()?)
 }
 fn fresh_epoch(conn: &Connection) -> Result<u64, StoreError> {
@@ -121,7 +124,7 @@ fn fresh_epoch(conn: &Connection) -> Result<u64, StoreError> {
         .filter(|v| *v <= i64::MAX as u64)
         .ok_or(StoreError::CorruptAccount)
 }
-fn reset(conn: &Connection, anchor: [u8; 32]) -> Result<u64, StoreError> {
+pub(super) fn reset(conn: &Connection, anchor: [u8; 32]) -> Result<u64, StoreError> {
     let epoch = fresh_epoch(conn)?;
     conn.execute("INSERT INTO account_projection(id,anchor,epoch,through_position,through_hash,summary)
         VALUES(1,?1,?2,0,zeroblob(32),x'') ON CONFLICT(id) DO UPDATE SET
@@ -146,7 +149,7 @@ pub(super) fn apply_delta(
         None if d.epoch.is_none() && d.expected == (0, [0; 32]) => reset(conn, anchor)?,
         _ => return Err(StoreError::AuthorityChanged),
     };
-    if d.through.0 <= d.expected.0 || d.summary.len() != 2602 {
+    if d.through.0 <= d.expected.0 || !(MIN_SUMMARY..=MAX_SUMMARY).contains(&d.summary.len()) {
         return Err(StoreError::CorruptAccount);
     }
     for row in &d.added {

@@ -35,6 +35,17 @@ class DeviceKeysEmulatorTest {
     }
     private fun containsBytes(haystack: ByteArray, needle: ByteArray): Boolean =
         haystack.asList().windowed(needle.size).any { it == needle.asList() }
+    private fun roles() = listOf("ordinary", "receiver", "control", "control-public")
+    private fun recordFiles(handle: String) = roles().map { File(dir(), "$handle.$it") }
+    private fun filesFor(handle: String) = roles().flatMap { role ->
+        listOf(File(dir(), "$handle.$role"), File(dir(), "$handle.$role.tmp"))
+    }
+    private fun createDevice(handle: String, ordinary: ByteArray = byteArrayOf(1, 2, 3), receiver: ByteArray = byteArrayOf(4, 5, 6)) {
+        val t = ticket()
+        DeviceKeysBridge.create(activity, handle, ordinary, receiver, controlRecord(), t)
+        assertTrue(ProbeResults.noResponseFor(2))
+        assertEquals(DeviceKeysBridge.OK, fingerprint(t).code)
+    }
 
     @Before fun launch() {
         // Load the debug-only native callback from the target APK class loader.
@@ -160,6 +171,112 @@ class DeviceKeysEmulatorTest {
         val cleanup = ticket()
         DeviceKeysBridge.retirePending(activity, home, cleanup)
         assertEquals(DeviceKeysBridge.OK, result(cleanup).code)
+    }
+
+    @Test fun deleteKeysErasesCreatedKeys() {
+        val h = handle()
+        createDevice(h)
+        assertTrue(aliases(h).all { store().containsAlias(it) })
+        assertTrue(recordFiles(h).all { it.isFile })
+        // A crash between write and rename leaves a .tmp; erase must remove those too.
+        val strays = listOf("ordinary", "control-public").map { File(dir(), "$h.$it.tmp") }
+        for (stray in strays) {
+            stray.writeBytes(byteArrayOf(9))
+            assertTrue(stray.isFile)
+        }
+        val erase = ticket()
+        DeviceKeysBridge.deleteKeys(activity, h, erase)
+        assertEquals(DeviceKeysBridge.OK, result(erase).code)
+        assertTrue("erasure left records: ${filesFor(h).filter { it.exists() }}", filesFor(h).none { it.exists() })
+        assertTrue("erasure left aliases: ${aliases(h).filter { store().containsAlias(it) }}", aliases(h).none { store().containsAlias(it) })
+        for (role in listOf("ordinary", "receiver")) {
+            val load = ticket()
+            DeviceKeysBridge.readOrdinary(activity, h, role, load)
+            assertEquals("erased $role still loaded", DeviceKeysBridge.INVALIDATED, result(load).code)
+        }
+        val control = ticket()
+        DeviceKeysBridge.readControlPublic(activity, h, control)
+        assertEquals("erased control still loaded", DeviceKeysBridge.INVALIDATED, result(control).code)
+    }
+
+    @Test fun deleteKeysIsIdempotent() {
+        val h = handle()
+        createDevice(h)
+        repeat(2) { attempt ->
+            val erase = ticket()
+            DeviceKeysBridge.deleteKeys(activity, h, erase)
+            assertEquals("erase attempt $attempt", DeviceKeysBridge.OK, result(erase).code)
+        }
+        assertTrue(filesFor(h).none { it.exists() })
+        assertTrue(aliases(h).none { store().containsAlias(it) })
+        // A handle whose creation never completed was already erased.
+        val never = handle()
+        val absent = ticket()
+        DeviceKeysBridge.deleteKeys(activity, never, absent)
+        assertEquals(DeviceKeysBridge.OK, result(absent).code)
+        assertTrue(filesFor(never).none { it.exists() })
+        assertTrue(aliases(never).none { store().containsAlias(it) })
+    }
+
+    @Test fun deleteKeysLeavesAnotherHandle() {
+        val h = handle()
+        val other = handle()
+        createDevice(h)
+        createDevice(other)
+        val erase = ticket()
+        DeviceKeysBridge.deleteKeys(activity, h, erase)
+        assertEquals(DeviceKeysBridge.OK, result(erase).code)
+        assertTrue(filesFor(h).none { it.exists() })
+        assertTrue(aliases(h).none { store().containsAlias(it) })
+        assertTrue("another handle's records were erased", recordFiles(other).all { it.isFile })
+        assertTrue("another handle's aliases were erased", aliases(other).all { store().containsAlias(it) })
+        for ((role, expected) in listOf("ordinary" to byteArrayOf(1, 2, 3), "receiver" to byteArrayOf(4, 5, 6))) {
+            val load = ticket()
+            DeviceKeysBridge.readOrdinary(activity, other, role, load)
+            assertArrayEquals("another handle's $role was disturbed", expected, result(load).bytes)
+        }
+        val control = ticket()
+        DeviceKeysBridge.readControlPublic(activity, other, control)
+        assertArrayEquals(byteArrayOf(1, 1) + ByteArray(32) { it.toByte() }, result(control).bytes)
+    }
+
+    @Test fun deleteKeysRejectsInvalidHandle() {
+        val dir = dir()
+        val existed = dir.exists()
+        fun snapshot() = dir.listFiles()?.map { it.name }?.sorted() ?: emptyList()
+        val before = snapshot()
+        val invalid = handle().uppercase() // right length, not lowercase hex
+        val erase = ticket()
+        DeviceKeysBridge.deleteKeys(activity, invalid, erase)
+        assertEquals(DeviceKeysBridge.FAILURE, result(erase).code)
+        assertEquals("invalid handle created the key directory", existed, dir.exists())
+        assertEquals("invalid handle touched device-key storage", before, snapshot())
+        assertFalse(store().containsAlias("app.basehero.device-keys.v1.$invalid.ordinary"))
+        assertFalse(store().containsAlias("app.basehero.device-keys.v1.$invalid.control"))
+    }
+
+    @Test fun deleteKeysReportsFailureWhenARecordCannotBeDeleted() {
+        val h = handle()
+        createDevice(h)
+        // A non-empty directory in a record's place cannot be deleted by File.delete.
+        val blocked = File(dir(), "$h.receiver")
+        assertTrue(blocked.delete())
+        assertTrue(blocked.mkdir())
+        val blocker = File(blocked, "still-here")
+        blocker.writeText("blocker")
+        val erase = ticket()
+        DeviceKeysBridge.deleteKeys(activity, h, erase)
+        assertEquals("an undeletable record was reported as erased", DeviceKeysBridge.FAILURE, result(erase).code)
+        assertTrue(blocked.isDirectory)
+        assertTrue(blocker.isFile)
+        // Clearing the obstacle lets a later erase finish; partial erasure never claims success.
+        assertTrue(blocker.delete())
+        assertTrue(blocked.delete())
+        val retry = ticket()
+        DeviceKeysBridge.deleteKeys(activity, h, retry)
+        assertEquals(DeviceKeysBridge.OK, result(retry).code)
+        assertTrue(filesFor(h).none { it.exists() })
+        assertTrue(aliases(h).none { store().containsAlias(it) })
     }
 
     @Test fun cancelledCreationLeavesNothing() {

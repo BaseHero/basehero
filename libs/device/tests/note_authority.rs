@@ -68,7 +68,7 @@ fn initialize_account(owner: &Owner, id: ContainerId) -> (Account, Arc<AccountCa
         &Password::new("correct horse battery staple").unwrap(),
     ))
     .unwrap();
-    account.confirm_home_ordered(status.head).unwrap();
+    account.confirm_home_ordered(status.head, None).unwrap();
     account.confirm_kit_saved().unwrap();
     let record = DeviceJournal::from_shared(db).load().unwrap().unwrap();
     let signed: Vec<_> = record.history.iter().map(Vec::as_slice).collect();

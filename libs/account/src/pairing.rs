@@ -480,6 +480,36 @@ impl ShowingSession {
         candidate.request = Some((request.signing_bytes().to_vec(), *request.expected_key()));
         Ok(request)
     }
+
+    /// Prepare the candidate's request, re-reading the owner's projection once
+    /// when the loaded view's local index cannot answer at the verified head it
+    /// carries. A setup commit may replay that head into a fresh index epoch
+    /// while the prompt is open; the unchanged head still decides that this
+    /// request applies, so the re-read and one retry recover it. A moved head
+    /// refuses instead. Evidence that still cannot answer is retryable and the
+    /// session stays live, exactly as a retryable stage does.
+    pub fn prepare_with_re_read<J: AccountJournal, S: DeviceKeyStore, P: PendingSetupProtector>(
+        &self,
+        owner: &mut AccountOwner<J, S, P>,
+        capability: &AccountCapability,
+    ) -> Result<SigningRequest, PairError> {
+        match self.prepare(owner, capability) {
+            Err(PairError::Owner(OwnerError::Invalid(Error::Unavailable))) => {
+                // A failed prepare does not move the loaded view, so this is
+                // still the head the request named: the fence below refuses a
+                // head that moved meanwhile.
+                let head = owner.verified(capability)?.head();
+                owner.re_read_projection(head).map_err(prepare_error)?;
+                self.prepare(owner, capability)
+                    .map_err(|error| match error {
+                        PairError::Owner(error) => prepare_error(error),
+                        error => error,
+                    })
+            }
+            result => result,
+        }
+    }
+
     /// Invoke the caller's synchronous durable stage only while the session is
     /// live. A cancelled or competing reply fences late OS signatures. No network
     /// send is permitted until the stage commits exact signed add and seal bytes.
@@ -505,15 +535,20 @@ impl ShowingSession {
             candidate.reply.keys.clone()
         };
         self.stage(signed, delivery, |event, seal| {
-            owner.stage_signed_admission(capability, &recipient, event, seal)
+            owner
+                .stage_signed_admission(capability, &recipient, event, seal)
+                .map_err(stage_error)
         })
     }
 
-    pub fn stage<E>(
+    /// Run the caller's durable stage exactly once for the verified request.
+    /// Any error leaves the session live; `Unavailable` means the local index
+    /// could not answer yet and the same signed bytes may be staged again.
+    pub fn stage(
         &self,
         signed: &[u8],
         delivery: &[u8],
-        persist: impl FnOnce(&[u8], &[u8]) -> Result<(), E>,
+        persist: impl FnOnce(&[u8], &[u8]) -> Result<(), PairError>,
     ) -> Result<(), PairError> {
         let mut state = self.state.lock().expect("session lock poisoned");
         let State::Live {
@@ -531,8 +566,29 @@ impl ShowingSession {
             .try_into()
             .map_err(|_| PairError::ChangedRequest)?;
         crypto::verify(key, request, &signature).map_err(|_| PairError::ChangedRequest)?;
-        persist(signed, delivery).map_err(|_| PairError::StageFailed)?;
+        persist(signed, delivery)?;
         *state = State::Ended;
         Ok(())
+    }
+}
+
+/// A prepare that one re-read could not settle is retryable when only local
+/// evidence was unreadable; a moved head or any other outcome is reported as
+/// it was before.
+fn prepare_error(error: OwnerError) -> PairError {
+    match error {
+        OwnerError::Invalid(Error::Unavailable) => PairError::Unavailable,
+        error => PairError::Owner(error),
+    }
+}
+
+/// A stage that failed only because local index evidence was momentarily
+/// unavailable is retryable: the session stays live and the same signed
+/// bytes can be staged once the projection answers again. Any other durable
+/// stage failure ends this approval as before.
+fn stage_error(error: OwnerError) -> PairError {
+    match error {
+        OwnerError::Invalid(Error::Unavailable) => PairError::Unavailable,
+        _ => PairError::StageFailed,
     }
 }

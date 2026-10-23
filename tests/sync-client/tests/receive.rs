@@ -12,7 +12,9 @@ mod support;
 
 use bh_device::incoming::Unaccepted;
 use bh_storage::sync_state::{BaseControl, ControlOutcome};
-use bh_sync::{BodyObject, EventId, OpaqueEvent, Route, referenced_body, wire::Refusal};
+use bh_sync::{
+    BaseId, BodyObject, Commitment, EventId, OpaqueEvent, Route, referenced_body, wire::Refusal,
+};
 use bh_sync_client::{Client, Signer, SyncStatus};
 use std::sync::{Arc, atomic::Ordering};
 use support::{
@@ -22,6 +24,370 @@ use support::{
 use tokio::sync::watch;
 
 type Started = (Client, watch::Receiver<SyncStatus>);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn altered_wrapper_of_signed_signup_original_cannot_poison_outer_checkpoint() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    hosted
+        .edge
+        .alter_account_second_on_append
+        .store(true, Ordering::SeqCst);
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    let (client, _) = mac.start(&hosted);
+    until(20, "forged outer page read", || {
+        hosted
+            .edge
+            .reads(mac.account_log)
+            .iter()
+            .any(|(first, last)| *first == 1 && *last == 64)
+    })
+    .await;
+    until(20, "own base registered", || mac.registered()).await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        0
+    );
+    client.shutdown().await;
+    hosted
+        .edge
+        .alter_account_second_on_append
+        .store(false, Ordering::SeqCst);
+    hosted.edge.serve_ordered(mac.account_log);
+    let (client, _) = mac.start(&hosted);
+    until(20, "honest signup prefix checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 3
+    })
+    .await;
+    let next = mac.signer.add_device(test_keys(81));
+    hosted.edge.order_account(mac.account_log, &next);
+    client.wake();
+    until(20, "honest suffix applied and checkpointed", || {
+        mac.signer.current_account().unwrap().head().position == 4
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 4
+    })
+    .await;
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_outer_page_with_wrong_opening_cannot_advance_checkpoint() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "outer signup checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 3
+    })
+    .await;
+    let first = mac.signer.add_device(test_keys(71));
+    hosted.edge.order_account(mac.account_log, &first);
+    client.wake();
+    until(20, "outer fourth", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 4
+    })
+    .await;
+    client.shutdown().await;
+    let opening3 = hosted.edge.entries(mac.account_log)[2].0.after();
+    let alternate = bh_authz::proto::account_log_wrap(b"alternate fourth", None).unwrap();
+    let fork4 = Commitment::order(
+        BaseId(mac.account_log.id),
+        opening3,
+        &alternate,
+        Route::Control,
+    )
+    .unwrap();
+    let next = mac.signer.add_device(test_keys(81));
+    hosted.edge.order_account(mac.account_log, &next);
+    hosted
+        .edge
+        .serve_account_after(mac.account_log, 5, fork4.after(), &[next]);
+    let prior = hosted.edge.reads(mac.account_log).len();
+    let (client, mut status) = mac.start(&hosted);
+    until(20, "wrong outer page", || {
+        hosted.edge.reads(mac.account_log).len() > prior
+    })
+    .await;
+    client.wake();
+    until(20, "wrong outer page retried", || {
+        hosted.edge.reads(mac.account_log).len() > prior + 1
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        4
+    );
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 4);
+    assert_ne!(*status.borrow_and_update(), SyncStatus::Stopped);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outer_page_that_differs_from_the_stored_inner_original_does_not_advance() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    // This test commits a successor directly: setup must first finish its
+    // separate evidence-attachment transaction.
+    until(20, "setup confirmed", || !mac.home_pending()).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "outer signup checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 3
+    })
+    .await;
+    client.shutdown().await;
+    let kept = mac.signer.add_device(test_keys(71));
+    let other = mac.signer.add_device(test_keys(81));
+    let at = hosted.edge.order_account(mac.account_log, &kept);
+    let confirmed = hosted.edge.account_confirmation(mac.account_log, at);
+    mac.signer
+        .apply_account_timed(
+            mac.signer.current_account().unwrap().head(),
+            vec![(kept, Some(confirmed))],
+        )
+        .await
+        .unwrap();
+    hosted.edge.serve_account(mac.account_log, 4, &[other]);
+    let prior = hosted.edge.reads(mac.account_log).len();
+    let (client, mut status) = mac.start(&hosted);
+    until(20, "mismatch read", || {
+        hosted.edge.reads(mac.account_log).len() > prior
+    })
+    .await;
+    client.wake();
+    until(20, "mismatch retried", || {
+        hosted.edge.reads(mac.account_log).len() > prior + 1
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 4);
+    assert_eq!(mac.signer.applied.lock().unwrap().len(), 1);
+    assert_ne!(*status.borrow_and_update(), SyncStatus::Stopped);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_outer_checkpoint_write_retries_exact_inner_overlap() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "outer signup checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 3
+    })
+    .await;
+    client.shutdown().await;
+    let sql = mac.raw();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_outer BEFORE UPDATE ON account_outer_progress
+        BEGIN SELECT RAISE(FAIL, 'checkpoint denied'); END;",
+    )
+    .unwrap();
+    let first = mac.signer.add_device(test_keys(71));
+    hosted.edge.order_account(mac.account_log, &first);
+    let (client, _) = mac.start(&hosted);
+    until(20, "inner applied", || {
+        mac.signer.current_account().unwrap().head().position == 4
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    client.shutdown().await;
+    sql.execute_batch("DROP TRIGGER fail_outer").unwrap();
+    let (client, _) = mac.start(&hosted);
+    until(20, "outer reconciled", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 4
+    })
+    .await;
+    assert_eq!(mac.signer.applied.lock().unwrap().len(), 1);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inner_commit_before_outer_checkpoint_reconciles_exactly_without_reapplying() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    // The fixture's owner may still be completing private signup while the
+    // follower has already checkpointed the public three-event prefix.
+    until(
+        20,
+        "outer signup checkpoint and local home completion",
+        || {
+            !mac.home_pending()
+                && db
+                    .lock()
+                    .unwrap()
+                    .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                    .unwrap()
+                    .order
+                    .position()
+                    == 3
+        },
+    )
+    .await;
+    client.shutdown().await;
+    let first = mac.signer.add_device(test_keys(71));
+    let at = hosted.edge.order_account(mac.account_log, &first);
+    let confirmed = hosted
+        .confirmed_account(mac.account_log)
+        .await
+        .pop()
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(at, 4);
+    let before = mac.signer.current_account().unwrap().head();
+    mac.signer
+        .apply_account_timed(before, vec![(first, Some(confirmed))])
+        .await
+        .unwrap();
+    assert_eq!(mac.signer.applied.lock().unwrap().len(), 1);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+
+    let (client, _) = mac.start(&hosted);
+    until(20, "outer caught up", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 4
+    })
+    .await;
+    assert_eq!(
+        mac.signer.applied.lock().unwrap().len(),
+        1,
+        "the already committed inner change must not be applied twice"
+    );
+    let next = mac.signer.add_device(test_keys(81));
+    hosted.edge.order_account(mac.account_log, &next);
+    client.wake();
+    until(20, "new suffix", || {
+        mac.signer.current_account().unwrap().head().position == 5
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 5
+    })
+    .await;
+    assert_eq!(mac.signer.applied.lock().unwrap().len(), 2);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_device_restart_reads_only_outer_suffix() {
+    let hosted = Hosted::new();
+    let (_mac, mac_client, fold, fold_client) = two(&hosted).await;
+    let db = fold.owner.shared_database(fold.id).unwrap();
+    until(20, "joined outer checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(fold.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 4
+    })
+    .await;
+    fold_client.0.shutdown().await;
+    mac_client.0.shutdown().await;
+    let prior = hosted.edge.reads(fold.account_log).len();
+    let (client, _) = fold.start(&hosted);
+    until(20, "joined resumed read", || {
+        hosted.edge.reads(fold.account_log).len() > prior
+    })
+    .await;
+    assert_eq!(
+        hosted.edge.reads(fold.account_log)[prior].0,
+        5,
+        "a durable opening must not replay the four-entry account prefix"
+    );
+    client.shutdown().await;
+}
 
 /// Started, with the own base registered and its genesis applied.
 async fn registered(hosted: &Arc<Hosted>, device: &Device) -> Started {
@@ -46,7 +412,7 @@ fn copied(device: &Device) -> u64 {
 async fn two(hosted: &Arc<Hosted>) -> (Device, Started, Device, Started) {
     let mac = Device::new();
     let mac_client = registered(hosted, &mac).await;
-    let fold = Device::join(&mac, hosted);
+    let fold = Device::join(&mac, hosted).await;
     until(20, "addition copied", || copied(&mac) == 4).await;
     let fold_client = fold.start(hosted);
     until(20, "joined device caught up", || {
@@ -218,7 +584,7 @@ async fn status_not_synced_until_accepted_echo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ack_before_echo_and_rejected_own_keep_work() {
+async fn ack_before_echo_and_wrong_route_does_not_claim_content_identity() {
     let hosted = Hosted::new();
     let device = Device::new();
     let mut started = registered(&hosted, &device).await;
@@ -250,60 +616,214 @@ async fn ack_before_echo_and_rejected_own_keep_work() {
     until(20, "accepted from the echo", || device.pending() == 0).await;
     assert_eq!(device.inserted(writer.note, "acked first"), 1);
 
-    // This device's exact package, ordered where it is an invalid
-    // submission: rejected, its work kept and shown, never resent once
-    // judged. The publisher does not wait for the receiver, so before the
-    // echo is read it may send the bytes, on the note's own alarm backoff:
-    // each is refused as a conflict and changes nothing.
+    // The same bytes first ordered on the wrong route consume a separate
+    // routed ID. They cannot reserve the pending content package's ID.
     hosted.go_down();
     let second = device.append(&mut writer, "rejected");
     started.0.wake();
     until(20, "sealed", || device.package(second).is_some()).await;
     let stored = device.package(second).unwrap();
-    hosted.edge.order(
+    let wrong_at = hosted.edge.order(
         log,
         &stored.descriptor,
         Some(stored.body.clone()),
         Route::Control,
     );
+    // Keep the independently routed content publication pending while the
+    // receiver judges this wrong-route use of the same exact descriptor.
+    hosted.edge.refuse_next_event(Refusal::Predecessor);
     hosted.come_up();
     started.0.wake();
+    until(20, "wrong-route original judged", || {
+        device.progress().position >= wrong_at
+    })
+    .await;
+    assert_ne!(
+        stored.descriptor.publication_id(Route::Control),
+        stored.descriptor.publication_id(Route::Content),
+    );
+    // The wrong-route append used its staged body. The exact pending content
+    // package cannot restage that already ordered body, but it is not falsely
+    // marked rejected, accepted or conflicted by the control's routed ID.
+    assert_eq!(device.pending(), 1);
+    let current = device.package(second).unwrap();
+    assert_eq!(current.descriptor.encode(), stored.descriptor.encode());
+    assert_eq!(current.body, stored.body);
+    assert_eq!(current.event_id, stored.event_id);
+    let unaccepted = device
+        .owner
+        .unaccepted(device.id, device.key(writer.note))
+        .unwrap();
+    assert_eq!(unaccepted.len(), 1);
+    assert_eq!(unaccepted[0].update_id, second);
+    assert_eq!(unaccepted[0].state, Unaccepted::Sealed);
+    assert_eq!(device.inserted(writer.note, "rejected"), 1);
+    assert_ne!(status(&mut started), SyncStatus::PublishingStopped);
+    assert!(
+        !hosted
+            .edge
+            .entries(log)
+            .iter()
+            .any(|(c, e)| c.route() == Route::Content && e.digest() == stored.descriptor.digest())
+    );
+    started.0.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_exact_own_content_keeps_work_and_stops_resends_after_judgment() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    fold_client.0.shutdown().await;
+    hosted.go_down();
+    let (writer, update) = mac.new_note("sealed before closure");
+    mac_client.0.wake();
+    until(20, "sealed while offline", || mac.package(update).is_some()).await;
+    let stored = mac.package(update).unwrap();
+    mac_client.0.shutdown().await;
+    hosted
+        .edge
+        .order_account(mac.account_log, &fold.signer.remove_self());
+    hosted.come_up();
+    let (client, mut current) = mac.start(&hosted);
+    until(20, "content epoch closed", || {
+        copied(&mac) == 5 && mac.progress().epoch_id.is_none()
+    })
+    .await;
+    let at = hosted.edge.order(
+        mac.log(),
+        &stored.descriptor,
+        Some(stored.body.clone()),
+        Route::Content,
+    );
+    client.wake();
+    let judged = || {
+        mac.owner
+            .unaccepted(mac.id, mac.key(writer.note))
+            .unwrap()
+            .first()
+            .map(|entry| entry.state)
+            == Some(Unaccepted::Rejected)
+    };
+    until(20, "exact own original rejected by history", || {
+        mac.progress().position >= at && judged()
+    })
+    .await;
+    assert_eq!(mac.pending(), 1);
+    assert_eq!(
+        mac.package(update).unwrap().descriptor.encode(),
+        stored.descriptor.encode()
+    );
+    assert_eq!(mac.inserted(writer.note, "sealed before closure"), 1);
+    until(20, "not accepted shown", || {
+        *current.borrow_and_update() == SyncStatus::NotAccepted { notes: 1 }
+    })
+    .await;
+    let sent = || {
+        hosted
+            .edge
+            .appends(mac.log().id)
+            .iter()
+            .filter(|bytes| **bytes == stored.descriptor.encode())
+            .count()
+    };
+    let before = sent();
+    client.wake();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(sent(), before, "judged exact package is never resent");
+    assert!(judged());
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn judgment_of_exact_invalid_kept_bytes_stops_an_eligible_publisher() {
+    let hosted = Hosted::new();
+    let device = Device::new();
+    let (client, _) = registered(&hosted, &device).await;
+    hosted.go_down();
+    let (writer, update) = device.new_note("kept invalid original");
+    client.wake();
+    until(20, "sealed", || device.package(update).is_some()).await;
+    client.shutdown().await;
+    // Keep the body reference and nonce but invalidate the binding ciphertext.
+    // This fault-injected exact outbox package has a valid routed ID; the
+    // publisher remains eligible until verified history judges it rejected.
+    let stored = device.package(update).unwrap();
+    let mut envelope = stored.descriptor.envelope().to_vec();
+    envelope[500] ^= 1;
+    let invalid = OpaqueEvent::new(stored.descriptor.nonce(), envelope).unwrap();
+    let raw = device.raw();
+    raw.execute(
+        "UPDATE note_outbox SET descriptor=?2,event_id=?3 WHERE update_id=?1",
+        rusqlite::params![
+            update,
+            invalid.encode(),
+            invalid.publication_id(Route::Content).0.as_slice()
+        ],
+    )
+    .unwrap();
+    let exact = device.package(update).unwrap();
+    assert_eq!(exact.descriptor.encode(), invalid.encode());
+    assert_eq!(exact.body, stored.body);
+    let before = hosted.edge.counts().want_stage;
+    hosted.come_up();
+    let (client, mut current) = device.start(&hosted);
+    until(20, "eligible publisher tried invalid package", || {
+        hosted.edge.counts().want_stage > before
+    })
+    .await;
+    let at = hosted.edge.order(
+        device.log(),
+        &invalid,
+        Some(exact.body.clone()),
+        Route::Content,
+    );
+    client.wake();
     let judged = || {
         device
             .owner
             .unaccepted(device.id, device.key(writer.note))
             .unwrap()
             .first()
-            .map(|u| u.state)
+            .map(|entry| entry.state)
+            == Some(Unaccepted::Rejected)
     };
-    until(20, "rejected from its echo", || {
-        judged() == Some(Unaccepted::Rejected)
+    until(20, "rejected exact stored bytes", || {
+        device.progress().position >= at && judged()
     })
     .await;
+    assert_eq!(device.pending(), 1);
+    assert_eq!(device.inserted(writer.note, "kept invalid original"), 1);
     until(20, "not accepted", || {
-        status(&mut started) == SyncStatus::NotAccepted { notes: 1 }
+        *current.borrow_and_update() == SyncStatus::NotAccepted { notes: 1 }
     })
     .await;
-    let state = device
-        .owner
-        .unaccepted(device.id, device.key(writer.note))
-        .unwrap();
-    assert_eq!(state.len(), 1);
-    assert_eq!(device.inserted(writer.note, "rejected"), 1);
-    let sent = |hosted: &Hosted| {
-        hosted
-            .edge
-            .appends(log.id)
-            .iter()
-            .filter(|a| **a == stored.descriptor.encode())
-            .count()
-    };
-    let before = sent(&hosted);
-    started.0.wake();
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    assert_eq!(sent(&hosted), before, "never resent once judged");
-    assert_eq!(status(&mut started), SyncStatus::NotAccepted { notes: 1 });
-    started.0.shutdown().await;
+    let requests = hosted.edge.counts().want_stage;
+    client.wake();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        hosted.edge.counts().want_stage,
+        requests,
+        "no new staging after judgment"
+    );
+    assert!(judged());
+    client.shutdown().await;
+    let (restarted, mut status) = device.start(&hosted);
+    until(20, "reopened judged package", || {
+        *status.borrow_and_update() == SyncStatus::NotAccepted { notes: 1 }
+    })
+    .await;
+    restarted.wake();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        hosted.edge.counts().want_stage,
+        requests,
+        "restart cannot resend judged bytes"
+    );
+    assert_eq!(
+        device.package(update).unwrap().descriptor.encode(),
+        invalid.encode()
+    );
+    restarted.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -369,7 +889,7 @@ async fn lost_response_exact_control_retry_after_restart() {
     let log = mac.log();
     // The copy is ordered, then the device loses the answer and the edge.
     hosted.edge.hook(Hook::DropAfterAppend { then_down: true });
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     until(20, "copy ordered", || hosted.edge.entries(log).len() == 2).await;
     client.shutdown().await;
     assert_eq!(copied(&mac), 3, "not yet verified here");
@@ -405,8 +925,11 @@ async fn account_add_copy_then_new_device_can_write() {
     let mac = Device::new();
     let (mac_client, _) = registered(&hosted, &mac).await;
     mac_client.shutdown().await;
-    // The fold is in the account, not yet in the base's copy of it.
-    let fold = Device::join(&mac, &hosted);
+    // The fold is in the account, not yet in the base's copy of it. It has
+    // no approval to copy its own addition; a confirmed run permits a
+    // newly added copier, but does not confer the person's approval.
+    let fold = Device::join(&mac, &hosted).await;
+    fold.signer.approve_controls.store(false, Ordering::SeqCst);
     let mut fold_started = fold.start(&hosted);
     let (note_writer, id) = fold.new_note("written by the fold");
     fold_started.0.wake();
@@ -442,7 +965,7 @@ async fn invalid_after_already_ordered_copy_reconciles_from_verified_log() {
     // The copy is ordered and its Ack lost; the edge stays up. The service
     // then confirms the copy from the log and refuses it as no longer next.
     hosted.edge.hook(Hook::DropAfterAppend { then_down: false });
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     until(20, "copied", || copied(&mac) == 4).await;
     let db = mac.owner.shared_database(mac.id).unwrap();
     until(20, "settled", || {
@@ -476,7 +999,7 @@ async fn account_change_pending_and_resync_handling() {
     // Without the person's approval the copy waits; so does content, which
     // the service refuses until the base has the account change.
     mac.signer.approve_controls.store(false, Ordering::SeqCst);
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     let (_, id) = mac.new_note("waits for the copy");
     started.0.wake();
     until(20, "waiting for authorization", || {
@@ -518,9 +1041,9 @@ async fn account_change_pending_and_resync_handling() {
     })
     .await;
     assert_eq!(registrations(), 1);
-    hosted.restart_service_empty();
+    hosted.restart_service_without_bases().await;
     let signatures = mac.signer.control_signatures.load(Ordering::SeqCst);
-    let _third = Device::join(&mac, &hosted);
+    let _third = Device::join(&mac, &hosted).await;
     until(20, "second copy", || copied(&mac) == 5).await;
     assert_eq!(registrations(), 2);
     assert_eq!(
@@ -576,7 +1099,7 @@ async fn remote_removal_before_account_follow_is_not_unsupported() {
     // virtual seconds requires the receiver's follow handoff.
     until(10, "receiver-led account follow and copy", || {
         assert_ne!(status(&mut mac_started), SyncStatus::Unsupported);
-        copied(&mac) == known + 1
+        copied(&mac) > known
     })
     .await;
     let _ = stop_monitor.send(());
@@ -597,22 +1120,39 @@ async fn removal_closure_waits_and_keeps_work() {
     let (mac, mut mac_started, fold, fold_client) = two(&hosted).await;
     fold_client.0.shutdown().await;
     // The fold removes itself in the account; the mac copies the removal,
-    // which closes the base's content epoch.
+    // which closes the base's content epoch. The mac's rotation for it
+    // waits until the closed epoch has been seen.
+    mac.signer.refuse_rotation.store(true, Ordering::SeqCst);
     let removal = fold.signer.remove_self();
     hosted.edge.order_account(mac.account_log, &removal);
     until(20, "removal copied", || copied(&mac) == 5).await;
     assert_eq!(mac.progress().epoch_id, None);
     let (writer, id) = mac.new_note("kept while closed");
     mac_started.0.wake();
-    until(20, "waiting for authorization", || {
-        status(&mut mac_started) == SyncStatus::WaitingAuthorization
+    until(20, "protecting", || {
+        status(&mut mac_started) == SyncStatus::Protecting
     })
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(mac.acked(id), None);
     assert_eq!(mac.pending(), 1);
     assert_eq!(mac.inserted(writer.note, "kept while closed"), 1);
-    assert_eq!(status(&mut mac_started), SyncStatus::WaitingAuthorization);
+    assert_eq!(status(&mut mac_started), SyncStatus::Protecting);
+    // The rotation and the base's rekey reopen the epoch: the kept work is
+    // acknowledged under the new key.
+    mac.signer.refuse_rotation.store(false, Ordering::SeqCst);
+    until(30, "acknowledged once the epoch reopens", || {
+        mac_started.0.wake();
+        mac.acked(id).is_some() && status(&mut mac_started) == SyncStatus::Synced
+    })
+    .await;
+    let epoch = mac.progress().epoch_id.unwrap();
+    assert!(mac.signer.holds_epoch(epoch));
+    let package = mac.package(id).unwrap();
+    assert_eq!(
+        bh_event::sealed_epoch(&package.descriptor, mac.metadata_key().expose(), mac.base).unwrap(),
+        epoch
+    );
     mac_started.0.shutdown().await;
 }
 
@@ -987,18 +1527,46 @@ async fn unauthenticated_account_event_is_refused_then_valid_progresses() {
     let hosted = Hosted::new();
     let mac = Device::new();
     let mut started = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "verified signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
     // The account home orders a valid addition; the edge serves the
     // device a copy whose signature does not verify.
     let valid = mac.signer.add_device(test_keys(71));
     let mut forged = valid.clone();
     *forged.last_mut().unwrap() ^= 1;
+    let reads = hosted.edge.reads(mac.account_log).len();
+    let applies = mac.signer.apply_attempts.load(Ordering::SeqCst);
     hosted.edge.serve_account(mac.account_log, 4, &[forged]);
     hosted.edge.order_account(mac.account_log, &valid);
     started.0.wake();
-    until(20, "refused twice", || {
-        mac.signer.apply_attempts.load(Ordering::SeqCst) >= 2
+    until(20, "unconfirmed substitution read twice", || {
+        hosted.edge.reads(mac.account_log).len() >= reads + 2
     })
     .await;
+    // The reader, not the owner, refuses bytes the home did not confirm.
+    assert_eq!(mac.signer.apply_attempts.load(Ordering::SeqCst), applies);
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
     // Nothing applied and nothing latched: the device stays active.
     assert!(!mac.signer.account_stopped());
     assert!(mac.signer.applied.lock().unwrap().is_empty());
@@ -1014,26 +1582,685 @@ async fn unauthenticated_account_event_is_refused_then_valid_progresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_signed_wrong_accepted_head_or_commitment_never_advances_state() {
+    for bad_hash in [true, false] {
+        let hosted = Hosted::new();
+        let mac = Device::new();
+        let (client, _) = registered(&hosted, &mac).await;
+        let db = mac.owner.shared_database(mac.id).unwrap();
+        until(20, "signup checkpoint", || {
+            !mac.home_pending()
+                && db
+                    .lock()
+                    .unwrap()
+                    .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                    .unwrap()
+                    .order
+                    .position()
+                    == 3
+        })
+        .await;
+        client.shutdown().await;
+        let prior = db.lock().unwrap().observed_account_floor().unwrap();
+        let original = mac.signer.add_device(test_keys(71));
+        hosted.edge.order_account(mac.account_log, &original);
+        hosted.corrupt_accepted_account(mac.account_log, bad_hash);
+        let applies = mac.signer.apply_attempts.load(Ordering::SeqCst);
+        let (client, _) = mac.start(&hosted);
+        until(20, "wrong accepted retried", || {
+            hosted
+                .edge
+                .reads(mac.account_log)
+                .iter()
+                .filter(|(first, _)| *first == 4)
+                .count()
+                >= 2
+        })
+        .await;
+        assert_eq!(mac.signer.apply_attempts.load(Ordering::SeqCst), applies);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position(),
+            3
+        );
+        assert_eq!(db.lock().unwrap().observed_account_floor().unwrap(), prior);
+        assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
+        client.shutdown().await;
+        hosted.restore_account_confirmations();
+        let (client, _) = mac.start(&hosted);
+        until(20, "honest original applied", || {
+            mac.signer.current_account().unwrap().head().position == 4
+        })
+        .await;
+        client.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ahead_accepted_time_does_not_bless_earlier_account_page() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    for original in mac.signer.signed_additions(65, hosted.edge.clock.now()) {
+        hosted.edge.order_account(mac.account_log, &original);
+    }
+    let _ = hosted.confirmed_account(mac.account_log).await;
+    hosted.edge.clock.advance(25_000);
+    let accepted_at = hosted.edge.clock.now();
+    hosted.omit_account_confirmation(mac.account_log, 68);
+    let (client, _) = mac.start(&hosted);
+    until(20, "first full page applied", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 67
+    })
+    .await;
+    until(20, "missing later proof read", || {
+        hosted
+            .edge
+            .reads(mac.account_log)
+            .iter()
+            .any(|(first, _)| *first == 68)
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 67);
+    assert!(
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .is_none_or(|floor| floor < accepted_at)
+    );
+    client.shutdown().await;
+    hosted.restore_account_confirmations();
+    let (client, _) = mac.start(&hosted);
+    until(20, "exact later page observed", || {
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .is_some_and(|floor| floor >= accepted_at)
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 68);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_head_ahead_of_full_page_observes_only_after_exact_later_match() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    for original in mac.signer.signed_additions(65, hosted.edge.clock.now()) {
+        hosted.edge.order_account(mac.account_log, &original);
+    }
+    assert_eq!(hosted.edge.head(mac.account_log).position, 68);
+    let _ = hosted.confirmed_account(mac.account_log).await;
+    hosted.edge.clock.advance(25_000);
+    let accepted_at = hosted.edge.clock.now();
+    let (client, _) = mac.start(&hosted);
+    until(20, "later exact accepted", || {
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .is_some_and(|floor| floor >= accepted_at)
+            && mac.signer.current_account().unwrap().head().position == 68
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 68
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 68);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        68
+    );
+    let reads = hosted.edge.reads(mac.account_log);
+    assert!(reads.iter().any(|(first, last)| *first == 4 && *last == 67));
+    assert!(
+        reads
+            .iter()
+            .any(|(first, last)| *first == 68 && *last == 131)
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_full_initial_proof_page_with_later_accepted_head_does_not_apply() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    let creator = mac
+        .signer
+        .identity()
+        .unwrap()
+        .anchor
+        .added_at(mac.signer.identity().unwrap().device);
+    // Sixty-four genuine signed successors fill the first bounded follow
+    // page. The challenged AcceptedHead at 67 remains valid while all 64
+    // confirmations on that page are withheld.
+    for original in mac.signer.signed_additions(64, hosted.edge.clock.now()) {
+        hosted.edge.order_account(mac.account_log, &original);
+    }
+    assert_eq!(hosted.edge.head(mac.account_log).position, 67);
+    hosted.omit_account_proof_range(mac.account_log, 4, 67);
+    let applies = mac.signer.apply_attempts.load(Ordering::SeqCst);
+    let (client, _) = mac.start(&hosted);
+    until(20, "whole missing page retried", || {
+        hosted
+            .edge
+            .reads(mac.account_log)
+            .iter()
+            .filter(|(first, last)| *first == 4 && *last == 67)
+            .count()
+            >= 2
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert_eq!(mac.signer.apply_attempts.load(Ordering::SeqCst), applies);
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
+    assert_eq!(
+        mac.signer
+            .identity()
+            .unwrap()
+            .anchor
+            .added_at(mac.signer.identity().unwrap().device),
+        creator
+    );
+    assert!(db.lock().unwrap().confirmation(4).unwrap().is_none());
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_stored_historical_proof_never_falls_back_to_v1_copy() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    until(20, "signup copied", || {
+        !mac.home_pending() && copied(&mac) == 3
+    })
+    .await;
+    client.shutdown().await;
+    mac.signer.approve_controls.store(false, Ordering::SeqCst);
+    let original = mac.signer.add_device(test_keys(71));
+    hosted.edge.order_account(mac.account_log, &original);
+    let (client, _) = mac.start(&hosted);
+    until(20, "account ahead", || {
+        mac.signer.current_account().unwrap().head().position == 4
+            && mac.signer.control_requests.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    client.shutdown().await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    let saved = db.lock().unwrap().confirmation(4).unwrap().unwrap();
+    mac.raw()
+        .execute("DELETE FROM account_confirmations WHERE position=4", [])
+        .unwrap();
+    assert!(db.lock().unwrap().confirmation(4).unwrap().is_none());
+    let signatures = mac.signer.control_signatures.load(Ordering::SeqCst);
+    mac.signer.approve_controls.store(true, Ordering::SeqCst);
+    let (client, _) = mac.start(&hosted);
+    let reads = hosted.edge.reads(mac.account_log).len();
+    until(20, "missing proof retry", || {
+        hosted.edge.reads(mac.account_log).len() >= reads + 2
+    })
+    .await;
+    assert_eq!(copied(&mac), 3);
+    assert!(
+        db.lock()
+            .unwrap()
+            .pending_base_control(mac.base.0)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        mac.signer.control_signatures.load(Ordering::SeqCst),
+        signatures
+    );
+    client.shutdown().await;
+    mac.raw().execute("INSERT INTO account_confirmations(position,earliest_ms,latest_ms,confirmation) VALUES(4,?1,?2,?3)",
+        rusqlite::params![i64::try_from(saved.earliest_ms).unwrap(), i64::try_from(saved.latest_ms).unwrap(), saved.bytes]).unwrap();
+    let (client, _) = mac.start(&hosted);
+    until(20, "exact proof copy resumes", || copied(&mac) == 4).await;
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lagging_base_copies_one_historical_v2_proof_not_the_current_head() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending() && copied(&mac) == 3
+    })
+    .await;
+    client.shutdown().await;
+    mac.signer.approve_controls.store(false, Ordering::SeqCst);
+    let originals = mac.signer.signed_additions(2, hosted.edge.clock.now());
+    for original in &originals {
+        hosted.edge.order_account(mac.account_log, original);
+    }
+    let (client, _) = mac.start(&hosted);
+    until(20, "account two ahead of base", || {
+        mac.signer.current_account().unwrap().head().position == 5
+            && mac.signer.control_requests.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert_eq!(copied(&mac), 3);
+    let proof = db.lock().unwrap().confirmation(4).unwrap().unwrap().bytes;
+    mac.signer.approve_controls.store(true, Ordering::SeqCst);
+    client.wake();
+    until(20, "historical fourth copied", || copied(&mac) >= 4).await;
+    let rows = db
+        .lock()
+        .unwrap()
+        .log_account_changes(bh_sync::permit::LogKind::Base as u8, mac.base.0)
+        .unwrap();
+    let first = bh_event::account_run::decode_copies(&rows[0]).unwrap();
+    assert_eq!(first.len(), 2, "both entries in one approved run");
+    assert_eq!(first[0].original, originals[0]);
+    assert_eq!(first[1].original, originals[1]);
+    assert_eq!(first[0].confirmation.as_deref(), Some(proof.as_slice()));
+    let verified = bh_sync::evidence::OrderingConfirmation::decode(&proof).unwrap();
+    let claim = verified
+        .verify_for(&hosted.edge.root(), &originals[0], None)
+        .unwrap();
+    assert_eq!(claim.original_previous.position, 3);
+    assert_eq!(
+        claim.original_previous.hash.0,
+        mac.signer.identity().unwrap().anchor.head().hash
+    );
+    assert_eq!(claim.original_head.position, 4);
+    assert_ne!(
+        claim.original_head.position,
+        mac.signer.current_account().unwrap().head().position
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_initial_confirmation_does_not_advance_account_or_anchor() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    hosted.omit_account_confirmation(mac.account_log, 2);
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    let (client, _) = mac.start(&hosted);
+    until(20, "missing initial proof retried", || {
+        hosted.edge.reads(mac.account_log).len() >= 2
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        0
+    );
+    assert!(db.lock().unwrap().confirmation(2).unwrap().is_none());
+    assert_eq!(
+        mac.signer
+            .identity()
+            .unwrap()
+            .anchor
+            .added_at(mac.signer.identity().unwrap().device),
+        None
+    );
+    assert!(mac.home_pending());
+    client.shutdown().await;
+    hosted.restore_account_confirmations();
+    let (client, _) = mac.start(&hosted);
+    until(20, "honest signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    assert!(db.lock().unwrap().confirmation(2).unwrap().is_some());
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_stored_confirmation_never_observes_or_checkpoints() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    let original = mac.signer.add_device(test_keys(71));
+    let position = hosted.edge.order_account(mac.account_log, &original);
+    // Independently root-signed, but not the home-confirmed exact proof.
+    let alternate = hosted.edge.account_confirmation(mac.account_log, position);
+    let before = mac.signer.current_account().unwrap().head();
+    mac.signer
+        .apply_account_timed(before, vec![(original, Some(alternate))])
+        .await
+        .unwrap();
+    let floor = db.lock().unwrap().observed_account_floor().unwrap();
+    let reads = hosted.edge.reads(mac.account_log).len();
+    let (client, _) = mac.start(&hosted);
+    until(20, "conflicting proof retried", || {
+        hosted.edge.reads(mac.account_log).len() >= reads + 2
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert_eq!(db.lock().unwrap().observed_account_floor().unwrap(), floor);
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 4);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_exact_head_establishes_removal_deadline_alert_after_restart() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    let target = test_keys(71).id();
+    hosted
+        .edge
+        .order_account(mac.account_log, &mac.signer.add_device(test_keys(71)));
+    client.wake();
+    until(20, "addition verified", || {
+        mac.signer.current_account().unwrap().head().position == 4
+    })
+    .await;
+    hosted
+        .edge
+        .order_account(mac.account_log, &mac.signer.request_removal(target));
+    client.wake();
+    until(20, "request verified", || {
+        mac.signer.current_account().unwrap().head().position == 5
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 5
+    })
+    .await;
+    let deadline = db
+        .lock()
+        .unwrap()
+        .alerts(20)
+        .unwrap()
+        .into_iter()
+        .find(|alert| {
+            alert.kind == bh_storage::AlertKind::RemovalRequested && alert.position == Some(5)
+        })
+        .unwrap()
+        .deadline_ms
+        .unwrap();
+    assert!(deadline > hosted.edge.clock.now());
+    assert_eq!(
+        deadline
+            - db.lock()
+                .unwrap()
+                .confirmation(5)
+                .unwrap()
+                .unwrap()
+                .latest_ms,
+        bh_account::REMOVAL_WAIT_MS
+    );
+    client.shutdown().await;
+    hosted
+        .edge
+        .clock
+        .advance(deadline - hosted.edge.clock.now() + 1);
+    let (client, _) = mac.start(&hosted);
+    until(20, "exact-head deadline observed", || {
+        db.lock().unwrap().alerts(20).unwrap().iter().any(|alert| {
+            alert.kind == bh_storage::AlertKind::RemovalEffective && alert.position == Some(5)
+        })
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 5);
+    assert!(
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .unwrap()
+            >= deadline
+    );
+    client.shutdown().await;
+    let count = db
+        .lock()
+        .unwrap()
+        .alerts(20)
+        .unwrap()
+        .iter()
+        .filter(|a| a.kind == bh_storage::AlertKind::RemovalEffective)
+        .count();
+    let previous_floor = db
+        .lock()
+        .unwrap()
+        .observed_account_floor()
+        .unwrap()
+        .unwrap();
+    hosted.edge.clock.advance(25_000);
+    let next_floor = hosted.edge.clock.now();
+    assert!(next_floor > previous_floor);
+    let (client, _) = mac.start(&hosted);
+    until(20, "restarted exact observation", || {
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .unwrap()
+            >= next_floor
+    })
+    .await;
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .alerts(20)
+            .unwrap()
+            .iter()
+            .filter(|a| a.kind == bh_storage::AlertKind::RemovalEffective)
+            .count(),
+        count
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_exact_account_head_records_verified_observation() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "verified signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    let before = db.lock().unwrap().observed_account_floor().unwrap();
+    hosted.edge.clock.advance(25_000);
+    let observed_at = hosted.edge.clock.now();
+    client.shutdown().await;
+    let (client, _) = mac.start(&hosted);
+    until(20, "exact accepted observation", || {
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .is_some_and(|floor| floor >= observed_at)
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
+    assert!(db.lock().unwrap().observed_account_floor().unwrap() > before);
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_account_event_pauses_then_recovers() {
     let hosted = Hosted::new();
     let mac = Device::new();
     let mut started = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    let applies = mac.signer.apply_attempts.load(Ordering::SeqCst);
     let valid = mac.signer.add_device(test_keys(71));
     // A newer version of the account event format, after the 23-byte domain.
     let mut newer = valid.clone();
-    newer[23..27].copy_from_slice(&[0, 2, 0, 2]);
+    newer[23..27].copy_from_slice(&[0, 3, 0, 3]);
     hosted.edge.serve_account(mac.account_log, 4, &[newer]);
     hosted.edge.order_account(mac.account_log, &valid);
+    hosted.confirm_served_account(mac.account_log);
     started.0.wake();
     until(20, "unsupported", || {
         status(&mut started) == SyncStatus::Unsupported
     })
     .await;
+    assert!(
+        mac.signer.apply_attempts.load(Ordering::SeqCst) > applies,
+        "root-confirmed unknown version reached the owner"
+    );
     assert!(!mac.signer.account_stopped());
     assert!(mac.signer.applied.lock().unwrap().is_empty());
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
 
     // Readable history in its place: the pause ends.
     hosted.edge.serve_ordered(mac.account_log);
+    hosted.confirm_ordered_account();
     started.0.wake();
     until(20, "copied", || copied(&mac) == 4).await;
     until(20, "synced", || status(&mut started) == SyncStatus::Synced).await;
@@ -1045,9 +2272,20 @@ async fn authenticated_account_fork_stops() {
     let hosted = Hosted::new();
     let mac = Device::new();
     let mut started = registered(&hosted, &mac).await;
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     until(20, "addition copied", || copied(&mac) == 4).await;
     let head = mac.signer.applied.lock().unwrap()[0];
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "addition checkpoint", || {
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position()
+            == 4
+    })
+    .await;
     // The mac's own control key signed a successor of another event at
     // position 4, and the edge serves it after the ordered one: history
     // contradicting what the mac verified.
@@ -1056,6 +2294,7 @@ async fn authenticated_account_fork_stops() {
         .serve_account(mac.account_log, 5, &[mac.signer.fork_successor()]);
     let next = mac.signer.add_device(test_keys(111));
     hosted.edge.order_account(mac.account_log, &next);
+    hosted.confirm_served_account(mac.account_log);
     started.0.wake();
     until(20, "stopped", || {
         status(&mut started) == SyncStatus::Stopped
@@ -1063,11 +2302,20 @@ async fn authenticated_account_fork_stops() {
     .await;
     assert!(mac.signer.account_stopped());
     assert_eq!(*mac.signer.applied.lock().unwrap(), vec![head]);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        4
+    );
     started.0.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn other_bytes_under_the_kept_copy_id_are_not_a_commit() {
+async fn other_bytes_with_the_kept_copys_nonce_are_not_its_commit() {
     let hosted = Hosted::new();
     let mac = Device::new();
     let mut started = registered(&hosted, &mac).await;
@@ -1077,25 +2325,29 @@ async fn other_bytes_under_the_kept_copy_id_are_not_a_commit() {
     let log = mac.log();
     // Every send of the copy is refused, so it stays kept.
     hosted.edge.refuse_next_event(Refusal::Predecessor);
-    let _fold = Device::join(&mac, &hosted);
+    let _fold = Device::join(&mac, &hosted).await;
     let kept = kept_and_sent(&hosted, &mac, 4).await;
-    // Other bytes ordered under the kept copy's id: an ordered original
-    // that is not this copy and has no effect.
+    // Different bytes can reuse the copy's nonce without reserving the
+    // copy's route-derived ID or satisfying its pending outcome.
     let stored = mac.package(note).unwrap();
     let other = OpaqueEvent::new(
-        EventId(kept.event_id),
+        OpaqueEvent::decode(&kept.descriptor).unwrap().nonce(),
         stored.descriptor.envelope().to_vec(),
     )
     .unwrap();
     let other_at = hosted
         .edge
         .order(log, &other, Some(stored.body.clone()), Route::Content);
+    assert_eq!(
+        other.nonce(),
+        OpaqueEvent::decode(&kept.descriptor).unwrap().nonce()
+    );
+    assert_ne!(other.publication_id(Route::Content).0, kept.event_id);
     started.0.wake();
-    until(20, "not accepted", || {
-        status(&mut started) == SyncStatus::ControlNotAccepted
+    until(20, "other bytes followed", || {
+        mac.progress().position == other_at
     })
     .await;
-    assert_eq!(mac.progress().position, other_at);
     let sends = || {
         hosted
             .edge
@@ -1107,13 +2359,30 @@ async fn other_bytes_under_the_kept_copy_id_are_not_a_commit() {
     let sent = sends();
     started.0.wake();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    // Still kept and unsettled, never sent again or signed again.
+    // Still kept and unsettled; a refusal can retry its exact stored bytes,
+    // but a nonce collision must never cause a second control signature.
     assert_eq!(outcome(&mac, 4), Some(None));
-    assert_eq!(sends(), sent);
+    assert!(sends() >= sent);
     assert_eq!(mac.signer.control_signatures.load(Ordering::SeqCst), 1);
     assert_eq!(copied(&mac), 3);
-    assert_eq!(status(&mut started), SyncStatus::ControlNotAccepted);
+    assert_ne!(status(&mut started), SyncStatus::Synced);
     started.0.shutdown().await;
+    let prior_sends = sends();
+    let (client, _) = mac.start(&hosted);
+    until(20, "exact persisted copy retried", || sends() > prior_sends).await;
+    let pending = mac
+        .owner
+        .shared_database(mac.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .pending_base_control(mac.base.0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.descriptor, kept.descriptor);
+    assert_eq!(pending.body, kept.body);
+    assert_eq!(mac.signer.control_signatures.load(Ordering::SeqCst), 1);
+    client.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1124,7 +2393,7 @@ async fn another_device_copying_first_supersedes_the_kept_copy() {
     let log = mac.log();
     // The mac's copy of the next change is refused every time it is sent.
     hosted.edge.refuse_next_event(Refusal::Predecessor);
-    let _third = Device::join(&mac, &hosted);
+    let _third = Device::join(&mac, &hosted).await;
     let kept = kept_and_sent(&hosted, &mac, 5).await;
     mac_client.0.shutdown().await;
     // Once the service lets the mac's permitted copy lapse, the fold
@@ -1143,7 +2412,7 @@ async fn another_device_copying_first_supersedes_the_kept_copy() {
             .edge
             .entries(log)
             .iter()
-            .all(|(_, event)| event.id().0 != kept.event_id)
+            .all(|(_, event)| event.publication_id(bh_sync::Route::Control).0 != kept.event_id)
     );
     assert_eq!(mac.signer.control_signatures.load(Ordering::SeqCst), 2);
     assert_eq!(fold.signer.control_signatures.load(Ordering::SeqCst), 1);
@@ -1153,4 +2422,620 @@ async fn another_device_copying_first_supersedes_the_kept_copy() {
     .await;
     mac_started.0.shutdown().await;
     fold_client.0.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_signed_original_rejects_a_proof_with_another_predecessor() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    hosted
+        .edge
+        .order_account(mac.account_log, &mac.signer.add_device(test_keys(71)));
+    hosted.wrong_account_predecessor(mac.account_log, 4);
+    let applies = mac.signer.apply_attempts.load(Ordering::SeqCst);
+    let (client, _) = mac.start(&hosted);
+    until(20, "wrong predecessor evidence handled", || {
+        mac.signer.current_account().unwrap().head().position == 4
+            || hosted
+                .edge
+                .reads(mac.account_log)
+                .iter()
+                .filter(|(first, _)| *first == 4)
+                .count()
+                >= 2
+    })
+    .await;
+    assert_eq!(mac.signer.apply_attempts.load(Ordering::SeqCst), applies);
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 3);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .account_outer_progress(mac.account_log.id, hosted.edge.root())
+            .unwrap()
+            .order
+            .position(),
+        3
+    );
+    assert!(db.lock().unwrap().confirmation(4).unwrap().is_none());
+    assert!(
+        db.lock()
+            .unwrap()
+            .pending_base_control(mac.base.0)
+            .unwrap()
+            .is_none()
+    );
+    client.shutdown().await;
+    hosted.restore_account_confirmations();
+    let (client, _) = mac.start(&hosted);
+    until(20, "honest proof accepted", || {
+        mac.signer.current_account().unwrap().head().position == 4
+    })
+    .await;
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_page_observes_its_own_newer_accepted_head() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    for original in mac.signer.signed_additions(65, hosted.edge.clock.now()) {
+        hosted.edge.order_account(mac.account_log, &original);
+    }
+    let proof68 = hosted.confirmed_account(mac.account_log).await[67]
+        .1
+        .as_ref()
+        .unwrap()
+        .1
+        .clone();
+    hosted.edge.clock.advance(25_000);
+    let new_time = hosted.edge.clock.now();
+    let last = mac.signer.signed_additions(66, new_time).pop().unwrap();
+    hosted.edge.order_account(mac.account_log, &last);
+    hosted.first_account_page_claim(mac.account_log, 68, proof68);
+    let (client, _) = mac.start(&hosted);
+    until(20, "newer later-page observation", || {
+        db.lock()
+            .unwrap()
+            .observed_account_floor()
+            .unwrap()
+            .is_some_and(|t| t >= new_time)
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 69
+    })
+    .await;
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 69);
+    assert!(db.lock().unwrap().confirmation(69).unwrap().is_some());
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn already_committed_challenged_head_is_observed_before_its_suffix() {
+    let hosted = Hosted::new();
+    let mac = Device::new();
+    let (client, _) = registered(&hosted, &mac).await;
+    let db = mac.owner.shared_database(mac.id).unwrap();
+    until(20, "signup checkpoint", || {
+        !mac.home_pending()
+            && db
+                .lock()
+                .unwrap()
+                .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position()
+                == 3
+    })
+    .await;
+    client.shutdown().await;
+    let originals = mac.signer.signed_additions(2, hosted.edge.clock.now());
+    hosted.edge.order_account(mac.account_log, &originals[0]);
+    hosted.edge.clock.advance(25_000);
+    let new_time = hosted.edge.clock.now();
+    hosted.edge.order_account(mac.account_log, &originals[1]);
+    let confirmed = hosted.confirmed_account(mac.account_log).await;
+    let proof4 = confirmed[3].1.as_ref().unwrap().1.clone();
+    let confirmation = bh_sync::evidence::OrderingConfirmation::decode(&proof4).unwrap();
+    let claim = confirmation.claim();
+    let inner = mac.signer.current_account().unwrap().head();
+    mac.signer
+        .apply_account_timed(
+            inner,
+            vec![(
+                originals[0].clone(),
+                Some((
+                    bh_account::ConfirmedTime {
+                        earliest_ms: claim.bounds.earliest_ms,
+                        latest_ms: claim.bounds.latest_ms,
+                    },
+                    proof4.clone(),
+                )),
+            )],
+        )
+        .await
+        .unwrap();
+    let before = db.lock().unwrap().observed_account_floor().unwrap();
+    hosted.matched_account_page_claim(mac.account_log, 4, proof4);
+    let (client, _) = mac.start(&hosted);
+    until(
+        20,
+        "committed challenged head observed before suffix",
+        || {
+            db.lock()
+                .unwrap()
+                .observed_account_floor()
+                .unwrap()
+                .is_some_and(|t| t >= new_time)
+                && db
+                    .lock()
+                    .unwrap()
+                    .account_outer_progress(mac.account_log.id, hosted.edge.root())
+                    .unwrap()
+                    .order
+                    .position()
+                    == 5
+        },
+    )
+    .await;
+    let (floor, outer) = {
+        let mut db = db.lock().unwrap();
+        (
+            db.observed_account_floor().unwrap(),
+            db.account_outer_progress(mac.account_log.id, hosted.edge.root())
+                .unwrap()
+                .order
+                .position(),
+        )
+    };
+    assert!(
+        floor.is_some_and(|t| t >= new_time),
+        "floor={floor:?}, outer={outer}, account={}",
+        mac.signer.current_account().unwrap().head().position
+    );
+    assert!(db.lock().unwrap().observed_account_floor().unwrap() > before);
+    assert_eq!(mac.signer.current_account().unwrap().head().position, 5);
+    assert!(db.lock().unwrap().confirmation(5).unwrap().is_some());
+    client.shutdown().await;
+}
+
+/// The judged control at `position` of the device's own base, if its
+/// control feed has one.
+fn judged(device: &Device, position: u64) -> Option<bh_device::control::ControlFact> {
+    device
+        .owner
+        .control_fact(device.id, device.log(), position)
+        .unwrap()
+}
+
+/// The metadata-only control feed judges a control the content cursor has
+/// not reached, while content waits at a missing body before it; content
+/// then passes the control only because the feed judged it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controls_advance_from_the_feed_while_content_waits() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    let (lost_note, lost) = fold.new_note("its body goes missing");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    let lost_at = fold.acked(lost).unwrap();
+    let body = referenced_body(&fold.package(lost).unwrap().descriptor).unwrap();
+    let bytes = hosted.edge.take_body(mac.log(), body).unwrap();
+    // The fold adds a device and copies the addition into the base: a
+    // control after the gap.
+    let third = test_keys(91);
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(third.clone()));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    assert!(copy_at > lost_at);
+    assert!(judged(&fold, copy_at).is_some_and(|f| f.accepted));
+
+    let mut started = mac.start(&hosted);
+    until(20, "the feed judged the copy", || {
+        judged(&mac, copy_at).is_some_and(|f| f.accepted)
+    })
+    .await;
+    until(20, "content waits at the gap", || {
+        status(&mut started) == SyncStatus::HistoryMissing
+    })
+    .await;
+    assert_eq!(mac.progress().position, lost_at - 1);
+    let anchor = mac.signer.identity().unwrap().anchor;
+    let view = mac.owner.control_view(mac.id, mac.log(), &anchor).unwrap();
+    let third = bh_device::control::Author {
+        account: mac.signer.identity_account(),
+        device: third.id(),
+    };
+    assert_eq!(view.authorised_at(third, copy_at), Ok(true));
+    assert_eq!(view.authorised_at(third, lost_at), Ok(false));
+
+    hosted.edge.insert_body(mac.log(), bytes);
+    started.0.wake();
+    until(20, "content passed the judged control", || {
+        mac.progress().position == copy_at
+            && mac.inserted(lost_note.note, "its body goes missing") == 1
+    })
+    .await;
+    assert_eq!(copied(&mac), 5);
+    started.0.shutdown().await;
+    fold_client.0.shutdown().await;
+}
+
+/// Content never passes a control the feed has not judged: with the
+/// device's control reads refused, content stops just before the control,
+/// and continues once the feed can read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_waits_at_a_control_the_feed_has_not_judged() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    let (_, before) = fold.new_note("before the control");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    let before_at = fold.acked(before).unwrap();
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(test_keys(93)));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    let (after_note, after) = fold.new_note("after the control");
+    fold_client.0.wake();
+    until(20, "fold accepted again", || fold.pending() == 0).await;
+    assert!(fold.acked(after).unwrap() > copy_at);
+
+    fold_client.0.shutdown().await;
+    hosted
+        .edge
+        .refuse_control_reads
+        .store(true, Ordering::SeqCst);
+    let reads = hosted.edge.counts().read_controls;
+    let started = mac.start(&hosted);
+    until(20, "content up to the control", || {
+        mac.progress().position == copy_at - 1
+    })
+    .await;
+    assert_eq!(copy_at - 1, before_at);
+    // The feed was asked again after a refusal, and content still waits.
+    until(20, "control reads refused twice", || {
+        hosted.edge.counts().read_controls >= reads + 2
+    })
+    .await;
+    assert_eq!(mac.progress().position, copy_at - 1);
+    assert!(judged(&mac, copy_at).is_none());
+    assert_eq!(mac.inserted(after_note.note, "after the control"), 0);
+
+    hosted
+        .edge
+        .refuse_control_reads
+        .store(false, Ordering::SeqCst);
+    started.0.wake();
+    until(20, "content passed the judged control", || {
+        mac.inserted(after_note.note, "after the control") == 1
+    })
+    .await;
+    assert!(judged(&mac, copy_at).is_some_and(|f| f.accepted));
+    started.0.shutdown().await;
+}
+
+/// Content at a position where the feed judged a control is a second head
+/// there, each proven under the pinned root: the base stops, keeping what
+/// verified before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_at_a_judged_controls_position_stops_the_base() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    let (lost_note, lost) = fold.new_note("its body goes missing");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    let lost_at = fold.acked(lost).unwrap();
+    let body = referenced_body(&fold.package(lost).unwrap().descriptor).unwrap();
+    let bytes = hosted.edge.take_body(mac.log(), body).unwrap();
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(test_keys(94)));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    fold_client.0.shutdown().await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    assert!(copy_at > lost_at);
+
+    // The feed judges the copy while content waits before the gap.
+    let started = mac.start(&hosted);
+    until(20, "the feed judged the copy", || {
+        judged(&mac, copy_at).is_some_and(|f| f.accepted)
+    })
+    .await;
+    until(20, "content waits at the gap", || {
+        mac.progress().position == lost_at - 1
+    })
+    .await;
+    started.0.shutdown().await;
+    assert_eq!(hosted.edge.head(mac.log()).position, copy_at);
+
+    // The service now orders content at the copy's position. Control reads
+    // are refused: only content meets it.
+    hosted.edge.fork(mac.log());
+    hosted
+        .edge
+        .refuse_control_reads
+        .store(true, Ordering::SeqCst);
+    hosted.edge.insert_body(mac.log(), bytes);
+    let mut started = mac.start(&hosted);
+    until(20, "stopped", || {
+        status(&mut started) == SyncStatus::Stopped
+    })
+    .await;
+    let stopped = mac.progress();
+    assert!(stopped.stopped.is_some());
+    assert_eq!(stopped.position, copy_at - 1);
+    assert_eq!(mac.inserted(lost_note.note, "its body goes missing"), 1);
+    assert!(judged(&mac, copy_at).is_some_and(|f| f.accepted));
+    started.0.shutdown().await;
+}
+
+/// Content that meets a control appended after the feed's endpoint scans
+/// for it again in the same pass: it passes the control without ever
+/// reporting missing history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_after_the_feeds_endpoint_is_scanned_for_without_missing_history() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(test_keys(95)));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    let (after_note, _) = fold.new_note("after the control");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    fold_client.0.shutdown().await;
+
+    *hosted.edge.lag_next_control_read.lock().unwrap() = Some(copy_at - 1);
+    let started = mac.start(&hosted);
+    let mut statuses = started.1.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            while statuses.changed().await.is_ok() {
+                let status = *statuses.borrow_and_update();
+                seen.lock().unwrap().push(status);
+            }
+        })
+    };
+    until(20, "content passed the control", || {
+        mac.inserted(after_note.note, "after the control") == 1
+    })
+    .await;
+    assert!(
+        hosted.edge.lag_next_control_read.lock().unwrap().is_none(),
+        "the lagging read was made"
+    );
+    assert!(judged(&mac, copy_at).is_some_and(|f| f.accepted));
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.contains(&SyncStatus::HistoryMissing), "{seen:?}");
+    recorder.abort();
+    started.0.shutdown().await;
+}
+
+/// A control at a position the feed covered, where it judged none, is a
+/// second history at that position, each proven under the pinned root: the
+/// base stops, keeping what verified before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_where_the_feed_judged_none_stops_the_base() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    let (lost_note, lost) = fold.new_note("its body goes missing");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    let lost_at = fold.acked(lost).unwrap();
+    let (_, between) = fold.new_note("between the gap and the control");
+    fold_client.0.wake();
+    until(20, "fold accepted again", || fold.pending() == 0).await;
+    let between_at = fold.acked(between).unwrap();
+    assert_eq!(between_at, lost_at + 1);
+    let body = referenced_body(&fold.package(lost).unwrap().descriptor).unwrap();
+    let bytes = hosted.edge.take_body(mac.log(), body).unwrap();
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(test_keys(96)));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    fold_client.0.shutdown().await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    assert!(copy_at > between_at);
+
+    // The feed judges through the copy while content waits at the gap.
+    let started = mac.start(&hosted);
+    until(20, "the feed judged the copy", || {
+        judged(&mac, copy_at).is_some_and(|f| f.accepted)
+    })
+    .await;
+    until(20, "content waits at the gap", || {
+        mac.progress().position == lost_at - 1
+    })
+    .await;
+    started.0.shutdown().await;
+    assert!(judged(&mac, between_at).is_none());
+
+    // The service now orders a control where the feed judged none. Control
+    // reads are refused: only content meets it.
+    hosted.edge.flip_route(mac.log(), between_at);
+    hosted
+        .edge
+        .refuse_control_reads
+        .store(true, Ordering::SeqCst);
+    hosted.edge.insert_body(mac.log(), bytes);
+    let mut started = mac.start(&hosted);
+    until(20, "stopped", || {
+        status(&mut started) == SyncStatus::Stopped
+    })
+    .await;
+    let stopped = mac.progress();
+    assert!(stopped.stopped.is_some());
+    assert_eq!(stopped.position, lost_at);
+    assert_eq!(mac.inserted(lost_note.note, "its body goes missing"), 1);
+    assert!(judged(&mac, copy_at).is_some_and(|f| f.accepted));
+    started.0.shutdown().await;
+}
+
+/// A kept copy whose seen claim fell further behind the log than the
+/// services take is never sent again: the same account change is prepared
+/// and signed afresh from the base's current state, and that copy orders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_copy_older_than_the_seen_window_is_prepared_and_signed_again() {
+    let hosted = Hosted::new();
+    *hosted.edge.seen_window.lock().unwrap() = Some(3);
+    let mac = Device::new();
+    let started = registered(&hosted, &mac).await;
+    let log = mac.log();
+    // Every send of the first copy is refused, so it stays kept.
+    hosted.edge.refuse_next_event(Refusal::Predecessor);
+    let _fold = Device::join(&mac, &hosted).await;
+    let kept = kept_and_sent(&hosted, &mac, 4).await;
+    let metadata = mac.metadata_key();
+    let seen_of = |descriptor: &[u8]| {
+        bh_event::sealed_seen(
+            &OpaqueEvent::decode(descriptor).unwrap(),
+            metadata.expose(),
+            mac.base,
+        )
+        .unwrap()
+        .position
+    };
+    let kept_seen = seen_of(&kept.descriptor);
+    // The log moves on past the window, and the service lets the first
+    // copy's permit lapse, as it has long before a copy falls this far
+    // behind.
+    for note in 0..4 {
+        mac.remote_note(&hosted, [80 + note; 32], b"later");
+    }
+    hosted.edge.clock.advance(120_000);
+    started.0.wake();
+    until(20, "the change copied afresh", || copied(&mac) == 4).await;
+    let entries = hosted.edge.entries(log);
+    assert!(
+        entries
+            .iter()
+            .all(|(_, event)| event.publication_id(Route::Control).0 != kept.event_id),
+        "the stale copy never ordered"
+    );
+    let (ordered, copy) = entries
+        .iter()
+        .rev()
+        .find(|(ordered, _)| ordered.route() == Route::Control)
+        .unwrap();
+    let seen = seen_of(&copy.encode());
+    assert!(seen > kept_seen + 3);
+    assert!(ordered.head().position - seen <= 3, "within the window");
+    assert_eq!(mac.signer.control_signatures.load(Ordering::SeqCst), 2);
+    // The copier settles the fresh copy once it sees it ordered.
+    until(20, "the fresh copy settled the change", || {
+        started.0.wake();
+        outcome(&mac, 4) == Some(Some(ControlOutcome::Committed))
+    })
+    .await;
+    started.0.shutdown().await;
+}
+
+/// The control feed reads on from its own cursor, a control it judged,
+/// never from the content cursor: here content waits at a note between
+/// controls while the feed reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_reads_go_on_from_the_feeds_own_cursor() {
+    let hosted = Hosted::new();
+    let (mac, mac_client, fold, fold_client) = two(&hosted).await;
+    mac_client.0.shutdown().await;
+    let (_, before) = fold.new_note("before the gap");
+    let (lost_note, lost) = fold.new_note("its body goes missing");
+    fold_client.0.wake();
+    until(20, "fold accepted", || fold.pending() == 0).await;
+    let (before_at, lost_at) = (fold.acked(before).unwrap(), fold.acked(lost).unwrap());
+    assert!(before_at < lost_at);
+    let body = referenced_body(&fold.package(lost).unwrap().descriptor).unwrap();
+    let bytes = hosted.edge.take_body(mac.log(), body).unwrap();
+    hosted
+        .edge
+        .order_account(fold.account_log, &fold.signer.add_device(test_keys(98)));
+    fold_client.0.wake();
+    until(20, "fold copied the addition", || copied(&fold) == 5).await;
+    fold_client.0.shutdown().await;
+    let copy_at = hosted.edge.head(mac.log()).position;
+    hosted.edge.control_reads.lock().unwrap().clear();
+
+    let started = mac.start(&hosted);
+    until(20, "content waits at the gap, the feed past it", || {
+        mac.progress().position == lost_at - 1 && judged(&mac, copy_at).is_some()
+    })
+    .await;
+    let reads = hosted.edge.control_reads.lock().unwrap().clone();
+    // Read again while content waits: from the feed's cursor at the copy.
+    until(20, "the feed read again", || {
+        started.0.wake();
+        hosted.edge.control_reads.lock().unwrap().len() > reads.len()
+    })
+    .await;
+    assert!(
+        judged(&mac, lost_at - 1).is_none(),
+        "content waits between controls"
+    );
+    let reads = hosted.edge.control_reads.lock().unwrap().clone();
+    assert!(reads.iter().any(|(_, after)| *after == copy_at));
+    for (log, after) in reads {
+        assert_eq!(log, mac.log());
+        assert!(
+            judged(&mac, after).is_some(),
+            "a control read after {after}, which is no judged control"
+        );
+    }
+    hosted.edge.insert_body(mac.log(), bytes);
+    until(20, "content passed the gap", || {
+        started.0.wake();
+        mac.inserted(lost_note.note, "its body goes missing") == 1
+    })
+    .await;
+    started.0.shutdown().await;
 }

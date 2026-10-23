@@ -1,9 +1,10 @@
 //! Ordered device-local migrations: fresh, from the note-only v2 layout, a
 //! rolled-back failed step, and newer-version refusal. Storage-only; no
 //! verification lives here.
-use bh_core::LOCAL_DATA_VERSION;
+use bh_core::{LOCAL_DATA_VERSION, NewerDataVersion, check_data_version};
 use bh_storage::{DeviceDatabase, OpenError};
 use rusqlite::{Connection, TransactionBehavior, params};
+use std::collections::BTreeMap;
 
 #[path = "support/legacy.rs"]
 mod legacy;
@@ -663,6 +664,122 @@ fn failed_account_migration_leaves_v2_layout_and_version() {
     assert!(!table_exists(&connection, "account_events"));
     assert!(!table_exists(&connection, "account_device"));
     assert!(table_exists(&connection, "account_pending_setup"));
+}
+
+#[test]
+fn v13_upgrades_to_v14_preserving_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("previous.sqlite");
+    let mut db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.data_version(), LOCAL_DATA_VERSION);
+    let note = db.create_note([1; 32], [2; 32]).unwrap();
+    let mut document = bh_core::note::Note::new().unwrap();
+    let delta = document.append_paragraph("retained").unwrap();
+    db.apply_local_update(
+        bh_storage::NoteKey {
+            base: [1; 32],
+            audience: [2; 32],
+            note,
+        },
+        [4; 16],
+        &delta,
+    )
+    .unwrap();
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    // The fresh migration ran the real v13 step. Strip only the additive
+    // security tables to reconstruct that shipped layout with populated rows.
+    conn.execute_batch("DROP TABLE security_alerts; DROP TABLE security_alert_cursor; DROP TABLE staged_account_control; DROP TABLE account_confirmations; DROP TABLE account_directory_versions; DROP TABLE base_epoch_keys; DROP TABLE account_personal_delivery; DROP TABLE account_directory_state; DROP TABLE account_outer_progress; DROP TABLE base_control_fact; DROP TABLE base_control_cursor; DROP TABLE base_seal_wait; DROP TABLE base_control_seal_set; ALTER TABLE account_state DROP COLUMN observed_earliest_ms; ALTER TABLE log_progress DROP COLUMN order_format; ALTER TABLE log_progress DROP COLUMN opening; ALTER TABLE log_progress DROP COLUMN floor_opening; PRAGMA user_version=13;").unwrap();
+    assert_eq!(version(&conn), 13);
+    let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let before: BTreeMap<_, _> = tables
+        .iter()
+        .map(|name| (name.clone(), legacy::dump(&conn, name)))
+        .collect();
+    drop(conn);
+
+    let db = DeviceDatabase::open(&path).unwrap();
+    assert_eq!(db.data_version(), 14);
+    assert_eq!(db.pending_note_updates().unwrap()[0].bytes, delta);
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(version(&conn), 14);
+    for (name, rows) in &before {
+        assert_eq!(&legacy::dump(&conn, name), rows, "v13 table {name} changed");
+    }
+    for name in [
+        "security_alerts",
+        "security_alert_cursor",
+        "staged_account_control",
+        "account_confirmations",
+        "account_directory_versions",
+        "base_epoch_keys",
+        "account_personal_delivery",
+        "account_directory_state",
+        "account_outer_progress",
+        "base_control_fact",
+        "base_control_cursor",
+        "base_seal_wait",
+        "base_control_seal_set",
+    ] {
+        assert!(table_exists(&conn, name), "v14 table {name} absent");
+    }
+    assert!(!table_exists(&conn, "account_event_times"));
+    assert!(!table_exists(&conn, "erase_marker"));
+}
+
+#[test]
+fn v14_refused_by_a_v13_client_layout_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("newer.sqlite");
+    drop(DeviceDatabase::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let marker = version(&conn);
+    assert_eq!(marker, 14, "real database reached the current layout");
+    assert_eq!(
+        check_data_version(marker, 13),
+        Err(NewerDataVersion {
+            found: 14,
+            supported: 13
+        })
+    );
+    assert_eq!(
+        version(&conn),
+        marker,
+        "layout check leaves the marker untouched"
+    );
+}
+
+#[test]
+fn open_refuses_data_newer_than_this_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("future.sqlite");
+    drop(DeviceDatabase::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE guard_probe(value BLOB NOT NULL); INSERT INTO guard_probe(value) VALUES (x'010203');").unwrap();
+    conn.pragma_update(None, "user_version", LOCAL_DATA_VERSION + 1)
+        .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        DeviceDatabase::open(&path),
+        Err(OpenError::NewerData { found, supported })
+            if found == LOCAL_DATA_VERSION + 1 && supported == LOCAL_DATA_VERSION
+    ));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "database file unchanged"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(version(&conn), LOCAL_DATA_VERSION + 1);
+    assert_eq!(
+        conn.query_row("SELECT value FROM guard_probe", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        [1, 2, 3]
+    );
 }
 
 #[test]

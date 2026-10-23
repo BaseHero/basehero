@@ -32,7 +32,7 @@ case "${1:-}" in
     python3 - "$LOCAL_STACK_DIR" <<'PY'
 import json,pathlib,sys
 s=pathlib.Path(sys.argv[1]); k=s/'keys'
-e={'edge_url':(s/'edge-url').read_text().strip(),'hosting_root':(k/'hosting-root.pub').read_text().strip(),'app_root':(k/'app-root.pub').read_text().strip(),'policy':(k/'policy.json').read_bytes().hex(),'policy_signature':(k/'policy.sig').read_text().strip(),'max_lifetime_secs':86400,'max_uncertainty_secs':0,'build_floor':1,'appraisal':'synthetic'}
+e={'edge_url':(s/'edge-url').read_text().strip(),'hosting_root':(k/'hosting-root.pub').read_text().strip(),'app_root':(k/'app-root.pub').read_text().strip(),'policy':(k/'policy.json').read_bytes().hex(),'policy_signature':(k/'policy.sig').read_text().strip(),'recovery_key':(k/'recovery.cert').read_text().strip(),'max_lifetime_secs':86400,'max_uncertainty_secs':0,'build_floor':1,'appraisal':'synthetic'}
 (s/'host-endpoint.json').write_text(json.dumps(e,separators=(',',':')))
 e['edge_url']=e['edge_url'].replace('127.0.0.1','10.0.2.2')
 (s/'emulator-endpoint.json').write_text(json.dumps(e,separators=(',',':')))
@@ -63,7 +63,7 @@ ep=endpoint.read_bytes(); e=json.loads(ep)
 if stack:
     s=pathlib.Path(stack)
     assert e['edge_url']==(s/'edge-url').read_text().strip().replace('127.0.0.1','10.0.2.2')
-    for f,k in [('hosting-root.pub','hosting_root'),('app-root.pub','app_root'),('policy.sig','policy_signature')]:
+    for f,k in [('hosting-root.pub','hosting_root'),('app-root.pub','app_root'),('policy.sig','policy_signature'),('recovery.cert','recovery_key')]:
         assert e[k]==(s/'keys'/f).read_text().strip()
     assert e['policy']==(s/'keys/policy.json').read_bytes().hex()
 stamps=[]

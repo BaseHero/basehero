@@ -46,6 +46,11 @@ pub struct RotatingProtector {
 const KIT: u8 = 1;
 const HOME: u8 = 2;
 impl RotatingProtector {
+    /// Keys held now.
+    #[allow(dead_code)] // Not every test binary counts them.
+    pub fn live(&self) -> usize {
+        self.keys.lock().unwrap().len()
+    }
     pub fn fail_next_retirement(&self) {
         self.fail_retire.store(true, Ordering::SeqCst);
     }
@@ -118,6 +123,14 @@ impl PendingSetupProtector for RotatingProtector {
         let handle: [u8; 32] = saved[33..65]
             .try_into()
             .map_err(|_| ProtectorError::Failed)?;
+        self.keys.lock().unwrap().remove(&handle);
+        Ok(())
+    }
+    fn retire_key(&mut self, blob: &[u8]) -> Result<(), ProtectorError> {
+        let handle: [u8; 32] = blob
+            .get(1..33)
+            .and_then(|h| h.try_into().ok())
+            .ok_or(ProtectorError::Failed)?;
         self.keys.lock().unwrap().remove(&handle);
         Ok(())
     }

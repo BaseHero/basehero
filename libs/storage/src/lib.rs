@@ -12,6 +12,7 @@
 
 pub mod account;
 mod catalogue;
+pub mod control_facts;
 mod data;
 pub mod held_notes;
 pub mod joined;
@@ -19,6 +20,10 @@ pub mod note_writers;
 pub mod own_base;
 pub mod retained;
 mod runs;
+mod security;
+pub use security::{
+    AlertKind, ConfirmationRow, EpochKeyRow, KeyringSnapshot, NewAlert, StagedControl, StoredAlert,
+};
 pub mod sync_state;
 pub mod typed_outbox;
 pub use catalogue::{MAX_NOTE_PAGE, MAX_NOTE_TITLE, NoteEntry};
@@ -133,6 +138,10 @@ pub enum StoreError {
     AuthorityChanged,
     #[error("local request id reused with different content")]
     RequestConflict,
+    #[error("new account original needs confirmation after an accepted-head observation")]
+    MissingTime,
+    #[error("new account original predates a verified accepted-head observation")]
+    TimeRegressed,
     #[error("stored account state is inconsistent")]
     CorruptAccount,
     #[error("account head has no matching stored signed bytes")]
@@ -149,12 +158,22 @@ pub enum StoreError {
     CorruptOutbox,
     #[error("a staged account admission already exists")]
     StagedAdmissionExists,
+    #[error("a staged account control already exists")]
+    StagedControlExists,
+    #[error("staged account control changed before it could be cleared")]
+    StagedControlChanged,
+    #[error("stored security state or security input is invalid")]
+    CorruptSecurity,
     #[error("staged account admission changed before it could be cleared")]
     StagedAdmissionChanged,
     #[error("staged account admission row is invalid")]
     CorruptStagedAdmission,
     #[error("stored own-base record is inconsistent")]
     CorruptOwnBase,
+    #[error("accepted personal key, account head or local keyring changed; nothing written")]
+    KeyringChanged,
+    #[error("a held base has no local keyring rows yet; nothing written")]
+    KeyringIncomplete,
     #[error("invalid or unavailable writer reservation")]
     InvalidWriter,
     #[error("log is stopped by a proven contradiction")]
@@ -980,9 +999,9 @@ impl DeviceDatabase {
         descriptor: OpaqueEvent,
         body: BodyObject,
     ) -> Result<StoredNotePackage, StoreError> {
-        let id = candidate.event_id;
-        if id.0 == [0; 32]
-            || descriptor.id() != id
+        let id = descriptor.publication_id(bh_sync::Route::Content);
+        if candidate.event_id.0 == [0; 32]
+            || descriptor.nonce() != candidate.event_id
             || referenced_body(&descriptor).map_err(|_| StoreError::InvalidPackage)?
                 != body.commitment()
         {
@@ -1039,6 +1058,123 @@ impl DeviceDatabase {
             ack: None,
         })
     }
+    /// Phase 1 of a reseal: a fresh candidate for exactly the pending run
+    /// this device's undecided note package covering `update_id` carries,
+    /// for a package under an epoch content has left (`publish_note_reseal`
+    /// checks that). None if there is no such package.
+    pub fn prepare_note_reseal(
+        &self,
+        update_id: i64,
+    ) -> Result<Option<PackageCandidate>, StoreError> {
+        if sync_state::publishing_stopped(&self.connection)? {
+            return Err(StoreError::PublishingStopped);
+        }
+        let package = runs::covering(&self.connection, update_id)?.unwrap_or(update_id);
+        let Some(stored) = read_package(&self.connection, package)? else {
+            return Ok(None);
+        };
+        if stored.ack.is_some() || !sync_state::package_undecided(&self.connection, package)? {
+            return Ok(None);
+        }
+        let covers = runs::covered(&self.connection, package)?;
+        if covers.last() != Some(&package) {
+            return Ok(None);
+        }
+        let key = runs::pending_key(&self.connection, package)?;
+        let mut deltas = Vec::with_capacity(covers.len());
+        for id in &covers {
+            deltas.push(self.connection.query_row(
+                "SELECT delta FROM note_updates WHERE id=?1",
+                [id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )?);
+        }
+        let bytes = match <[Vec<u8>; 1]>::try_from(deltas) {
+            Ok([only]) => only,
+            Err(deltas) => bh_core::note::merge_updates(&deltas)?,
+        };
+        Ok(Some(PackageCandidate {
+            event_id: EventId(bh_crypto::random::<32>()),
+            pending: PendingNoteUpdate {
+                update_id: package,
+                key,
+                bytes,
+                writer: note_writers::pending_writer(&self.connection, package)?,
+            },
+            covers,
+        }))
+    }
+
+    /// Phase 2 of a reseal, in one transaction: the package `old`, sealed
+    /// under `sealed_epoch`, is retired and `candidate`'s exact new bytes
+    /// replace it, only while it is still kept undecided as read, its run
+    /// unchanged, and its base's verified content in another epoch: content
+    /// passed the control that replaced it, so it can never be ordered and
+    /// its bytes are never sent again. None, changing nothing, otherwise.
+    pub fn publish_note_reseal(
+        &mut self,
+        candidate: PackageCandidate,
+        old: EventId,
+        sealed_epoch: [u8; 32],
+        descriptor: OpaqueEvent,
+        body: BodyObject,
+    ) -> Result<Option<StoredNotePackage>, StoreError> {
+        let id = descriptor.publication_id(bh_sync::Route::Content);
+        if candidate.event_id.0 == [0; 32]
+            || descriptor.nonce() != candidate.event_id
+            || referenced_body(&descriptor).map_err(|_| StoreError::InvalidPackage)?
+                != body.commitment()
+        {
+            return Err(StoreError::InvalidPackage);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if sync_state::publishing_stopped(&tx)? {
+            return Err(StoreError::PublishingStopped);
+        }
+        let package = candidate.pending.update_id;
+        let Some(stored) = read_package(&tx, package)? else {
+            return Ok(None);
+        };
+        if stored.event_id != old
+            || stored.ack.is_some()
+            || !sync_state::package_undecided(&tx, package)?
+            || !sync_state::content_left(&tx, candidate.pending.key.base, sealed_epoch)?
+            || runs::covered(&tx, package)? != candidate.covers
+        {
+            return Ok(None);
+        }
+        tx.execute(
+            "DELETE FROM note_outbox_progress WHERE update_id=?1",
+            [package],
+        )?;
+        tx.execute(
+            "DELETE FROM note_outbox_members WHERE package_update_id=?1",
+            [package],
+        )?;
+        tx.execute("DELETE FROM note_outbox WHERE update_id=?1", [package])?;
+        tx.execute(
+            "INSERT INTO note_outbox(update_id,event_id,descriptor,body) VALUES (?1,?2,?3,?4)",
+            params![package, id.0.as_slice(), descriptor.encode(), body.bytes()],
+        )?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO note_outbox_members(update_id,package_update_id) VALUES(?1,?2)",
+            )?;
+            for member in &candidate.covers {
+                insert.execute(params![member, package])?;
+            }
+        }
+        tx.commit()?;
+        Ok(Some(StoredNotePackage {
+            event_id: id,
+            descriptor,
+            body: body.bytes().to_vec(),
+            ack: None,
+        }))
+    }
+
     /// Small single-thread test helper. Native callers with a container mutex
     /// must use prepare/publish above; this closure must never run under that
     /// mutex, even though SQLite itself is unlocked during it.
@@ -1184,7 +1320,7 @@ fn read_package(
     let event_id = EventId(id.try_into().map_err(|_| StoreError::CorruptOutbox)?);
     let descriptor = OpaqueEvent::decode(&descriptor).map_err(|_| StoreError::CorruptOutbox)?;
     let object = BodyObject::new(body).map_err(|_| StoreError::CorruptOutbox)?;
-    if descriptor.id() != event_id
+    if descriptor.publication_id(bh_sync::Route::Content) != event_id
         || referenced_body(&descriptor).map_err(|_| StoreError::CorruptOutbox)?
             != object.commitment()
     {
@@ -1232,6 +1368,7 @@ const MIGRATIONS: &[(u32, u32, Migration)] = &[
     (10, 11, sync_state::migrate),
     (11, 12, runs::migrate),
     (12, 13, data::migrate),
+    (13, 14, security::migrate),
 ];
 
 fn initialize(connection: &mut Connection) -> Result<(), OpenError> {

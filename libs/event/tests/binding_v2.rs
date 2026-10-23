@@ -1,4 +1,4 @@
-//! Version-2 bindings carry a hosting receipt for the author's observed head.
+//! Historical binding compatibility fixtures and canonical v3 receipt behavior.
 use bh_account::{AccountEvent, AccountId, DevicePublicKeys, RecoveryPublicKeys, VerifiedAccount};
 use bh_core::note::Note;
 use bh_crypto::{KemKey, Secret, SigningKey, aead_open, aead_seal, derive_key};
@@ -88,8 +88,13 @@ impl Fixture {
         let (genesis, base) = request.finish(signature).unwrap();
         let hosting = Hosting::new();
         let mut history = History::with_account(&account, base, hosting.root(), 1).unwrap();
-        let ordered =
-            Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+        let ordered = Commitment::order(
+            base,
+            bh_sync::OrderState::EMPTY,
+            &genesis.descriptor,
+            Route::Control,
+        )
+        .unwrap();
         let mut scratch = Note::new().unwrap();
         assert_eq!(
             history.apply(
@@ -123,7 +128,7 @@ impl Fixture {
         let mut history = History::with_account(&self.account, self.base, root, 1).unwrap();
         let ordered = Commitment::order(
             self.base,
-            Head::EMPTY,
+            bh_sync::OrderState::EMPTY,
             &self.genesis.descriptor,
             Route::Control,
         )
@@ -147,8 +152,8 @@ impl Fixture {
     }
     fn binding(&self, receipt: [u8; RECEIPT_LEN]) -> Binding {
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: self.base.0,
             audience: [0; 32],
@@ -179,9 +184,13 @@ impl Fixture {
         .unwrap()
     }
     fn apply(&self, history: &mut History, event: &Encoded, note: &mut Note) -> Outcome {
-        let ordered =
-            Commitment::order(self.base, history.head(), &event.descriptor, Route::Content)
-                .unwrap();
+        let ordered = Commitment::order(
+            self.base,
+            history.order_state(),
+            &event.descriptor,
+            Route::Content,
+        )
+        .unwrap();
         history.apply(
             &ordered,
             &event.descriptor,
@@ -283,15 +292,22 @@ fn genesis_v1_bytes_unchanged() {
     let account =
         VerifiedAccount::from_genesis(AccountId::of_genesis(&first).unwrap(), &account_genesis)
             .unwrap();
-    let verified = verify_genesis(&account, &descriptor, &body, &seed(0x33), 1).unwrap();
-    assert_eq!(verified.base, base);
-    assert_eq!(verified.metadata_key_id, key_id(&seed(0x33)));
-    assert_eq!(verified.content_key_id, key_id(&seed(0x44)));
-    // Genesis is fixed v1 bytes: a remembered v2 floor still opens the base.
-    for floor in [1, 2] {
+    // The old sealed bytes and pinned base ID remain decodable, but cannot
+    // introduce a canonical base regardless of the remembered floor.
+    assert_eq!(
+        verify_genesis(&account, &descriptor, &body, &seed(0x33), 1).err(),
+        Some(Outcome::UnsupportedPause)
+    );
+    for floor in [1, 2, 3] {
         let mut history =
             History::with_account(&account, base, Hosting::new().root(), floor).unwrap();
-        let ordered = Commitment::order(base, Head::EMPTY, &descriptor, Route::Control).unwrap();
+        let ordered = Commitment::order(
+            base,
+            bh_sync::OrderState::EMPTY,
+            &descriptor,
+            Route::Control,
+        )
+        .unwrap();
         let mut note = Note::new().unwrap();
         assert_eq!(
             history.apply(
@@ -302,26 +318,29 @@ fn genesis_v1_bytes_unchanged() {
                 None,
                 NoteTarget {
                     id: [7; 32],
-                    note: &mut note,
-                },
+                    note: &mut note
+                }
             ),
-            Outcome::Accepted,
+            Outcome::UnsupportedPause,
             "floor {floor}"
         );
     }
-    // A freshly prepared genesis still signs the 346-byte v1 fields.
-    let request = prepare_genesis(&account, verified.device, &seed(0x33), &seed(0x44)).unwrap();
+    let device = account.active_devices().unwrap().next().unwrap().id();
+    let request = prepare_genesis(&account, device, &seed(0x33), &seed(0x44)).unwrap();
     let domain = b"bh/original-envelope/v1\0";
-    assert_eq!(request.signing_bytes().len(), domain.len() + 346);
+    assert_eq!(
+        request.signing_bytes().len(),
+        domain.len() + 346 + RECEIPT_LEN + 24
+    );
     assert_eq!(&request.signing_bytes()[..domain.len()], domain);
     assert_eq!(
         &request.signing_bytes()[domain.len()..domain.len() + 4],
-        &[0, 1, 0, 1]
+        &[0, 3, 0, 3]
     );
 }
 
 #[test]
-fn v2_requires_receipt() {
+fn canonical_binding_requires_receipt() {
     let f = Fixture::new();
     let data = note_data("needs a receipt");
     f.assert_rejected(&f.note([0; RECEIPT_LEN], &data), "zeroed receipt");
@@ -329,11 +348,11 @@ fn v2_requires_receipt() {
     let mut note = Note::new().unwrap();
     let event = f.note(f.valid_receipt(), &data);
     assert_eq!(f.apply(&mut history, &event, &mut note), Outcome::Accepted);
-    assert_eq!(history.floor(), 2);
+    assert_eq!(history.floor(), 3);
 }
 
 #[test]
-fn v2_receipt_must_match_seen() {
+fn canonical_receipt_must_match_seen() {
     let f = Fixture::new();
     let data = note_data("observed head");
     let seen = f.history.head();
@@ -375,7 +394,7 @@ fn v2_receipt_must_match_seen() {
 }
 
 #[test]
-fn v2_roundtrip_large_body_1mib() {
+fn canonical_roundtrip_large_body_1mib() {
     assert_eq!(ENVELOPE_SIZES, [1024, 4096, 16384, 65536]);
     assert_eq!(
         BODY_SIZES,
@@ -441,7 +460,7 @@ fn v2_roundtrip_large_body_1mib() {
 }
 
 #[test]
-fn v2_small_edit_envelope_is_one_kib() {
+fn canonical_small_edit_envelope_is_one_kib() {
     let f = Fixture::new();
     let event = f.note(f.valid_receipt(), &note_data("a typical small edit"));
     assert_eq!(event.descriptor.envelope().len(), 1024);
@@ -491,12 +510,12 @@ fn downgrade_to_v1(
         ad.extend(version.to_be_bytes());
         ad.push(0);
         ad.extend(base.0);
-        ad.extend(event.id().0);
+        ad.extend(event.nonce().0);
         ad.extend(&env[..32]);
         ad
     };
     let key = derive_key(metadata, b"bhBind01", 0);
-    let plain = aead_open(&key, env[32..56].try_into().unwrap(), &aad(2), &env[56..]).unwrap();
+    let plain = aead_open(&key, env[32..56].try_into().unwrap(), &aad(3), &env[56..]).unwrap();
     let mut header = plain.expose()[..346].to_vec();
     header[..4].copy_from_slice(&[0, 1, 0, 1]);
     let mut signed = b"bh/original-envelope/v1\0".to_vec();
@@ -508,7 +527,7 @@ fn downgrade_to_v1(
     let mut envelope = env[..32].to_vec();
     envelope.extend(nonce);
     envelope.extend(cipher);
-    OpaqueEvent::new(event.id(), envelope).unwrap()
+    OpaqueEvent::new(event.nonce(), envelope).unwrap()
 }
 
 #[test]
@@ -517,8 +536,13 @@ fn note_payload_names_its_writer_and_authenticated_author() {
     let update = Note::new().unwrap().append_paragraph("declared").unwrap();
     let event = f.note(f.valid_receipt(), &note_payload([7; 32], WRITER, &update));
     let mut history = f.history.clone();
-    let ordered =
-        Commitment::order(f.base, history.head(), &event.descriptor, Route::Content).unwrap();
+    let ordered = Commitment::order(
+        f.base,
+        history.order_state(),
+        &event.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     let prepared = history
         .prepare(
             &ordered,
@@ -557,8 +581,13 @@ fn a_recomposed_note_payload_is_byte_identical_to_the_opened_one() {
     let data = note_payload([7; 32], WRITER, &update);
     let event = f.note(f.valid_receipt(), &data);
     let mut history = f.history.clone();
-    let ordered =
-        Commitment::order(f.base, history.head(), &event.descriptor, Route::Content).unwrap();
+    let ordered = Commitment::order(
+        f.base,
+        history.order_state(),
+        &event.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     let prepared = history
         .prepare(
             &ordered,

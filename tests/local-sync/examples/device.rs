@@ -488,7 +488,15 @@ fn outbound(faults: &Faults, sent: &mut HashMap<u32, Sent>, message: &Message) -
             };
             let content = log.kind == LogKind::Base && after.is_none();
             let event_id = bh_sync::OpaqueEvent::decode(&event)
-                .map(|e| hex(&e.id().0))
+                .map(|e| {
+                    hex(&e
+                        .publication_id(if after.is_some() {
+                            bh_sync::Route::Control
+                        } else {
+                            bh_sync::Route::Content
+                        })
+                        .0)
+                })
                 .unwrap_or_default();
             resending(faults, &event_id);
             faults.record(json!({"out": "stage", "id": id, "log": log_hex(log),
@@ -554,7 +562,15 @@ fn outbound(faults: &Faults, sent: &mut HashMap<u32, Sent>, message: &Message) -
             };
             let content = log.kind == LogKind::Base && after.is_none();
             let event_id = bh_sync::OpaqueEvent::decode(&event)
-                .map(|e| hex(&e.id().0))
+                .map(|e| {
+                    hex(&e
+                        .publication_id(if after.is_some() {
+                            bh_sync::Route::Control
+                        } else {
+                            bh_sync::Route::Content
+                        })
+                        .0)
+                })
                 .unwrap_or_default();
             resending(faults, &event_id);
             faults.record(json!({"out": "append", "id": id, "log": log_hex(log),
@@ -1196,6 +1212,7 @@ impl Device {
                 log,
                 event: removal.clone(),
                 delivery: None,
+                attachment: None,
             })
             .await
             .map_err(|e| format!("{e:?}"))?;

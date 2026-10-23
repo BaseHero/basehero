@@ -69,6 +69,10 @@ enum Family {
     Permits,
     Home,
     ReadBatch,
+    Recovery,
+    Notices,
+    Confirmed,
+    AccountEvidence,
 }
 impl Family {
     fn for_request(message: &ToService) -> Self {
@@ -76,6 +80,10 @@ impl Family {
             ToService::Authenticate { .. } => Self::Authenticate,
             ToService::StoreHomeObjects { .. } => Self::Home,
             ToService::ReadBatch { .. } => Self::ReadBatch,
+            ToService::Recover { .. } => Self::Recovery,
+            ToService::ReadNotices { .. } => Self::Notices,
+            ToService::ConfirmControl { .. } => Self::Confirmed,
+            ToService::ReadAccountEvidence { .. } => Self::AccountEvidence,
             ToService::Permits { .. }
             | ToService::SubmitControl { .. }
             | ToService::RegisterBase { .. }
@@ -90,6 +98,10 @@ impl Family {
                 | (Self::Permits, FromService::Permits { .. })
                 | (Self::Home, FromService::HomeObjectsStored { .. })
                 | (Self::ReadBatch, FromService::ReadBatch { .. })
+                | (Self::Recovery, FromService::Recovery(_))
+                | (Self::Notices, FromService::Notices { .. })
+                | (Self::Confirmed, FromService::Confirmed { .. })
+                | (Self::AccountEvidence, FromService::AccountEvidence { .. })
         )
     }
 }
@@ -256,12 +268,15 @@ pub(super) fn check_size(message: &ToService) -> Result<usize, ClientError> {
                 size += 34
                     + match item {
                         Want::ReadEvents { .. } => 16,
+                        Want::ReadControls { .. } => 8,
                         Want::ReadBodies { bodies, .. } => 2 + bodies.len().saturating_mul(32),
                         Want::Stage { .. } => 36,
                         Want::Append { event, .. } => 36 + event.len(),
                         Want::Subscribe { .. } => 0,
                         Want::Presence { .. } => 32,
                         Want::ReadBatch { .. } => return Err(ClientError::Channel),
+                        Want::ReadDirectory { .. } => 0,
+                        Want::StoreDirectoryEntry { .. } => 76,
                     };
                 if size > MAX_PLAIN {
                     return Err(ClientError::Channel);
@@ -270,7 +285,10 @@ pub(super) fn check_size(message: &ToService) -> Result<usize, ClientError> {
             size
         }
         ToService::SubmitControl {
-            event, delivery, ..
+            event,
+            delivery,
+            attachment,
+            ..
         } => {
             3 + 33
                 + 4
@@ -279,7 +297,19 @@ pub(super) fn check_size(message: &ToService) -> Result<usize, ClientError> {
                 + delivery.as_ref().map_or(0, |d| {
                     32 + 32 + d.recipient.receiving().len() + 4 + d.frame.len()
                 })
+                + 1
+                + attachment.as_ref().map_or(0, |a| {
+                    1 + a.record.as_ref().map_or(0, |r| 4 + r.len())
+                        + 4
+                        + a.recovery_seal.len()
+                        + 1
+                        + a.rotation_body.map_or(0, |_| 32)
+                })
         }
+        ToService::Recover { sealed, .. } => 3 + 1 + 4 + sealed.len(),
+        ToService::ReadNotices { .. } => 3 + 8,
+        ToService::ConfirmControl { .. } => 3 + 33 + 32 + 32,
+        ToService::ReadAccountEvidence { genesis, .. } => 3 + 4 + genesis.len() + 8 + 8 + 32,
         ToService::RegisterBase {
             descriptor, body, ..
         } => 3 + 8 + descriptor.len() + body.len() + 40 + 32,

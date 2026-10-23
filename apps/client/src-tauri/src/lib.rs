@@ -1,10 +1,13 @@
 //! Thin desktop/mobile entry point for the bundled client.
 
+mod about;
 mod account_host;
 #[cfg(not(target_os = "macos"))]
 mod account_stub;
+mod alerts_host;
 #[cfg(target_os = "android")]
 mod android_account;
+mod devices_host;
 mod lifecycle;
 mod mac_update;
 #[cfg(target_os = "macos")]
@@ -15,6 +18,8 @@ mod passwords;
 mod sync_host;
 // No release-approved policy root, signed bundle or public endpoint is configured.
 // The native bootstrap is deliberately inert until those release inputs exist.
+#[cfg(target_os = "android")]
+mod notify_android;
 #[allow(dead_code)]
 mod policy_host;
 #[cfg(target_os = "android")]
@@ -37,6 +42,8 @@ pub fn run() {
     let builder = builder.plugin(android_account::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(qr_scan::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(notify_android::init());
     #[cfg(feature = "webdriver")]
     let builder = webdriver::register(builder);
     let context = tauri::generate_context!();

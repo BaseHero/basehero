@@ -55,27 +55,29 @@ async function withEdge(run, bindings) {
   try { await run(mf); } finally { await mf.dispose(); }
 }
 
-// Client-side data-wire request: version 1, tag, id, permit, then the body or
+// Client-side data-wire request: version 3, tag, id, permit, then the body or
 // event blob (Stage/Append) or `after` (Subscribe).
-const TAGS = { read: 1, stage: 2, append: 3, subscribe: 4, storeHome: 6 };
+const TAGS = { read: 1, stage: 2, append: 3, subscribe: 4, storeHome: 6,
+  readDirectory: 37, storeDirectory: 38, retireHome: 39 };
 function request(kind, id, permit, extra) {
   const blob = value => { const b = unhex(value); const n = Buffer.alloc(4); n.writeUInt32BE(b.length); return [n, b]; };
   const head = Buffer.alloc(7);
-  head.writeUInt16BE(1); head[2] = TAGS[kind]; head.writeUInt32BE(id, 3);
+  head.writeUInt16BE(3); head[2] = TAGS[kind]; head.writeUInt32BE(id, 3);
   const parts = [head, ...blob(permit)];
-  if (kind === 'stage' || kind === 'append' || kind === 'storeHome') parts.push(...blob(extra));
+  if (kind === 'stage' || kind === 'append' || kind === 'storeHome' || kind === 'storeDirectory') parts.push(...blob(extra));
+  if (kind === 'readDirectory') parts.push(Uint8Array.of(extra ? 1 : 0), ...(extra ? [unhex(extra)] : []));
   if (kind === 'subscribe') { const after = Buffer.alloc(8); after.writeBigUInt64BE(BigInt(extra ?? 0)); parts.push(after); }
   return new Uint8Array(Buffer.concat(parts));
 }
 function publish(id, stagePermit, appendPermit, event, body) {
-  const head = Buffer.alloc(7); head.writeUInt16BE(2); head[2] = 32; head.writeUInt32BE(id, 3);
+  const head = Buffer.alloc(7); head.writeUInt16BE(3); head[2] = 32; head.writeUInt32BE(id, 3);
   const blob = value => { const b = Buffer.from(value, 'hex'); const n = Buffer.alloc(4); n.writeUInt32BE(b.length); return [n, b]; };
   return new Uint8Array(Buffer.concat([head, ...blob(stagePermit), ...blob(appendPermit), ...blob(event), ...blob(body)]));
 }
 // A Credit grant: tag 5, request id 0, `bytes:u32`.
 function credit(bytes, id = 0) {
   const out = Buffer.alloc(11);
-  out.writeUInt16BE(1); out[2] = 5; out.writeUInt32BE(id, 3); out.writeUInt32BE(bytes, 7);
+  out.writeUInt16BE(3); out[2] = 5; out.writeUInt32BE(id, 3); out.writeUInt32BE(bytes, 7);
   return new Uint8Array(out);
 }
 const MAX_FRAME = 4 * 1024 * 1024 + 64 * 1024;
@@ -124,7 +126,7 @@ async function genesis(data, fx) {
 async function content(data, fx) {
   assert.deepEqual(await ask(data, request('stage', 2, fx.stage_b1, fx.b1)), [{ type: 'staged', id: 2 }]);
   assert.deepEqual(await ask(data, request('append', 3, fx.append_c1, fx.c1)),
-    [acked(3, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+    [acked(3, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
 }
 
 test('unknown_route_404', () => withEdge(async mf => {
@@ -148,11 +150,32 @@ test('private_home_objects_ack_retry_and_no_public_reads', () => withEdge(async 
   assert.deepEqual(await ask(data, request('storeHome', 11, fixtures().home_store, fx.home_bundle)), expected(11));
   assert.deepEqual(await ask(data, request('storeHome', 12, fx.home_store_conflict, fx.home_conflict)),
     [{ type: 'refused', id: 12, reason: 'Conflict' }]);
-  for (const [id, permit] of [[13,fx.home_read_events], [14,fx.home_read_controls]])
-    assert.deepEqual(await ask(data, request('read', id, permit)), [{ type: 'events', id, items: [], head: null, receipt: null }]);
+  assert.deepEqual(await ask(data, request('read', 13, fx.home_read_events)),
+    [{ type: 'events', id: 13, items: [], head: null, receipt: null }]);
+  assert.deepEqual(await ask(data, request('read', 14, fx.home_read_controls)),
+    [{ type: 'refused', id: 14, reason: 'Unavailable' }]);
   assert.deepEqual(await ask(data, request('read', 15, fx.home_read_body)), [{ type: 'refused', id: 15, reason: 'Missing' }]);
   for (const path of [`/v1/home/${fx.home_prefix}`, `/b/${fx.account}/${fx.home_digest}`])
     assert.equal((await mf.dispatchFetch(`http://edge.invalid${path}`)).status, 404);
+}));
+
+test('directory_frames_routed_with_deadline_checked_per_frame', () => withSlowEdge(async (mf, control) => {
+  const fx = fixtures();
+  const data = await socket(mf, '/v1/data');
+  assert.deepEqual(await ask(data, request('storeHome', 1, fx.home_store, fx.home_bundle)),
+    [{ type: 'home_objects_stored', id: 1, prefix_digest: fx.home_prefix, bundle_digest: fx.home_digest }]);
+  assert.deepEqual(await ask(data, request('storeDirectory', 2, fx.directory_store, fx.directory_body)),
+    [{ type: 'directory_entry_stored', id: 2 }]);
+  assert.deepEqual(await ask(data, request('readDirectory', 3, fx.directory_read)),
+    [{ type: 'directory', id: 3, entries: [fx.directory_body], more: false }]);
+  assert.deepEqual(await ask(data, request('retireHome', 4, fx.directory_retire)),
+    [{ type: 'home_objects_retired', id: 4 }]);
+  await control.log(fx.account, { readDirectory: 2_500 });
+  assert.deepEqual(await ask(data, request('readDirectory', 5, expiring(2_000).directory_read)),
+    [{ type: 'refused', id: 5, reason: 'Expired' }]);
+  await control.log(fx.account, {});
+  assert.deepEqual(await ask(data, request('readDirectory', 6, fixtures().directory_read)),
+    [{ type: 'directory', id: 6, entries: [fx.directory_body], more: false }]);
 }));
 
 test('ack_receipt_verifies', () => withEdge(async mf => {
@@ -162,10 +185,10 @@ test('ack_receipt_verifies', () => withEdge(async mf => {
   await content(data, fx);
   // An exact retry under a fresh permit returns the original Ack.
   assert.deepEqual(await ask(data, request('append', 9, fixtures().append_c1, fx.c1)),
-    [acked(9, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+    [acked(9, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
   // An account-home log is served by the same object class, with no receipt.
   assert.deepEqual(await ask(data, request('append', 4, fx.append_account_genesis, fx.account_genesis)),
-    [acked(4, fx.account, '07'.repeat(32), fx.account_head, null)]);
+    [acked(4, fx.account, fx.account_genesis_id, fx.account_head, null)]);
 }));
 
 test('compound publication returns one proof-carrying frame; exact retry preserves stored commitment', () => withEdge(async mf => {
@@ -175,7 +198,7 @@ test('compound publication returns one proof-carrying frame; exact retry preserv
   const requestBytes = publish(90, fx.stage_b1, fx.append_c1, fx.c1, fx.b1);
   const answer = await ask(data, requestBytes);
   assert.deepEqual(answer, [{ type: 'published', id: 90, log: fx.base,
-    event_id: '02'.repeat(32), head: fx.c1_head, receipt: 'verified',
+    event_id: fx.c1_id, head: fx.c1_head, receipt: 'verified',
     commitment: fx.c1_commitment, proof_head: fx.c1_head }]);
   assert.deepEqual(await ask(data, publish(91, fx.stage_b1, fixtures().append_c1, fx.c1, fx.b1)),
     [{ ...answer[0], id: 91 }]);
@@ -188,15 +211,16 @@ test('historical read carries its returned tail receipt, not the current head', 
   const data = await socket(mf, '/v1/data');
   await genesis(data, fx);
   await content(data, fx);
-  // ReadControls returns only genesis although latest is content at 2.
+  // The sparse page has only genesis, but authenticates the content endpoint.
   data.send(request('read', 70, fx.read_controls_0));
   const [frame] = await data.next();
   const raw = unhex(frame);
-  assert.equal(raw[9], 1, 'nonempty base Events must carry its exact tail receipt');
+  assert.equal(raw[9], 0, 'sparse Events do not carry a last-item receipt');
+  assert.equal(raw[10], 2, 'nonempty sparse endpoint carries opening and receipt');
   const [events] = decode(frame);
-  assert.equal(events.receipt, 'verified');
+  assert.equal(events.receipt, null);
   assert.deepEqual(events.head, fx.genesis_head);
-  assert.notDeepEqual(events.head, fx.c1_head);
+  assert.deepEqual(events.coverage, { order: fx.c1_order, head: fx.c1_head, receipt: 'verified' });
 }));
 
 test('data_rejects_bad_permit', () => withEdge(async mf => {
@@ -238,8 +262,11 @@ test('read_range_bounds', () => withEdge(async mf => {
 test('read_controls_permit_routed', () => withEdge(async mf => {
   const fx = fixtures();
   const data = await socket(mf, '/v1/data');
-  const events = (id, items) => [{ type: 'events', id, items, head: items.length ? fx.control_head : null, receipt: items.length ? 'verified' : null }];
-  assert.deepEqual(await ask(data, request('read', 20, fx.read_controls_0)), events(20, []));
+  const events = (id, items, order = fx.control_order, head = fx.control_head) => [{ type: 'events', id, items,
+    head: items.length ? (items.at(-1).commitment === fx.genesis_commitment ? fx.genesis_head : fx.control_head) : null,
+    receipt: null, coverage: { order, head, receipt: head.position ? 'verified' : null } }];
+  assert.deepEqual(await ask(data, request('read', 20, fx.read_controls_0)),
+    events(20, [], '0002' + '00'.repeat(80), { position: 0, hash: '00'.repeat(32) }));
   await genesis(data, fx);
   await content(data, fx);
   assert.deepEqual(await ask(data, request('append', 4, fx.append_control, fx.control)),
@@ -249,6 +276,16 @@ test('read_controls_permit_routed', () => withEdge(async mf => {
   // Only control-route events, after the permit's position; never c1.
   assert.deepEqual(await ask(data, request('read', 21, fx.read_controls_0)), events(21, [genesisItem, controlItem]));
   assert.deepEqual(await ask(data, request('read', 22, fx.read_controls_1)), events(22, [controlItem]));
+  // A control ordered after issuance is withheld by the signed upper bound.
+  assert.deepEqual(await ask(data, request('read', 24, fx.read_control_range_1)),
+    events(24, [genesisItem], fx.genesis_order, fx.genesis_head));
+  assert.deepEqual(await ask(data, request('read', 25, fx.read_control_range_3)), events(25, [genesisItem, controlItem]));
+  // Account-home reads are contiguous, not base sparse authority scans.
+  assert.deepEqual(await ask(data, request('read', 26, fx.read_account_control_range)),
+    [{ type: 'refused', id: 26, reason: 'Missing' }]);
+  await ask(data, request('append', 27, fx.append_account_genesis, fx.account_genesis));
+  assert.deepEqual(await ask(data, request('read', 28, fx.read_account_control_range)),
+    [{ type: 'refused', id: 28, reason: 'Missing' }]);
   // A controls permit is a read permit only.
   assert.deepEqual(await ask(data, request('subscribe', 23, fx.read_controls_0, 0)),
     [{ type: 'refused', id: 23, reason: 'Scope' }]);
@@ -262,7 +299,7 @@ test('read bodies serves only ordered bodies, one frame each, in permit order', 
   assert.deepEqual(await ask(data, request('stage', 2, fx.stage_b1, fx.b1)), [{ type: 'staged', id: 2 }]);
   assert.deepEqual(await ask(data, request('read', 30, fx.read_bodies_b1)), [{ type: 'refused', id: 30, reason: 'Missing' }]);
   assert.deepEqual(await ask(data, request('append', 3, fx.append_c1, fx.c1)),
-    [acked(3, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+    [acked(3, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
   assert.deepEqual(await ask(data, request('read', 31, fx.read_bodies_b1)),
     [{ type: 'body', id: 31, index: 0, last: true, bytes: fx.b1 }]);
   // b2 is staged but not ordered: b1 is served, then the stream ends Missing.
@@ -273,6 +310,18 @@ test('read bodies serves only ordered bodies, one frame each, in permit order', 
   ]);
 }));
 
+// Only the service can obtain a read permit for an account body that is not
+// ordered; it reads a rotation's staged body back before permitting it.
+test('read bodies serves an account log its staged body', () => withEdge(async mf => {
+  const fx = fixtures();
+  const data = await socket(mf, '/v1/data');
+  await ask(data, request('append', 1, fx.append_account_genesis, fx.account_genesis));
+  assert.deepEqual(await ask(data, request('read', 2, fx.read_bodies_account_b1)), [{ type: 'refused', id: 2, reason: 'Missing' }]);
+  assert.deepEqual(await ask(data, request('stage', 3, fx.stage_account_b1, fx.b1)), [{ type: 'staged', id: 3 }]);
+  assert.deepEqual(await ask(data, request('read', 4, fx.read_bodies_account_b1)),
+    [{ type: 'body', id: 4, index: 0, last: true, bytes: fx.b1 }]);
+}));
+
 test('one MiB body stages, appends and reads over /v1/data', () => withEdge(async mf => {
   const fx = fixtures();
   const data = await socket(mf, '/v1/data');
@@ -280,12 +329,12 @@ test('one MiB body stages, appends and reads over /v1/data', () => withEdge(asyn
   assert.deepEqual(await ask(data, request('stage', 2, fx.stage_b4, fx.b4)), [{ type: 'staged', id: 2 }]);
   const [ack] = await ask(data, request('append', 3, fx.append_c4, fx.c4));
   assert.equal(ack.type, 'acked');
-  assert.equal(ack.event_id, '05'.repeat(32));
+  assert.equal(ack.event_id, fx.c4_id);
   assert.equal(ack.receipt, 'verified');
   // Parse the large frame locally: native example argv cannot carry a MiB body.
   data.send(request('read', 4, fx.read_bodies_b4));
   const [frame] = await data.next();
-  assert.equal(frame.slice(0, 26), '00010200000004000100100000');
+  assert.equal(frame.slice(0, 26), '00030200000004000100100000');
   assert.equal(frame.slice(26), fx.b4);
 }));
 
@@ -305,7 +354,7 @@ test('subscriptions send heads after the cursor, with receipts for base logs', (
   await sleep(300);
   assert.deepEqual(watch.inbox, []);
   assert.deepEqual(await ask(data, request('append', 4, fx.append_account_genesis, fx.account_genesis)),
-    [acked(4, fx.account, '07'.repeat(32), fx.account_head, null)]);
+    [acked(4, fx.account, fx.account_genesis_id, fx.account_head, null)]);
   assert.deepEqual(decode(...await watch.next()), [{ type: 'head', id: 41, head: fx.account_head, receipt: null }]);
 }));
 
@@ -344,7 +393,7 @@ test('stream_stops_at_deadline', () => withEdge(async mf => {
   // still gets its log's head.
   await content(data, fx);
   assert.deepEqual(await ask(data, request('append', 4, fx.append_account_genesis, fx.account_genesis)),
-    [acked(4, fx.account, '07'.repeat(32), fx.account_head, null)]);
+    [acked(4, fx.account, fx.account_genesis_id, fx.account_head, null)]);
   assert.deepEqual(decode(...await watch.next()), [{ type: 'head', id: 51, head: fx.account_head, receipt: null }]);
   // A request on the same socket still succeeds.
   const [events] = await ask(watch, request('read', 52, fixtures().read_1_2));
@@ -666,11 +715,12 @@ test('sync failure cannot release a signed read of an unconfirmed append', () =>
   assert.deepEqual(read.head, fx.c1_head);
   assert.equal(read.items[1].commitment, fx.c1_commitment);
   const [controls] = await ask(data, request('read', 7, fx.read_controls_0));
-  assert.equal(controls.receipt, 'verified');
+  assert.equal(controls.receipt, null);
   assert.deepEqual(controls.head, fx.genesis_head);
+  assert.deepEqual(controls.coverage, { order: fx.c1_order, head: fx.c1_head, receipt: 'verified' });
   // Retry never allocates a new position.
   assert.deepEqual(await ask(data, request('append', 8, fx.append_c1, fx.c1)),
-    [acked(8, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+    [acked(8, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
 }));
 
 test('private object ack waits for its own deadline and is charged to Credit', () => withSlowEdge(async (mf, control) => {
@@ -711,9 +761,9 @@ test('every data frame is gated on its own permit deadline; the socket stays ope
   // The commit and the staged body stood: an exact retry returns the original
   // Ack, and c2 orders against the staged b2.
   assert.deepEqual(await ask(data, request('append', 6, fixtures().append_c1, fx.c1)),
-    [acked(6, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+    [acked(6, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
   assert.deepEqual(await ask(data, request('append', 7, fixtures().append_c2, fx.c2)),
-    [acked(7, fx.base, '03'.repeat(32), fx.c2_head, 'verified')]);
+    [acked(7, fx.base, fx.c2_id, fx.c2_head, 'verified')]);
   // A body stream held between frames: b1 is sent, then the deadline passes
   // before b2 and the stream ends Expired.
   await control.edge({ bodyHolds: { [`b/${fx.base}/${fx.b2_commitment}`]: 2_500 } });
@@ -1075,7 +1125,7 @@ test('ends of requests, subscriptions, joins and authz sessions return their cha
   const backends = await backend();
   try {
     await withSlowEdge(async (mf, control) => {
-      const fx = fixtures(); // subscribe_short and presence_short expire 3 s after this call
+      const fx = fixtures();
       const start = charged(await control.budget());
       const { limits } = await control.budget();
       const data = await socket(mf, '/v1/data');
@@ -1093,11 +1143,14 @@ test('ends of requests, subscriptions, joins and authz sessions return their cha
       // A subscription replaced before its deadline keeps one charge, and
       // returns it when the replacement ends Expired; a presence join returns
       // its charge when it ends Expired.
-      device.send(request('subscribe', 10, fx.subscribe_short, 2));
-      device.send(request('subscribe', 11, fx.subscribe_short, 2));
-      device.send(presenceJoin(12, fx.presence_short));
+      // Short permits expire 3 s after creation; do not spend their lifetime on setup.
+      const streamPermits = fixtures();
+      device.send(request('subscribe', 10, streamPermits.subscribe_short, 2));
+      device.send(request('subscribe', 11, streamPermits.subscribe_short, 2));
+      device.send(presenceJoin(12, streamPermits.presence_short));
       const [snapshot] = await device.next();
-      assert.deepEqual(decode(snapshot)[0].event, 'snapshot');
+      const first = decode(snapshot)[0];
+      assert.deepEqual([first.type, first.event, first.id], ['peers', 'snapshot', 12], JSON.stringify(first));
       creditFor(device, [snapshot]);
       await settles(control, plus(admitted, 2 * limits.stream), 'one subscription and one join');
       const ended = decode(...await device.next(2, 6_000)).map(f => [f.type, f.id, f.reason]).sort((a, b) => a[1] - b[1]);
@@ -1307,7 +1360,7 @@ test('bulk frames are served in arrival order across sockets: a 4.2 MB read is n
 const STALL = 120_000;
 // What a read of two events takes before it is answered, and the two Body
 // frames of a read of b1 and b2.
-const READ_BOUND = 7 + 2 + 1 + 300 + 2 * (4 + 179 + 4 + 2 + 32 + 4 + 65536);
+const READ_BOUND = 7 + 2 + 1 + 1 + 82 + 300 + 2 * (4 + 149 + 4 + 2 + 32 + 4 + 65536);
 const B1_B2 = 7 + 2 + 4 + 1024 + 7 + 2 + 4 + 4096;
 async function orderAll(data, fx) {
   await genesis(data, fx);
@@ -1483,11 +1536,11 @@ test('a waiting frame released from another socket\'s request leaves the frames 
 
 // ---- presence --------------------------------------------------------------
 
-// Presence frames are data-wire version 2: PresenceJoin (tag 33) carries a
+// Presence frames are data-wire version 3: PresenceJoin (tag 33) carries a
 // presence permit, Presence (tag 34) opaque sealed bytes under the join's id.
 function presenceFrame(tag, id, bytes) {
   const head = Buffer.alloc(11);
-  head.writeUInt16BE(2); head[2] = tag; head.writeUInt32BE(id, 3); head.writeUInt32BE(bytes.length, 7);
+  head.writeUInt16BE(3); head[2] = tag; head.writeUInt32BE(id, 3); head.writeUInt32BE(bytes.length, 7);
   return new Uint8Array(Buffer.concat([head, Buffer.from(bytes)]));
 }
 const presenceJoin = (id, permit) => presenceFrame(33, id, unhex(permit));
@@ -1880,7 +1933,7 @@ test(`presence never waits on an append held at ${where}, and the append complet
   }
   assert.deepEqual(data.inbox, [], 'the append is still held');
   await control.log(fx.base, { action: release });
-  assert.deepEqual(decode(...await data.next()), [acked(3, fx.base, '02'.repeat(32), fx.c1_head, 'verified')]);
+  assert.deepEqual(decode(...await data.next()), [acked(3, fx.base, fx.c1_id, fx.c1_head, 'verified')]);
   // Presence caused no append: the log holds the genesis and c1 only.
   assert.equal((await control.log(fx.base, { action: 'calls' })).append, 2);
   assert.equal((await ask(data, request('read', 4, fx.read_1_64)))[0].items.length, 2);

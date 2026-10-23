@@ -599,6 +599,10 @@ async fn not_staged_restages_same_bytes() {
     client.shutdown().await;
 }
 
+/// A package the log refuses for its epoch while this device's verified
+/// content is still in that epoch waits with its exact bytes: it is
+/// resealed only once content has passed the control that replaced the
+/// epoch (`rekey_driver.rs`), which here it never does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn epoch_refusal_waits_no_reseal() {
     let (hosted, device) = setup();
@@ -625,7 +629,17 @@ async fn epoch_refusal_waits_no_reseal() {
             .iter()
             .all(|a| *a == stored.descriptor.encode())
     );
-    // Never resealed, never acknowledged, and the work stays pending.
+    // Content never left the package's epoch: never resealed, never
+    // acknowledged, and the work stays pending.
+    assert_eq!(
+        bh_event::sealed_epoch(
+            &stored.descriptor,
+            device.metadata_key().expose(),
+            device.base
+        )
+        .ok(),
+        device.progress().epoch_id
+    );
     let again = device.package(id).unwrap();
     assert_eq!(again.event_id, stored.event_id);
     assert_eq!(again.descriptor.encode(), stored.descriptor.encode());
@@ -636,7 +650,12 @@ async fn epoch_refusal_waits_no_reseal() {
     client.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A package sealed before the base's content moved to another epoch is
+/// never moved to that epoch, and its bytes are never sent: content has
+/// left its epoch, so it can never be ordered. It is kept until its work is
+/// sealed again under an epoch whose key this device holds, which here it
+/// does not.
+#[tokio::test(start_paused = true)]
 async fn package_sealed_before_a_rotation_names_its_own_epoch() {
     let (hosted, device) = setup();
     let log = device.log();
@@ -648,7 +667,6 @@ async fn package_sealed_before_a_rotation_names_its_own_epoch() {
     let stored = device.package(id).unwrap();
 
     // The base moves on to another epoch, on the log and on this device.
-    // The package still belongs to the epoch it was sealed under.
     let rotated = [0x5e; 32];
     hosted.edge.rotate_epoch(log, rotated);
     let raw = device.raw();
@@ -656,20 +674,29 @@ async fn package_sealed_before_a_rotation_names_its_own_epoch() {
     raw.execute("UPDATE log_progress SET epoch_id=?1", [rotated.as_slice()])
         .unwrap();
     hosted.come_up();
-    client.wake();
-    until(20, "refused by the log object", || {
-        refused(&hosted, Refusal::Epoch) >= 1
-            && *status.borrow_and_update() == SyncStatus::WaitingAuthorization
+    let stages = hosted.edge.counts().want_stage;
+    until(20, "waiting for the new epoch's key", || {
+        client.wake();
+        *status.borrow_and_update() == SyncStatus::WaitingAuthorization
+            && hosted.edge.counts().want_stage == stages
     })
     .await;
+    // For a minute of the paused clock, woken every second, it still sends
+    // nothing.
+    for _ in 0..60 {
+        client.wake();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(hosted.edge.counts().want_stage, stages, "never sent");
     assert!(
-        hosted.edge.appends(log.id)[1..]
-            .iter()
-            .all(|a| *a == stored.descriptor.encode())
+        !hosted
+            .edge
+            .appends(log.id)
+            .contains(&stored.descriptor.encode())
     );
     let again = device.package(id).unwrap();
     assert_eq!(again.descriptor.encode(), stored.descriptor.encode());
-    assert_eq!(again.body, stored.body);
+    assert_eq!(device.pending(), 1, "the work is kept");
     assert_eq!(device.acked(id), None);
     assert_eq!(hosted.edge.entries(log).len(), 1);
     client.shutdown().await;
@@ -766,16 +793,38 @@ async fn status_transitions() {
     let (hosted, device) = setup();
     let log = device.log();
     let (mut first, _) = device.new_note("first");
-    device.append(&mut first, "second");
+    let second = device.append(&mut first, "second");
+    // Hold the first DATA connection (registration's, in this client), then
+    // the note's stage before it is ordered. The recorder must see each phase
+    // before its gate is released.
+    let connecting = hosted.edge.hold_next_data_connect();
+    let staging = hosted.edge.hold_next_stage();
     let (client, status) = device.start(&hosted);
     let history = Arc::new(Mutex::new(Vec::new()));
+    let (saved_tx, saved_rx) = tokio::sync::oneshot::channel();
+    let (syncing_tx, syncing_rx) = tokio::sync::oneshot::channel();
     let recorder = {
         let history = history.clone();
         let mut status = status.clone();
         tokio::spawn(async move {
-            history.lock().unwrap().push(*status.borrow_and_update());
+            let mut saved_tx = Some(saved_tx);
+            let mut syncing_tx = Some(syncing_tx);
+            let mut record = |value| {
+                history.lock().unwrap().push(value);
+                if value == (SyncStatus::SavedLocal { pending: 1 })
+                    && let Some(tx) = saved_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+                if value == (SyncStatus::Syncing { pending: 1 })
+                    && let Some(tx) = syncing_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            };
+            record(*status.borrow_and_update());
             while status.changed().await.is_ok() {
-                history.lock().unwrap().push(*status.borrow_and_update());
+                record(*status.borrow_and_update());
             }
         })
     };
@@ -783,6 +832,47 @@ async fn status_transitions() {
         let history = history.clone();
         move || history.lock().unwrap().contains(&want)
     };
+    tokio::time::timeout(Duration::from_secs(20), connecting.arrived)
+        .await
+        .expect("registration DATA connection was not held within 20s")
+        .expect("registration DATA connection hold channel closed");
+    assert!(
+        !device.registered(),
+        "registration must await its DATA connection"
+    );
+    tokio::time::timeout(Duration::from_secs(20), saved_rx)
+        .await
+        .expect("recorder did not observe locally saved note within 20s")
+        .expect("recorder ended before observing locally saved note");
+    assert!(
+        !device.registered(),
+        "registration must still await its DATA connection"
+    );
+    connecting
+        .release
+        .send(())
+        .expect("release DATA connection");
+    tokio::time::timeout(Duration::from_secs(20), staging.arrived)
+        .await
+        .expect("note was not staged within 20s")
+        .expect("note stage hold channel closed");
+    assert_eq!(hosted.edge.entries(log).len(), 1, "only genesis is ordered");
+    assert!(
+        device.acked(second).is_none(),
+        "staged note is not acknowledged"
+    );
+    // The stage hold proves the note is not ordered yet, but the publisher
+    // may not have marked its first pass started. Freeze the echo so releasing
+    // it completes that pass and the recorder sees Syncing{pending:1} before
+    // acceptance.
+    hosted.edge.freeze_reads(Some(device.progress().position));
+    staging.release.send(()).expect("release staged note");
+    tokio::time::timeout(Duration::from_secs(20), syncing_rx)
+        .await
+        .expect("recorder did not observe pending sync within 20s")
+        .expect("recorder ended before observing pending sync");
+    hosted.edge.freeze_reads(None);
+    client.wake();
     until(20, "synced", reached(SyncStatus::Synced)).await;
     {
         let history = history.lock().unwrap();

@@ -40,7 +40,13 @@ fn scope() -> Scope {
     }
 }
 fn genesis_order() -> Commitment {
-    Commitment::order(BaseId(base()), Head::EMPTY, &genesis(), Route::Control).unwrap()
+    Commitment::order(
+        BaseId(base()),
+        bh_sync::OrderState::EMPTY,
+        &genesis(),
+        Route::Control,
+    )
+    .unwrap()
 }
 
 /// A host that confirms this device's rule changes: test-only admission, never
@@ -180,7 +186,7 @@ impl Sealed {
     fn ordered(&self) -> Commitment {
         Commitment::order(
             BaseId(base()),
-            genesis_order().head(),
+            genesis_order().after(),
             &self.descriptor,
             Route::Content,
         )
@@ -190,7 +196,7 @@ impl Sealed {
     fn ordered_after(&self, earlier: &Commitment) -> Commitment {
         Commitment::order(
             BaseId(base()),
-            earlier.head(),
+            earlier.after(),
             &self.descriptor,
             Route::Content,
         )
@@ -205,8 +211,8 @@ fn sealed(id: EventId, payload: &[u8]) -> Encoded {
     let signer = SigningKey::generate();
     seal(
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: base(),
             audience: [0; 32],
@@ -458,7 +464,7 @@ fn a_waiting_verified_echo_without_an_ack_releases_the_next_scope_head() {
     let filler = sealed(EventId(bh_crypto::random()), b"filler");
     let filler_order = Commitment::order(
         BaseId(base()),
-        genesis_order().head(),
+        genesis_order().after(),
         &filler.descriptor,
         Route::Content,
     )
@@ -519,12 +525,33 @@ fn a_waiting_verified_echo_without_an_ack_releases_the_next_scope_head() {
 
     // Supplying full scope coverage in the next verified batch replays the
     // parked payload and settles the exact ordered position, not the next head.
-    raw.execute(
-        "INSERT INTO log_progress(log_kind,log_id,position,head_hash,receipt,control_digest,stopped_reason,hosting_root,account_position,account_hash,metadata_id,epoch_id,floor)
-         VALUES(1,?1,0,?2,NULL,zeroblob(32),NULL,?3,NULL,NULL,NULL,NULL,1)",
-        rusqlite::params![base().as_slice(), [7u8; 32].as_slice(), [8u8; 32].as_slice()],
+    store.db.record_registration(base(), None, [8; 32]).unwrap();
+    let final_event = sealed(EventId(bh_crypto::random()), b"last");
+    let final_order = Commitment::order(
+        BaseId(base()),
+        ordered.after(),
+        &final_event.descriptor,
+        Route::Content,
     )
     .unwrap();
+    let records = [genesis_order(), filler_order, ordered, final_order]
+        .into_iter()
+        .map(|commitment| VerifiedRecord {
+            seen: SeenRow {
+                position: commitment.head().position,
+                head_hash: commitment.head().hash.0,
+                control_digest: genesis_order().event_digest().0,
+                account_position: 1,
+                account_hash: [0; 32],
+            },
+            order: commitment.after(),
+            event_id: commitment.event_id().0,
+            digest: commitment.event_digest().0,
+            account_change: None,
+            judged_floor: 1,
+            floor: 1,
+        })
+        .collect();
     store
         .db
         .commit_incoming(
@@ -532,22 +559,10 @@ fn a_waiting_verified_echo_without_an_ack_releases_the_next_scope_head() {
                 log_kind: LOG_BASE,
                 log_id: base(),
                 hosting_root: [8; 32],
-                after: (0, [7; 32]),
+                after: (0, [0; 32]),
+                after_order: bh_sync::OrderState::EMPTY,
                 receipt: [0; bh_sync::receipt::RECEIPT_LEN],
-                records: vec![VerifiedRecord {
-                    seen: SeenRow {
-                        position: 4,
-                        head_hash: [9; 32],
-                        control_digest: [0; 32],
-                        account_position: 1,
-                        account_hash: [0; 32],
-                    },
-                    event_id: [10; 32],
-                    digest: [11; 32],
-                    account_change: None,
-                    judged_floor: 1,
-                    floor: 1,
-                }],
+                records,
                 metadata_id: [0; 32],
                 epoch_id: None,
                 notes: vec![],
@@ -589,7 +604,7 @@ fn the_verified_echo_wins_over_a_stored_ack_and_alarms_it() {
     let filler = sealed(EventId(bh_crypto::random()), b"filler");
     let filler_order = Commitment::order(
         BaseId(base()),
-        genesis_order().head(),
+        genesis_order().after(),
         &filler.descriptor,
         Route::Content,
     )
@@ -992,5 +1007,73 @@ fn a_queued_mutation_has_one_outbox_entry_even_after_reopen() {
                 .get::<_, i64>(0))
             .unwrap(),
         1
+    );
+}
+
+/// A typed package under an epoch the base's verified content has passed
+/// is replaced, in one transaction and under the same entry, by its saved
+/// work sealed again with a new id: only while unacknowledged.
+#[test]
+fn a_typed_package_under_a_passed_epoch_is_replaced_by_its_work_sealed_again() {
+    let mut store = Store::new();
+    let package = store.queue("Resealed");
+    store.db.record_registration(base(), None, [7; 32]).unwrap();
+    let sealed_under = [0x5e; 32];
+    let epoch = |store: &Store, epoch: Option<[u8; 32]>| {
+        store
+            .raw()
+            .execute(
+                "UPDATE log_progress SET epoch_id=?2 WHERE log_kind=1 AND log_id=?1",
+                rusqlite::params![base().as_slice(), epoch.as_ref().map(|e| e.as_slice())],
+            )
+            .unwrap();
+    };
+    epoch(&store, Some(sealed_under));
+    let first = store.publish(package);
+    let reseal = |store: &mut Store, old: EventId| {
+        let candidate = store.db.prepare_typed_reseal(package).unwrap().unwrap();
+        let encoded = sealed(candidate.event_id, &candidate.payload);
+        let body = bh_sync::BodyObject::new(encoded.body).unwrap();
+        store
+            .db
+            .publish_typed_reseal(candidate, old, sealed_under, encoded.descriptor, body)
+            .unwrap()
+    };
+    assert!(
+        reseal(&mut store, first.event_id).is_none(),
+        "content is still in its epoch"
+    );
+    epoch(&store, Some([0x6f; 32]));
+    assert!(reseal(&mut store, EventId([1; 32])).is_none());
+    let again = reseal(&mut store, first.event_id).unwrap();
+    assert_ne!(again.event_id, first.event_id);
+    let mut store = Store::reopen(store.dir);
+    match store.db.prepare_typed_package(package).unwrap() {
+        TypedPackagePreparation::Existing(kept) => assert_eq!(kept.event_id, again.event_id),
+        TypedPackagePreparation::Candidate(_) => panic!("replaced, not dropped"),
+    }
+    // An acknowledged package stays exactly as it is.
+    let ordered = Commitment::order(
+        BaseId(base()),
+        genesis_order().after(),
+        &again.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    store
+        .db
+        .acknowledge_typed_package(package, &ordered)
+        .unwrap();
+    epoch(&store, None);
+    assert!(store.db.prepare_typed_reseal(package).unwrap().is_none());
+    // Its bytes are still exact under the table's own check.
+    assert!(
+        store
+            .raw()
+            .execute(
+                "UPDATE typed_outbox SET descriptor=x'00' WHERE id=?1",
+                [package]
+            )
+            .is_err()
     );
 }

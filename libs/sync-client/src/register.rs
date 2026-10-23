@@ -12,6 +12,7 @@
 //! log. Completing the first device's setup at its home is `home`'s.
 use crate::{
     Identity, Shared,
+    account_evidence::{self, Session, VerifiedEvent},
     authz::Authz,
     outbox::{Fail, Link},
 };
@@ -20,13 +21,11 @@ use bh_account::{
     journal::{AccountJournal, HistoryCursor},
     storage::DeviceJournal,
 };
-use bh_authz_proto::{
-    FromService, MetadataKey, ToService, Want, account_log_id, account_log_unwrap, account_log_wrap,
-};
+use bh_authz_proto::{FromService, MetadataKey, ToService, account_log_id, account_log_wrap};
 use bh_device::incoming::VerifiedBatch;
 use bh_storage::own_base::OwnBaseRecord;
 use bh_sync::{
-    BaseId, Commitment, Head, OpaqueEvent, Route,
+    BaseId, Commitment, OpaqueEvent, OrderState, Route,
     permit::{AppendAck, LogId, LogKind},
     receipt::{self, RECEIPT_LEN},
     wire::{self, Request, Response},
@@ -122,14 +121,14 @@ async fn register(
     let base = BaseId(record.base);
     let ordered = local(Commitment::order(
         base,
-        Head::EMPTY,
+        OrderState::EMPTY,
         &descriptor,
         Route::Control,
     ))?;
     let mut metadata = None;
     shared
         .signer
-        .with_base_keys(base, &mut |m, _| metadata = Some(MetadataKey::new(m)))
+        .with_metadata_key(base, &mut |m| metadata = Some(MetadataKey::new(m)))
         .map_err(|_| Fail::Authorization)?;
     let message = ToService::RegisterBase {
         descriptor: record.genesis_descriptor.clone(),
@@ -180,7 +179,7 @@ async fn register(
             kind: LogKind::Base,
             id: base.0,
         })
-        || ack.event != descriptor.id()
+        || ack.event != descriptor.publication_id(Route::Control)
         || ack.head != ordered.head()
         || receipt::verify(&shared.endpoint.hosting_root, base, &receipt).map(|r| r.head())
             != Ok(ordered.head())
@@ -223,21 +222,17 @@ fn apply_genesis(
     let descriptor = local(OpaqueEvent::decode(&record.genesis_descriptor))?;
     let ordered = local(Commitment::order(
         BaseId(record.base),
-        Head::EMPTY,
+        OrderState::EMPTY,
         &descriptor,
         Route::Control,
     ))?;
     let mut prepared = None;
     shared
         .signer
-        .with_base_keys(BaseId(record.base), &mut |m, k| {
-            prepared = Some(history.prepare(
-                &ordered,
-                &descriptor,
-                Some(&record.genesis_body),
-                m,
-                Some(k),
-            ))
+        .with_metadata_key(BaseId(record.base), &mut |m| {
+            // The genesis is judged with M alone.
+            prepared =
+                Some(history.prepare(&ordered, &descriptor, Some(&record.genesis_body), m, None))
         })
         .map_err(|_| Fail::Authorization)?;
     let prepared = local(prepared.ok_or(Fail::Local)?)?;
@@ -263,7 +258,7 @@ async fn catch_up(shared: &Shared, link: &mut Link) -> Result<(), Fail> {
     // possession at the first head this device was active at.
     let at = earliest_active(&identity, &originals)?;
     let ordered = order_prefix(shared, &shared.authz, link, &identity, &originals, at).await?;
-    let read: Vec<&[u8]> = ordered.iter().map(Vec::as_slice).collect();
+    let read: Vec<&[u8]> = ordered.iter().map(|e| e.original.as_slice()).collect();
     replayed(&identity, &read)?;
     // Later requests authenticate at the device's current head.
     shared.authz.close().await;
@@ -272,9 +267,10 @@ async fn catch_up(shared: &Shared, link: &mut Link) -> Result<(), Fail> {
 
 /// Make the account log's first events exactly `originals`, the start of
 /// the account's history, publishing those it lacks one at a time after a
-/// verified read of the log. Returns the log's verified copy. Events the log
-/// holds are skipped, so a lost answer is settled by the next read and a
-/// missing event is sent again with the same bytes.
+/// verified read of the log. Returns the log's verified copy, each event
+/// with the home's confirmation. Events the log holds are skipped, so a lost
+/// answer is settled by the next read and a missing event is sent again
+/// with the same bytes.
 pub(crate) async fn order_prefix(
     shared: &Shared,
     authz: &Authz,
@@ -282,7 +278,7 @@ pub(crate) async fn order_prefix(
     identity: &Identity,
     originals: &[Vec<u8>],
     at: Option<AccountHead>,
-) -> Result<Vec<Vec<u8>>, Fail> {
+) -> Result<Vec<VerifiedEvent>, Fail> {
     let log = LogId {
         kind: LogKind::Account,
         id: local(account_log_id(&identity.genesis))?,
@@ -295,14 +291,14 @@ pub(crate) async fn order_prefix(
         if ordered
             .iter()
             .zip(originals)
-            .any(|((theirs, _), ours)| theirs != ours)
+            .any(|(theirs, ours)| theirs.original != *ours)
         {
             return Err(Fail::Local);
         }
         let Some(missing) = originals.get(ordered.len()) else {
-            return Ok(ordered.into_iter().map(|(o, _)| o).collect());
+            return Ok(ordered);
         };
-        let previous = ordered.last().map_or(Head::EMPTY, |(_, head)| *head);
+        let previous = ordered.last().map_or(OrderState::EMPTY, |e| e.opening);
         submit_account_event(shared, authz, link, log, at, previous, missing).await?;
     }
 }
@@ -361,8 +357,8 @@ pub(crate) fn earliest_active(
     Ok(None)
 }
 
-/// The account log's first `last` events as `(original, log head)`, each
-/// commitment chained from the log's start and naming its exact event.
+/// The account log's first `last` events, each commitment chained from the
+/// log's start and naming its exact event, verified with its confirmation.
 async fn read_account_log(
     shared: &Shared,
     authz: &Authz,
@@ -370,56 +366,40 @@ async fn read_account_log(
     log: LogId,
     at: Option<AccountHead>,
     last: u64,
-) -> Result<Vec<(Vec<u8>, Head)>, Fail> {
-    let mut ordered = Vec::new();
-    let mut head = Head::EMPTY;
-    let mut first = 1;
-    while first <= last {
-        let end = last.min(first + 63);
-        let answer = {
-            let mut session = authz.session_at(shared, at).await?;
-            session
-                .ask(ToService::Permits {
-                    items: vec![Want::ReadEvents {
-                        log,
-                        first,
-                        last: end,
-                    }],
-                })
-                .await?
-        };
-        let FromService::Permits { items } = answer else {
-            return Err(Fail::from_answer(&answer));
-        };
-        let [Ok(permit)] = items.as_slice() else {
-            return Err(Fail::Authorization);
-        };
-        let data = link.data(shared).await?;
-        let permit = permit.clone();
-        let response = data
-            .ask(|id| Request::Read { id, permit })
-            .await
-            .map_err(|_| Fail::Network)?;
-        let Response::Events { items, .. } = response else {
-            return Err(Fail::from_response(&response));
-        };
-        let count = items.len() as u64;
-        for (commitment, event) in items {
-            let commitment = Commitment::decode(&commitment).map_err(|_| Fail::Network)?;
-            let event = OpaqueEvent::decode(&event).map_err(|_| Fail::Network)?;
-            head = commitment
-                .verify_next(BaseId(log.id), head)
-                .map_err(|_| Fail::Network)?;
-            if commitment.verify_body(&event).is_err() || commitment.route() != Route::Control {
-                return Err(Fail::Network);
-            }
-            let (original, _) = account_log_unwrap(&event).map_err(|_| Fail::Network)?;
-            ordered.push((original.to_vec(), head));
+) -> Result<Vec<VerifiedEvent>, Fail> {
+    let genesis = shared
+        .signer
+        .identity()
+        .map_err(|_| Fail::Authorization)?
+        .genesis;
+    if account_log_id(&genesis).map_err(|_| Fail::Network)? != log.id {
+        return Err(Fail::Network);
+    }
+    let mut ordered: Vec<VerifiedEvent> = Vec::new();
+    let mut order = OrderState::EMPTY;
+    while order.position() < last {
+        let end = last.min(order.position() + 64);
+        let prior = ordered.last().and_then(|e| e.time);
+        let page = account_evidence::read(
+            shared,
+            link,
+            &genesis,
+            order,
+            prior,
+            end,
+            Session::At(authz, at),
+        )
+        .await?;
+        let count = page.events.len() as u64;
+        for event in page.events {
+            order = event.opening;
+            ordered.push(event);
         }
-        if count < end - first + 1 {
+        if count == 0 || order.position() < end {
+            // An empty account log at signup is not a currentness proof.
+            // The next exact original still needs the service's append grant.
             break;
         }
-        first = end + 1;
     }
     Ok(ordered)
 }
@@ -431,7 +411,7 @@ async fn submit_account_event(
     link: &mut Link,
     log: LogId,
     at: Option<AccountHead>,
-    previous: Head,
+    previous: OrderState,
     original: &[u8],
 ) -> Result<(), Fail> {
     let answer = {
@@ -441,6 +421,7 @@ async fn submit_account_event(
                 log,
                 event: original.to_vec(),
                 delivery: None,
+                attachment: None,
             })
             .await?
     };
@@ -472,7 +453,10 @@ async fn submit_account_event(
     match response {
         Response::Acked { ack, .. } => {
             let ack = AppendAck::decode(&ack).map_err(|_| Fail::Network)?;
-            if ack.log != log || ack.event != event.id() || ack.head != expected.head() {
+            if ack.log != log
+                || ack.event != event.publication_id(Route::Control)
+                || ack.head != expected.head()
+            {
                 return Err(Fail::Network);
             }
             Ok(())

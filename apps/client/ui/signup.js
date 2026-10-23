@@ -2,6 +2,8 @@
 // key release, kit destinations and the note binding. No account id, path,
 // key handle or recovery private material is supplied by this page.
 import { android, joinScreen } from './pairing.js';
+import { recoveryScreen } from './recover.js';
+import { printableKit } from './kit-print.js';
 
 export function mountSignup(root, invoke, openBoundNote) {
   const location = document.querySelector('header strong');
@@ -50,8 +52,8 @@ export function mountSignup(root, invoke, openBoundNote) {
   };
   const draw = (next) => {
     screen = next;
-    if (next.screen === 'kit') {
-      printKit = element('pre', `BaseHero recovery kit\n\nRecovery code: ${next.code}\n\nKeep this code and your password. You need both if you lose access to your devices. BaseHero cannot reset a forgotten password. Keep the kit somewhere you can reach if this Mac is lost. The password is not in this file.\n`, 'signup-print-kit');
+    if (next.screen === 'kit' || next.screen === 'new_kit') {
+      printKit = printableKit(next.code);
     } else if (next.screen !== 'confirm') {
       printKit = undefined;
     }
@@ -60,22 +62,70 @@ export function mountSignup(root, invoke, openBoundNote) {
       ticket,
       ready: async () => { joined = true; draw(await invoke('account_screen')); },
       retry: async () => draw(await invoke('account_screen')),
-      back: android() ? null : () => draw({screen:'welcome'}),
+      back: () => recovery.choice(),
+    });
+    const recovery = recoveryScreen(root, invoke, {
+      heading,
+      ready: async () => { joined = true; draw({screen:'recovered'}); },
+      back: () => join(),
     });
     switch (next.screen) {
       case 'welcome':
-        // A phone joins the account another device already holds; it has no
-        // first-device signup of its own.
-        if (android()) { join(); break; }
+        // A phone has no first-device signup, but either joining or
+        // password-and-kit recovery can open its account.
+        if (android()) { recovery.choice(); break; }
         heading('WELCOME', 'A place for your thoughts.', 'Keep notes in your own space. You do not need an email to create an account.');
         controls(
           button('Create my account', async () => draw(await invoke('account_suggest_password')), true),
-          button('I already have an account', async () => join()),
+          button('I already have an account', async () => recovery.choice()),
         );
         break;
       case 'joining':
         join(next.ticket);
         break;
+      case 'return':
+        recovery.choice();
+        break;
+      case 'recover':
+        recovery.form();
+        break;
+      case 'recover_refused':
+        recovery.showRefusal(next);
+        break;
+      case 'recovered':
+        heading('ACCOUNT / RECOVERY','Back in your space','Your account is open. Your other devices have been told.','');
+        controls(button('Open notes', async () => {await invoke('account_open_note');await openBoundNote();}, true),
+          button('Review devices', async () => {const {openDevices}=await import('./devices.js');await openDevices(invoke);}));
+        break;
+      case 'erased':
+        heading('ACCOUNT / REMOVED','This device was removed','This device was removed from your account. BaseHero erased this account’s data here.','');
+        root.append(element('p',`${next.unsent} unsynced changes were not sent.`,'signup-caption'));
+        controls(button('Add an account',async()=>draw(await invoke('account_screen')),true));
+        break;
+      case 'erase_incomplete':
+        heading('ACCOUNT / REMOVED','Erasure incomplete','BaseHero couldn’t finish erasing this account’s data.','');
+        controls(button('Try again',async()=>draw(await invoke('account_retry')),true));
+        break;
+      case 'cancel_took_effect':
+        heading('ACCOUNT / DEVICES','Removal pending','This removal already took effect.','');
+        break;
+      case 'new_kit': {
+        heading('ACCOUNT / RECOVERY KIT','Keep your way back in','Either way you get a new recovery kit and the old one stops working at once.','');
+        root.append(element('p',next.code,'signup-kit-code'));
+        const routeNew = async command => {
+          const result=await invoke(command);
+          if(result.result==='saved'){draw(await invoke('account_screen'));return;}
+          if(result.result==='opened'){
+            heading('ACCOUNT / RECOVERY KIT','Did you keep your kit?','Opening a print or mail destination does not save your kit. If you cancelled or it did not work, choose another way.','');
+            controls(button('Try another way',async()=>draw(next)),button('I saved my kit',async()=>draw(await invoke('account_confirm_new_kit'))));
+          } else if(result.result==='failed') showError('That save didn’t work. Try another destination.');
+        };
+        controls(button('Print',()=>routeNew('account_print_kit')),
+          button('Email to myself',()=>routeNew('account_email_kit')),
+          button('Save a file',()=>routeNew('account_save_kit_file')),
+          button('I saved my kit',async()=>draw(await invoke('account_confirm_new_kit')),true));
+        break;
+      }
       case 'stopped':
         heading('ACCOUNT / STOPPED', 'Sync stopped', 'We could not verify this account’s history. Your verified notes and saved changes are still on this device.');
         break;
@@ -138,10 +188,6 @@ export function mountSignup(root, invoke, openBoundNote) {
         break;
       case 'update':
         heading('ACCOUNT / UPDATE REQUIRED', 'Update BaseHero to open this account', 'This account was saved by a newer version. Your data has not been changed.');
-        break;
-      case 'return':
-        heading('ACCOUNT / RETURN', 'I already have an account', 'Use another signed-in device or your recovery kit to add this device. Email is not an account login.');
-        controls(button('Back', async () => draw({screen:'welcome'})));
         break;
       case 'retry':
         heading('ACCOUNT / RETRY', 'Try again', 'BaseHero couldn’t open this account. Your account is still on this Mac. Try again when you’re ready.');

@@ -16,7 +16,9 @@ use bh_sync::{BaseId, Digest, Head, permit::LogKind, receipt};
 /// Why a pending update cannot be sealed now. Its work stays pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealRefusal {
-    /// The base's content epoch is closed: content waits for a new one.
+    /// The base's content epoch is closed, or replaced by a removal or
+    /// rekey the control feed judged ahead of content: content waits for a
+    /// new one.
     EpochClosed,
     /// The stored head's receipt does not verify under the pinned root for
     /// that head, so an event claiming it would be refused.
@@ -66,13 +68,23 @@ impl Owner {
             return Err(OwnerError::AnchorMismatch);
         }
         let database = self.shared_database(id)?;
-        let (progress, changes) = {
+        let (progress, changes, judged) = {
             let db = database.lock().expect("container writer lock");
             let kind = LogKind::Base as u8;
             let progress = db
                 .log_progress(kind, base)?
                 .ok_or(OwnerError::NotRegistered)?;
-            (progress, db.log_account_changes(kind, base)?)
+            // The epoch the control feed's judged state holds, where it is
+            // ahead of content.
+            let judged = match db.control_cursor(base)? {
+                Some(cursor) if cursor.position > progress.position => Some(
+                    db.control_fact_at(base, cursor.position)?
+                        .ok_or(bh_storage::StoreError::CorruptSyncState)?
+                        .epoch,
+                ),
+                _ => None,
+            };
+            (progress, db.log_account_changes(kind, base)?, judged)
         };
         if progress.stopped.is_some() {
             return Err(OwnerError::Stopped);
@@ -89,6 +101,12 @@ impl Owner {
         let epoch = progress
             .epoch_id
             .ok_or(OwnerError::SealRefused(SealRefusal::EpochClosed))?;
+        // A removal or rekey the control feed judged past content replaced
+        // this epoch: no new content is sealed under it. It waits until
+        // content reaches the epoch that replaced it.
+        if judged.is_some_and(|judged| judged != Some(epoch)) {
+            return Err(OwnerError::SealRefused(SealRefusal::EpochClosed));
+        }
         if metadata_id != key_id(metadata) || epoch != key_id(content) {
             return Err(OwnerError::Unavailable);
         }
@@ -99,10 +117,8 @@ impl Owner {
         if receipt::verify(&hosting_root, BaseId(base), &stored).map(|r| r.head()) != Ok(head) {
             return Err(OwnerError::SealRefused(SealRefusal::SeenUnverified));
         }
-        let mut account = anchor.clone();
-        for change in &changes {
-            account.apply(change).map_err(|_| OwnerError::Unavailable)?;
-        }
+        let account = bh_event::account_run::base_account(anchor, &changes, &hosting_root)
+            .map_err(|_| OwnerError::Unavailable)?;
         if account.head() != (AccountHead { position, hash }) {
             return Err(OwnerError::Unavailable);
         }

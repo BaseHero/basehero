@@ -2,7 +2,7 @@
 //! included in the Worker module, which holds no signing key.
 #[path = "support/home_objects.rs"]
 mod home_objects;
-use bh_crypto::{Secret, SigningKey};
+use bh_crypto::{Secret, SigningKey, hash};
 use bh_sync::permit::{self, LogId, LogKind, Permit, Scope};
 use bh_sync::{BaseId, BodyObject, Commitment, EventId, Head, OpaqueEvent, Route};
 use serde_json::{Map, Value, json};
@@ -88,6 +88,27 @@ impl Signer {
             body: body.map(BodyObject::commitment),
             epoch,
             after,
+            attached: None,
+        };
+        self.sign(scope, at)
+    }
+    /// A control append that also orders `attached`, as a rekey does.
+    fn append_attached(
+        &mut self,
+        log: LogId,
+        event: &OpaqueEvent,
+        body: &BodyObject,
+        attached: &BodyObject,
+        after: Head,
+        at: u64,
+    ) -> String {
+        let scope = Scope::Append {
+            log,
+            event: event.digest(),
+            body: Some(body.commitment()),
+            epoch: OTHER_EPOCH,
+            after: Some(after),
+            attached: Some(attached.commitment()),
         };
         self.sign(scope, at)
     }
@@ -113,47 +134,62 @@ fn main() {
     let control = event(3, None, 0x31);
 
     let h0 = Head::EMPTY;
-    let g = Commitment::order(BaseId(base.id), h0, &genesis, Route::Control).unwrap();
-    let k1 = Commitment::order(BaseId(base.id), g.head(), &c1, Route::Content).unwrap();
-    let k2 = Commitment::order(BaseId(base.id), k1.head(), &c2, Route::Content).unwrap();
+    let g = Commitment::order(
+        BaseId(base.id),
+        bh_sync::OrderState::EMPTY,
+        &genesis,
+        Route::Control,
+    )
+    .unwrap();
+    let k1 = Commitment::order(BaseId(base.id), g.after(), &c1, Route::Content).unwrap();
+    let k2 = Commitment::order(BaseId(base.id), k1.after(), &c2, Route::Content).unwrap();
     let k1_control =
-        Commitment::order(BaseId(base.id), g.head(), &control, Route::Control).unwrap();
+        Commitment::order(BaseId(base.id), g.after(), &control, Route::Control).unwrap();
     // A second control naming the same predecessor, and a removal that closes
     // the epoch; each is ordered after the genesis or after c1.
     let control2 = event(5, None, 0x51);
     let removal = event(6, None, 0x61);
     let control_after_c1 =
-        Commitment::order(BaseId(base.id), k1.head(), &control, Route::Control).unwrap();
+        Commitment::order(BaseId(base.id), k1.after(), &control, Route::Control).unwrap();
     let control2_after_control = Commitment::order(
         BaseId(base.id),
-        control_after_c1.head(),
+        control_after_c1.after(),
         &control2,
         Route::Control,
     )
     .unwrap();
     let removal_after_c1 =
-        Commitment::order(BaseId(base.id), k1.head(), &removal, Route::Control).unwrap();
+        Commitment::order(BaseId(base.id), k1.after(), &removal, Route::Control).unwrap();
     let c2_after_control = Commitment::order(
         BaseId(base.id),
-        control_after_c1.head(),
+        control_after_c1.after(),
         &c2,
         Route::Content,
     )
     .unwrap();
 
+    // A rekey after the genesis: its own body, and the seal set it attaches.
+    let b3 = BodyObject::new(vec![0xb3; 1024]).unwrap();
+    let s1 = BodyObject::new(vec![0x51; 4096]).unwrap();
+    let rekey = event(8, Some(&b3), 0x81);
+    let rekey_order =
+        Commitment::order(BaseId(base.id), g.after(), &rekey, Route::Control).unwrap();
+
     // A chain of controls directly after the genesis, each after the last.
     let mut chain = Vec::new();
     let mut chain_head = g.head();
+    let mut chain_order = g.after();
     for i in 0..CHAIN {
         let link = event(100 + i, None, 0x80 + i);
         let ordered =
-            Commitment::order(BaseId(base.id), chain_head, &link, Route::Control).unwrap();
+            Commitment::order(BaseId(base.id), chain_order, &link, Route::Control).unwrap();
         chain.push(json!({
             "event": hex(&link.encode()),
             "commitment": hex(&ordered.encode()),
             "append": signer.append(base, &link, None, EPOCH, Some(chain_head), TIME_START),
         }));
         chain_head = ordered.head();
+        chain_order = ordered.after();
     }
 
     // Account-home log served by the same object class.
@@ -162,7 +198,13 @@ fn main() {
         kind: LogKind::Account,
         id: account_genesis.digest().0,
     };
-    let ag = Commitment::order(BaseId(account.id), h0, &account_genesis, Route::Control).unwrap();
+    let ag = Commitment::order(
+        BaseId(account.id),
+        bh_sync::OrderState::EMPTY,
+        &account_genesis,
+        Route::Control,
+    )
+    .unwrap();
 
     let mut out: Map<String, Value> = [
         ("root", json!(hex(&root.public()))),
@@ -174,6 +216,7 @@ fn main() {
         ("account", json!(name(account))),
         ("genesis", json!(hex(&genesis.encode()))),
         ("genesis_commitment", json!(hex(&g.encode()))),
+        ("genesis_id", json!(hex(&g.event_id().0))),
         ("genesis_head", json!(head(g.head()))),
         (
             "append_genesis",
@@ -195,7 +238,7 @@ fn main() {
             json!(signer.stage(account, &b1, TIME_START)),
         ),
         ("c1", json!(hex(&c1.encode()))),
-        ("c1_id", json!(hex(&c1.id().0))),
+        ("c1_id", json!(hex(&c1.publication_id(Route::Content).0))),
         ("c1_commitment", json!(hex(&k1.encode()))),
         ("c1_head", json!(head(k1.head()))),
         (
@@ -225,6 +268,7 @@ fn main() {
         ),
         ("c2", json!(hex(&c2.encode()))),
         ("c2_commitment", json!(hex(&k2.encode()))),
+        ("c2_id", json!(hex(&k2.event_id().0))),
         ("c2_head", json!(head(k2.head()))),
         (
             "append_c2",
@@ -232,6 +276,7 @@ fn main() {
         ),
         ("control", json!(hex(&control.encode()))),
         ("control_commitment", json!(hex(&k1_control.encode()))),
+        ("control_id", json!(hex(&k1_control.event_id().0))),
         (
             "append_control_stale",
             json!(signer.append(base, &control, None, EPOCH, Some(h0), TIME_START)),
@@ -289,6 +334,7 @@ fn main() {
             json!(head(c2_after_control.head())),
         ),
         ("removal", json!(hex(&removal.encode()))),
+        ("removal_id", json!(hex(&removal_after_c1.event_id().0))),
         (
             "removal_after_c1_commitment",
             json!(hex(&removal_after_c1.encode())),
@@ -306,12 +352,28 @@ fn main() {
             json!(signer.append(base, &c1, Some(&b1), CLOSED, None, TIME_START)),
         ),
         ("chain", Value::Array(chain)),
+        ("other_epoch", json!(hex(&OTHER_EPOCH))),
+        ("b3", json!(hex(b3.bytes()))),
+        ("b3_commitment", json!(hex(&b3.commitment().0))),
+        ("s1", json!(hex(s1.bytes()))),
+        ("s1_commitment", json!(hex(&s1.commitment().0))),
+        ("stage_b3", json!(signer.stage(base, &b3, TIME_START))),
+        ("stage_s1", json!(signer.stage(base, &s1, TIME_START))),
+        ("rekey", json!(hex(&rekey.encode()))),
+        ("rekey_head", json!(head(rekey_order.head()))),
+        ("rekey_id", json!(hex(&rekey_order.event_id().0))),
+        (
+            "append_rekey",
+            json!(signer.append_attached(base, &rekey, &b3, &s1, g.head(), TIME_START)),
+        ),
         (
             "append_content_on_empty",
             json!(signer.append(base, &c1, Some(&b1), EPOCH, None, TIME_START)),
         ),
         ("account_genesis", json!(hex(&account_genesis.encode()))),
         ("account_genesis_commitment", json!(hex(&ag.encode()))),
+        ("account_genesis_id", json!(hex(&ag.event_id().0))),
+        ("account_genesis_head", json!(head(ag.head()))),
         (
             "append_account_genesis",
             json!(signer.append(
@@ -327,8 +389,87 @@ fn main() {
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
+    let directory = [0xa5; 1024];
+    let directory_other = [0xb5; 1024];
+    let entry = [0x20; 32];
+    let store = |log, version, body: &[u8]| Scope::StoreDirectoryEntry {
+        log,
+        entry,
+        version,
+        body: bh_sync::Digest(hash(body)),
+        len: body.len() as u32,
+    };
+    let directory_page: Vec<Value> = (0..66u8)
+        .map(|i| {
+            let entry = [i; 32];
+            json!({ "entry": hex(&entry), "permit": signer.sign(Scope::StoreDirectoryEntry {
+            log: account, entry, version: 1, body: bh_sync::Digest(hash(&directory)), len: 1024,
+        }, TIME_START) })
+        })
+        .collect();
+    out.extend([
+        ("directory_page".into(), json!(directory_page)),
+        ("directory_body".into(), json!(hex(&directory))),
+        ("directory_other".into(), json!(hex(&directory_other))),
+        ("directory_entry".into(), json!(hex(&entry))),
+        ("directory_digest".into(), json!(hex(&hash(&directory)))),
+        (
+            "directory_other_digest".into(),
+            json!(hex(&hash(&directory_other))),
+        ),
+        (
+            "directory_read".into(),
+            json!(signer.sign(Scope::ReadDirectory { log: account }, TIME_START)),
+        ),
+        (
+            "directory_store_1".into(),
+            json!(signer.sign(store(account, 1, &directory), TIME_START)),
+        ),
+        (
+            "directory_store_2".into(),
+            json!(signer.sign(store(account, 2, &directory_other), TIME_START)),
+        ),
+        (
+            "directory_store_conflict".into(),
+            json!(signer.sign(store(account, 1, &directory_other), TIME_START)),
+        ),
+        (
+            "directory_store_base".into(),
+            json!(signer.sign(store(base, 1, &directory), TIME_START)),
+        ),
+        (
+            "directory_read_base".into(),
+            json!(signer.sign(Scope::ReadDirectory { log: base }, TIME_START)),
+        ),
+        (
+            "directory_retire".into(),
+            json!(signer.sign(
+                Scope::RetireHomeObjects {
+                    log: account,
+                    prefix_digest: bh_sync::Digest([6; 32]),
+                },
+                TIME_START
+            )),
+        ),
+    ]);
     out.extend(home_objects::fixtures(account, base, |scope| {
         signer.sign(scope, TIME_START)
     }));
+    out.insert(
+        "home_store_other".into(),
+        json!(
+            signer.sign(
+                Scope::StoreHomeObjects {
+                    log: account,
+                    prefix_digest: bh_sync::Digest([7; 32]),
+                    bundle_digest: bh_sync::home_objects::digest(
+                        &bh_sync::home_objects::encode(&[1; 242], &[2; 1299], &[3; 1299]).unwrap()
+                    )
+                    .unwrap(),
+                },
+                TIME_START
+            )
+        ),
+    );
     println!("{}", Value::Object(out));
 }

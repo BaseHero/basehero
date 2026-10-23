@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-account-recover"
+description = "Enables the account_recover command without any pre-configured scope."
+commands.allow = ["account_recover"]
+
+[[permission]]
+identifier = "deny-account-recover"
+description = "Denies the account_recover command without any pre-configured scope."
+commands.deny = ["account_recover"]

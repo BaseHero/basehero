@@ -3,13 +3,13 @@ use bh_account::{
     journal::AccountJournal, storage::DeviceJournal,
 };
 use bh_core::note::Note;
-use bh_crypto::{KemKey, Secret, SigningKey, aead_open, aead_seal, derive_key};
+use bh_crypto::{AeadSealNonce, KemKey, Secret, SigningKey, aead_open, aead_seal, derive_key};
 use bh_event::{
     ACCOUNT_CHANGE, Binding, CLASS_CONTENT, CLASS_CONTROL, Encoded, GENESIS, History, NOTE,
     NoteTarget, Outcome, OwnedNoteTarget, Payload, key_id, seal,
 };
 use bh_sync::receipt::{self, RECEIPT_LEN};
-use bh_sync::{BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, Route};
+use bh_sync::{BaseId, Commitment, Digest, EventId, Head, OpaqueEvent, OrderState, Route};
 
 /// The fixtures' pinned hosting root, fixed so re-signed bindings can carry a
 /// fresh receipt for whatever head they claim to have seen.
@@ -77,8 +77,8 @@ impl Fixture {
         let epoch = Secret::<32>::random();
         assert_ne!(key_id(&metadata), key_id(&epoch));
         let binding = Binding {
-            version: 1,
-            highest: 1,
+            version: 3,
+            highest: 3,
             mode: 1,
             base: [0; 32],
             audience: [0; 32],
@@ -115,8 +115,13 @@ impl Fixture {
         assert_eq!(genesis.descriptor.encode().len(), 1062);
         assert_eq!(genesis.body.len(), 1024);
         let base = BaseId::from_genesis(&genesis.descriptor);
-        let ordered =
-            Commitment::order(base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+        let ordered = Commitment::order(
+            base,
+            bh_sync::OrderState::EMPTY,
+            &genesis.descriptor,
+            Route::Control,
+        )
+        .unwrap();
         let mut history = History::new(id, account_genesis.as_bytes(), base, root(), 1).unwrap();
         let mut note = Note::new().unwrap();
         assert_eq!(
@@ -156,8 +161,8 @@ impl Fixture {
     }
     fn binding(&self, device: &Device, class: u8) -> Binding {
         Binding {
-            version: 2,
-            highest: 2,
+            version: 3,
+            highest: 3,
             mode: 0,
             base: self.base.0,
             audience: [0; 32],
@@ -199,8 +204,13 @@ impl Fixture {
             content,
         )
         .unwrap();
-        let ordered =
-            Commitment::order(self.base, self.history.head(), &event.descriptor, route).unwrap();
+        let ordered = Commitment::order(
+            self.base,
+            self.history.order_state(),
+            &event.descriptor,
+            route,
+        )
+        .unwrap();
         (event, ordered)
     }
     fn content(&self, device: &Device, kind: u16, data: &[u8]) -> (Encoded, Commitment) {
@@ -240,10 +250,10 @@ fn rewrap_metadata(
 ) -> OpaqueEvent {
     let env = event.envelope();
     let mut aad = b"bh/author-binding-aad/v1\0".to_vec();
-    aad.extend(2u16.to_be_bytes());
+    aad.extend(3u16.to_be_bytes());
     aad.push(0);
     aad.extend(base.0);
-    aad.extend(event.id().0);
+    aad.extend(event.nonce().0);
     aad.extend(&env[..32]);
     let from_key = derive_key(from, b"bhBind01", 0);
     let plaintext =
@@ -253,7 +263,7 @@ fn rewrap_metadata(
     let mut envelope = env[..32].to_vec();
     envelope.extend(nonce);
     envelope.extend(cipher);
-    OpaqueEvent::new(event.id(), envelope).unwrap()
+    OpaqueEvent::new(event.nonce(), envelope).unwrap()
 }
 
 fn note_delta(text: &str) -> (Vec<u8>, Note) {
@@ -302,13 +312,13 @@ fn rebind(
         ad.extend(version.to_be_bytes());
         ad.push(0);
         ad.extend(base.0);
-        ad.extend(event.id().0);
+        ad.extend(event.nonce().0);
         ad.extend(digest);
         ad
     };
     let key = derive_key(metadata, b"bhBind01", 0);
     let nonce: &[u8; 24] = env[32..56].try_into().unwrap();
-    let mut plain = [1u16, 2, 3]
+    let mut plain = [1u16, 2, 3, 4]
         .into_iter()
         .find_map(|v| aead_open(&key, nonce, &aad(v), &env[56..]).ok())
         .unwrap()
@@ -317,7 +327,7 @@ fn rebind(
     change(&mut plain[..346]);
     // Later versions sign a receipt for the (possibly changed) seen head.
     let version = u16::from_be_bytes(plain[..2].try_into().unwrap());
-    let len = if version == 1 { 346 } else { 346 + RECEIPT_LEN };
+    let mut len = if version == 1 { 346 } else { 346 + RECEIPT_LEN };
     if version != 1 {
         let seen = Head {
             position: u64::from_be_bytes(plain[237..245].try_into().unwrap()),
@@ -325,16 +335,24 @@ fn rebind(
         };
         plain[346..len].copy_from_slice(&receipt_for(base, seen));
     }
+    let nonce = AeadSealNonce::new();
+    // The authenticated next-version fixture now uses the v3 signed layout:
+    // version 4 pauses only after its nonce and author signature verify.
+    if version >= 3 {
+        plain[len..len + 24].copy_from_slice(nonce.bytes());
+        len += 24;
+    }
     plain[len..].fill(0);
     let mut signed = b"bh/original-envelope/v1\0".to_vec();
     signed.extend(&plain[..len]);
     plain[len..len + 64].copy_from_slice(&signer.sign(&signed));
-    let (nonce, body) = aead_seal(&key, &aad(version), &plain).unwrap();
+    let nonce_bytes = *nonce.bytes();
+    let body = nonce.seal(&key, &aad(version), &plain).unwrap();
     plain.fill(0);
     let mut envelope = digest.to_vec();
-    envelope.extend(nonce);
+    envelope.extend(nonce_bytes);
     envelope.extend(body);
-    OpaqueEvent::new(event.id(), envelope).unwrap()
+    OpaqueEvent::new(event.nonce(), envelope).unwrap()
 }
 
 #[test]
@@ -344,7 +362,7 @@ fn unrelated_metadata_root_cannot_rewrap_a_valid_content_original() {
     let (first, order) = f.content(&f.first, NOTE, &prior);
     assert_eq!(f.apply(&first, &order, true), Outcome::Accepted);
     let note_before = f.note.state().unwrap();
-    let head_before = f.history.head();
+    let head_before = f.history.order_state();
     let floor_before = f.history.floor();
     let (data, _) = note_delta("next");
     let (event, original_order) = f.content(&f.first, NOTE, &data);
@@ -404,8 +422,13 @@ fn indexed_account_evidence_loss_pauses_without_advancing_then_retries_same_view
     let indexed = journal.load_projection().unwrap().unwrap();
     assert_eq!(indexed.account.head(), f.account.head());
     f.history = History::with_account(&indexed.account, f.base, root(), 1).unwrap();
-    let genesis_order =
-        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    let genesis_order = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &f.genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     assert_eq!(
         f.history.apply(
             &genesis_order,
@@ -479,7 +502,7 @@ fn signed_inner_unknown_account_version_pauses_but_a_bad_inner_event_is_rejected
         .unwrap();
     let mut future = original.as_bytes().to_vec();
     let version_offset = b"BaseHero account event\0".len();
-    future[version_offset..version_offset + 4].copy_from_slice(&[0, 2, 0, 2]);
+    future[version_offset..version_offset + 4].copy_from_slice(&[0, 3, 0, 3]);
     let signature = f.first.control.sign(&future[..future.len() - 64]);
     let signature_offset = future.len() - 64;
     future[signature_offset..].copy_from_slice(&signature);
@@ -570,7 +593,7 @@ fn malformed_authentic_note_rejects_content_then_accepts_next() {
     assert_eq!(f.apply(&event, &order, true), Outcome::ContentRejected);
     assert_eq!(f.note.state().unwrap(), before);
     assert_eq!(f.history.head(), order.head());
-    assert_eq!(f.history.floor(), 2);
+    assert_eq!(f.history.floor(), 3);
     let next = with_writer(&edited.append_paragraph("later").unwrap());
     let (event, order) = f.content(&f.first, NOTE, &next);
     assert_eq!(f.apply(&event, &order, true), Outcome::Accepted);
@@ -592,6 +615,7 @@ fn unknown_control_pauses_and_ciphertext_tamper_stops_without_losing_note() {
     assert_eq!(f.note.state().unwrap(), before);
     // An unknown control kind still pauses the whole base.
     let head = f.history.head();
+    let before_order = f.history.order_state();
     let (unknown, order) = f.create(
         f.binding(&f.first, CLASS_CONTROL),
         0xf124,
@@ -603,7 +627,7 @@ fn unknown_control_pauses_and_ciphertext_tamper_stops_without_losing_note() {
     assert_eq!(f.history.head(), head);
     let (mut bad, _) = f.content(&f.first, NOTE, &data);
     bad.body[31] ^= 1; // recompute untrusted outer order: body commitment remains signed and rejects
-    let order = Commitment::order(f.base, head, &bad.descriptor, Route::Content).unwrap();
+    let order = Commitment::order(f.base, before_order, &bad.descriptor, Route::Content).unwrap();
     assert_eq!(f.apply(&bad, &order, true), Outcome::IntegrityStop);
     assert_eq!(f.note.state().unwrap(), before);
     assert_eq!(f.history.head(), head);
@@ -791,8 +815,13 @@ fn prepared_typed_content_seals_the_shared_content_binding_and_verifies_as_typed
     assert_eq!(*request.expected_key(), f.first.signing.public());
     let signature = f.first.signing.sign(request.signing_bytes());
     let event = request.finish(signature).unwrap();
-    let ordered =
-        Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content).unwrap();
+    let ordered = Commitment::order(
+        f.base,
+        f.history.order_state(),
+        &event.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     let prepared = f
         .history
         .prepare(
@@ -924,6 +953,7 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
     // the applied one would reuse its event ID and be rejected for that.
     let (fresh, _) = f.content(&f.first, NOTE, &data);
     let head = f.history.head();
+    let before_order = f.history.order_state();
     // An unknown control kind still pauses; nothing is consumed.
     let (unknown, order) = f.create(
         f.binding(&f.first, CLASS_CONTROL),
@@ -934,20 +964,20 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
     );
     assert_eq!(f.apply(&unknown, &order, false), Outcome::UnsupportedPause);
     assert_eq!(f.history.head(), head);
-    // A v3 header is recognised and paused, never read as v2.
-    let v3 = rebind(
+    // The next (v4) header is recognised and paused, never read as v3.
+    let v4 = rebind(
         &fresh.descriptor,
         f.base,
         &f.metadata,
         &f.first.signing,
         |s| {
-            s[..2].copy_from_slice(&3u16.to_be_bytes());
-            s[2..4].copy_from_slice(&3u16.to_be_bytes());
+            s[..2].copy_from_slice(&4u16.to_be_bytes());
+            s[2..4].copy_from_slice(&4u16.to_be_bytes());
         },
     );
-    let order = Commitment::order(f.base, head, &v3, Route::Content).unwrap();
+    let order = Commitment::order(f.base, before_order, &v4, Route::Content).unwrap();
     assert_eq!(
-        f.history.inspect(&order, &v3, &f.metadata).err(),
+        f.history.inspect(&order, &v4, &f.metadata).err(),
         Some(Outcome::UnsupportedPause)
     );
     // Another audience's semantics are unknown, so it pauses.
@@ -964,7 +994,7 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
         Some(&f.epoch),
     )
     .unwrap();
-    let order = Commitment::order(f.base, head, &event.descriptor, Route::Content).unwrap();
+    let order = Commitment::order(f.base, before_order, &event.descriptor, Route::Content).unwrap();
     assert_eq!(
         f.history.apply(
             &order,
@@ -980,20 +1010,20 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
         Outcome::UnsupportedPause
     );
     assert_eq!(f.history.head(), head);
-    // A signed v4 header is not recognised at all: ordered with no effect.
-    let v4 = rebind(
+    // A signed v5 header is not recognised at all: ordered with no effect.
+    let v5 = rebind(
         &fresh.descriptor,
         f.base,
         &f.metadata,
         &f.first.signing,
         |s| {
-            s[..2].copy_from_slice(&4u16.to_be_bytes());
-            s[2..4].copy_from_slice(&4u16.to_be_bytes());
+            s[..2].copy_from_slice(&5u16.to_be_bytes());
+            s[2..4].copy_from_slice(&5u16.to_be_bytes());
         },
     );
-    let order = Commitment::order(f.base, head, &v4, Route::Content).unwrap();
+    let order = Commitment::order(f.base, before_order, &v5, Route::Content).unwrap();
     assert_eq!(
-        f.history.inspect(&order, &v4, &f.metadata).err(),
+        f.history.inspect(&order, &v5, &f.metadata).err(),
         Some(Outcome::Rejected)
     );
     // A class above control is invalid under a version this build knows.
@@ -1004,7 +1034,7 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
         &f.first.signing,
         |s| s[309] = 2,
     );
-    let order = Commitment::order(f.base, head, &class_two, Route::Content).unwrap();
+    let order = Commitment::order(f.base, before_order, &class_two, Route::Content).unwrap();
     assert_eq!(
         f.history.inspect(&order, &class_two, &f.metadata).err(),
         Some(Outcome::Rejected)
@@ -1039,7 +1069,7 @@ fn unknown_controls_versions_and_audiences_pause_while_later_formats_reject() {
     let (later, later_order) = f.content(&f.first, NOTE, &data);
     assert_eq!(f.apply(&later, &later_order, true), Outcome::Accepted);
     assert_eq!(f.history.head(), later_order.head());
-    assert_eq!(f.history.floor(), 2);
+    assert_eq!(f.history.floor(), 3);
     assert!(!f.history.is_stopped());
 }
 
@@ -1072,7 +1102,8 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
             &f.first.signing,
             |s| s[mutate] ^= 1,
         );
-        let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
+        let order =
+            Commitment::order(f.base, f.history.order_state(), &altered, Route::Content).unwrap();
         let mut history = f.history.clone();
         let mut note = Note::new().unwrap();
         assert_eq!(
@@ -1109,7 +1140,8 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
         &SigningKey::generate(),
         |_| {},
     );
-    let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
+    let order =
+        Commitment::order(f.base, f.history.order_state(), &altered, Route::Content).unwrap();
     assert_eq!(
         f.history.inspect(&order, &altered, &f.metadata).err(),
         Some(Outcome::Rejected)
@@ -1118,8 +1150,13 @@ fn signed_seen_forks_and_original_signature_are_checked_inside_outer_commitment(
     assert_eq!(
         f.history
             .inspect(
-                &Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
-                    .unwrap(),
+                &Commitment::order(
+                    f.base,
+                    f.history.order_state(),
+                    &event.descriptor,
+                    Route::Content
+                )
+                .unwrap(),
                 &event.descriptor,
                 &wrong
             )
@@ -1171,7 +1208,8 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         &f.first.control,
         |s| s[245] ^= 1,
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
+    let reordered =
+        Commitment::order(f.base, f.history.order_state(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
         Some(Outcome::IntegrityStop)
@@ -1187,7 +1225,8 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
             s[245..277].fill(0);
         },
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
+    let reordered =
+        Commitment::order(f.base, f.history.order_state(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
         Some(Outcome::Rejected)
@@ -1207,10 +1246,14 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
         &f.second.control,
         None,
     );
-    let genesis_head =
-        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control)
-            .unwrap()
-            .head();
+    let genesis_head = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &f.genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap()
+    .head();
     let original_account_head = AccountEvent::decode(&f.account_genesis).unwrap().head();
     let fork = rebind(
         &candidate.descriptor,
@@ -1225,7 +1268,8 @@ fn account_controls_require_original_account_history_and_close_old_epoch() {
             // signed predecessor remains add's digest, correct at ordering but wrong at seen.
         },
     );
-    let reordered = Commitment::order(f.base, f.history.head(), &fork, Route::Control).unwrap();
+    let reordered =
+        Commitment::order(f.base, f.history.order_state(), &fork, Route::Control).unwrap();
     assert_eq!(
         f.history.inspect(&reordered, &fork, &f.metadata).err(),
         Some(Outcome::Rejected)
@@ -1287,7 +1331,8 @@ fn event_version_floor_capability_and_duplicate_identity() {
             &f.first.signing,
             |s| s[offset..offset + 2].copy_from_slice(&bytes),
         );
-        let order = Commitment::order(f.base, f.history.head(), &changed, Route::Content).unwrap();
+        let order =
+            Commitment::order(f.base, f.history.order_state(), &changed, Route::Content).unwrap();
         let mut state = f.history.clone();
         let mut note = Note::new().unwrap();
         assert_eq!(
@@ -1304,15 +1349,20 @@ fn event_version_floor_capability_and_duplicate_identity() {
             ),
             expected
         );
-        // Accepting the first v2 event raises the floor from genesis's v1.
-        let floor = if expected == Outcome::Accepted { 2 } else { 1 };
+        // The canonical genesis already establishes the v3 floor.
+        let floor = 3;
         assert_eq!(state.floor(), floor);
     }
     let mut high = History::new(f.account.id(), &f.account_genesis, f.base, root(), 3).unwrap();
-    // Genesis is v1 forever and opens under any remembered floor; a v3 floor
-    // then refuses a correctly signed v2 event.
-    let first =
-        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    // The canonical genesis opens at the remembered v3 floor; a v2
+    // binding under that floor must still be refused.
+    let first = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &f.genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let mut note = Note::new().unwrap();
     assert_eq!(
         high.apply(
@@ -1330,24 +1380,33 @@ fn event_version_floor_capability_and_duplicate_identity() {
     );
     assert_eq!(high.floor(), 3);
     assert_eq!(high.head(), first.head());
-    let order = Commitment::order(f.base, high.head(), &event.descriptor, Route::Content).unwrap();
+    let legacy = rebind(
+        &event.descriptor,
+        f.base,
+        &f.metadata,
+        &f.first.signing,
+        |s| {
+            s[..4].copy_from_slice(&[0, 2, 0, 2]);
+        },
+    );
+    let order = Commitment::order(f.base, high.order_state(), &legacy, Route::Content).unwrap();
     assert_eq!(
-        high.inspect(&order, &event.descriptor, &f.metadata).err(),
+        high.inspect(&order, &legacy, &f.metadata).err(),
         Some(Outcome::Rejected)
     );
-    // A signed v3 binding is recognised and paused, not read as v2.
+    // A signed v4 binding is recognised and paused, not read as v3.
     let upgraded = rebind(
         &event.descriptor,
         f.base,
         &f.metadata,
         &f.first.signing,
         |s| {
-            s[..2].copy_from_slice(&3u16.to_be_bytes());
-            s[2..4].copy_from_slice(&3u16.to_be_bytes());
+            s[..2].copy_from_slice(&4u16.to_be_bytes());
+            s[2..4].copy_from_slice(&4u16.to_be_bytes());
         },
     );
     let upgrade_order =
-        Commitment::order(f.base, f.history.head(), &upgraded, Route::Content).unwrap();
+        Commitment::order(f.base, f.history.order_state(), &upgraded, Route::Content).unwrap();
     assert_eq!(
         f.history
             .inspect(&upgrade_order, &upgraded, &f.metadata)
@@ -1356,8 +1415,13 @@ fn event_version_floor_capability_and_duplicate_identity() {
     );
     let mut accepted = f.history.clone();
     let mut note = Note::new().unwrap();
-    let order =
-        Commitment::order(f.base, accepted.head(), &event.descriptor, Route::Content).unwrap();
+    let order = Commitment::order(
+        f.base,
+        accepted.order_state(),
+        &event.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     assert_eq!(
         accepted.apply(
             &order,
@@ -1372,8 +1436,13 @@ fn event_version_floor_capability_and_duplicate_identity() {
         ),
         Outcome::Accepted
     );
-    let repeat =
-        Commitment::order(f.base, accepted.head(), &event.descriptor, Route::Content).unwrap();
+    let repeat = Commitment::order(
+        f.base,
+        accepted.order_state(),
+        &event.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     assert_eq!(
         accepted
             .inspect(&repeat, &event.descriptor, &f.metadata)
@@ -1381,7 +1450,7 @@ fn event_version_floor_capability_and_duplicate_identity() {
         Some(Outcome::Rejected)
     );
     let mut next = f.binding(&f.first, CLASS_CONTENT);
-    next.event_id = event.descriptor.id();
+    next.event_id = event.descriptor.nonce();
     next.seen = accepted.head();
     next.seen_receipt = receipt_for(f.base, next.seen);
     let different = seal(
@@ -1397,16 +1466,16 @@ fn event_version_floor_capability_and_duplicate_identity() {
     .unwrap();
     let repeat = Commitment::order(
         f.base,
-        accepted.head(),
+        accepted.order_state(),
         &different.descriptor,
         Route::Content,
     )
     .unwrap();
-    assert_eq!(
+    assert_ne!(repeat.event_id(), order.event_id());
+    assert!(
         accepted
             .inspect(&repeat, &different.descriptor, &f.metadata)
-            .err(),
-        Some(Outcome::Rejected)
+            .is_ok()
     );
 }
 
@@ -1418,8 +1487,13 @@ fn body_padding_authenticated_but_noncanonical_is_rejected_at_plaintext_validati
     let signed = f
         .history
         .inspect(
-            &Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
-                .unwrap(),
+            &Commitment::order(
+                f.base,
+                f.history.order_state(),
+                &event.descriptor,
+                Route::Content,
+            )
+            .unwrap(),
             &event.descriptor,
             &f.metadata,
         )
@@ -1454,10 +1528,10 @@ fn body_padding_authenticated_but_noncanonical_is_rejected_at_plaintext_validati
     let old = event.descriptor.envelope();
     let bind_key = derive_key(&f.metadata, b"bhBind01", 0);
     let mut bind_ad = b"bh/author-binding-aad/v1\0".to_vec();
-    bind_ad.extend(2u16.to_be_bytes());
+    bind_ad.extend(3u16.to_be_bytes());
     bind_ad.push(0);
     bind_ad.extend(f.base.0);
-    bind_ad.extend(event.descriptor.id().0);
+    bind_ad.extend(event.descriptor.nonce().0);
     bind_ad.extend(&old[..32]);
     let mut bind_plain = aead_open(
         &bind_key,
@@ -1469,18 +1543,22 @@ fn body_padding_authenticated_but_noncanonical_is_rejected_at_plaintext_validati
     .expose()
     .to_vec();
     bind_plain[314..346].copy_from_slice(&digest);
+    let seal_nonce = AeadSealNonce::new();
+    bind_plain[646..670].copy_from_slice(seal_nonce.bytes());
     let mut to_sign = b"bh/original-envelope/v1\0".to_vec();
-    to_sign.extend(&bind_plain[..646]);
-    bind_plain[646..710].copy_from_slice(&f.first.signing.sign(&to_sign));
+    to_sign.extend(&bind_plain[..670]);
+    bind_plain[670..734].copy_from_slice(&f.first.signing.sign(&to_sign));
     let end = bind_ad.len();
     bind_ad[end - 32..].copy_from_slice(&digest);
-    let (nonce, cipher) = aead_seal(&bind_key, &bind_ad, &bind_plain).unwrap();
+    let nonce_bytes = *seal_nonce.bytes();
+    let cipher = seal_nonce.seal(&bind_key, &bind_ad, &bind_plain).unwrap();
     bind_plain.fill(0);
     let mut envelope = digest.to_vec();
-    envelope.extend(nonce);
+    envelope.extend(nonce_bytes);
     envelope.extend(cipher);
-    let descriptor = OpaqueEvent::new(event.descriptor.id(), envelope).unwrap();
-    let order = Commitment::order(f.base, f.history.head(), &descriptor, Route::Content).unwrap();
+    let descriptor = OpaqueEvent::new(event.descriptor.nonce(), envelope).unwrap();
+    let order =
+        Commitment::order(f.base, f.history.order_state(), &descriptor, Route::Content).unwrap();
     assert!(f.history.inspect(&order, &descriptor, &f.metadata).is_ok());
     assert_eq!(
         f.history.apply(
@@ -1521,8 +1599,13 @@ fn old_truthful_content_seen_head_remains_valid_after_intervening_content() {
     )
     .unwrap();
     assert_eq!(f.apply(&one, &one_order, true), Outcome::Accepted);
-    let two_order =
-        Commitment::order(f.base, f.history.head(), &two.descriptor, Route::Content).unwrap();
+    let two_order = Commitment::order(
+        f.base,
+        f.history.order_state(),
+        &two.descriptor,
+        Route::Content,
+    )
+    .unwrap();
     assert_eq!(f.apply(&two, &two_order, true), Outcome::Accepted);
 }
 
@@ -1994,8 +2077,13 @@ fn same_head_trust_context_refuses_prepared_genesis() {
     let f = Fixture::new();
     let other = Fixture::new();
     let mut source = History::new(f.account.id(), &f.account_genesis, f.base, root(), 1).unwrap();
-    let order =
-        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    let order = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &f.genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let floor_two = History::new(f.account.id(), &f.account_genesis, f.base, root(), 2).unwrap();
     let other_account = History::new(
         other.account.id(),
@@ -2780,9 +2868,13 @@ fn note_account_copy_scale_probe() {
             .collect();
         let start = Instant::now();
         for event in events {
-            let order =
-                Commitment::order(f.base, f.history.head(), &event.descriptor, Route::Content)
-                    .unwrap();
+            let order = Commitment::order(
+                f.base,
+                f.history.order_state(),
+                &event.descriptor,
+                Route::Content,
+            )
+            .unwrap();
             let prepared = f
                 .history
                 .prepare(
@@ -2817,8 +2909,13 @@ fn note_account_copy_scale_probe() {
 #[test]
 fn replay_verifies_records_from_anchors_without_applying_notes() {
     let mut f = Fixture::new();
-    let first_order =
-        Commitment::order(f.base, Head::EMPTY, &f.genesis.descriptor, Route::Control).unwrap();
+    let first_order = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &f.genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let mut records = vec![(
         first_order,
         f.genesis.descriptor.encode(),
@@ -2922,7 +3019,7 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
     let mut changed = records.clone();
     changed[1].0 = Commitment::order(
         f.base,
-        records[0].0.head(),
+        records[0].0.after(),
         &other.descriptor,
         Route::Content,
     )
@@ -2937,11 +3034,11 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
     let mut repeated = f.binding(&f.first, CLASS_CONTENT);
     repeated.seen = records[2].0.head();
     repeated.seen_receipt = receipt_for(f.base, repeated.seen);
-    repeated.event_id = OpaqueEvent::decode(&records[1].1).unwrap().id();
+    repeated.event_id = OpaqueEvent::decode(&records[1].1).unwrap().nonce();
     let (duplicate, _) = f.create(repeated, NOTE, &data, &f.first.signing, Some(&f.epoch));
     let duplicate_order = Commitment::order(
         f.base,
-        records[2].0.head(),
+        records[2].0.after(),
         &duplicate.descriptor,
         Route::Content,
     )
@@ -2979,17 +3076,16 @@ fn replay_verifies_records_from_anchors_without_applying_notes() {
         check(records.clone(), BaseId([99; 32])),
         Some(Outcome::IntegrityStop)
     );
-    // Each event is judged under the floor in force at its own position. A
-    // floor of 3 for events after position 2 rejects the v2 account addition
-    // at position 3; the same rise after position 3 leaves it accepted, as
-    // live verification did. Under another pinned hosting root (whose
-    // receipts these are not) each later event is rejected.
+    // Canonical v3 genesis establishes floor 3. A rise above v3 after
+    // position 2 rejects the position-3 account control; the same rise after
+    // position 3 leaves it accepted. An earlier lower rise cannot downgrade.
     let genesis_account = AccountEvent::decode(&f.account_genesis).unwrap().head();
     for (root, rises, account, floor) in [
-        (root(), vec![(0, 2)], f.history.account_head(), 2),
-        (root(), vec![(2, 3)], genesis_account, 3),
-        (root(), vec![(3, 3)], f.history.account_head(), 3),
-        (SigningKey::generate().public(), vec![], genesis_account, 1),
+        (root(), vec![(0, 2)], f.history.account_head(), 3),
+        (root(), vec![(2, 3)], f.history.account_head(), 3),
+        (root(), vec![(2, 4)], genesis_account, 4),
+        (root(), vec![(3, 4)], f.history.account_head(), 4),
+        (SigningKey::generate().public(), vec![], genesis_account, 3),
     ] {
         let replayed = History::replay(
             f.account.id(),
@@ -3071,7 +3167,8 @@ fn author_signed_padded_size_other_than_the_body_is_rejected_not_a_stop() {
             .unwrap()
             .commitment()
     );
-    let order = Commitment::order(f.base, f.history.head(), &altered, Route::Content).unwrap();
+    let order =
+        Commitment::order(f.base, f.history.order_state(), &altered, Route::Content).unwrap();
     let event = Encoded {
         descriptor: altered,
         body: event.body,
@@ -3345,8 +3442,13 @@ fn resume_continues_from_durable_rows_without_replay() {
         descriptor: f.genesis.descriptor.clone(),
         body: f.genesis.body.clone(),
     };
-    let order =
-        Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control).unwrap();
+    let order = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
     let mut live = f.history.clone();
     assert_eq!(
         step(&mut live, &rows, &f, &genesis, &order, false),
@@ -3417,14 +3519,19 @@ fn resume_continues_from_durable_rows_without_replay() {
     let (data, _) = note_delta("from the added device");
     let (added, order) = f.content(&f.second, NOTE, &data);
     let mut old = f.binding(&f.first, CLASS_CONTENT);
-    old.seen = Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control)
-        .unwrap()
-        .head();
+    old.seen = Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap()
+    .head();
     old.seen_receipt = receipt_for(f.base, old.seen);
     old.account_head = anchor.head();
     old.seen_control = order_digest(&f, &genesis);
     let mut reused = f.binding(&f.first, CLASS_CONTENT);
-    reused.event_id = first.descriptor.id();
+    reused.event_id = first.descriptor.nonce();
     let mut forked = f.binding(&f.first, CLASS_CONTENT);
     forked.seen = Head {
         position: 1,
@@ -3441,10 +3548,36 @@ fn resume_continues_from_durable_rows_without_replay() {
         step(&mut resumed, &rows, &f, &added, &order, true),
         Outcome::Accepted
     );
+    // Reorder the *exact* original already recorded before the durable cut.
+    // A fresh publication with the same nonce above is different; this routed
+    // ID must still be found in the durable first-use rows after resume.
+    let account_before_repeat = resumed.account_head();
+    let repeated_order = Commitment::order(
+        f.base,
+        live.order_state(),
+        &first.descriptor,
+        Route::Content,
+    )
+    .unwrap();
+    assert_eq!(
+        repeated_order.event_id(),
+        first.descriptor.publication_id(Route::Content)
+    );
+    assert_eq!(
+        step(&mut live, &scratch, &f, &first, &repeated_order, true),
+        Outcome::Rejected
+    );
+    assert_eq!(
+        step(&mut resumed, &rows, &f, &first, &repeated_order, true),
+        Outcome::Rejected
+    );
+    assert_eq!(resumed.account_head(), account_before_repeat);
+    assert_eq!(resumed.order_state(), repeated_order.after());
+    assert_eq!(live.head(), resumed.head());
     f.history = live.clone();
     for (binding, outcome) in [
         (old, Outcome::Accepted),
-        (reused, Outcome::Rejected),
+        (reused, Outcome::Accepted),
         (forked, Outcome::IntegrityStop),
     ] {
         let (event, order) = f.create(binding, NOTE, &data, &f.first.signing, Some(&f.epoch));
@@ -3500,9 +3633,112 @@ fn resume_continues_from_durable_rows_without_replay() {
     assert_eq!(waiting.head(), continuation.seen.head);
 }
 
-fn order_digest(f: &Fixture, genesis: &Encoded) -> [u8; 32] {
-    Commitment::order(f.base, Head::EMPTY, &genesis.descriptor, Route::Control)
+#[test]
+fn rejected_control_routed_id_is_reserved_after_durable_resume() {
+    let mut f = Fixture::new();
+    let anchor = VerifiedAccount::from_genesis(f.account.id(), &f.account_genesis).unwrap();
+    let rows = std::sync::Arc::new(Rows::default());
+    let mut live = History::with_account(&anchor, f.base, root(), 1).unwrap();
+    let genesis = Encoded {
+        descriptor: f.genesis.descriptor.clone(),
+        body: f.genesis.body.clone(),
+    };
+    let genesis_order = Commitment::order(
+        f.base,
+        OrderState::EMPTY,
+        &genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap();
+    assert_eq!(
+        step(&mut live, &rows, &f, &genesis, &genesis_order, false),
+        Outcome::Accepted
+    );
+    f.history = live.clone();
+    // A control whose binding, author and seen claims all verify, but whose
+    // copied account event is corrupt: only its body makes it invalid.
+    let req = f
+        .account
+        .add_device(f.first.keys().id(), f.second.keys())
+        .unwrap();
+    let mut corrupt = req
+        .finish(f.first.control.sign(req.signing_bytes()))
         .unwrap()
-        .event_digest()
-        .0
+        .as_bytes()
+        .to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    let (bad, ordered) = f.create(
+        f.binding(&f.first, CLASS_CONTROL),
+        ACCOUNT_CHANGE,
+        &corrupt,
+        &f.first.control,
+        None,
+    );
+    let prepared = live
+        .prepare(
+            &ordered,
+            &bad.descriptor,
+            Some(&bad.body),
+            &f.metadata,
+            None,
+        )
+        .unwrap();
+    let applied = live.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.outcome(), Outcome::Rejected);
+    rows.record(&applied);
+    let continuation = applied.continuation().unwrap();
+    let mut resumed = History::resume(
+        &anchor,
+        f.base,
+        root(),
+        continuation,
+        Vec::<Vec<u8>>::new(),
+        rows.clone(),
+        1,
+    )
+    .unwrap();
+    let account = resumed.account_head();
+    let next = Commitment::order(
+        f.base,
+        resumed.order_state(),
+        &bad.descriptor,
+        Route::Control,
+    )
+    .unwrap();
+    assert_eq!(next.event_id(), ordered.event_id());
+    // The repeat's binding still verifies against the resumed state, so
+    // only the durably retained first-use ID identifies it: judged afresh
+    // it would wait for a body this reader no longer has.
+    let prepared = resumed
+        .prepare(&next, &bad.descriptor, None, &f.metadata, None)
+        .unwrap();
+    let applied = resumed.consume_unapplied(prepared).unwrap();
+    assert_eq!(applied.outcome(), Outcome::Rejected);
+    rows.record(&applied);
+    assert_eq!(
+        resumed.order_state(),
+        next.after(),
+        "even a rejected repeat advances structural order"
+    );
+    assert_eq!(resumed.account_head(), account);
+    assert!(
+        rows.changes.lock().unwrap().is_empty(),
+        "neither rejected control has an account effect"
+    );
+    assert_eq!(
+        rows.ids.lock().unwrap().get(&ordered.event_id().0),
+        Some(&ordered.event_digest())
+    );
+}
+
+fn order_digest(f: &Fixture, genesis: &Encoded) -> [u8; 32] {
+    Commitment::order(
+        f.base,
+        bh_sync::OrderState::EMPTY,
+        &genesis.descriptor,
+        Route::Control,
+    )
+    .unwrap()
+    .event_digest()
+    .0
 }

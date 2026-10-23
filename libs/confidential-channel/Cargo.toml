@@ -13,6 +13,7 @@ synthetic-attestation = ["bh-confidential-attestation/synthetic-attestation"]
 
 [dependencies]
 bh-crypto.workspace = true
+bh-flags.workspace = true
 bh-confidential-policy.workspace = true
 bh-confidential-attestation.workspace = true
 

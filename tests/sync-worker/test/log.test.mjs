@@ -36,15 +36,14 @@ async function call(mf, action, args = [], bytes = [], log = fx.base) {
 const stage = (mf, permit, body, log) => call(mf, 'stage', [permit, body], [0, 1], log);
 const append = async (mf, permit, event, log) => {
   const { commitment, ...result } = await call(mf, 'append', [permit, event], [0, 1], log);
-  return result; // Existing legacy assertions concern only the old Ack fields.
+  return result;
 };
 const clock = (mf, ms, log) => call(mf, 'control', [{ clock: ms }], [], log);
 const inspect = (mf, log) => call(mf, 'inspect', [], [], log);
 const r2 = (mf, ...args) => call(mf, 'r2', args);
 const key = commitment => `b/${fx.base}/${commitment}`;
 const ack = (head, id) => ({ position: head.position, hash: head.hash, eventId: id });
-const id = byte => byte.repeat(32);
-const genesisAck = ack(fx.genesis_head, id('01'));
+const genesisAck = ack(fx.genesis_head, fx.genesis_id);
 const c1Ack = ack(fx.c1_head, fx.c1_id);
 
 async function withLog(run, path) {
@@ -73,7 +72,7 @@ test('private_home_objects_sync_retry_conflict_and_no_append', () => withLog(asy
   assert.deepEqual(state.events, []);
   assert.deepEqual(state.bodies, []);
   assert.deepEqual(await call(mf, 'read', [1, 3], [], fx.account), []);
-  assert.deepEqual(await call(mf, 'controls', [0], [], fx.account), []);
+  assert.deepEqual(await call(mf, 'controls', [0], [], fx.account), { items: [], endpoint: null });
   assert.deepEqual(await r2(mf, 'list'), []);
   assert.deepEqual(await call(mf, 'privateObjects', [], [], fx.account),
     [{ prefix_digest: fx.home_prefix, bundle_digest: fx.home_digest, bundle: fx.home_bundle }]);
@@ -90,6 +89,28 @@ test('private_home_objects_failed_sync_no_ack_then_exact_retry', () => withLog(a
   assert.deepEqual(await storeHome(mf), homeAck);
   assert.equal((await call(mf, 'privateObjects', [], [], fx.account)).length, 1);
 }));
+
+test('populated legacy account-home order store refuses without relabeling other accounts', async () => {
+  const path = mkdtempSync(join(tmpdir(), 'bh-account-order-legacy-'));
+  temporary.push(path);
+  let before;
+  await withLog(async mf => {
+    await clock(mf, fx.t0, fx.account);
+    assert.deepEqual(await append(mf, fx.append_account_genesis, fx.account_genesis, fx.account),
+      ack(fx.account_genesis_head, fx.account_genesis_id));
+    assert.deepEqual(await call(mf, 'removeOrderMarker', [], [], fx.account), { ok: true });
+    before = await inspect(mf, fx.account);
+    assert.equal(before.meta.order_format, undefined);
+    assert.equal(before.events.length, 1);
+  }, path);
+  await withLog(async mf => {
+    assert.deepEqual(await call(mf, 'head', [], [], fx.account), { refused: 'Unavailable' });
+    assert.deepEqual(await inspect(mf, fx.account), before, 'no relabel, reset or row rewrite');
+    const healthy = '02' + 'f2'.repeat(32);
+    await clock(mf, fx.t0, healthy);
+    assert.deepEqual(await call(mf, 'controls', [0], [], healthy), { items: [], endpoint: null });
+  }, path);
+});
 
 test('private_home_objects_scope_and_deadline_at_use', () => withLog(async mf => {
   await clock(mf, fx.t0, fx.account);
@@ -124,6 +145,112 @@ test('private_home_objects_survive_workerd_restart_and_sweep_after_lost_response
   }, path);
 });
 
+const directoryStore = (mf, permit, body, log = fx.account) =>
+  call(mf, 'storeDirectoryEntry', [permit, body], [0, 1], log);
+const directoryRead = (mf, after = null, permit = fx.directory_read, log = fx.account) =>
+  call(mf, 'readDirectory', [permit, after], [0], log);
+
+test('directory_entry_versions_only_increase', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_2, fx.directory_other), { ok: true });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { refused: 'Conflict' });
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_other }]);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_conflict, fx.directory_other), { refused: 'Conflict' });
+}));
+
+test('directory_retry_with_same_bytes_is_ok', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_conflict, fx.directory_other), { refused: 'Conflict' });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_other), { refused: 'Scope' });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_2, fx.directory_other), { ok: true });
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_other }]);
+  assert.deepEqual(await r2(mf, 'list'), [`d/${fx.account}/${fx.directory_entry}/${fx.directory_other_digest}`]);
+}));
+
+test('directory_update_deletes_the_superseded_revision', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  const old = `d/${fx.account}/${fx.directory_entry}/${fx.directory_digest}`;
+  const current = `d/${fx.account}/${fx.directory_entry}/${fx.directory_other_digest}`;
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  assert.equal(await r2(mf, 'head', old), 1024);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_2, fx.directory_other), { ok: true });
+  assert.equal(await r2(mf, 'head', old), null);
+  assert.equal(await r2(mf, 'head', current), 1024);
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_other }]);
+}));
+
+test('directory_retry_deletes_nothing', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  const current = `d/${fx.account}/${fx.directory_entry}/${fx.directory_digest}`;
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  assert.deepEqual(await r2(mf, 'list'), [current]);
+  assert.equal(await r2(mf, 'head', current), 1024);
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_body }]);
+}));
+
+test('directory_read_of_a_just_superseded_revision_is_retryable', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  await directoryStore(mf, fx.directory_store_1, fx.directory_body);
+  await call(mf, 'control', [{ supersedeOnDirectoryRead: { permit: fx.directory_store_2, body: fx.directory_other } }], [], fx.account);
+  assert.deepEqual(await directoryRead(mf), { refused: 'Missing' });
+  assert.deepEqual(await directoryRead(mf), { entries: [{ entry: fx.directory_entry, body: fx.directory_other }], more: false });
+}));
+
+test('directory_failed_sync_retries_without_exposing_new_revision_early', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  await directoryStore(mf, fx.directory_store_1, fx.directory_body);
+  await call(mf, 'control', [{ failSync: true }], [], fx.account);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_2, fx.directory_other), { refused: 'Unavailable' });
+  assert.deepEqual(await directoryRead(mf), { refused: 'Unavailable' });
+  await call(mf, 'control', [{ failSync: false }], [], fx.account);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_2, fx.directory_other), { ok: true });
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_other }]);
+}));
+
+test('directory_ids_are_stored_verbatim', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_1, fx.directory_body), { ok: true });
+  const dump = await call(mf, 'dump', [], [], fx.account);
+  assert.deepEqual(dump.rows.private_directory, [{ entry: fx.directory_entry, version: 1,
+    digest: fx.directory_digest, len: 1024 }]);
+  assert.deepEqual((await directoryRead(mf)).entries, [{ entry: fx.directory_entry, body: fx.directory_body }]);
+  assert.deepEqual((await inspect(mf, fx.account)).events, []);
+  assert.deepEqual(await r2(mf, 'list'), [`d/${fx.account}/${fx.directory_entry}/${fx.directory_digest}`]);
+  assert.deepEqual(Object.keys(dump.rows).filter(name => name.includes('directory')), ['private_directory']);
+}));
+
+test('directory_read_pages_entries_in_entry_order', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  for (const { permit } of [...fx.directory_page].reverse())
+    assert.deepEqual(await directoryStore(mf, permit, fx.directory_body), { ok: true });
+  const first = await directoryRead(mf);
+  assert.equal(first.more, true);
+  assert.deepEqual(first.entries, fx.directory_page.slice(0, 64).map(({ entry }) => ({ entry, body: fx.directory_body })));
+  assert.deepEqual(await directoryRead(mf, fx.directory_page[63].entry), {
+    entries: fx.directory_page.slice(64).map(({ entry }) => ({ entry, body: fx.directory_body })), more: false });
+  assert.deepEqual(await directoryRead(mf, fx.directory_page[65].entry), { entries: [], more: false });
+  assert.deepEqual(await directoryRead(mf, 'ff'.repeat(32)), { entries: [], more: false });
+}));
+
+test('retire_deletes_only_the_named_bundle', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  await storeHome(mf);
+  assert.deepEqual(await storeHome(mf, fx.home_store_other), { prefixDigest: '07'.repeat(32), bundleDigest: fx.home_digest });
+  assert.deepEqual(await call(mf, 'retireHomeObjects', [fx.directory_retire], [0], fx.account), { ok: true });
+  assert.deepEqual(await call(mf, 'privateObjects', [], [], fx.account), [
+    { prefix_digest: '07'.repeat(32), bundle_digest: fx.home_digest, bundle: fx.home_bundle },
+  ]);
+  assert.deepEqual(await call(mf, 'retireHomeObjects', [fx.directory_retire], [0], fx.account), { ok: true });
+}));
+
+test('directory_permit_for_a_base_log_refused', () => withLog(async mf => {
+  assert.deepEqual(await directoryRead(mf, null, fx.directory_read_base, fx.base), { refused: 'Malformed' });
+  assert.deepEqual(await directoryStore(mf, fx.directory_store_base, fx.directory_body, fx.base), { refused: 'Malformed' });
+}));
+
 test('append_requires_staged_body', () => withLog(async mf => {
   await genesis(mf);
   const before = await inspect(mf);
@@ -144,7 +271,7 @@ test('ack_after_storage_sync', () => withLog(async mf => {
   const failed = await call(mf, 'traced', ['append', fx.append_c2, fx.c2], [1, 2]);
   assert.deepEqual(failed, { result: { refused: 'Unavailable' }, trace: ['sync', 'resolved'] });
   await call(mf, 'control', [{ failSync: false }]);
-  assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_head, id('04')));
+  assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_head, fx.c2_id));
   assert.equal((await inspect(mf)).events.length, 3);
 }));
 
@@ -158,8 +285,10 @@ test('bounded reads expose immutable rows only after storage sync', () => withLo
     await call(mf, 'control', [{ failSync: false }]);
     const retry = await call(mf, 'traced', [method, ...args]);
     assert.deepEqual(retry.trace, ['sync', 'synced', 'resolved']);
-    assert.equal(retry.result.length, 1);
-    assert.equal(retry.result[0].commitment, fx.genesis_commitment);
+    const items = method === 'controls' ? retry.result.items : retry.result;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].commitment, fx.genesis_commitment);
+    if (method === 'controls') assert.equal(retry.result.endpoint, fx.genesis_commitment);
   }
   assert.deepEqual(await inspect(mf), before, 'reads allocate no position or writes');
 }));
@@ -186,12 +315,12 @@ test('lost_response_same_bytes_same_ack', () => withLog(async mf => {
   assert.deepEqual(await call(mf, 'head'), fx.c1_head);
 }));
 
-test('same_id_different_bytes_conflict', () => withLog(async mf => {
+test('same_nonce_different_original_cannot_retrieve_first_ack', () => withLog(async mf => {
   await genesis(mf);
   assert.deepEqual(await stage(mf, fx.stage_b1, fx.b1), { ok: true });
   assert.deepEqual(await append(mf, fx.append_c1, fx.c1), c1Ack);
   const before = await inspect(mf);
-  assert.deepEqual(await append(mf, fx.append_c1_other, fx.c1_other), { refused: 'Conflict' });
+  assert.deepEqual(await append(mf, fx.append_c1_other, fx.c1_other), { refused: 'NotStaged' });
   assert.deepEqual(await inspect(mf), before);
 }));
 
@@ -240,8 +369,8 @@ test('control_predecessor_checked', () => withLog(async mf => {
 }));
 
 test('stored_commitment_route_matches_permit', () => withLog(async mf => {
-  // The route is the commitment byte after the event digest.
-  const route = commitment => parseInt(commitment.slice(2 * 138, 2 * 139), 16);
+  // The canonical route is the byte after version and base.
+  const route = commitment => parseInt(commitment.slice(2 * 34, 2 * 35), 16);
   await genesis(mf);
   assert.deepEqual(await stage(mf, fx.stage_b1, fx.b1), { ok: true });
   assert.deepEqual(await append(mf, fx.append_c1, fx.c1), c1Ack);
@@ -276,14 +405,14 @@ test('control_predecessor_is_control_head', () => withLog(async mf => {
   assert.deepEqual(await append(mf, fx.append_control_after_log_head, fx.control), { refused: 'Predecessor' });
   assert.equal((await inspect(mf)).events.length, 2);
   assert.deepEqual(await append(mf, fx.append_control, fx.control),
-    ack(fx.control_after_c1_head, id('03')));
+    ack(fx.control_after_c1_head, fx.control_id));
   const state = await inspect(mf);
   assert.deepEqual(state.events.map(e => [e.position, e.control]), [[1, 1], [2, 0], [3, 1]]);
   assert.equal(state.events[2].commitment, fx.control_after_c1_commitment);
   assert.deepEqual(JSON.parse(state.meta.control), fx.control_after_c1_head);
   // Content still orders after the control, at the log head.
   assert.deepEqual(await stage(mf, fx.stage_b2, fx.b2), { ok: true });
-  assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_after_control_head, id('04')));
+  assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_after_control_head, fx.c2_id));
   assert.equal((await inspect(mf)).events[3].commitment, fx.c2_after_control_commitment);
 }));
 
@@ -316,9 +445,9 @@ test('content_before_closure_ordered', () => withLog(async mf => {
   await genesis(mf);
   await c1(mf);
   // The removal names the control head, behind the content just ordered.
-  assert.deepEqual(await append(mf, fx.append_removal, fx.removal), ack(fx.removal_after_c1_head, id('06')));
+  assert.deepEqual(await append(mf, fx.append_removal, fx.removal), ack(fx.removal_after_c1_head, fx.removal_id));
   const state = await inspect(mf);
-  assert.deepEqual(state.events.map(e => [e.event_id, e.control]), [[id('01'), 1], [fx.c1_id, 0], [id('06'), 1]]);
+  assert.deepEqual(state.events.map(e => [e.event_id, e.control]), [[fx.genesis_id, 1], [fx.c1_id, 0], [fx.removal_id, 1]]);
   assert.equal(state.events[2].commitment, fx.removal_after_c1_commitment);
   // The content's exact retry still reports where it was ordered; new content is refused.
   assert.deepEqual(await append(mf, fx.append_c1_again, fx.c1), c1Ack);
@@ -330,21 +459,25 @@ test('content_before_closure_ordered', () => withLog(async mf => {
 test('exact_retry_route_must_match', () => withLog(async mf => {
   await genesis(mf);
   await c1(mf);
-  // The ordered content's exact bytes under a control permit.
-  assert.deepEqual(await append(mf, fx.append_c1_as_control, fx.c1), { refused: 'Conflict' });
-  assert.deepEqual(await append(mf, fx.append_control, fx.control), ack(fx.control_after_c1_head, id('03')));
+  // Wrong-route identity does not retrieve the content Ack; predecessor
+  // admission refuses this stale control grant independently.
+  assert.deepEqual(await append(mf, fx.append_c1_as_control, fx.c1), { refused: 'Predecessor' });
+  assert.deepEqual(await append(mf, fx.append_control, fx.control), ack(fx.control_after_c1_head, fx.control_id));
   const before = await inspect(mf);
-  // The ordered control's exact bytes under a content permit.
-  assert.deepEqual(await append(mf, fx.append_control_as_content, fx.control), { refused: 'Conflict' });
-  assert.deepEqual(await inspect(mf), before);
+  // This orderer is content-blind: a signed permit for wrong-route bytes may
+  // append them, but has a different ID and the full reader rejects its class.
+  const wrongRoute = await append(mf, fx.append_control_as_content, fx.control);
+  assert.equal(wrongRoute.position, before.events.length + 1);
+  assert.notEqual(wrongRoute.eventId, fx.control_id);
+  assert.equal((await inspect(mf)).events.length, before.events.length + 1);
   // Each on its own route is still the original Ack.
   assert.deepEqual(await append(mf, fx.append_c1_again, fx.c1), c1Ack);
-  assert.deepEqual(await append(mf, fx.append_control, fx.control), ack(fx.control_after_c1_head, id('03')));
+  assert.deepEqual(await append(mf, fx.append_control, fx.control), ack(fx.control_after_c1_head, fx.control_id));
 }));
 
 test('controls_read_only_controls_after_position', () => withLog(async mf => {
   const controls = after => call(mf, 'controls', [after]);
-  assert.deepEqual(await controls(0), []);
+  assert.deepEqual(await controls(0), { items: [], endpoint: null });
   await genesis(mf);
   await c1(mf);
   assert.equal((await append(mf, fx.append_control, fx.control)).position, 3);
@@ -353,14 +486,30 @@ test('controls_read_only_controls_after_position', () => withLog(async mf => {
   const before = await inspect(mf);
   const genesisItem = { commitment: fx.genesis_commitment, event: fx.genesis };
   const controlItem = { commitment: fx.control_after_c1_commitment, event: fx.control };
-  assert.deepEqual(await controls(0), [genesisItem, controlItem]);
-  assert.deepEqual(await controls(1), [controlItem]);
-  assert.deepEqual(await controls(2), [controlItem]);
-  assert.deepEqual(await controls(3), []);
-  assert.deepEqual(await controls(9), []);
+  assert.deepEqual(await controls(0), { items: [genesisItem, controlItem], endpoint: fx.c2_after_control_commitment });
+  assert.deepEqual(await controls(1), { items: [controlItem], endpoint: fx.c2_after_control_commitment });
+  assert.deepEqual(await controls(2), { items: [controlItem], endpoint: fx.c2_after_control_commitment });
+  assert.deepEqual(await controls(3), { items: [], endpoint: fx.c2_after_control_commitment });
+  assert.deepEqual(await controls(9), { items: [], endpoint: fx.c2_after_control_commitment });
   for (const after of [-1, 1.5, '1', null, 2 ** 53])
     assert.deepEqual(await controls(after), { refused: 'Malformed' });
   assert.deepEqual(await inspect(mf), before);
+}));
+
+test('control page freezes its trailing content endpoint before an append', () => withLog(async mf => {
+  await genesis(mf);
+  await c1(mf);
+  await call(mf, 'control', [{ appendOnControlRead: { permit: fx.append_control, event: fx.control } }]);
+  const page = await call(mf, 'controls', [0]);
+  assert.deepEqual(page, { items: [{ commitment: fx.genesis_commitment, event: fx.genesis }],
+    endpoint: fx.c1_commitment });
+  assert.equal((await inspect(mf)).events[2].commitment, fx.control_after_c1_commitment);
+  assert.deepEqual(await call(mf, 'controls', [3, 4]), { refused: 'Missing' });
+}));
+
+test('sparse bounded control read uses the control partial index, not a content scan', () => withLog(async mf => {
+  const plan = await call(mf, 'controlPlan', [1, 2 ** 53 - 1]);
+  assert.ok(plan.some(row => row.detail.includes('USING INDEX events_controls')), JSON.stringify(plan));
 }));
 
 test('controls_read_only_controls_after_position: at most 64 in order', () => withLog(async mf => {
@@ -369,8 +518,8 @@ test('controls_read_only_controls_after_position: at most 64 in order', () => wi
   const all = [{ commitment: fx.genesis_commitment, event: fx.genesis },
     ...fx.chain.map(link => ({ commitment: link.commitment, event: link.event }))];
   assert.equal(all.length, 66);
-  assert.deepEqual(await call(mf, 'controls', [0]), all.slice(0, 64));
-  assert.deepEqual(await call(mf, 'controls', [64]), all.slice(64));
+  assert.deepEqual(await call(mf, 'controls', [0]), { items: all.slice(0, 64), endpoint: fx.chain.at(-1).commitment });
+  assert.deepEqual(await call(mf, 'controls', [64]), { items: all.slice(64), endpoint: fx.chain.at(-1).commitment });
 }));
 
 test('reclaim_vs_append_race: reclaim first, then restage and append once', () => withLog(async mf => {
@@ -444,6 +593,46 @@ test('reclaim_resumes_after_crash', () => withLog(async mf => {
   assert.deepEqual(await append(mf, fx.append_c1_late, fx.c1), c1Ack);
 }));
 
+// An account log's staging body is served, so the service can read a
+// rotation's body back before it permits the append; a base log's never is.
+test('ordered_bodies_serves_account_staging_never_base_staging_or_reclaiming', () => withLog(async mf => {
+  await genesis(mf);
+  assert.deepEqual(await stage(mf, fx.stage_b1, fx.b1), { ok: true });
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.b1_commitment]]), [null]);
+  assert.deepEqual(await append(mf, fx.append_c1, fx.c1), c1Ack);
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.b1_commitment]]), [1024]);
+  await clock(mf, fx.t0, fx.account);
+  assert.deepEqual(await stage(mf, fx.stage_b1_account, fx.b1, fx.account), { ok: true });
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.b1_commitment, fx.b2_commitment]], [], fx.account),
+    [1024, null]);
+  // Once a sweep marks it, it is not served, though its object remains.
+  await clock(mf, fx.t1, fx.account);
+  await call(mf, 'control', [{ crashAfterMark: true }], [], fx.account);
+  assert.equal((await call(mf, 'sweep', [], [], fx.account)).status, 500);
+  await clock(mf, fx.t1, fx.account);
+  assert.deepEqual((await inspect(mf, fx.account)).bodies.map(b => b.state), ['reclaiming']);
+  assert.equal(await r2(mf, 'head', `b/${fx.account}/${fx.b1_commitment}`), 1024);
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.b1_commitment]], [], fx.account), [null]);
+}));
+
+// No row with its object left behind: a reclaimed account body is never
+// taken for an ordered one.
+test('reclaim_deletes_the_object_before_its_row', () => withLog(async mf => {
+  await clock(mf, fx.t0, fx.account);
+  const object = `b/${fx.account}/${fx.b1_commitment}`;
+  assert.deepEqual(await stage(mf, fx.stage_b1_account, fx.b1, fx.account), { ok: true });
+  await clock(mf, fx.t1, fx.account);
+  await call(mf, 'control', [{ crashAfterDelete: true }], [], fx.account);
+  assert.equal((await call(mf, 'sweep', [], [], fx.account)).status, 500);
+  await clock(mf, fx.t1, fx.account);
+  assert.equal(await r2(mf, 'head', object), null);
+  assert.deepEqual((await inspect(mf, fx.account)).bodies.map(b => b.state), ['reclaiming']);
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.b1_commitment]], [], fx.account), [null]);
+  await call(mf, 'sweep', [], [], fx.account);
+  assert.deepEqual((await inspect(mf, fx.account)).bodies, []);
+  assert.equal(await r2(mf, 'head', object), null);
+}));
+
 test('restart_preserves_order_and_index', async () => {
   const path = mkdtempSync(join(tmpdir(), 'bh-log-do-'));
   try {
@@ -462,7 +651,7 @@ test('restart_preserves_order_and_index', async () => {
       assert.deepEqual(await append(mf, fx.append_c1_again, fx.c1), c1Ack);
       assert.equal(await r2(mf, 'head', key(fx.b1_commitment)), 1024);
       assert.deepEqual(await stage(mf, fx.stage_b2, fx.b2), { ok: true });
-      assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_head, id('04')));
+      assert.deepEqual(await append(mf, fx.append_c2, fx.c2), ack(fx.c2_head, fx.c2_id));
       assert.deepEqual((await inspect(mf)).events.map(e => e.position), [1, 2, 3]);
     }, path);
   } finally { rmSync(path, { recursive: true, force: true }); }
@@ -509,7 +698,7 @@ test('append checks the exact staged R2 length before ordering', () => withLog(a
 test('an account-home log uses the same object class', () => withLog(async mf => {
   await clock(mf, fx.t0, fx.account);
   assert.deepEqual(await append(mf, fx.append_account_genesis, fx.account_genesis, fx.account),
-    { position: 1, hash: fx.account_genesis_commitment.slice(-64), eventId: id('07') });
+    { ...fx.account_genesis_head, eventId: fx.account_genesis_id });
   assert.deepEqual(await append(mf, fx.append_genesis, fx.genesis, fx.account), { refused: 'Scope' });
   assert.deepEqual(await call(mf, 'head'), { position: 0, hash: '00'.repeat(32) });
 }));
@@ -759,3 +948,33 @@ test('log entrypoint and local config expose no public route or deploy target', 
     assert.doesNotMatch(toml, forbidden);
   for (const binding of ['LOG', 'RELAY', 'BODIES']) assert.match(toml, new RegExp(`(name|binding) = "${binding}"`));
 });
+
+const rekeyAck = ack(fx.rekey_head, fx.rekey_id);
+test('attached_seal_set_is_retained_after_the_reclaim_window', () => withLog(async mf => {
+  await genesis(mf);
+  assert.deepEqual(await stage(mf, fx.stage_b3, fx.b3), { ok: true });
+  assert.deepEqual(await stage(mf, fx.stage_s1, fx.s1), { ok: true });
+  assert.deepEqual(await append(mf, fx.append_rekey, fx.rekey), rekeyAck);
+  // Both bodies were ordered with the event, in the same transaction.
+  assert.deepEqual((await inspect(mf)).bodies.map(b => b.state), ['ordered', 'ordered']);
+  // A day and an hour later the sweep reclaims neither.
+  await clock(mf, fx.t1);
+  await call(mf, 'sweep');
+  assert.equal(await r2(mf, 'head', key(fx.s1_commitment)), 4096);
+  assert.equal(await r2(mf, 'head', key(fx.b3_commitment)), 1024);
+  assert.deepEqual(await call(mf, 'orderedBodies', [[fx.s1_commitment, fx.b3_commitment]]), [4096, 1024]);
+  // The ordered control carries the epoch it names.
+  assert.equal((await inspect(mf)).meta.epoch, fx.other_epoch);
+}));
+
+test('rekey_append_without_its_staged_seal_set_is_refused', () => withLog(async mf => {
+  await genesis(mf);
+  assert.deepEqual(await stage(mf, fx.stage_b3, fx.b3), { ok: true });
+  const before = await inspect(mf);
+  assert.deepEqual(await append(mf, fx.append_rekey, fx.rekey), { refused: 'NotStaged' });
+  assert.deepEqual(await inspect(mf), before);
+  assert.deepEqual(await call(mf, 'head'), fx.genesis_head);
+  // Its own body stays staging, so it can still be ordered with its set.
+  assert.deepEqual(await stage(mf, fx.stage_s1, fx.s1), { ok: true });
+  assert.deepEqual(await append(mf, fx.append_rekey, fx.rekey), rekeyAck);
+}));

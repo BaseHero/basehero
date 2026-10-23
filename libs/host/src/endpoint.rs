@@ -20,6 +20,9 @@ pub struct Fields {
     pub max_uncertainty_secs: u64,
     pub build_floor: u64,
     pub synthetic: bool,
+    /// The home's recovery-key certificate, exactly, naming `hosting_root`.
+    /// The host verifies its signature before using it.
+    pub recovery_key: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +30,7 @@ pub enum ConfigError {
     Invalid,
 }
 
-const KEYS: [&str; 9] = [
+const KEYS: [&str; 10] = [
     "edge_url",
     "hosting_root",
     "app_root",
@@ -37,7 +40,12 @@ const KEYS: [&str; 9] = [
     "max_uncertainty_secs",
     "build_floor",
     "appraisal",
+    "recovery_key",
 ];
+
+/// A recovery-key certificate: version 1, the root that signed it, the
+/// X-Wing public key and the signature.
+const RECOVERY_KEY_LEN: usize = 2 + 32 + 1216 + 64;
 
 fn hex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
@@ -95,10 +103,14 @@ pub fn parse(text: &str, synthetic_allowed: bool) -> Result<Option<Fields>, Conf
         max_uncertainty_secs: number("max_uncertainty_secs")?,
         build_floor: number("build_floor")?,
         synthetic,
+        recovery_key: bytes("recovery_key")?,
     };
     if fields.max_lifetime_secs == 0
         || fields.build_floor == 0
         || fields.policy.is_empty() != fields.policy_signature.is_empty()
+        || fields.recovery_key.len() != RECOVERY_KEY_LEN
+        || fields.recovery_key[..2] != 1u16.to_be_bytes()
+        || fields.recovery_key[2..34] != fields.hosting_root
     {
         return Err(invalid);
     }
@@ -123,6 +135,13 @@ mod tests {
     const ROOT_A: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const ROOT_B: &str = "0202020202020202020202020202020202020202020202020202020202020202";
 
+    /// A recovery-key certificate's shape under `root`: version, root, the
+    /// X-Wing public key and the root's signature. Only its shape is checked
+    /// here; the host checks the signature.
+    fn recovery_key(root: &str) -> String {
+        format!("0001{root}{}{}", "a7".repeat(1216), "5c".repeat(64))
+    }
+
     fn complete() -> serde_json::Value {
         serde_json::json!({
             "edge_url": "https://edge.example",
@@ -133,7 +152,8 @@ mod tests {
             "max_lifetime_secs": 86400,
             "max_uncertainty_secs": 30,
             "build_floor": 1760000000,
-            "appraisal": "hardware"
+            "appraisal": "hardware",
+            "recovery_key": recovery_key(ROOT_A)
         })
     }
 
@@ -172,6 +192,8 @@ mod tests {
         assert_eq!(fields.max_uncertainty_secs, 30);
         assert_eq!(fields.build_floor, 1_760_000_000);
         assert!(!fields.synthetic);
+        assert_eq!(fields.recovery_key.len(), 1314);
+        assert_eq!(fields.recovery_key[2..34], [1; 32]);
         // No delivered policy at all is allowed: both empty.
         let mut none = complete();
         none["policy"] = "".into();
@@ -207,6 +229,14 @@ mod tests {
             ("max_lifetime_secs", (-1).into()),
             ("max_lifetime_secs", "86400".into()),
             ("build_floor", 0.into()),
+            ("recovery_key", "".into()),
+            ("recovery_key", recovery_key(ROOT_A)[..2626].into()),
+            ("recovery_key", format!("{}00", recovery_key(ROOT_A)).into()),
+            ("recovery_key", recovery_key(ROOT_B).into()),
+            (
+                "recovery_key",
+                format!("0002{}", &recovery_key(ROOT_A)[4..]).into(),
+            ),
             ("appraisal", "".into()),
             ("appraisal", "any".into()),
             ("unknown", true.into()),

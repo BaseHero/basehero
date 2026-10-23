@@ -2,7 +2,7 @@
 //!
 //! `cargo run --release -p bh-storage --features testkit --example note_projection_bench`
 //! prints paired same-run baseline/projection commit p95s and a 100k-note
-//! v13 step time, write-ahead log peak and database growth. `--notes N` and
+//! v12-to-current upgrade time, write-ahead log peak and database growth. `--notes N` and
 //! `--paired-notes N` change the sizes, so `--paired-notes 100000` runs the
 //! commit comparison on the same B-tree depth as the upgrade. It makes no
 //! acceptance claim.
@@ -144,7 +144,12 @@ fn paired_commit(path: &Path, notes: usize) {
 
 fn drop_typed_layout(conn: &Connection) {
     conn.execute_batch(
-        "DROP TABLE IF EXISTS data_fts; DROP TABLE IF EXISTS note_projection_repair;",
+        "DROP TABLE IF EXISTS data_fts; DROP TABLE IF EXISTS note_projection_repair;
+         DROP TABLE IF EXISTS typed_outbox; DROP TABLE IF EXISTS typed_alarm;
+         DROP TABLE IF EXISTS security_alerts; DROP TABLE IF EXISTS security_alert_cursor;
+         DROP TABLE IF EXISTS staged_account_control; DROP TABLE IF EXISTS account_confirmations;
+         DROP TABLE IF EXISTS account_directory_versions; DROP TABLE IF EXISTS base_epoch_keys;
+         DROP TABLE IF EXISTS account_personal_delivery; DROP TABLE IF EXISTS account_directory_state; DROP TABLE IF EXISTS account_outer_progress;",
     )
     .unwrap();
     loop {
@@ -177,7 +182,7 @@ fn drop_typed_layout(conn: &Connection) {
     }
 }
 
-fn v13_step(path: &Path, notes: usize) {
+fn upgrade_from_v12(path: &Path, notes: usize) {
     drop(DeviceDatabase::open(path).unwrap());
     let mut conn = Connection::open(path).unwrap();
     conn.execute(
@@ -220,7 +225,7 @@ fn v13_step(path: &Path, notes: usize) {
     let started = Instant::now();
     let db = DeviceDatabase::open(path).unwrap();
     let first_open = started.elapsed().as_micros();
-    assert_eq!(db.data_version(), 13);
+    assert_eq!(db.data_version(), bh_core::LOCAL_DATA_VERSION);
     drop(db);
     let wal_peak = peak.finish();
     let db_after = file_bytes(path);
@@ -228,7 +233,7 @@ fn v13_step(path: &Path, notes: usize) {
     drop(DeviceDatabase::open(path).unwrap());
     let reopen = started.elapsed().as_micros();
     println!(
-        "{{\"kind\":\"v13-step\",\"notes\":{},\"first_open_us\":{},\"ordinary_reopen_us\":{},\"db_before_bytes\":{},\"db_after_bytes\":{},\"db_growth_bytes\":{},\"wal_peak_bytes\":{}}}",
+        "{{\"kind\":\"v12-to-current\",\"notes\":{},\"first_open_us\":{},\"ordinary_reopen_us\":{},\"db_before_bytes\":{},\"db_after_bytes\":{},\"db_growth_bytes\":{},\"wal_peak_bytes\":{}}}",
         notes,
         first_open,
         reopen,
@@ -273,7 +278,7 @@ fn main() {
     }
     let dir = tempfile::tempdir().unwrap();
     paired_commit(&dir.path().join("paired.sqlite"), paired_notes);
-    v13_step(&dir.path().join("upgrade.sqlite"), upgrade_notes);
+    upgrade_from_v12(&dir.path().join("upgrade.sqlite"), upgrade_notes);
 }
 
 #[cfg(not(feature = "testkit"))]

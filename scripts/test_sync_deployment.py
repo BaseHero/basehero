@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import sys
 
 HERE = Path(__file__).resolve().parent
@@ -51,19 +52,21 @@ class DeploymentTests(unittest.TestCase):
                       'protected_mount': str(self.root / 'protected'), 'uid': os.getuid(), 'gid': os.getgid(),
                       'quote_socket': str(self.root / 'missing-quote'),
                       'files': {key: str(self.root / ('missing-' + key)) for key in
-                                ('permit_key', 'permit_cert', 'policy', 'policy_signature', 'collateral')},
+                                ('permit_key', 'permit_cert', 'recovery_key', 'recovery_cert', 'policy', 'policy_signature', 'collateral')},
                       'roughtime': [{'address': '192.0.2.1:2002', 'key': '11' * 32},
                                    {'address': '192.0.2.2:2002', 'key': '22' * 32}],
                       'time_config': [1000000000, 100, 1000000, 120000000000, 1000]},
             'endpoint': {'edge_url': 'https://edge.invalid', 'hosting_root': '11' * 32,
                          'app_root': '22' * 32, 'policy': '', 'policy_signature': '',
-                         'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
+                         'recovery_key': '03', 'max_lifetime_secs': 86400, 'max_uncertainty_secs': 30,
                          'build_floor': 1, 'appraisal': 'hardware'}}
 
     def test_candidate_is_complete_deterministic_and_policy_independent(self):
         """Catches policy-derived or partial/noncanonical candidate hashes."""
-        self.packaging.validate_inputs(self.inputs, preparation=True)
-        first = self.wrapper.render(self.inputs, self.image)
+        inputs = copy.deepcopy(self.inputs)
+        inputs['authz']['uid'] = inputs['authz']['gid'] = 1000
+        self.packaging.validate_inputs(inputs, preparation=True)
+        first = self.wrapper.render(inputs, self.image)
         app, digest = first
         self.assertEqual(app['manifest_version'], 2)
         self.assertEqual(app['runner'], 'docker-compose')
@@ -73,7 +76,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('ssh', json.dumps(app).lower())
         self.assertEqual(digest, hashlib.sha256(json.dumps(app, sort_keys=True, separators=(',', ':'),
                                                         ensure_ascii=False).encode()).hexdigest())
-        changed_policy = copy.deepcopy(self.inputs)
+        changed_policy = copy.deepcopy(inputs)
         changed_policy['endpoint']['policy'] = 'deadbeef'
         changed_policy['endpoint']['policy_signature'] = 'cafe'
         self.assertEqual(first, self.wrapper.render(changed_policy, self.image))
@@ -82,13 +85,25 @@ class DeploymentTests(unittest.TestCase):
                                       ('authz', 'protected_mount', str(self.root / 'other')),
                                       ('authz', 'quote_socket', '/tmp/other.sock')]:
             with self.subTest(field=field):
-                changed = copy.deepcopy(self.inputs)
+                changed = copy.deepcopy(inputs)
                 changed[section][field] = value
                 self.assertNotEqual(digest, self.wrapper.render(changed, self.image)[1])
-        changed = copy.deepcopy(self.inputs)
+        changed = copy.deepcopy(inputs)
         changed['authz']['roughtime'][0]['address'] = '192.0.2.3:2002'
         self.assertNotEqual(digest, self.wrapper.render(changed, self.image)[1])
         self.assertNotIn('fixture-secret', json.dumps(app))
+
+    def test_preparation_rejects_root_uid_or_gid(self):
+        """Catches accepting a root deployment identity for either credential."""
+        inputs = copy.deepcopy(self.inputs)
+        inputs['authz']['uid'] = inputs['authz']['gid'] = 1000
+        self.packaging.validate_inputs(inputs, preparation=True)
+        for key in ('uid', 'gid'):
+            with self.subTest(key=key):
+                rooted = copy.deepcopy(inputs)
+                rooted['authz'][key] = 0
+                with self.assertRaisesRegex(ValueError, 'explicit non-root ' + key + ' required'):
+                    self.packaging.validate_inputs(rooted, preparation=True)
 
     def test_registry_file_relocation_is_not_preparation_identity_but_bytes_are_checked(self):
         """Catches binding a host-only pathname or skipping raw registry verification."""
@@ -127,7 +142,23 @@ class DeploymentTests(unittest.TestCase):
         value['authz']['protected_mount'] = '/protected/authz'
         value['authz']['quote_socket'] = '/run/quote.sock'
         self.assertEqual(self.wrapper.render(value, self.image)[1],
-                         'df5de343008dc0848b63964a0716599fcd79a3c242521fd0490f6dc04adf1612')
+                         '7046dca5b0acb4e372a16271765d422efb425bb421109bcc5e5d6ee5da40d43e')
+
+    def test_recovery_inputs_reach_private_runtime_files_and_service_arguments(self):
+        app, _ = self.wrapper.render(self.inputs, self.image, runtime_dir=str(self.root / 'runtime'),
+                                     registry_config_dir=str(self.root / 'docker'))
+        service = json.loads(app['docker_compose_file'])['services']['authz']
+        for name in ('recovery_key', 'recovery_cert'):
+            env_name = 'BH_AUTHZ_' + name.upper()
+            target = '/run/config/' + name
+            self.assertIn(env_name, app['allowed_envs'])
+            self.assertIn(env_name, app['pre_launch_script'])
+            self.assertIn(['--' + name.replace('_', '-'), target],
+                          [service['command'][i:i + 2] for i in range(len(service['command']) - 1)])
+            self.assertIn({'type': 'bind', 'source': str(self.root / 'runtime' / name),
+                           'target': target, 'read_only': True, 'bind': {'create_host_path': False}},
+                          service['volumes'])
+        self.assertNotIn('PRIVATE-ENCRYPTED-SENTINEL', json.dumps(app))
 
     def test_saved_provider_response_must_match_hash_and_compose(self):
         """Catches adoption of a provider-selected hash or a differently normalized object."""
@@ -147,28 +178,53 @@ class DeploymentTests(unittest.TestCase):
         service = json.loads(app['docker_compose_file'])['services']['authz']
         mounts = {v['target']: v['source'] for v in service['volumes']}
         sentinel = 'PRIVATE-ENCRYPTED-SENTINEL-491'
-        env = {**os.environ, 'DSTACK_DOCKER_REGISTRY': 'registry.invalid',
-               'DSTACK_DOCKER_USERNAME': sentinel, 'DSTACK_DOCKER_PASSWORD': sentinel}
-        (self.root / 'home').mkdir()
-        env['HOME'] = str(self.root / 'home')
-        if not shutil.which('jq'):
-            self.skipTest('host jq is required to execute the pinned guest bootstrap')
+        # Probe only fake parent values; never print real host environment values.
+        parent_secret = 'PARENT-UNRELATED-CREDENTIAL-SENTINEL'
+        for name in ('home', 'gh-config', 'xdg-config', 'xdg-data', 'xdg-cache'):
+            (self.root / name).mkdir()
+        # Explicit child environment: no host credentials or XDG state cross into it.
+        env = {'DSTACK_DOCKER_REGISTRY': 'registry.invalid',
+               'DSTACK_DOCKER_USERNAME': sentinel, 'DSTACK_DOCKER_PASSWORD': sentinel,
+               'HOME': str(self.root / 'home'), 'GH_CONFIG_DIR': str(self.root / 'gh-config'),
+               'XDG_CONFIG_HOME': str(self.root / 'xdg-config'),
+               'XDG_DATA_HOME': str(self.root / 'xdg-data'),
+               'XDG_CACHE_HOME': str(self.root / 'xdg-cache'), 'LC_ALL': 'C'}
         guest_bin = self.root / 'guest-bin'
         guest_bin.mkdir()
         for command in GUEST_COMMANDS:
             executable = shutil.which(command)
             self.assertIsNotNone(executable, f'host lacks guest command {command}')
             (guest_bin / command).symlink_to(Path(executable).resolve())
+        for command in GUEST_COMMANDS:
+            self.assertTrue((guest_bin / command).resolve().is_file(), f'{command} stub must resolve')
+        isolation = shutil.which('unshare')
+        self.assertIsNotNone(isolation, 'Linux network isolation required')
         env['PATH'] = str(guest_bin)
-        env.pop('DOCKER_CONFIG', None)
-        env.pop('GH_TOKEN', None)
-        env.pop('GITHUB_TOKEN', None)
         for name in self.wrapper.RUNTIME_FILES:
-            env[self.wrapper.RUNTIME_FILES[name]] = sentinel + '\n' + name
+            env[self.wrapper.RUNTIME_FILES[name]] = sentinel + '\n' + name + '\n'
             self.assertEqual(mounts['/run/config/' + name], str(self.root / 'runtime' / name))
         script_file = self.root / 'pre-launch.sh'
         script_file.write_text(script)
-        run = subprocess.run(['bash', '-c', 'source "$1"; bash -c \'printf %s "${DOCKER_CONFIG-unset}"\'',
+        with mock.patch.dict(os.environ, {
+            'BH_FIXTURE_UNRELATED_CREDENTIAL': parent_secret,
+            'XDG_DATA_HOME': str(self.root / 'parent-data-sentinel'),
+            'XDG_CACHE_HOME': str(self.root / 'parent-cache-sentinel'),
+            'XDG_CONFIG_HOME': str(self.root / 'parent-config-sentinel'),
+            'GH_CONFIG_DIR': str(self.root / 'parent-gh-sentinel'),
+            'HOME': str(self.root / 'parent-home-sentinel'),
+        }):
+            probe = subprocess.run([isolation, '-rn', '--map-current-user', 'bash', '--noprofile', '--norc', '-c',
+                                    'printf "%s\\n" "${BH_FIXTURE_UNRELATED_CREDENTIAL-unset}" '
+                                    '"${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" '
+                                    '"${XDG_CONFIG_HOME-unset}" "${GH_CONFIG_DIR-unset}" "${HOME-unset}"'],
+                                   env=env, capture_output=True, text=True)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(probe.stdout.splitlines(),
+                         ['unset', str(self.root / 'xdg-data'), str(self.root / 'xdg-cache'),
+                          str(self.root / 'xdg-config'), str(self.root / 'gh-config'), str(self.root / 'home')])
+        self.assertNotIn(parent_secret, probe.stdout + probe.stderr)
+        run = subprocess.run([isolation, '-rn', '--map-current-user', 'bash', '--noprofile', '--norc', '-c',
+                              'source "$1"; bash --noprofile --norc -c \'printf %s "${DOCKER_CONFIG-unset}"\'',
                               'bash', str(script_file)], env=env, capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout, str(self.root / 'docker'))
@@ -177,24 +233,34 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('/dstack/bh-registry/config.json', default_script)
         self.assertNotIn('/root/', default_script)
         self.assertNotIn(sentinel, run.stdout + run.stderr + json.dumps(app))
+        def assert_private(path, mode):
+            stat = path.stat()
+            self.assertEqual(stat.st_mode & 0o777, mode, str(path))
+            self.assertEqual((stat.st_uid, stat.st_gid),
+                             (self.inputs['authz']['uid'], self.inputs['authz']['gid']), str(path))
+
         registry_file = self.root / 'docker/config.json'
-        self.assertEqual(registry_file.stat().st_mode & 0o777, 0o600)
-        self.assertEqual((self.root / 'docker').stat().st_mode & 0o777, 0o700)
+        assert_private(registry_file, 0o600)
+        assert_private(self.root / 'docker', 0o700)
         registry = json.loads(registry_file.read_text())['auths']
         self.assertEqual(list(registry), ['registry.invalid'])
         self.assertEqual(registry['registry.invalid']['auth'],
                          base64.b64encode((sentinel + ':' + sentinel).encode()).decode())
-        self.assertEqual((self.root / 'runtime').stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.root / 'protected').stat().st_mode & 0o777, 0o700)
+        assert_private(self.root / 'runtime', 0o700)
+        assert_private(self.root / 'protected', 0o700)
         for name in self.wrapper.RUNTIME_FILES:
             file = self.root / 'runtime' / name
             self.assertEqual(file.read_bytes(), env[self.wrapper.RUNTIME_FILES[name]].encode())
-            self.assertEqual(file.stat().st_mode & 0o777, 0o600)
-        env.pop(self.wrapper.RUNTIME_FILES['policy'])
-        failed = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertNotIn(sentinel, failed.stdout + failed.stderr)
-        self.assertNotIn('PRIVATE-', failed.stdout + failed.stderr)
+            assert_private(file, 0o600)
+        for missing in ('recovery_key', 'recovery_cert', 'policy'):
+            absent_env = {**env}
+            absent_env.pop(self.wrapper.RUNTIME_FILES[missing])
+            failed = subprocess.run([isolation, '-rn', '--map-current-user', 'bash', '--noprofile', '--norc', str(script_file)],
+                                    env=absent_env, capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0, missing)
+            self.assertIn('missing_' + missing, failed.stderr)
+            self.assertNotIn(sentinel, failed.stdout + failed.stderr)
+            self.assertNotIn('PRIVATE-', failed.stdout + failed.stderr)
 
     def test_config_file_set_and_endpoint_hash_are_verified(self):
         """Catches root/config mismatch, untracked added files and endpoint hash substitution."""

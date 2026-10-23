@@ -19,9 +19,12 @@ export class FixtureLog extends LogObject {
   trace = [];
   failSync = false;
   crashAfterMark = false;
+  crashAfterDelete = false;
   reclaimAfterHead = false;
   advanceAfterHead = 0;
   restageAfterHead = null;
+  supersedeOnDirectoryRead = null;
+  appendOnControlRead = null;
   #stalled = null;
   #restage = null;
   constructor(ctx, env) {
@@ -50,6 +53,20 @@ export class FixtureLog extends LogObject {
           });
         }
       },
+      afterControlRows: async () => {
+        if (!this.appendOnControlRead) return;
+        const { permit, event } = this.appendOnControlRead;
+        this.appendOnControlRead = null;
+        const result = await this.append(unhex(permit), unhex(event));
+        if (result.refused) throw new Error('test append failed');
+      },
+      afterDirectoryRows: async () => {
+        if (!this.supersedeOnDirectoryRead) return;
+        const { permit, body } = this.supersedeOnDirectoryRead;
+        this.supersedeOnDirectoryRead = null;
+        const result = await this.storeDirectoryEntry(unhex(permit), unhex(body));
+        if (result.refused) throw new Error('test supersede failed');
+      },
       beforePut: () => {
         const stalled = this.#stalled;
         if (!stalled) return;
@@ -57,6 +74,9 @@ export class FixtureLog extends LogObject {
       },
       afterMark: async () => {
         if (this.crashAfterMark) ctx.abort('test crash between mark and delete');
+      },
+      afterDelete: async () => {
+        if (this.crashAfterDelete) ctx.abort('test crash between object and row deletes');
       },
     });
   }
@@ -90,6 +110,17 @@ export class FixtureLog extends LogObject {
     this.ctx.storage.sql.exec('UPDATE private_home_objects SET bundle=? WHERE prefix_digest=?', bundle, prefix);
     await this.ctx.storage.sync();
     return { ok: true };
+  }
+  // Test-only simulation of an old populated account-home order store. Never
+  // run a production migration or relabel the legacy state to canonical.
+  async removeOrderMarker() {
+    this.ctx.storage.sql.exec("DELETE FROM meta WHERE key='order_format'");
+    await this.ctx.storage.sync();
+    return { ok: true };
+  }
+  // Explain the production bounded read against the object's actual SQLite schema.
+  async controlPlan(after, through) {
+    return this.ctx.storage.sql.exec(`EXPLAIN QUERY PLAN ${LogObject.boundedControlQuery}`, after, through, 64).toArray();
   }
   // Every row of every table this object stores, and its key-value entries.
   // The runtime's own tables are not readable; `list()` covers its key-value one.
@@ -142,7 +173,7 @@ export default {
         if (op === 'put') { await env.BODIES.put(key, unhex(value)); return Response.json(true); }
         if (op === 'list') return Response.json((await env.BODIES.list()).objects.map(o => o.key));
       }
-      if (!['storeHomeObjects', 'privateObjects', 'corruptPrivateBundle', 'stage', 'append', 'read', 'controls', 'head', 'sweep', 'control', 'inspect', 'traced', 'failStalledPut', 'dump', 'attachments', 'attachmentReads', 'presenceOpen'].includes(action))
+      if (!['storeDirectoryEntry', 'readDirectory', 'retireHomeObjects', 'storeHomeObjects', 'privateObjects', 'corruptPrivateBundle', 'removeOrderMarker', 'stage', 'append', 'read', 'controls', 'controlPlan', 'head', 'sweep', 'control', 'inspect', 'traced', 'failStalledPut', 'dump', 'attachments', 'attachmentReads', 'presenceOpen', 'orderedBodies'].includes(action))
         return Response.json({ error: 'unknown action' }, { status: 400 });
       return Response.json(wire(await stub[action](...values)));
     } catch (error) {

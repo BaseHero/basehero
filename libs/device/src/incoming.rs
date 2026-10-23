@@ -227,6 +227,7 @@ fn record(event: &AppliedEvent) -> VerifiedRecord {
     let seen = event.seen();
     let ordered = event.commitment();
     VerifiedRecord {
+        order: ordered.after(),
         seen: SeenRow {
             position: seen.head.position,
             head_hash: seen.head.hash.0,
@@ -502,6 +503,7 @@ impl Owner {
             return Err(StoreError::CorruptSyncState.into());
         };
         let continuation = Continuation {
+            order: progress.order,
             seen: Seen {
                 head: Head {
                     position: progress.position,
@@ -641,10 +643,11 @@ impl Owner {
         // one before, ending at the head it names.
         if last.head() != head
             || events.windows(2).any(|pair| {
-                pair[1]
-                    .commitment()
-                    .verify_next(BaseId(base), pair[0].head())
-                    .is_err()
+                pair[1].commitment().before() != pair[0].commitment().after()
+                    || pair[1]
+                        .commitment()
+                        .verify_next(BaseId(base), pair[0].head())
+                        .is_err()
             })
             || events[0].commitment().base() != BaseId(base)
         {
@@ -707,6 +710,9 @@ impl Owner {
             return Err(OwnerError::InvalidBatch);
         }
         let after = (progress.position, progress.head_hash);
+        if events[0].commitment().before() != progress.order {
+            return Err(OwnerError::InvalidBatch);
+        }
         events[0]
             .commitment()
             .verify_next(
@@ -858,6 +864,7 @@ impl Owner {
             log_id: base,
             hosting_root: root,
             after,
+            after_order: progress.order,
             receipt,
             records: events.iter().map(record).collect(),
             metadata_id: continuation.metadata_id,

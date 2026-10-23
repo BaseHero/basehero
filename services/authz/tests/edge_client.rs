@@ -129,8 +129,9 @@ async fn fake_edge(behaviour: Behaviour) -> (String, Arc<Seen>) {
                         } else {
                             vec![Response::Events {
                                 id,
-                                items: vec![(vec![1; 178], permit.clone())],
+                                items: vec![(vec![1; bh_sync::Commitment::LEN], permit.clone())],
                                 receipt: Some([0x5a; 300]),
+                                coverage: None,
                             }]
                         };
                         in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -150,8 +151,9 @@ async fn fake_edge(behaviour: Behaviour) -> (String, Arc<Seen>) {
 fn frame_len(id: u32, permit: Vec<u8>) -> u32 {
     Response::Events {
         id,
-        items: vec![(vec![1; 178], permit)],
+        items: vec![(vec![1; bh_sync::Commitment::LEN], permit)],
         receipt: Some([0x5a; 300]),
+        coverage: None,
     }
     .encode()
     .unwrap()
@@ -181,11 +183,14 @@ async fn receipt_is_preserved_while_legacy_read_intentionally_strips_it() {
     let (url, seen) = fake_edge(PROMPT).await;
     let client = EdgeClient::new(url, Duration::from_secs(5)).unwrap();
     let result = client.read_log_with_receipt(vec![7; 300]).await.unwrap();
-    assert_eq!(result.items, vec![(vec![1; 178], vec![7; 300])]);
+    assert_eq!(
+        result.items,
+        vec![(vec![1; bh_sync::Commitment::LEN], vec![7; 300])]
+    );
     assert_eq!(result.receipt, Some([0x5a; 300]));
     assert_eq!(
         client.read_log(vec![8; 300]).await.unwrap(),
-        vec![(vec![1; 178], vec![8; 300])]
+        vec![(vec![1; bh_sync::Commitment::LEN], vec![8; 300])]
     );
     tokio::task::yield_now().await;
     let requests = seen.requests.lock().unwrap();
@@ -199,7 +204,10 @@ async fn reads_grant_credit_and_reuse_sockets() {
     let (url, seen) = fake_edge(PROMPT).await;
     let client = EdgeClient::new(url, Duration::from_secs(5)).unwrap();
     let items = client.read_log(vec![7; 300]).await.unwrap();
-    assert_eq!(items, vec![(vec![1; 178], vec![7; 300])]);
+    assert_eq!(
+        items,
+        vec![(vec![1; bh_sync::Commitment::LEN], vec![7; 300])]
+    );
     assert_eq!(
         client.read_log(vec![0]).await.err(),
         Some(EdgeError::Refused)
@@ -282,7 +290,7 @@ async fn concurrent_reads_share_a_few_sockets_and_match_reordered_answers() {
     for (n, result) in join_all(reads).await {
         assert_eq!(
             result.unwrap(),
-            vec![(vec![1; 178], vec![n; 20])],
+            vec![(vec![1; bh_sync::Commitment::LEN], vec![n; 20])],
             "read {n}"
         );
     }
@@ -426,7 +434,7 @@ async fn reads_that_time_out_while_connecting_leave_the_pool_usable() {
     // The edge now upgrades: a fifth read opens a socket and is answered.
     assert_eq!(
         client.read_log(vec![5; 3]).await.unwrap(),
-        vec![(vec![1; 178], vec![5; 3])]
+        vec![(vec![1; bh_sync::Commitment::LEN], vec![5; 3])]
     );
     assert_eq!(seen.connections.load(Ordering::SeqCst), 1);
 }

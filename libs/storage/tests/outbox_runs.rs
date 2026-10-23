@@ -53,8 +53,17 @@ fn open(path: &std::path::Path) -> DeviceDatabase {
         )
         .unwrap();
         db.record_registration(BASE, None, [7; 32]).unwrap();
+        // This outbox fixture starts immediately after a canonical genesis.
+        let genesis = bh_sync::canonical::CanonicalCommitment::order(
+            BaseId(BASE),
+            bh_sync::OrderState::EMPTY,
+            Digest(BASE),
+            Route::Control,
+        )
+        .unwrap();
         rusqlite::Connection::open(path).unwrap().execute(
-            "UPDATE log_progress SET position=1,account_position=1,account_hash=zeroblob(32),metadata_id=zeroblob(32)", [],
+            "UPDATE log_progress SET position=1,head_hash=?1,opening=?2,account_position=1,account_hash=zeroblob(32),metadata_id=zeroblob(32)",
+            rusqlite::params![genesis.head().hash.0.as_slice(), genesis.after().encode().as_slice()],
         ).unwrap();
     }
     db
@@ -182,10 +191,7 @@ fn ordered(db: &DeviceDatabase, stored: &StoredNotePackage, position: u64) -> Co
     assert_eq!(progress.position + 1, position);
     Commitment::order(
         BaseId(BASE),
-        Head {
-            position: progress.position,
-            hash: Digest(progress.head_hash),
-        },
+        progress.order,
         &stored.descriptor,
         Route::Content,
     )
@@ -208,6 +214,7 @@ fn echo(
             log_id: BASE,
             hosting_root: [7; 32],
             after: (progress.position, progress.head_hash),
+            after_order: progress.order,
             receipt: [0; bh_sync::receipt::RECEIPT_LEN],
             records: vec![VerifiedRecord {
                 seen: SeenRow {
@@ -217,8 +224,9 @@ fn echo(
                     account_position: 1,
                     account_hash: [0; 32],
                 },
+                order: ordered.after(),
                 event_id: stored.event_id.0,
-                digest: [9; 32],
+                digest: stored.descriptor.digest().0,
                 account_change: None,
                 judged_floor: 1,
                 floor: 1,

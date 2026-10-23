@@ -123,7 +123,7 @@ def validate_inputs(value, preparation=False):
     object_keys(authz, ('backends', 'image', 'image_id', 'archive_sha256', 'registry_manifest_file', 'protected_mount', 'uid', 'gid',
                         'quote_socket', 'files', 'roughtime', 'time_config'), 'authz')
     object_keys(endpoint, ('edge_url', 'hosting_root', 'app_root', 'policy', 'policy_signature',
-                           'max_lifetime_secs', 'max_uncertainty_secs', 'build_floor', 'appraisal'), 'endpoint')
+                           'recovery_key', 'max_lifetime_secs', 'max_uncertainty_secs', 'build_floor', 'appraisal'), 'endpoint')
     # The Rust app parser is authoritative for endpoint fields. These early
     # transport guards also reject inputs before any private file is opened.
     require(endpoint['appraisal'] == 'hardware' and https(endpoint['edge_url']), 'endpoint requires hardware appraisal and HTTPS')
@@ -158,7 +158,7 @@ def validate_inputs(value, preparation=False):
         require(absolute_path(authz[key]), 'required host path: authz.' + key)
     for key in ('uid', 'gid'):
         require(type(authz[key]) is int and 0 < authz[key] < 2**32 - 1, 'explicit non-root ' + key + ' required')
-    object_keys(authz['files'], ('permit_key', 'permit_cert', 'policy', 'policy_signature', 'collateral'), 'authz.files')
+    object_keys(authz['files'], tuple(sync_deployment.RUNTIME_FILES), 'authz.files')
     require(all(absolute_path(p) for p in authz['files'].values()), 'absolute runtime file references required')
     require(isinstance(authz['roughtime'], list) and len(authz['roughtime']) == 2, 'exactly two Roughtime pins required')
     for server in authz['roughtime']:

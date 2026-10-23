@@ -11,11 +11,35 @@ use bh_storage::{
     DeviceDatabase, NoteKey,
     sync_state::{IncomingCommit, IncomingNote, IncomingStep, LOG_BASE, SeenRow, VerifiedRecord},
 };
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 const BASE: [u8; 32] = [2; 32];
 const AUDIENCE: [u8; 32] = [0; 32];
 const ANCHOR: [u8; 32] = [4; 32];
+
+// A structurally canonical test-only log with a genesis and one content
+// event; storage tests exercise atomic projection, not signature authority.
+fn synthetic_order(position: u64) -> bh_sync::canonical::CanonicalCommitment {
+    use bh_sync::{BaseId, Digest, OrderState, Route, canonical::CanonicalCommitment};
+    let genesis = CanonicalCommitment::order(
+        BaseId(BASE),
+        OrderState::EMPTY,
+        Digest(BASE),
+        Route::Control,
+    )
+    .unwrap();
+    match position {
+        1 => genesis,
+        2 => CanonicalCommitment::order(
+            BaseId(BASE),
+            genesis.after(),
+            Digest([11; 32]),
+            Route::Content,
+        )
+        .unwrap(),
+        _ => panic!("unexpected projection fixture position"),
+    }
+}
 
 fn recent_query() -> Query {
     Query {
@@ -183,34 +207,29 @@ fn incoming_apply_projects_the_final_title() {
         audience: AUDIENCE,
         note,
     };
-    {
-        let raw = Connection::open(&path).unwrap();
-        raw.execute(
-            "INSERT INTO log_progress(log_kind,log_id,position,head_hash,receipt,control_digest,stopped_reason,hosting_root,account_position,account_hash,metadata_id,epoch_id,floor)
-             VALUES(1,?1,0,?2,NULL,zeroblob(32),NULL,?3,NULL,NULL,NULL,NULL,1)",
-            params![BASE.as_slice(), [7u8; 32].as_slice(), [8u8; 32].as_slice()],
-        )
-        .unwrap();
-    }
+    db.record_registration(BASE, None, [8; 32]).unwrap();
     let mut working = Note::new().unwrap();
     let first = working.append_paragraph("incoming title").unwrap();
-    let commit = |position: u64, after: (u64, [u8; 32]), delta: Vec<u8>, title: Option<String>| {
+    let commit = |position: u64, delta: Vec<u8>, title: Option<String>| {
+        let ordered = synthetic_order(position);
         IncomingCommit {
             log_kind: LOG_BASE,
             log_id: BASE,
             hosting_root: [8; 32],
-            after,
+            after: (ordered.previous().position, ordered.previous().hash.0),
+            after_order: ordered.before(),
             receipt: [0; bh_sync::receipt::RECEIPT_LEN],
             records: vec![VerifiedRecord {
                 seen: SeenRow {
                     position,
-                    head_hash: [9u8; 32],
+                    head_hash: ordered.head().hash.0,
                     control_digest: [0; 32],
                     account_position: 1,
                     account_hash: [0; 32],
                 },
-                event_id: [position as u8; 32],
-                digest: [11; 32],
+                order: ordered.after(),
+                event_id: ordered.event_id().0,
+                digest: ordered.event_digest().0,
                 account_change: None,
                 judged_floor: 1,
                 floor: 1,
@@ -231,10 +250,9 @@ fn incoming_apply_projects_the_final_title() {
             held: vec![],
         }
     };
-    db.commit_incoming(
-        &commit(1, (0, [7; 32]), first, Some("incoming title".to_owned())),
-        |_| Ok(()),
-    )
+    db.commit_incoming(&commit(1, first, Some("incoming title".to_owned())), |_| {
+        Ok(())
+    })
     .unwrap();
     let raw = Connection::open(&path).unwrap();
     assert_eq!(
@@ -244,7 +262,7 @@ fn incoming_apply_projects_the_final_title() {
 
     // A later apply with no derived title keeps the catalogue title.
     let second = working.append_paragraph("later").unwrap();
-    db.commit_incoming(&commit(2, (1, [9; 32]), second, None), |_| Ok(()))
+    db.commit_incoming(&commit(2, second, None), |_| Ok(()))
         .unwrap();
     assert_eq!(
         titles(&raw),
@@ -276,15 +294,7 @@ fn a_repeated_note_step_is_corrupt_and_changes_nothing() {
         audience: AUDIENCE,
         note,
     };
-    {
-        let raw = Connection::open(&path).unwrap();
-        raw.execute(
-            "INSERT INTO log_progress(log_kind,log_id,position,head_hash,receipt,control_digest,stopped_reason,hosting_root,account_position,account_hash,metadata_id,epoch_id,floor)
-             VALUES(1,?1,0,?2,NULL,zeroblob(32),NULL,?3,NULL,NULL,NULL,NULL,1)",
-            params![BASE.as_slice(), [7u8; 32].as_slice(), [8u8; 32].as_slice()],
-        )
-        .unwrap();
-    }
+    db.record_registration(BASE, None, [8; 32]).unwrap();
     let before = note_commits(&path);
     let mut working = Note::new().unwrap();
     let delta = working.append_paragraph("twice").unwrap();
@@ -292,18 +302,20 @@ fn a_repeated_note_step_is_corrupt_and_changes_nothing() {
         log_kind: LOG_BASE,
         log_id: BASE,
         hosting_root: [8; 32],
-        after: (0, [7; 32]),
+        after: (0, [0; 32]),
+        after_order: bh_sync::OrderState::EMPTY,
         receipt: [0; bh_sync::receipt::RECEIPT_LEN],
         records: vec![VerifiedRecord {
             seen: SeenRow {
                 position: 1,
-                head_hash: [9u8; 32],
+                head_hash: synthetic_order(1).head().hash.0,
                 control_digest: [0; 32],
                 account_position: 1,
                 account_hash: [0; 32],
             },
-            event_id: [1; 32],
-            digest: [11; 32],
+            order: synthetic_order(1).after(),
+            event_id: synthetic_order(1).event_id().0,
+            digest: BASE,
             account_change: None,
             judged_floor: 1,
             floor: 1,

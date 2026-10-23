@@ -6,16 +6,21 @@
 pub mod base_keys;
 mod compaction;
 mod containers;
+pub mod control;
 pub mod coordinator;
 mod copy;
 pub mod incoming;
 pub mod join;
+mod keyring;
 pub mod own_base;
 mod records;
+mod rekey;
 pub use records::{ApprovalRequest, RecordsHandle};
 mod seal;
 mod sync_fence;
 pub mod writers;
+pub use copy::{CopyPlan, RUN_BYTES};
+pub use rekey::RekeySeals;
 pub use seal::SealRefusal;
 pub use sync_fence::SyncFence;
 
@@ -133,6 +138,10 @@ impl Drop for WorkSlot<'_> {
 }
 struct Container {
     anchor: Option<[u8; 32]>,
+    /// The exact file this container was opened from. The runtime
+    /// `ContainerId` is fresh each start; this is the stable identity a
+    /// removal marker and its deletion use.
+    path: std::path::PathBuf,
     session: Session,
     readers: Option<Arc<ReadPool>>,
 }
@@ -999,6 +1008,22 @@ impl Owner {
             .expect("container session lock")
             .shared_database())
     }
+    /// The stable file this container was opened from, for a removal marker
+    /// and its deletion. A fixture container without a file has none.
+    fn container_path(&self, id: ContainerId) -> Result<std::path::PathBuf, OwnerError> {
+        let registry = self.registry.lock().expect("owner registry lock");
+        let path = registry
+            .containers
+            .get(&id)
+            .ok_or(OwnerError::UnknownContainer)?
+            .path
+            .clone();
+        if path.as_os_str().is_empty() {
+            return Err(OwnerError::UnknownContainer);
+        }
+        Ok(path)
+    }
+
     /// True only for a never-anchored container with no durable account,
     /// pending setup, staged admission or device identity. A caller may reuse
     /// an empty unanchored file left by an interrupted signup.
@@ -1052,12 +1077,23 @@ impl Owner {
         verified: Option<&VerifiedAccount>,
         authority: Box<dyn AuthoritySource + Send>,
     ) -> Result<ContainerId, OwnerError> {
+        self.register_at(database, None, verified, authority)
+    }
+
+    /// As `register`, for a caller that knows the container's file.
+    pub fn register_at(
+        &self,
+        database: DeviceDatabase,
+        path: Option<std::path::PathBuf>,
+        verified: Option<&VerifiedAccount>,
+        authority: Box<dyn AuthoritySource + Send>,
+    ) -> Result<ContainerId, OwnerError> {
         let anchor = match (database.account_state()?, verified) {
             (None, None) => None,
             (Some(_), Some(proof)) => Some(verified_anchor(&database, proof)?),
             _ => return Err(OwnerError::AnchorMismatch),
         };
-        self.install(database, anchor, AccountAuthority::Fixture(authority))
+        self.install(database, path, anchor, AccountAuthority::Fixture(authority))
     }
 
     // An opened file deliberately starts without authority even when it has a
@@ -1065,6 +1101,7 @@ impl Owner {
     fn install(
         &self,
         database: DeviceDatabase,
+        path: Option<std::path::PathBuf>,
         anchor: Option<[u8; 32]>,
         authority: AccountAuthority,
     ) -> Result<ContainerId, OwnerError> {
@@ -1086,6 +1123,7 @@ impl Owner {
             id,
             Container {
                 anchor,
+                path: path.unwrap_or_default(),
                 session: Arc::new(Mutex::new(session)),
                 readers,
             },
@@ -1656,7 +1694,21 @@ impl Owner {
                 {
                     return Err(OwnerError::WriterUnavailable);
                 }
-                self.final_fence(active, &writer, &working, attempt)?;
+                match self.final_fence(active, &writer, &working, attempt) {
+                    Err(OwnerError::WriterUnavailable)
+                        if attempt == writers::Fence::Unregistered =>
+                    {
+                        // Registration can finish while this note's work lock is held.
+                        // Recheck ownership and conflicts once against the new phase;
+                        // ordinary accepted-state changes still refuse this attempt.
+                        let current = self.attempt_fence(active, &writer, &working)?;
+                        if !matches!(current, writers::Fence::Registered(_)) {
+                            return Err(OwnerError::WriterUnavailable);
+                        }
+                        self.final_fence(active, &writer, &working, current)?;
+                    }
+                    result => result?,
+                }
                 let start = std::time::Instant::now();
                 let commit = writer.commit_writer_update_with_title(
                     frontier,

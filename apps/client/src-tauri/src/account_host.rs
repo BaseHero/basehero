@@ -65,6 +65,12 @@ impl HostKeyStore for LoginStore {
 impl HostKeyStore for LoginStore {
     // The Keystore adapter's only control key: strong biometrics, per use.
     const JOIN_POLICY: ControlKeyPolicy = ControlKeyPolicy::CurrentBiometricsOnly;
+    async fn erase_keys(
+        &mut self,
+        handle: bh_account::platform::KeyHandle,
+    ) -> Result<(), bh_account::platform::KeyStoreError> {
+        crate::android_account::AndroidKeyStore.erase_keys(handle)
+    }
 }
 
 /// The container owner appends `accounts/` beneath this app-data directory.
@@ -133,14 +139,16 @@ pub struct PasswordScreen {
 /// The setup window's account operation through the shared setup workflow
 /// (`PairingHost::setup_screen`), which follows or resumes a join.
 async fn run_account(
-    window: &tauri::WebviewWindow,
-    state: &tauri::State<'_, SharedAccountHost>,
-    sync: &tauri::State<'_, bh_host::sync::SyncHost>,
-    pairing: &tauri::State<'_, bh_host::pairing::PairingHost>,
+    label: &str,
+    state: &SharedAccountHost,
+    sync: &bh_host::sync::SyncHost,
+    pairing: &bh_host::pairing::PairingHost,
     operation: AccountOperation,
 ) -> Result<Screen, String> {
-    pairing
-        .setup_screen(window.label(), state, sync, operation)
+    // A Tauri command constructs this future on Android's JavaBridge thread.
+    // The account workflow's large future belongs on the async runtime, not
+    // on that small JNI stack. All setup operations share this entry point.
+    Box::pin(pairing.setup_screen(label, state, sync, operation))
         .await
         .map_err(str::to_owned)
 }
@@ -157,6 +165,31 @@ pub(crate) fn ensure_setup_window(
         .ok_or("setup unavailable")
 }
 
+/// The changed kit is shown over an already-bound note, while first setup is
+/// shown only on the unbound main window. Neither accepts a kit from the page.
+fn kit_on_this_window(
+    window: &tauri::WebviewWindow,
+    notes: &tauri::State<'_, crate::note_host::NoteHost>,
+    state: &tauri::State<'_, SharedAccountHost>,
+) -> Result<(RecoveryCode, bool), &'static str> {
+    if let Some(Screen::NewKit { code }) = state.screen() {
+        let bound = notes.owner().bound_container(window.label());
+        if match bound {
+            Some(id) => state.controls_account(id),
+            None => window.label() == "main",
+        } {
+            return RecoveryCode::from_kit_text(&code)
+                .map(|code| (code, true))
+                .map_err(|_| "kit unavailable");
+        }
+    }
+    ensure_setup_window(window, notes)?;
+    state
+        .pending_code()
+        .map(|code| (code, false))
+        .ok_or("kit unavailable")
+}
+
 #[tauri::command]
 pub async fn account_screen(
     window: tauri::WebviewWindow,
@@ -166,7 +199,14 @@ pub async fn account_screen(
     pairing: tauri::State<'_, bh_host::pairing::PairingHost>,
 ) -> Result<Screen, String> {
     ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
-    let screen = run_account(&window, &state, &sync, &pairing, AccountOperation::Startup).await?;
+    let screen = run_account(
+        window.label(),
+        &state,
+        &sync,
+        &pairing,
+        AccountOperation::Startup,
+    )
+    .await?;
     ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
     Ok(screen)
 }
@@ -180,7 +220,14 @@ pub async fn account_retry(
     pairing: tauri::State<'_, bh_host::pairing::PairingHost>,
 ) -> Result<Screen, String> {
     ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
-    let screen = run_account(&window, &state, &sync, &pairing, AccountOperation::Retry).await?;
+    let screen = run_account(
+        window.label(),
+        &state,
+        &sync,
+        &pairing,
+        AccountOperation::Retry,
+    )
+    .await?;
     ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
     Ok(screen)
 }
@@ -230,7 +277,7 @@ pub async fn account_create(
         }));
     }
     let screen = run_account(
-        &window,
+        window.label(),
         &state,
         &sync,
         &pairing,
@@ -254,7 +301,7 @@ pub async fn account_confirm_kit(
 ) -> Result<Screen, String> {
     ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
     run_account(
-        &window,
+        window.label(),
         &state,
         &sync,
         &pairing,
@@ -303,14 +350,7 @@ async fn kit_result(
     route: &'static str,
     action: fn(&RecoveryCode) -> Result<Destination, ()>,
 ) -> Result<RouteResult, String> {
-    ensure_setup_window(window, notes).map_err(str::to_owned)?;
-    let code = state.pending_code();
-    let Some(code) = code else {
-        return Ok(RouteResult {
-            result: "cancelled",
-            route,
-        });
-    };
+    let (code, _) = kit_on_this_window(window, notes, state).map_err(str::to_owned)?;
     let result = tauri::async_runtime::spawn_blocking(move || action(&code))
         .await
         .map_err(|_| "kit destination unavailable".to_owned())?;
@@ -323,11 +363,7 @@ pub async fn account_print_kit(
     notes: tauri::State<'_, crate::note_host::NoteHost>,
     state: tauri::State<'_, SharedAccountHost>,
 ) -> Result<RouteResult, String> {
-    ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
-    let code_available = state.pending_code().is_some();
-    if !code_available {
-        return Ok(kit_route(Ok(Destination::Cancelled), "print"));
-    }
+    let _ = kit_on_this_window(&window, &notes, &state).map_err(str::to_owned)?;
     #[cfg(target_os = "macos")]
     {
         // The kit is already visible only on the setup page. WKWebView's own
@@ -350,6 +386,19 @@ pub async fn account_email_kit(
     kit_result(&window, &notes, &state, "email", email_kit).await
 }
 
+async fn confirm_changed_kit(
+    state: &SharedAccountHost,
+    sync: &bh_host::sync::SyncHost,
+) -> Result<Screen, &'static str> {
+    // This saved-kit path is another IPC caller of the device workflow.
+    Box::pin(bh_host::devices::run(
+        state,
+        sync,
+        AccountOperation::ConfirmNewKit,
+    ))
+    .await
+}
+
 #[tauri::command]
 pub async fn account_save_kit_file(
     window: tauri::WebviewWindow,
@@ -358,33 +407,32 @@ pub async fn account_save_kit_file(
     sync: tauri::State<'_, bh_host::sync::SyncHost>,
     pairing: tauri::State<'_, bh_host::pairing::PairingHost>,
 ) -> Result<RouteResult, String> {
-    ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
-    let code = state.pending_code();
-    let Some(code) = code else {
-        return Ok(RouteResult {
-            result: "cancelled",
-            route: "file",
-        });
-    };
+    let (code, changed) = kit_on_this_window(&window, &notes, &state).map_err(str::to_owned)?;
     let saved = save_kit_file(&code).await;
     if matches!(saved, Ok(Destination::Saved)) {
-        ensure_setup_window(&window, &notes).map_err(str::to_owned)?;
         // The OS write succeeded. Confirm natively before the IPC response so
         // a page navigation after file success cannot abandon the saved kit.
-        let same_setup = state
-            .pending_code()
-            .is_some_and(|pending| pending.to_kit_text() == code.to_kit_text());
-        if !same_setup {
+        let same_kit =
+            kit_on_this_window(&window, &notes, &state).is_ok_and(|(still, is_changed)| {
+                is_changed == changed && still.to_kit_text() == code.to_kit_text()
+            });
+        if !same_kit {
             return Err("account changed during kit save".into());
         }
-        let screen = run_account(
-            &window,
-            &state,
-            &sync,
-            &pairing,
-            AccountOperation::ConfirmKit,
-        )
-        .await?;
+        let screen = if changed {
+            confirm_changed_kit(&state, &sync)
+                .await
+                .map_err(str::to_owned)?
+        } else {
+            run_account(
+                window.label(),
+                &state,
+                &sync,
+                &pairing,
+                AccountOperation::ConfirmKit,
+            )
+            .await?
+        };
         if !matches!(screen, Screen::Ready | Screen::Retry) {
             return Err("saved kit needs a retry".into());
         }
@@ -433,6 +481,33 @@ mod tests {
     };
 
     type Host = bh_host::accounts::SharedAccountHost<FakeStore, PlainProtector>;
+
+    #[test]
+    fn setup_command_workflow_future_stays_below_64_kib() {
+        let owner = Arc::new(bh_device::Owner::default());
+        let accounts = account_host(owner.clone()).into_state();
+        let sync = bh_host::sync::SyncHost::new(bh_host::sync::Configured::Missing, owner);
+        let pairing = bh_host::pairing::PairingHost::default();
+        let changed_kit = confirm_changed_kit(&accounts, &sync);
+        eprintln!(
+            "changed-kit save IPC adapter future: {} bytes",
+            std::mem::size_of_val(&changed_kit)
+        );
+        assert!(std::mem::size_of_val(&changed_kit) < 8 * 1024);
+        for operation in [
+            AccountOperation::Startup,
+            AccountOperation::Retry,
+            AccountOperation::Create(String::new()),
+            AccountOperation::ConfirmKit,
+        ] {
+            let future = run_account("main", &accounts, &sync, &pairing, operation);
+            eprintln!(
+                "boxed account workflow future: {} bytes",
+                std::mem::size_of_val(&future)
+            );
+            assert!(std::mem::size_of_val(&future) < 64 * 1024);
+        }
+    }
 
     async fn ready_on(owner: &Arc<bh_device::Owner>, dir: &std::path::Path) -> Host {
         ready_test_host(owner, dir, FakeStore::default()).await

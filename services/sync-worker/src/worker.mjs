@@ -11,6 +11,17 @@ function checked(view, ptr, len) {
       ptr > view.length || len > view.length - ptr) throw new Error('Wasm memory bounds');
   return view.subarray(ptr, ptr + len);
 }
+function wasmHelper(instance, name, parts) {
+  const exports = instance.exports;
+  const length = parts.reduce((total, part) => total + part.length, 0);
+  const ptr = exports.reserve_input(length);
+  const input = checked(new Uint8Array(exports.memory.buffer), ptr, length);
+  let offset = 0;
+  for (const part of parts) { input.set(part, offset); offset += part.length; }
+  if (exports[name](length) !== 0) throw new Error('canonical helper refused');
+  return JSON.parse(dec.decode(checked(new Uint8Array(exports.memory.buffer), exports.result_ptr(), exports.result_len())));
+}
+const unhex = value => Uint8Array.from(value.match(/../g) ?? [], pair => parseInt(pair, 16));
 function wasmPlan(instance, request) {
   const bytes = enc.encode(JSON.stringify(request));
   if (bytes.length < 1 || bytes.length > 10 * 1024 * 1024) throw new Error('request bound');
@@ -38,7 +49,7 @@ function stored(sql, row) {
   return { ...row, previous: prior };
 }
 function gate(sql) {
-  return only(sql, 'SELECT base,position,hash,incarnation,sequence,checker_key FROM gate WHERE singleton=1');
+  return only(sql, 'SELECT base,order_format,opening AS "order",position,hash,incarnation,sequence,checker_key FROM gate WHERE singleton=1');
 }
 export class BaseLog extends DurableObject {
   #instance;
@@ -69,11 +80,17 @@ export class BaseLog extends DurableObject {
         // to a default operation or a wrong body write.
         if (!['append', 'read', 'stage', 'readbodies'].includes(request.kind))
           throw new Error('unknown kind');
-        const head = before.position === 0 ? null : stored(sql,
-          only(sql, 'SELECT position,event_id,event_digest,commitment,event FROM events WHERE position=?', before.position));
-        if (before.position === 0 && maybe(sql, 'SELECT position FROM events LIMIT 1')) throw new Error('unexpected genesis row');
+        // Compare with the indexed actual tail, not the row at the gate's
+        // claimed position: a coherent earlier gate cannot hide later rows.
+        const tail = maybe(sql,
+          'SELECT position,event_id,event_digest,commitment,event FROM events ORDER BY position DESC LIMIT 1');
+        if (tail ? !Number.isSafeInteger(tail.position) || tail.position !== before.position
+                 : before.position !== 0) throw new Error('order tail mismatch');
+        const head = tail ? stored(sql, tail) : null;
+        const routed = request.kind === 'append'
+          ? wasmHelper(instance, 'routed_id', [unhex(before.base), unhex(request.event)]).event_id : null;
         const selection = request.kind === 'append'
-          ? [maybe(sql, 'SELECT position,event_id,event_digest,commitment,event FROM events WHERE event_id=?', request.event?.slice(4, 68))]
+          ? [maybe(sql, 'SELECT position,event_id,event_digest,commitment,event FROM events WHERE event_id=?', routed)]
           : request.kind === 'read' && Array.isArray(request.objects) && request.objects.length <= 64
             ? request.objects.map(d => maybe(sql, 'SELECT position,event_id,event_digest,commitment,event FROM events WHERE event_digest=?', d))
             : [];
@@ -113,15 +130,16 @@ export class BaseLog extends DurableObject {
         }
         if (plan.append) {
           // Canonical bytes produced by Rust Commitment::order, not JS crypto.
-          const id = plan.append.slice(148, 212);
-          const digest = plan.append.slice(212, 276);
+          const state = wasmHelper(instance, 'commitment_state', [unhex(before.base), unhex(plan.append)]);
+          if (state.position !== plan.position || state.hash !== plan.hash || state.order !== plan.order ||
+              state.event_id !== routed) throw new Error('ordered state mismatch');
           sql.exec('INSERT INTO events(position,event_id,event_digest,commitment,event) VALUES(?,?,?,?,?)',
-            plan.position, id, digest, plan.append, request.event);
+            plan.position, state.event_id, state.digest, plan.append, request.event);
         }
-        const changed = sql.exec(`UPDATE gate SET position=?,hash=?,sequence=?,last_approval=?,last_ack=?
-          WHERE singleton=1 AND base=? AND position=? AND hash=? AND incarnation=? AND sequence=? AND checker_key=?`,
-          plan.position, plan.hash, plan.sequence, request.grant, plan.ack,
-          before.base, before.position, before.hash, before.incarnation, before.sequence, before.checker_key);
+        const changed = sql.exec(`UPDATE gate SET position=?,hash=?,opening=?,sequence=?,last_approval=?,last_ack=?
+          WHERE singleton=1 AND base=? AND order_format=2 AND opening=? AND position=? AND hash=? AND incarnation=? AND sequence=? AND checker_key=?`,
+          plan.position, plan.hash, plan.order, plan.sequence, request.grant, plan.ack,
+          before.base, before.order, before.position, before.hash, before.incarnation, before.sequence, before.checker_key);
         if (changed.rowsWritten !== 1) throw new Error('gate compare');
         return plan.ack ? { ack: plan.ack }
           : plan.stage ? { commitment: plan.stage }

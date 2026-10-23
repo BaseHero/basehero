@@ -3,7 +3,7 @@
 use bh_sync::{
     Digest,
     receipt::RECEIPT_LEN,
-    wire::{MAX_FRAME_LEN, Request, Response},
+    wire::{CoverageEndpoint, MAX_FRAME_LEN, Request, Response},
 };
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use std::{
@@ -43,6 +43,7 @@ pub type LogItems = Vec<(Vec<u8>, Vec<u8>)>;
 pub struct LogRead {
     pub items: LogItems,
     pub receipt: Option<[u8; RECEIPT_LEN]>,
+    pub coverage: Option<CoverageEndpoint>,
 }
 
 /// Durable immutable private-object acknowledgement, with no append position.
@@ -77,6 +78,10 @@ pub trait EdgeReader: Send + Sync {
         _permit: Vec<u8>,
         _bundle: Vec<u8>,
     ) -> BoxFuture<'_, Result<HomeObjectsAck, EdgeError>> {
+        Box::pin(async { Err(EdgeError::Unavailable) })
+    }
+    /// Idempotently retire the initial immutable home bundle after durable replacement.
+    fn retire_home_objects(&self, _permit: Vec<u8>) -> BoxFuture<'_, Result<(), EdgeError>> {
         Box::pin(async { Err(EdgeError::Unavailable) })
     }
 }
@@ -116,6 +121,7 @@ struct Pool {
 #[allow(clippy::large_enum_variant)]
 enum Data {
     HomeObjects(HomeObjectsAck),
+    Retired,
     Events(LogRead),
     Bodies(Vec<Vec<u8>>),
 }
@@ -309,8 +315,20 @@ impl EdgeClient {
                     break;
                 };
                 match response {
-                    Response::Events { id, items, receipt } => {
-                        reading.answer(id, Ok(Data::Events(LogRead { items, receipt })));
+                    Response::Events {
+                        id,
+                        items,
+                        receipt,
+                        coverage,
+                    } => {
+                        reading.answer(
+                            id,
+                            Ok(Data::Events(LogRead {
+                                items,
+                                receipt,
+                                coverage,
+                            })),
+                        );
                     }
                     Response::Body {
                         id,
@@ -318,6 +336,9 @@ impl EdgeClient {
                         last,
                         bytes: body,
                     } => reading.body(id, index, last, body),
+                    Response::HomeObjectsRetired { id } => {
+                        reading.answer(id, Ok(Data::Retired));
+                    }
                     Response::HomeObjectsStored {
                         id,
                         prefix_digest,
@@ -403,7 +424,7 @@ impl EdgeClient {
         }
     }
 
-    async fn request_once(&self, permit: &[u8], bundle: Option<&[u8]>) -> Answer {
+    async fn request_once(&self, permit: &[u8], bundle: Option<&[u8]>, retire: bool) -> Answer {
         let (conn, slot) = self.acquire().await?;
         let id = conn.next_id.fetch_add(1, Ordering::SeqCst);
         let request = match bundle {
@@ -411,6 +432,10 @@ impl EdgeClient {
                 id,
                 permit: permit.to_vec(),
                 bundle: bundle.to_vec(),
+            },
+            None if retire => Request::RetireHomeObjects {
+                id,
+                permit: permit.to_vec(),
             },
             None => Request::Read {
                 id,
@@ -449,11 +474,11 @@ impl EdgeClient {
         result
     }
 
-    async fn request(&self, permit: &[u8], bundle: Option<&[u8]>) -> Answer {
+    async fn request(&self, permit: &[u8], bundle: Option<&[u8]>, retire: bool) -> Answer {
         tokio::time::timeout(self.timeout, async {
             let mut result = Err(EdgeError::Unavailable);
             for _ in 0..ATTEMPTS {
-                result = self.request_once(permit, bundle).await;
+                result = self.request_once(permit, bundle, retire).await;
                 if !matches!(result, Err(EdgeError::Unavailable)) {
                     break;
                 }
@@ -465,13 +490,21 @@ impl EdgeClient {
     }
 }
 impl EdgeReader for EdgeClient {
+    fn retire_home_objects(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<(), EdgeError>> {
+        Box::pin(async move {
+            match self.request(&permit, None, true).await? {
+                Data::Retired => Ok(()),
+                _ => Err(EdgeError::Malformed),
+            }
+        })
+    }
     fn store_home_objects(
         &self,
         permit: Vec<u8>,
         bundle: Vec<u8>,
     ) -> BoxFuture<'_, Result<HomeObjectsAck, EdgeError>> {
         Box::pin(async move {
-            match self.request(&permit, Some(&bundle)).await? {
+            match self.request(&permit, Some(&bundle), false).await? {
                 Data::HomeObjects(stored) => Ok(stored),
                 _ => Err(EdgeError::Malformed),
             }
@@ -479,7 +512,7 @@ impl EdgeReader for EdgeClient {
     }
     fn read_log(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<LogItems, EdgeError>> {
         Box::pin(async move {
-            match self.request(&permit, None).await? {
+            match self.request(&permit, None, false).await? {
                 Data::Events(read) => Ok(read.items),
                 _ => Err(EdgeError::Malformed),
             }
@@ -487,7 +520,7 @@ impl EdgeReader for EdgeClient {
     }
     fn read_log_with_receipt(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<LogRead, EdgeError>> {
         Box::pin(async move {
-            match self.request(&permit, None).await? {
+            match self.request(&permit, None, false).await? {
                 Data::Events(read) => Ok(read),
                 _ => Err(EdgeError::Malformed),
             }
@@ -495,7 +528,7 @@ impl EdgeReader for EdgeClient {
     }
     fn read_bodies(&self, permit: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, EdgeError>> {
         Box::pin(async move {
-            match self.request(&permit, None).await? {
+            match self.request(&permit, None, false).await? {
                 Data::Bodies(bodies) => Ok(bodies),
                 _ => Err(EdgeError::Malformed),
             }

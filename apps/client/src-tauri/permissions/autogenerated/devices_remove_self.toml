@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-devices-remove-self"
+description = "Enables the devices_remove_self command without any pre-configured scope."
+commands.allow = ["devices_remove_self"]
+
+[[permission]]
+identifier = "deny-devices-remove-self"
+description = "Denies the devices_remove_self command without any pre-configured scope."
+commands.deny = ["devices_remove_self"]

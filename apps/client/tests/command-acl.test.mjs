@@ -37,6 +37,16 @@ test("each command has its generated allow permission", async () => {
   }
 });
 
+test("native alert notifications have no WebView permission", async () => {
+  const manifest = await text("build.rs");
+  assert.match(manifest, /\.plugin\("notify", notify\)/);
+  const dir = new URL("capabilities/", root);
+  for (const file of (await readdir(dir)).filter(name => name.endsWith('.json'))) {
+    const config = await readFile(new URL(file, dir), 'utf8');
+    assert.doesNotMatch(config, /notify:allow-notify/, `${file} must not let a page post a native notification`);
+  }
+});
+
 test("capabilities grant each command once, to its reviewed windows only", async () => {
   const dir = new URL("capabilities/", root);
   const granted = new Map();

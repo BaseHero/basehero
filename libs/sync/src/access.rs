@@ -6,7 +6,7 @@
 //! plan and durably commit before releasing bytes or an acknowledgement.
 
 use crate::log::{BodyObject, Input, hash, referenced_body};
-use crate::{BaseId, Commitment, Digest, Error, Head, OpaqueEvent, Route, VERSION};
+use crate::{BaseId, Commitment, Digest, Error, Head, OpaqueEvent, OrderState, Route, VERSION};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccessError {
@@ -193,6 +193,7 @@ impl SignedApproval {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GateState {
     pub base: BaseId,
+    pub order: OrderState,
     pub head: Head,
     pub incarnation: [u8; 32],
     pub sequence: u64,
@@ -233,6 +234,9 @@ pub fn plan_consumption(
     staged_body: Option<Digest>,
     response_binding: Digest,
 ) -> Result<Consumption, AccessError> {
+    if state.order.head(state.base) != state.head {
+        return Err(AccessError::History);
+    }
     signed.check(state)?;
     let approval = signed.approval;
     if approval.operation != operation.digest() || approval.response_binding != response_binding {
@@ -291,13 +295,14 @@ pub fn plan_consumption(
             }
             // This approval lane has no control appends: only a genesis is a
             // control.
-            let route = if state.head == Head::EMPTY {
+            let route = if event.digest().0 == state.base.0 {
                 Route::Control
             } else {
                 Route::Content
             };
-            let committed = Commitment::order(state.base, state.head, event, route)
+            let committed = Commitment::order(state.base, state.order, event, route)
                 .map_err(|_| AccessError::History)?;
+            next.order = committed.after();
             next.head = committed.head();
             Ok(Consumption {
                 next,
@@ -329,7 +334,7 @@ impl ExecutionLane {
     /// Host integration boundary: only after current authority and storage state
     /// have been established, not from an arbitrary signed historical snapshot.
     pub fn establish(&mut self, state: GateState) -> Result<(), AccessError> {
-        if self.state.is_some() {
+        if self.state.is_some() || state.order.head(state.base) != state.head {
             return Err(AccessError::Uncertain);
         }
         self.state = Some(state);
@@ -358,6 +363,8 @@ impl ExecutionLane {
             || next.incarnation != before.incarnation
             || next.checker_key != before.checker_key
             || next.sequence != pending.approval.sequence
+            || next.order.head(next.base) != next.head
+            || (next.head == before.head && next.order != before.order)
             || !(next.head == before.head
                 || before.head.position.checked_add(1) == Some(next.head.position))
         {
@@ -376,7 +383,9 @@ impl ExecutionLane {
             || recovered.incarnation == before.incarnation
             || recovered.sequence < before.sequence
             || recovered.head.position < before.head.position
-            || (recovered.head.position == before.head.position && recovered.head != before.head)
+            || recovered.order.head(recovered.base) != recovered.head
+            || (recovered.head.position == before.head.position
+                && (recovered.head != before.head || recovered.order != before.order))
         {
             return Err(AccessError::Stale);
         }

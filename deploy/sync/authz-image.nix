@@ -5,6 +5,8 @@ let
     pname = "bh-authz";
     version = "0.1.0";
     inherit src;
+    # Pure Nix builds do not inherit the workflow shell's BH_RELEASE.
+    BH_RELEASE = "1";
     cargoLock = {
       lockFile = src + /Cargo.lock;
       allowBuiltinFetchGit = true;

@@ -2,12 +2,216 @@ use bh_account::{
     AccountId, DeviceId, DevicePublicKeys, Head as AccountHead, device_auth::PROOF_LEN,
 };
 use bh_authz_proto::{
-    Delivery, Error, FromService, LogId, LogKind, MAX_BODIES, MAX_MESSAGE, MetadataKey, Refusal,
-    ToService, Want, WrapError, account_log_id, account_log_unwrap, account_log_wrap,
-    delivery_body, delivery_frame,
+    Delivery, Error, FromService, LogId, LogKind, MAX_BODIES, MAX_MESSAGE, MetadataKey,
+    RecoverPurpose, RecoveryAnswer, RecoveryAttachment, Refusal, ToService, Want, WrapError,
+    account_log_id, account_log_unwrap, account_log_wrap, delivery_body, delivery_frame,
+    rotation_body, rotation_frame,
 };
 use bh_crypto::Secret;
 use bh_sync::{BODY_SIZES, BaseId, BodyObject, Digest, ENVELOPE_SIZES, EventId, OpaqueEvent};
+
+#[test]
+fn control_want_round_trip_and_strict_bounds() {
+    let message = ToService::Permits {
+        items: vec![Want::ReadControls {
+            log: account_log(2),
+            after: (1 << 53) - 1,
+        }],
+    };
+    let bytes = message.encode().unwrap();
+    assert_eq!(bytes[5], 12);
+    assert_eq!(ToService::decode(&bytes), Ok(message));
+    assert_eq!(
+        ToService::decode(&bytes[..bytes.len() - 1]),
+        Err(Error::Encoding)
+    );
+    assert_eq!(
+        ToService::decode(&[bytes.as_slice(), &[0]].concat()),
+        Err(Error::Encoding)
+    );
+    let too_far = ToService::Permits {
+        items: vec![Want::ReadControls {
+            log: account_log(2),
+            after: 1 << 53,
+        }],
+    };
+    assert!(too_far.encode().is_err());
+    let mut malformed = bytes;
+    let end = malformed.len();
+    malformed[end - 8..].copy_from_slice(&(1_u64 << 53).to_be_bytes());
+    assert!(ToService::decode(&malformed).is_err());
+}
+
+#[test]
+fn recovery_and_evidence_messages_round_trip() {
+    to_round_trip(ToService::Recover {
+        sealed: vec![4; 120],
+        purpose: RecoverPurpose::AddDevice,
+    });
+    to_round_trip(ToService::Recover {
+        sealed: vec![5; 120],
+        purpose: RecoverPurpose::Sign,
+    });
+    to_round_trip(ToService::ReadNotices { after_ms: 17 });
+    to_round_trip(ToService::SubmitControl {
+        log: account_log(2),
+        event: vec![1; 12],
+        delivery: None,
+        attachment: Some(Box::new(RecoveryAttachment {
+            record: Some(vec![3; 100]),
+            recovery_seal: vec![7; 120],
+            rotation_body: None,
+        })),
+    });
+    // A rotation names its staged body by its 32-byte commitment, never
+    // carrying the frame, so the message's size does not grow with it.
+    let rotation = ToService::SubmitControl {
+        log: account_log(2),
+        event: vec![1; 12],
+        delivery: None,
+        attachment: Some(Box::new(RecoveryAttachment {
+            record: None,
+            recovery_seal: vec![7; 120],
+            rotation_body: Some(Digest([8; 32])),
+        })),
+    };
+    let bytes = rotation.encode().unwrap();
+    assert_eq!(bytes.len(), 3 + 33 + 4 + 12 + 1 + 1 + 1 + 4 + 120 + 1 + 32);
+    assert_eq!(
+        bytes[bytes.len() - 33..],
+        [[1].as_slice(), &[8; 32]].concat()
+    );
+    assert_eq!(
+        ToService::decode(&bytes[..bytes.len() - 1]),
+        Err(Error::Encoding)
+    );
+    to_round_trip(rotation);
+    to_round_trip(ToService::ConfirmControl {
+        log: account_log(2),
+        event: Digest([4; 32]),
+        challenge: [7; 32],
+    });
+    to_round_trip(ToService::ReadAccountEvidence {
+        genesis: vec![1; 100],
+        first: 1,
+        last: 64,
+        challenge: [8; 32],
+    });
+    to_round_trip(ToService::Permits {
+        items: vec![
+            Want::ReadDirectory {
+                log: account_log(2),
+            },
+            Want::StoreDirectoryEntry {
+                log: account_log(2),
+                entry: [5; 32],
+                version: 7,
+                body: Digest([3; 32]),
+                len: 1024,
+            },
+        ],
+    });
+    from_round_trip(FromService::Confirmed {
+        confirmation: vec![1; 430],
+        head: vec![2; 349],
+    });
+    from_round_trip(FromService::AccountEvidence {
+        events_permit: vec![1; 128],
+        confirmations: vec![vec![2; 430], vec![3; 430]],
+        head: vec![4; 349],
+    });
+    for answer in [
+        RecoveryAnswer::NotRecognised,
+        RecoveryAnswer::PasswordMismatch {
+            tries_left: 2,
+            next_try_ms: None,
+        },
+        RecoveryAnswer::PasswordMismatch {
+            tries_left: 0,
+            next_try_ms: Some(44),
+        },
+        RecoveryAnswer::Wait { next_try_ms: 50 },
+        RecoveryAnswer::Released {
+            genesis: vec![1; 50],
+            record: vec![2; 60],
+            recovery_seal: vec![3; 70],
+        },
+    ] {
+        from_round_trip(FromService::Recovery(answer));
+    }
+    from_round_trip(FromService::Notices {
+        kit_used_ms: vec![7, 8],
+    });
+    for reason in [Refusal::NotOrdered, Refusal::Lapsed] {
+        from_round_trip(FromService::Refused { reason });
+    }
+}
+#[test]
+fn recovery_and_evidence_messages_refuse_trailing_bytes_and_unknown_purpose() {
+    assert_eq!(
+        ToService::ConfirmControl {
+            log: base(2),
+            event: Digest([4; 32]),
+            challenge: [7; 32]
+        }
+        .encode()
+        .err(),
+        Some(Error::Encoding)
+    );
+    assert_eq!(
+        ToService::Permits {
+            items: vec![Want::ReadDirectory { log: base(2) }]
+        }
+        .encode()
+        .err(),
+        Some(Error::Encoding)
+    );
+    assert_eq!(
+        ToService::Permits {
+            items: vec![Want::StoreDirectoryEntry {
+                log: base(2),
+                entry: [1; 32],
+                version: 1,
+                body: Digest([3; 32]),
+                len: 1024
+            }]
+        }
+        .encode()
+        .err(),
+        Some(Error::Encoding)
+    );
+    let mut bad = ToService::Recover {
+        sealed: vec![4; 120],
+        purpose: RecoverPurpose::Sign,
+    }
+    .encode()
+    .unwrap();
+    bad[3] = 3;
+    assert_eq!(ToService::decode(&bad).err(), Some(Error::Encoding));
+    for (first, last) in [(0, 1), (2, 1), (1, 65)] {
+        assert_eq!(
+            ToService::ReadAccountEvidence {
+                genesis: vec![1],
+                first,
+                last,
+                challenge: [0; 32]
+            }
+            .encode()
+            .err(),
+            Some(Error::Size)
+        );
+    }
+}
+#[test]
+fn account_log_wrap_is_unchanged() {
+    assert_eq!(
+        account_log_id(&vec![0x55; 2600]).unwrap(),
+        [
+            134, 219, 240, 118, 120, 175, 63, 65, 237, 32, 46, 20, 235, 49, 55, 37, 57, 18, 153,
+            195, 120, 27, 94, 105, 240, 73, 105, 141, 155, 96, 70, 115
+        ]
+    );
+}
 
 fn base(n: u8) -> LogId {
     LogId {
@@ -103,6 +307,7 @@ fn every_message_round_trips_strictly() {
         log: account_log(2),
         event: vec![1; 300],
         delivery: None,
+        attachment: None,
     });
     to_round_trip(ToService::SubmitControl {
         log: account_log(2),
@@ -111,6 +316,7 @@ fn every_message_round_trips_strictly() {
             recipient: keys(3),
             frame: vec![2; 1403],
         })),
+        attachment: None,
     });
     to_round_trip(register(1062, 1024));
     from_round_trip(FromService::Challenge { challenge: [5; 32] });
@@ -223,6 +429,7 @@ fn unknown_tags_and_versions_are_refused() {
             recipient: keys(3),
             frame: vec![2; 3],
         })),
+        attachment: None,
     }
     .encode()
     .unwrap();
@@ -278,7 +485,11 @@ fn account_log_events_wrap_into_the_smallest_envelope() {
         ]
         .concat(),
     );
-    assert_eq!(event.id(), EventId(id));
+    assert_eq!(event.nonce(), EventId(id));
+    assert_eq!(
+        event.publication_id(bh_sync::Route::Control),
+        bh_sync::canonical::publication_id(bh_sync::Route::Control, event.digest())
+    );
     assert!(account_log_unwrap(&event).unwrap() == (original.as_slice(), None));
     // The log object's body reference reads the wrapper's first 32 bytes.
     assert_eq!(bh_sync::referenced_body(&event).unwrap(), Digest([0; 32]));
@@ -321,13 +532,13 @@ fn a_wrapped_body_commitment_is_bound_into_the_event_id() {
     assert_eq!(bh_sync::referenced_body(&with).unwrap(), body);
     assert!(account_log_unwrap(&with).unwrap() == (original.as_slice(), Some(body)));
     // The same original with another body, or none, is another event.
-    assert_ne!(with.id(), without.id());
+    assert_ne!(with.nonce(), without.nonce());
     let other = account_log_wrap(&original, Some(Digest([8; 32]))).unwrap();
-    assert_ne!(with.id(), other.id());
+    assert_ne!(with.nonce(), other.nonce());
     // Swapping the commitment under the original's id is refused.
     let mut swapped = with.envelope().to_vec();
     swapped[..32].copy_from_slice(&[8; 32]);
-    let swapped = OpaqueEvent::new(with.id(), swapped).unwrap();
+    let swapped = OpaqueEvent::new(with.nonce(), swapped).unwrap();
     assert_eq!(
         account_log_unwrap(&swapped).err(),
         Some(WrapError::Encoding)
@@ -348,9 +559,9 @@ fn account_log_unwrap_is_strict() {
     let mut roomy = vec![0; 4096];
     roomy[..136].copy_from_slice(&good.envelope()[..136]);
     for event in [
-        rebuild(good.id(), padded),
-        rebuild(good.id(), long),
-        rebuild(good.id(), roomy),
+        rebuild(good.nonce(), padded),
+        rebuild(good.nonce(), long),
+        rebuild(good.nonce(), roomy),
         rebuild(EventId([0; 32]), good.envelope().to_vec()),
     ] {
         assert_eq!(account_log_unwrap(&event).err(), Some(WrapError::Encoding));
@@ -425,6 +636,37 @@ fn a_delivery_body_is_its_exact_frame_padded() {
     assert!(BodyObject::new(body.bytes().to_vec()).unwrap() == body);
 }
 
+#[test]
+fn rotation_transport_preserves_raw_bytes_and_rejects_noncanonical_bodies() {
+    use bh_authz_proto::{rotation_body, rotation_frame};
+    let raw = vec![0x5a; 1341];
+    let body = rotation_body(&raw).unwrap();
+    assert_eq!(body.bytes().len(), 4096);
+    assert_eq!(body.bytes()[0], 2);
+    assert_eq!(&body.bytes()[1..5], &1341u32.to_be_bytes());
+    assert_eq!(rotation_frame(body.bytes()).unwrap(), raw);
+    assert!(delivery_frame(body.bytes()).is_err());
+    assert!(rotation_frame(delivery_body(&raw).unwrap().bytes()).is_err());
+    assert!(rotation_body(&[]).is_err());
+    assert!(rotation_body(&vec![0; 4194304]).is_err());
+    let mut padding = body.bytes().to_vec();
+    padding[4000] = 1;
+    let mut length = body.bytes().to_vec();
+    length[1..5].copy_from_slice(&4096u32.to_be_bytes());
+    let mut nonminimal = body.bytes().to_vec();
+    nonminimal.resize(16384, 0);
+    for invalid in [
+        padding,
+        length,
+        nonminimal,
+        body.bytes()[..1000].to_vec(),
+        vec![],
+    ] {
+        assert!(rotation_frame(&invalid).is_err());
+    }
+    assert_eq!(rotation_body(&raw).unwrap(), body);
+}
+
 fn base_control(descriptor: usize, body: usize) -> ToService {
     ToService::SubmitBaseControl {
         log: base(7),
@@ -471,7 +713,18 @@ fn base_control_and_new_refusals_round_trip_strictly() {
         assert_eq!(bytes, [0, 1, 4, code]);
     }
     assert_eq!(
-        FromService::decode(&[0, 1, 4, 11]).err(),
+        FromService::decode(&[0, 1, 4, 13]).err(),
         Some(Error::Encoding)
     );
+}
+
+/// A rotation frame is a 10-byte header and one 1,331-byte entry (device id
+/// and seal) per device: the largest body carries 3,151 of them.
+#[test]
+fn the_largest_rotation_body_carries_3151_devices() {
+    let frame = |devices: usize| vec![1; 10 + 1331 * devices];
+    let largest = rotation_body(&frame(3151)).unwrap();
+    assert_eq!(largest.bytes().len(), 4 * 1024 * 1024);
+    assert_eq!(rotation_frame(largest.bytes()).unwrap(), frame(3151));
+    assert_eq!(rotation_body(&frame(3152)).err(), Some(WrapError::Size));
 }

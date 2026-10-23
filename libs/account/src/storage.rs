@@ -8,16 +8,18 @@ use std::{
 
 use crate::history::indexed::{HistoryIndex, KeyUse, receiving_hash};
 use crate::history::{DeviceId, Error, MAX_EVENT_LEN};
+use crate::trust::ConfirmedTime;
 use bh_storage::ReadPool;
 use bh_storage::account::{
     AccountHistoryCursor, DeviceIdentityRecord, PendingSetupRow, StagedAdmissionRow,
 };
-use bh_storage::{DeviceDatabase, StoreError};
+use bh_storage::{DeviceDatabase, EpochKeyRow, KeyringSnapshot, StoreError};
 
 use crate::history::{AccountEvent, AccountId, DevicePublicKeys, Head, VerifiedAccount};
 use crate::journal::{
-    AccountJournal, HistoryCursor, HistoryPage, JournalError, JournaledAccount, JournaledDevice,
-    JournaledProjection, PendingSetupRecord, SetupStage, StagedAdmission,
+    AcceptedPersonal, AccountJournal, HistoryCursor, HistoryPage, JournalError, JournaledAccount,
+    JournaledDevice, JournaledProjection, KeyringRow, KeyringState, PendingSetupRecord, SetupStage,
+    StagedAdmission, StagedControl,
 };
 use crate::platform::{ControlKeyPolicy, DeviceKeyStoreKind, KeyHandle};
 
@@ -95,6 +97,51 @@ fn staged_error(error: StoreError) -> JournalError {
     }
 }
 
+fn control_row(row: &StagedControl) -> bh_storage::StagedControl {
+    bh_storage::StagedControl {
+        kind: i64::from(row.kind),
+        event: row.event.clone(),
+        body: row.body.clone(),
+        attachment: row.attachment.clone(),
+        sealed_kit: row.sealed_kit.clone(),
+    }
+}
+fn control_error(error: StoreError) -> JournalError {
+    match error {
+        StoreError::StagedControlExists => JournalError::StagedControlExists,
+        StoreError::StagedControlChanged => JournalError::StagedControlChanged,
+        StoreError::CorruptSecurity => JournalError::Corrupt,
+        _ => JournalError::Storage,
+    }
+}
+
+fn keyring_error(error: StoreError) -> JournalError {
+    match error {
+        StoreError::KeyringChanged | StoreError::AuthorityChanged => JournalError::KeyringChanged,
+        StoreError::KeyringIncomplete => JournalError::KeyringIncomplete,
+        StoreError::CorruptSecurity => JournalError::Corrupt,
+        _ => JournalError::Storage,
+    }
+}
+fn epoch_row(row: &KeyringRow) -> EpochKeyRow {
+    EpochKeyRow {
+        base: row.base,
+        epoch_id: row.key_id,
+        purpose: row.purpose as i64,
+        seal: row.seal.clone(),
+    }
+}
+fn snapshot(state: &KeyringState) -> KeyringSnapshot {
+    KeyringSnapshot {
+        head: (state.head.position, state.head.hash),
+        delivery: match &state.accepted {
+            AcceptedPersonal::Rotated { position, body } => Some((*position, body.clone())),
+            _ => None,
+        },
+        rows: state.rows.iter().map(epoch_row).collect(),
+    }
+}
+
 fn index_error(error: StoreError) -> JournalError {
     if bh_storage::account::is_account_corruption(&error) {
         JournalError::Corrupt
@@ -139,6 +186,19 @@ impl HistoryIndex for SqliteIndex {
             .account_key_used(self.anchor.0, self.epoch, cut.position, space, &key)
             .map_err(|_| Error::Unavailable)
     }
+    fn confirmed_time(&self, cut: Head, position: u64) -> Result<Option<ConfirmedTime>, Error> {
+        self.pool
+            .upgrade()
+            .ok_or(Error::Unavailable)?
+            .account_confirmed_time(self.anchor.0, self.epoch, cut.position, position)
+            .map(|time| {
+                time.map(|(earliest_ms, latest_ms)| ConfirmedTime {
+                    earliest_ms,
+                    latest_ms,
+                })
+            })
+            .map_err(|_| Error::Unavailable)
+    }
 }
 
 impl AccountJournal for DeviceJournal {
@@ -179,9 +239,23 @@ impl AccountJournal for DeviceJournal {
                     if p.through_hash != [0; 32] || !p.summary.is_empty() {
                         return Err(JournalError::Corrupt);
                     }
-                    VerifiedAccount::from_genesis(anchor, &view.first)
-                        .map_err(|_| JournalError::Corrupt)?
-                        .pin_empty(p.epoch, index)
+                    let time = db
+                        .confirmation(1)
+                        .map_err(index_error)?
+                        .map(|row| ConfirmedTime {
+                            earliest_ms: row.earliest_ms,
+                            latest_ms: row.latest_ms,
+                        });
+                    VerifiedAccount::replay_timed(
+                        anchor,
+                        &[(&view.first, time)],
+                        Head {
+                            position: 1,
+                            hash: anchor.0,
+                        },
+                    )
+                    .map_err(|_| JournalError::Corrupt)?
+                    .pin_empty(p.epoch, index)
                 } else {
                     let through = Head {
                         position: p.through_position,
@@ -248,8 +322,28 @@ impl AccountJournal for DeviceJournal {
         Err(JournalError::Corrupt)
     }
     fn advance_projection(&mut self, account: &VerifiedAccount) -> Result<(), JournalError> {
-        self.database()?
-            .advance_account_projection(account.id().0, &account.delta(), MAX_EVENT_LEN)
+        let mut database = self.database()?;
+        let delta = account.delta();
+        // Rebuilds consume stored originals: their timed authority must also
+        // come from stored evidence, never from an unstored candidate overlay.
+        for position in delta.expected.0 + 1..=delta.through.0 {
+            let stored = database
+                .confirmation(position)
+                .map_err(index_error)?
+                .map(|row| ConfirmedTime {
+                    earliest_ms: row.earliest_ms,
+                    latest_ms: row.latest_ms,
+                });
+            if account
+                .confirmed_time(position)
+                .map_err(|_| JournalError::Corrupt)?
+                != stored
+            {
+                return Err(JournalError::Corrupt);
+            }
+        }
+        database
+            .advance_account_projection(account.id().0, &delta, MAX_EVENT_LEN)
             .map_err(index_error)
     }
     fn rebase_projection(&self, account: VerifiedAccount) -> Result<VerifiedAccount, JournalError> {
@@ -291,8 +385,8 @@ impl AccountJournal for DeviceJournal {
             cut: (c.cut.position, c.cut.hash),
             next_position: c.next_position,
         });
-        Ok(self
-            .database()?
+        let database = self.database()?;
+        database
             .account_history_page(cursor, limit, MAX_EVENT_LEN)
             .map_err(index_error)?
             .map(|p| {
@@ -304,16 +398,31 @@ impl AccountJournal for DeviceJournal {
                     },
                     next_position: p.cursor.next_position,
                 };
-                HistoryPage {
+                let times = (0..p.events.len())
+                    .map(|offset| {
+                        database
+                            .confirmation(c.next_position + offset as u64)
+                            .map_err(index_error)
+                            .map(|row| {
+                                row.map(|row| ConfirmedTime {
+                                    earliest_ms: row.earliest_ms,
+                                    latest_ms: row.latest_ms,
+                                })
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(HistoryPage {
                     anchor: c.anchor,
                     cut: c.cut,
                     first_position: c.next_position,
+                    times,
                     events: p.events,
                     next: p
                         .next_position
                         .map(|next_position| HistoryCursor { next_position, ..c }),
-                }
-            }))
+                })
+            })
+            .transpose()
     }
 
     fn load(&self) -> Result<Option<JournaledAccount>, JournalError> {
@@ -398,6 +507,50 @@ impl AccountJournal for DeviceJournal {
         projection: Option<&VerifiedAccount>,
         fence: impl FnOnce(bool),
     ) -> Result<(), JournalError> {
+        self.commit_timed_fenced(
+            anchor,
+            events,
+            &vec![None; events.len()],
+            head,
+            stopped,
+            projection,
+            fence,
+        )
+    }
+
+    fn commit_timed_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        evidence: &[Option<(ConfirmedTime, Vec<u8>)>],
+        head: Head,
+        stopped: bool,
+        projection: Option<&VerifiedAccount>,
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
+        self.commit_timed_alerted_fenced(
+            anchor,
+            events,
+            evidence,
+            head,
+            stopped,
+            projection,
+            &[],
+            fence,
+        )
+    }
+
+    fn commit_timed_alerted_fenced(
+        &mut self,
+        anchor: AccountId,
+        events: &[&[u8]],
+        evidence: &[Option<(ConfirmedTime, Vec<u8>)>],
+        head: Head,
+        stopped: bool,
+        projection: Option<&VerifiedAccount>,
+        alerts: &[bh_storage::NewAlert],
+        fence: impl FnOnce(bool),
+    ) -> Result<(), JournalError> {
         let mut database = match self.database.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -406,25 +559,138 @@ impl AccountJournal for DeviceJournal {
                 return Err(JournalError::Storage);
             }
         };
-        // Without a reader pool activation uses replay, with no indexed epoch
-        // continuation. Persist no projection on that path either.
-        let delta = if database.read_pool().is_some() {
-            projection.map(VerifiedAccount::delta)
-        } else {
-            None
-        };
-        let result = database
-            .commit_account_verified_projected(
+        let result = (|| {
+            if evidence.len() != events.len() {
+                return Err(JournalError::Corrupt);
+            }
+            let start = head
+                .position
+                .checked_sub(events.len() as u64)
+                .ok_or(JournalError::Corrupt)?;
+            if projection.is_some_and(|p| p.id() != anchor || p.head() != head) {
+                return Err(JournalError::Corrupt);
+            }
+            let mut confirmations = Vec::new();
+            for (offset, item) in evidence.iter().enumerate() {
+                let position = start + offset as u64 + 1;
+                let time = item.as_ref().map(|(time, _)| *time);
+                if let Some(p) = projection
+                    && p.confirmed_time(position)
+                        .map_err(|_| JournalError::Corrupt)?
+                        != time
+                {
+                    return Err(JournalError::Corrupt);
+                }
+                if let Some((time, bytes)) = item {
+                    confirmations.push(bh_storage::ConfirmationRow {
+                        position,
+                        earliest_ms: time.earliest_ms,
+                        latest_ms: time.latest_ms,
+                        bytes: bytes.clone(),
+                    });
+                }
+            }
+            // Ephemeral journals replay originals instead of persisting an index.
+            let delta = database
+                .read_pool()
+                .and_then(|_| projection.map(VerifiedAccount::delta));
+            database
+                .commit_account_verified_with_alerts(
+                    anchor.0,
+                    events,
+                    head.position,
+                    head.hash,
+                    stopped,
+                    delta.as_ref(),
+                    &confirmations,
+                    (!alerts.is_empty() || !events.is_empty()).then_some(alerts),
+                )
+                .map_err(|error| match error {
+                    StoreError::MissingTime => JournalError::MissingTime,
+                    StoreError::TimeRegressed => JournalError::TimeRegressed,
+                    _ => JournalError::Storage,
+                })
+        })();
+        // The canonical guard refuses missing evidence before any writes.
+        // Keep this owner's capabilities valid for a retry with the proof.
+        if result != Err(JournalError::MissingTime) {
+            fence(result.is_ok());
+        }
+        result
+    }
+
+    fn record_observed_alerts(
+        &mut self,
+        anchor: AccountId,
+        head: Head,
+        observed_earliest_ms: u64,
+        alerts: &[bh_storage::NewAlert],
+    ) -> Result<(), JournalError> {
+        self.database()?
+            .record_observed_account_alerts(
                 anchor.0,
-                events,
-                head.position,
-                head.hash,
-                stopped,
+                (head.position, head.hash),
+                observed_earliest_ms,
+                alerts,
+            )
+            .map_err(|_| JournalError::Storage)
+    }
+
+    fn observed_account_floor(&self) -> Result<Option<u64>, JournalError> {
+        self.database()?
+            .observed_account_floor()
+            .map_err(|_| JournalError::Storage)
+    }
+
+    fn attach_setup_confirmations(
+        &mut self,
+        anchor: AccountId,
+        setup_head: Head,
+        originals: [&[u8]; 2],
+        evidence: &[(ConfirmedTime, Vec<u8>); 2],
+        projection: &VerifiedAccount,
+    ) -> Result<(), JournalError> {
+        let corrupt = |_| JournalError::Corrupt;
+        if projection.id() != anchor
+            || projection.head() != setup_head
+            || projection.confirmed_time(1).map_err(corrupt)?.is_some()
+        {
+            return Err(JournalError::Corrupt);
+        }
+        let mut rows = Vec::with_capacity(2);
+        for (position, (original, (time, bytes))) in (2..).zip(originals.iter().zip(evidence)) {
+            if !projection
+                .verified_event_at(position, original)
+                .map_err(corrupt)?
+                || projection.confirmed_time(position).map_err(corrupt)? != Some(*time)
+            {
+                return Err(JournalError::Corrupt);
+            }
+            rows.push(bh_storage::ConfirmationRow {
+                position,
+                earliest_ms: time.earliest_ms,
+                latest_ms: time.latest_ms,
+                bytes: bytes.clone(),
+            });
+        }
+        let rows: [_; 2] = rows.try_into().map_err(|_| JournalError::Corrupt)?;
+        let mut database = self.database()?;
+        // Ephemeral journals replay originals instead of persisting an index.
+        let delta = database.read_pool().map(|_| projection.delta());
+        database
+            .attach_setup_confirmations(
+                anchor.0,
+                (setup_head.position, setup_head.hash),
+                originals,
+                &rows,
                 delta.as_ref(),
             )
-            .map_err(|_| JournalError::Storage);
-        fence(result.is_ok());
-        result
+            .map_err(|error| match error {
+                StoreError::AuthorityChanged
+                | StoreError::CorruptAccount
+                | StoreError::CorruptSecurity => JournalError::Corrupt,
+                _ => JournalError::Storage,
+            })
     }
 
     fn device(&self) -> Result<Option<JournaledDevice>, JournalError> {
@@ -532,6 +798,61 @@ impl AccountJournal for DeviceJournal {
             .map_err(|_| JournalError::Storage)
     }
 
+    fn keyring_state(&self) -> Result<KeyringState, JournalError> {
+        let db = self.database()?;
+        let snapshot = db
+            .keyring_snapshot()
+            .map_err(keyring_error)?
+            .ok_or(JournalError::Corrupt)?;
+        // An accepted rotation supersedes the delivery a joined device began with.
+        let accepted = match snapshot.delivery {
+            Some((position, body)) => AcceptedPersonal::Rotated { position, body },
+            None => match db.joined().map_err(|_| JournalError::Storage)? {
+                Some(joined) => match (joined.delivery, joined.added_at) {
+                    (Some(frame), Some(added_at)) => {
+                        AcceptedPersonal::Delivered { added_at, frame }
+                    }
+                    _ => return Err(JournalError::Corrupt),
+                },
+                None => AcceptedPersonal::Initial,
+            },
+        };
+        let rows = snapshot
+            .rows
+            .into_iter()
+            .map(|row| {
+                Ok(KeyringRow {
+                    base: row.base,
+                    key_id: row.epoch_id,
+                    purpose: row.purpose.try_into().map_err(|_| JournalError::Corrupt)?,
+                    seal: row.seal,
+                })
+            })
+            .collect::<Result<_, JournalError>>()?;
+        Ok(KeyringState {
+            head: Head {
+                position: snapshot.head.0,
+                hash: snapshot.head.1,
+            },
+            accepted,
+            rows,
+        })
+    }
+
+    fn commit_accepted_rotation(
+        &mut self,
+        expected: &KeyringState,
+        position: u64,
+        body: &[u8],
+        rows: &[KeyringRow],
+        current: impl Fn() -> bool,
+    ) -> Result<(), JournalError> {
+        let rows: Vec<_> = rows.iter().map(epoch_row).collect();
+        self.database()?
+            .accept_personal_delivery(&snapshot(expected), position, body, &rows, current)
+            .map_err(keyring_error)
+    }
+
     fn staged_admission(&self) -> Result<Option<StagedAdmission>, JournalError> {
         self.database()?
             .staged_admission()
@@ -557,6 +878,57 @@ impl AccountJournal for DeviceJournal {
         self.database()?
             .clear_staged_admission(&staged_row(expected))
             .map_err(staged_error)
+    }
+
+    fn staged_control(&self) -> Result<Option<StagedControl>, JournalError> {
+        let Some(row) = self
+            .database()?
+            .staged_account_control()
+            .map_err(control_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(StagedControl {
+            kind: u8::try_from(row.kind).map_err(|_| JournalError::Corrupt)?,
+            event: row.event,
+            body: row.body,
+            attachment: row.attachment,
+            sealed_kit: row.sealed_kit,
+        }))
+    }
+
+    fn stage_control(&mut self, row: &StagedControl) -> Result<(), JournalError> {
+        self.database()?
+            .stage_account_control(&control_row(row))
+            .map_err(control_error)
+    }
+
+    fn clear_staged_control(&mut self, expected: &StagedControl) -> Result<(), JournalError> {
+        self.database()?
+            .clear_staged_account_control(&control_row(expected))
+            .map_err(control_error)
+    }
+
+    fn clear_staged_kit(&mut self, expected: &StagedControl) -> Result<(), JournalError> {
+        self.database()?
+            .clear_staged_kit(&control_row(expected))
+            .map_err(control_error)
+    }
+
+    fn directory_version(&self, entry: [u8; 32]) -> Result<Option<u64>, JournalError> {
+        self.database()?
+            .directory_version(entry)
+            .map_err(control_error)
+    }
+
+    fn remember_directory_version(
+        &mut self,
+        entry: [u8; 32],
+        version: u64,
+    ) -> Result<bool, JournalError> {
+        self.database()?
+            .remember_directory_version(entry, version)
+            .map_err(control_error)
     }
 }
 

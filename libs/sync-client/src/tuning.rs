@@ -50,4 +50,14 @@ pub struct Tuning {
     /// history), awaited before the commit: a stand-in for storage sync
     /// time under a paused test clock. Zero, and never awaited, in use.
     pub commit_delay: Duration,
+    /// How long `verify` waits before retrying a retryable admission check.
+    /// `None` is the shipped backoff; a test that exercises the retry path
+    /// sets a short wait there, so only the wall-clock wait changes, never
+    /// the decision to retry.
+    pub verify_retry: Option<Duration>,
+    /// How far behind its own position a staged control's seen claim may
+    /// be. `None` is the services' rule (`copier::SEEN_WINDOW`); a test sets
+    /// a small one to reach it without thousands of events, never another
+    /// decision.
+    pub seen_window: Option<u64>,
 }

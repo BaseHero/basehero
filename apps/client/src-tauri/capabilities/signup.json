@@ -10,11 +10,11 @@
     "allow-account-create",
     "allow-account-confirm-kit",
     "allow-account-return",
-    "allow-account-print-kit",
-    "allow-account-email-kit",
-    "allow-account-save-kit-file",
     "allow-account-open-note",
     "allow-pairing-join",
-    "allow-pairing-join-status"
+    "allow-pairing-join-status",
+    "allow-account-recover",
+    "allow-account-check-code",
+    "allow-account-recovery-status"
   ]
 }

@@ -12,15 +12,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crypto::SecretBytes;
 use crate::history::{
-    AccountId, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, VerifiedAccount,
+    AccountId, Control, DeviceId, DevicePublicKeys, Error, Head, SigningRequest, VerifiedAccount,
 };
 use crate::journal::{
-    AccountJournal, HistoryCursor, JournalError, JournaledDevice, PENDING_SETUP_VERSION,
-    PendingSetupProtector, PendingSetupRecord, ProtectorError, SetupStage, StagedAdmission,
+    AcceptedPersonal, AccountJournal, HistoryCursor, JournalError, JournaledDevice,
+    JournaledProjection, KeyringRow, PENDING_SETUP_VERSION, PendingSetupProtector,
+    PendingSetupRecord, ProtectorError, SetupStage, StagedAdmission,
 };
 use crate::platform::{DeviceKeyStore, KeyStoreError, StoredDevice};
-use crate::recovery::{Password, RecoveryCode, RecoveryKeys, prepare_record};
-use crate::{AccountEvent, device_auth, personal};
+use crate::recovery::{
+    PASSWORD_CHECK_SIZE, Password, PasswordCheck, RecoveryCode, RecoveryKeys, make_password_check,
+    prepare_record,
+};
+use crate::{AccountEvent, device_auth, local_seal, personal};
+
+pub mod staging;
 
 const PENDING_MAGIC: &[u8; 8] = b"BHPEND01";
 const MAX_BLOB_PART: usize = 1 << 20;
@@ -224,6 +230,42 @@ struct Loaded {
     stopped: bool,
 }
 
+/// Why one loaded projection did not reach its verified target.
+enum CatchUp {
+    /// A newer generation owns this journal; nothing was adopted.
+    Stale,
+    /// Local evidence could not answer now; the same view may be retried.
+    Unavailable,
+    /// The durable target is not the caller's required head.
+    Moved,
+    /// A candidate for the target was contradicted by verified evidence.
+    CorruptHistory,
+    /// The journal could not read or record the projection.
+    Journal(JournalError),
+}
+
+/// How staging reports a projection that could not be refreshed. Only local
+/// evidence that could not answer, or a transient journal failure while
+/// repairing it, is retryable; a moved head, damaged history or another
+/// account would refuse the same bytes again.
+fn refresh_error(outcome: CatchUp) -> OwnerError {
+    match outcome {
+        CatchUp::Stale => OwnerError::Stale,
+        CatchUp::Unavailable | CatchUp::Journal(JournalError::Storage) => {
+            OwnerError::Invalid(Error::Unavailable)
+        }
+        CatchUp::Moved => OwnerError::Invalid(Error::WrongPredecessor),
+        CatchUp::CorruptHistory => JournalError::Corrupt.into(),
+        CatchUp::Journal(error) => error.into(),
+    }
+}
+
+/// What a device's second key signs as its half of the cosigned event
+/// whose unsigned bytes are `unsigned`, as `CosigningRequest` asks it to.
+pub fn cosigned_device_message(unsigned: &[u8]) -> Vec<u8> {
+    crate::history::cosign_bytes(crate::history::ROLE_DEVICE, unsigned)
+}
+
 pub struct AccountOwner<J, S, P> {
     journal: J,
     store: S,
@@ -281,53 +323,28 @@ where
             }
             Err(e) => return Err(e.into()),
         };
-        let (account, stopped) = if let Some(mut checked) = checked {
-            loop {
-                if self.generation.current() != generation {
-                    return Err(OwnerError::Stale);
+        let (mut account, stopped) = if let Some(checked) = checked {
+            match self.catch_up_projection(checked, generation, None) {
+                Ok(checked) => (checked.account, checked.stopped),
+                Err(CatchUp::Stale) => return Err(OwnerError::Stale),
+                Err(CatchUp::Unavailable) => {
+                    return Err(OwnerError::Invalid(Error::Unavailable));
                 }
-                if checked.account.head() == checked.target {
-                    break;
+                Err(CatchUp::Journal(error)) => return Err(error.into()),
+                Err(CatchUp::CorruptHistory | CatchUp::Moved) => {
+                    self.loaded = None;
+                    self.fence()?;
+                    return Ok(AccountLoad::AdmissionRequired(
+                        AdmissionReason::CorruptHistory,
+                    ));
                 }
-                let cursor = HistoryCursor {
-                    anchor: checked.account.id(),
-                    cut: checked.target,
-                    next_position: checked.account.head().position + 1,
-                };
-                let page = self
-                    .journal
-                    .history_prefix(Some(cursor), 256)?
-                    .ok_or(JournalError::Corrupt)?;
-                let refs: Vec<_> = page.events.iter().map(Vec::as_slice).collect();
-                let candidate = match checked.account.applied_batch(&refs) {
-                    Ok(candidate) => candidate,
-                    Err(Error::Unavailable) => return Err(OwnerError::Invalid(Error::Unavailable)),
-                    Err(_) => {
-                        self.loaded = None;
-                        self.fence()?;
-                        return Ok(AccountLoad::AdmissionRequired(
-                            AdmissionReason::CorruptHistory,
-                        ));
-                    }
-                };
-                if self.generation.current() != generation {
-                    return Err(OwnerError::Stale);
-                }
-                self.journal.advance_projection(&candidate)?;
-                std::thread::yield_now();
-                checked = self
-                    .journal
-                    .load_projection()?
-                    .ok_or(JournalError::Corrupt)?;
             }
-            (checked.account, checked.stopped)
         } else {
             let Some(record) = self.journal.load()? else {
                 self.loaded = None;
                 return Ok(AccountLoad::Uninitialized);
             };
-            let history: Vec<&[u8]> = record.history.iter().map(Vec::as_slice).collect();
-            let account = match VerifiedAccount::replay(record.anchor, &history, record.head) {
+            let account = match self.view_at(record.anchor, record.head, record.head.position) {
                 Ok(account) => account,
                 Err(_) => {
                     self.loaded = None;
@@ -339,6 +356,13 @@ where
             };
             (account, record.stopped)
         };
+
+        // Do not impose an observation made at the target head on older
+        // originals while a damaged/stale projection rebuilds its prefix.
+        // Bind the floor only after verified replay reaches that head.
+        if let Some(floor) = self.journal.observed_account_floor()? {
+            account.remember_observation_floor(floor);
+        }
 
         // A persisted stop stays stopped and keeps the last verified state. It is
         // checked before any device or native work.
@@ -447,6 +471,18 @@ where
     /// commits a sticky stop, keeping the last good head and bytes; anything
     /// else invalid or unreadable is refused or paused with nothing applied.
     pub fn apply_incoming(&mut self, events: &[&[u8]]) -> Result<Head, OwnerError> {
+        let events: Vec<_> = events.iter().map(|bytes| (*bytes, None)).collect();
+        self.apply_incoming_timed(&events)
+    }
+
+    /// Apply originals with caller-verified confirmation bounds and exact proof
+    /// bytes. The caller verifies confirmation signatures and their binding to
+    /// each original; this layer verifies account history and persists evidence.
+    #[allow(clippy::type_complexity)] // Keep each original paired with its exact evidence.
+    pub fn apply_incoming_timed(
+        &mut self,
+        events: &[(&[u8], Option<(crate::trust::ConfirmedTime, Vec<u8>)>)],
+    ) -> Result<Head, OwnerError> {
         let (anchor, device_id) = {
             let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
             if loaded.stopped {
@@ -462,32 +498,76 @@ where
         if events.is_empty() {
             return Ok(last_head);
         }
-        let candidate = self
-            .loaded
-            .as_ref()
-            .expect("checked")
-            .account
-            .clone()
-            .applied_batch(events);
+        // Setup may still receive the home's times; nothing builds on it first.
+        if last_head.position.saturating_add(events.len() as u64) > 3
+            && self.journal.pending_setup()?.is_some()
+        {
+            return Err(OwnerError::Invalid(Error::Unavailable));
+        }
+        if events
+            .iter()
+            .any(|(_, evidence)| evidence.as_ref().is_some_and(|(_, proof)| proof.is_empty()))
+        {
+            return Err(OwnerError::Refused(Error::MissingTime));
+        }
+        let timed: Vec<_> = events
+            .iter()
+            .map(|(bytes, evidence)| (*bytes, evidence.as_ref().map(|(time, _)| *time)))
+            .collect();
+        let originals: Vec<_> = events.iter().map(|(bytes, _)| *bytes).collect();
+        let evidence: Vec<_> = events
+            .iter()
+            .map(|(_, evidence)| evidence.clone())
+            .collect();
+        let candidate = (|| {
+            let mut candidate = self.loaded.as_ref().expect("checked").account.clone();
+            let mut alerts = Vec::new();
+            for (original, time) in &timed {
+                if let Some(own) = device_id {
+                    alerts.extend(crate::alerts::apply(&mut candidate, original, *time, own)?);
+                } else {
+                    candidate.apply_timed(original, *time)?;
+                }
+            }
+            Ok::<_, Error>((candidate, alerts))
+        })();
         match candidate {
-            Ok(candidate) => {
+            Ok((candidate, alerts)) => {
                 let head = candidate.head();
                 let removed = device_id
                     .map(|id| candidate.active_device(id).is_err())
                     .unwrap_or(false);
-                if let Err(error) = self.journal.commit_projected_fenced(
+                if let Err(error) = self.journal.commit_timed_alerted_fenced(
                     anchor,
-                    events,
+                    &originals,
+                    &evidence,
                     head,
                     false,
                     Some(&candidate),
+                    &alerts,
                     |success| {
                         if !success || removed {
                             self.generation.advance();
                         }
                     },
                 ) {
+                    if error == JournalError::MissingTime {
+                        return Err(OwnerError::Refused(Error::MissingTime));
+                    }
                     self.loaded.as_mut().expect("checked").stopped = true;
+                    if error == JournalError::TimeRegressed {
+                        self.journal.commit_projected_fenced(
+                            anchor,
+                            &[],
+                            last_head,
+                            true,
+                            None,
+                            |_| {
+                                self.generation.advance();
+                            },
+                        )?;
+                        return Err(OwnerError::Invalid(Error::TimeRegressed));
+                    }
                     return Err(error.into());
                 }
                 match self.journal.rebase_projection(candidate) {
@@ -505,7 +585,9 @@ where
             Err(error @ (Error::UnsupportedVersion | Error::UnsupportedControl)) => {
                 Err(OwnerError::Unsupported(error))
             }
-            Err(error) if error != Error::Fork => Err(OwnerError::Refused(error)),
+            Err(error) if !matches!(error, Error::Fork | Error::TimeRegressed) => {
+                Err(OwnerError::Refused(error))
+            }
             Err(error) => {
                 // Stop the session before the durable write: a storage failure
                 // must not leave this owner active with usable capabilities.
@@ -519,6 +601,43 @@ where
                 Err(OwnerError::Invalid(error))
             }
         }
+    }
+
+    /// Record deadlines established by a caller-verified fresh accepted-head
+    /// observation, even when no new account entry was ordered. `time` must be
+    /// the accepted head's verified lower/upper bounds, never the device clock
+    /// or server prose. The matching head prevents stale observations.
+    pub fn observe_accepted_alerts(
+        &mut self,
+        capability: &AccountCapability,
+        head: Head,
+        time: crate::trust::ConfirmedTime,
+    ) -> Result<(), OwnerError> {
+        let state = self.verified(capability)?;
+        if state.head() != head
+            || time.latest_ms < time.earliest_ms
+            || state
+                .confirmed_time(head.position)
+                .map_err(OwnerError::Invalid)?
+                .is_some_and(|last| {
+                    time.earliest_ms < last.earliest_ms || time.latest_ms < last.latest_ms
+                })
+        {
+            return Err(OwnerError::Invalid(Error::Unavailable));
+        }
+        let pending = state.pending_removals(0);
+        let alerts =
+            crate::alerts::deadlines(&pending, state, capability.device_id(), time.earliest_ms)
+                .map_err(OwnerError::Invalid)?;
+        self.journal
+            .record_observed_alerts(state.id(), head, time.earliest_ms, &alerts)?;
+        self.loaded
+            .as_mut()
+            .expect("checked")
+            .account
+            .remember_observation_floor(time.earliest_ms);
+        self.check(capability)?;
+        Ok(())
     }
 
     /// Borrow only checked native identity, never exposing it to the WebView.
@@ -572,6 +691,112 @@ where
         result.map_err(OwnerError::Invalid)
     }
 
+    /// Advance one loaded projection to its durable target, adopting only what
+    /// the journal verified. A required `expected` target (staging) also fences
+    /// a head that moved while the caller prepared; `activate` follows the
+    /// target it reads each round and passes `None`.
+    fn catch_up_projection(
+        &mut self,
+        mut checked: JournaledProjection,
+        generation: u64,
+        expected: Option<Head>,
+    ) -> Result<JournaledProjection, CatchUp> {
+        loop {
+            if self.generation.current() != generation {
+                return Err(CatchUp::Stale);
+            }
+            if expected.is_some_and(|expected| checked.target != expected) {
+                return Err(CatchUp::Moved);
+            }
+            if checked.account.head() == checked.target {
+                return Ok(checked);
+            }
+            let cursor = HistoryCursor {
+                anchor: checked.account.id(),
+                cut: checked.target,
+                next_position: checked.account.head().position + 1,
+            };
+            let Some(page) = self
+                .journal
+                .history_prefix(Some(cursor), 256)
+                .map_err(CatchUp::Journal)?
+            else {
+                return Err(CatchUp::Journal(JournalError::Corrupt));
+            };
+            if page.times.len() != page.events.len() {
+                return Err(CatchUp::Journal(JournalError::Corrupt));
+            }
+            let timed: Vec<_> = page
+                .events
+                .iter()
+                .zip(&page.times)
+                .map(|(bytes, time)| (bytes.as_slice(), *time))
+                .collect();
+            let candidate = match checked.account.applied_batch_timed(&timed) {
+                Ok(candidate) => candidate,
+                Err(Error::Unavailable) => return Err(CatchUp::Unavailable),
+                Err(_) => return Err(CatchUp::CorruptHistory),
+            };
+            if self.generation.current() != generation {
+                return Err(CatchUp::Stale);
+            }
+            self.journal
+                .advance_projection(&candidate)
+                .map_err(CatchUp::Journal)?;
+            std::thread::yield_now();
+            let Some(next) = self.journal.load_projection().map_err(CatchUp::Journal)? else {
+                return Err(CatchUp::Journal(JournalError::Corrupt));
+            };
+            checked = next;
+        }
+    }
+
+    /// Re-read the durable projection after the loaded view's local index
+    /// stopped answering, or once another process committed history past
+    /// it. It replaces the loaded view only when the durable
+    /// target is still `expected`, the verified head the request was prepared
+    /// at, keeping the accepted-head observation floor. A moved head or another
+    /// account refuses without retry; damaged history refuses; a transient
+    /// journal failure to complete the repair reports unavailability.
+    pub fn re_read_projection(&mut self, expected: Head) -> Result<(), OwnerError> {
+        let generation = self.generation.current();
+        let (anchor, floor) = {
+            let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
+            (
+                loaded.account.id(),
+                loaded.account.timeline.observed_earliest_ms,
+            )
+        };
+        let Some(checked) = self
+            .journal
+            .load_projection()
+            .map_err(|error| refresh_error(CatchUp::Journal(error)))?
+        else {
+            return Err(JournalError::Corrupt.into());
+        };
+        if checked.account.id() != anchor {
+            return Err(OwnerError::Stale);
+        }
+        let mut checked = self
+            .catch_up_projection(checked, generation, Some(expected))
+            .map_err(refresh_error)?;
+        // A rebuild must not drop an observation made at the target head.
+        if let Some(floor) = self
+            .journal
+            .observed_account_floor()
+            .map_err(|error| refresh_error(CatchUp::Journal(error)))?
+        {
+            checked.account.remember_observation_floor(floor);
+        }
+        if let Some(floor) = floor {
+            checked.account.remember_observation_floor(floor);
+        }
+        let loaded = self.loaded.as_mut().ok_or(OwnerError::NotActive)?;
+        loaded.stopped = checked.stopped;
+        loaded.account = checked.account;
+        Ok(())
+    }
+
     /// Stage one exact signed add before network submission. This is called by
     /// the live pairing session only after its request and signature match.
     pub fn stage_signed_admission(
@@ -582,7 +807,19 @@ where
         delivery: &[u8],
     ) -> Result<(), OwnerError> {
         self.check(capability)?;
-        let request = self.prepare_add_device(capability, recipient.clone())?;
+        let head = self.loaded.as_ref().expect("checked").account.head();
+        let request = match self.prepare_add_device(capability, recipient.clone()) {
+            Ok(request) => request,
+            // A projection rewrite may leave the loaded view's index at an
+            // older epoch over the same verified head while the approval is
+            // signed and sealed. Re-read it once: the unchanged head still
+            // decides that this request applies; a moved head refuses.
+            Err(OwnerError::Invalid(Error::Unavailable)) => {
+                self.re_read_projection(head)?;
+                self.prepare_add_device(capability, recipient.clone())?
+            }
+            Err(error) => return Err(error),
+        };
         if signed.len() != request.signing_bytes().len() + 64
             || !signed.starts_with(request.signing_bytes())
             || delivery.is_empty()
@@ -722,6 +959,46 @@ where
         Ok(event)
     }
 
+    /// Complete a removal-now through the native store: `recovery` is the
+    /// recovery key's half, checked before anything is asked of the person;
+    /// this device's second key then signs its half, under the same
+    /// confirmation and generation checks as [`Self::sign_control`].
+    pub async fn sign_cosigned(
+        &mut self,
+        capability: &AccountCapability,
+        request: &crate::CosigningRequest,
+        recovery: [u8; 64],
+    ) -> Result<AccountEvent, OwnerError> {
+        self.check(capability)?;
+        crate::crypto::verify(
+            request.recovery_key(),
+            &request.recovery_signing_bytes(),
+            &recovery,
+        )
+        .map_err(|_| OwnerError::Invalid(Error::BadSignature))?;
+        let device = self
+            .loaded
+            .as_ref()
+            .and_then(|loaded| loaded.device.clone())
+            .ok_or(OwnerError::NotActive)?;
+        if device.keys.control() != request.device_key() {
+            return Err(OwnerError::Device(KeyStoreError::WrongKey));
+        }
+        self.store
+            .load_matching(&device)
+            .await
+            .map_err(OwnerError::Device)?;
+        let signature = self
+            .store
+            .sign_control(device.handle.clone(), request.device_signing_bytes())
+            .await
+            .map_err(OwnerError::Device)?;
+        self.check(capability)?;
+        request
+            .finish(signature, recovery)
+            .map_err(OwnerError::Invalid)
+    }
+
     /// Complete a base control (such as the base copy of an account change)
     /// with the native second key, under the same confirmation and generation
     /// checks as [`Self::sign_control`]. Only base-event originals are
@@ -849,6 +1126,82 @@ where
         self.view_at(current.id(), head, position)
     }
 
+    /// After activation found this device no longer active in its own
+    /// verified history: its id and the newest view of that history in which
+    /// it still was. `None` while it is active, if it never was, or if no
+    /// such history is loaded. Grants no authority; only a starting point
+    /// from which public evidence of the removal can be checked.
+    pub fn last_member_view(&self) -> Result<Option<(DeviceId, VerifiedAccount)>, OwnerError> {
+        let Some(Loaded {
+            account,
+            device: Some(device),
+            stopped: false,
+        }) = self.loaded.as_ref()
+        else {
+            return Ok(None);
+        };
+        let id = device.keys.id();
+        if account.active_device(id).is_ok() {
+            return Ok(None);
+        }
+        let (anchor, head) = (account.id(), account.head());
+        let mut cursor = Some(HistoryCursor {
+            anchor,
+            cut: head,
+            next_position: 1,
+        });
+        let (mut events, mut times) = (Vec::new(), Vec::new());
+        while let Some(next) = cursor {
+            let page = self
+                .journal
+                .history_prefix(Some(next), 256)?
+                .ok_or(JournalError::Corrupt)?;
+            if page.times.len() != page.events.len() {
+                return Err(JournalError::Corrupt.into());
+            }
+            times.extend(page.times);
+            events.extend(page.events);
+            cursor = page.next;
+        }
+        if events.len() as u64 != head.position {
+            return Err(JournalError::Corrupt.into());
+        }
+        let timed: Vec<_> = events
+            .iter()
+            .zip(times)
+            .map(|(bytes, time)| (bytes.as_slice(), time))
+            .collect();
+        let prefix = |len: usize| {
+            VerifiedAccount::replay_timed(
+                anchor,
+                &timed[..len],
+                Head {
+                    position: len as u64,
+                    hash: crate::crypto::hash(timed[len - 1].0),
+                },
+            )
+            .map_err(OwnerError::Invalid)
+        };
+        // One replay, entry by entry, to the last entry it was a member at.
+        let mut view = prefix(1)?;
+        let mut member = view.active_device(id).is_ok().then_some(1);
+        for (index, entry) in timed.iter().enumerate().skip(1) {
+            view = view
+                .applied_batch_timed_with_outcomes(std::slice::from_ref(entry))
+                .map_err(OwnerError::Invalid)?
+                .0;
+            if view.active_device(id).is_ok() {
+                member = Some(index + 1);
+            }
+        }
+        if view.head() != head {
+            return Err(JournalError::Corrupt.into());
+        }
+        member
+            .map(|len| prefix(len).map(|view| (id, view)))
+            .transpose()
+    }
+
     // ---- A device joining by QR ----
 
     /// Prove possession of this device's journaled ordinary key at `head` of
@@ -918,6 +1271,102 @@ where
         Ok(view.head())
     }
 
+    /// `adopt_joined` for history read from the network: each original after
+    /// the genesis carries the caller-verified confirmed time and exact proof
+    /// bytes, committed with it from the first commit. A missing proof
+    /// refuses with nothing kept. A journal that already holds this account
+    /// (an interrupted earlier admission) is kept as it is, only if it holds
+    /// these originals with these times; one committed without them, or with
+    /// others, is `Stale`, and nothing is overwritten.
+    #[allow(clippy::type_complexity)] // Keep each original paired with its exact evidence.
+    pub fn adopt_joined_timed(
+        &mut self,
+        anchor: AccountId,
+        history: &[(&[u8], Option<(crate::trust::ConfirmedTime, Vec<u8>)>)],
+    ) -> Result<Head, OwnerError> {
+        let identity = self.journal.device()?.ok_or(OwnerError::NotActive)?;
+        let ((genesis, untimed), rest) = history
+            .split_first()
+            .ok_or(OwnerError::Invalid(Error::TruncatedHistory))?;
+        if untimed.is_some() {
+            return Err(OwnerError::Invalid(Error::Malformed));
+        }
+        if rest
+            .iter()
+            .any(|(_, evidence)| evidence.as_ref().is_none_or(|(_, proof)| proof.is_empty()))
+        {
+            return Err(OwnerError::Refused(Error::MissingTime));
+        }
+        if let Some(stored) = self.journal.load()? {
+            if stored.anchor != anchor || !self.holds_timed(&stored, history)? {
+                return Err(OwnerError::Stale);
+            }
+            return Ok(stored.head);
+        }
+        let mut view =
+            VerifiedAccount::from_genesis(anchor, genesis).map_err(OwnerError::Invalid)?;
+        for (original, evidence) in rest {
+            view.apply_timed(original, evidence.as_ref().map(|(time, _)| *time))
+                .map_err(OwnerError::Invalid)?;
+        }
+        if view
+            .active_device(identity.keys.id())
+            .map_err(OwnerError::Invalid)?
+            != &identity.keys
+        {
+            return Err(OwnerError::Invalid(Error::NotActive));
+        }
+        let originals: Vec<_> = history.iter().map(|(original, _)| *original).collect();
+        let evidence: Vec<_> = history
+            .iter()
+            .map(|(_, evidence)| evidence.clone())
+            .collect();
+        self.journal.commit_timed_fenced(
+            anchor,
+            &originals,
+            &evidence,
+            view.head(),
+            false,
+            Some(&view),
+            |_| {},
+        )?;
+        Ok(view.head())
+    }
+
+    /// Whether the journal holds `history`'s originals, each with its time,
+    /// as far as both reach.
+    #[allow(clippy::type_complexity)]
+    fn holds_timed(
+        &self,
+        stored: &crate::journal::JournaledAccount,
+        history: &[(&[u8], Option<(crate::trust::ConfirmedTime, Vec<u8>)>)],
+    ) -> Result<bool, OwnerError> {
+        let mut cursor = Some(HistoryCursor {
+            anchor: stored.anchor,
+            cut: stored.head,
+            next_position: 1,
+        });
+        let mut offered = history.iter();
+        while let Some(next) = cursor {
+            let page = self
+                .journal
+                .history_prefix(Some(next), 256)?
+                .ok_or(JournalError::Corrupt)?;
+            for (event, time) in page.events.iter().zip(&page.times) {
+                let Some((original, evidence)) = offered.next() else {
+                    return Ok(true);
+                };
+                if event.as_slice() != *original
+                    || *time != evidence.as_ref().map(|(time, _)| *time)
+                {
+                    return Ok(false);
+                }
+            }
+            cursor = page.next;
+        }
+        Ok(true)
+    }
+
     /// Open the personal key delivered to this device by the addition at
     /// `added_at`: the exact signed delivery frame that addition carried,
     /// checked against the verified account at that position before the
@@ -952,6 +1401,7 @@ where
             next_position: 1,
         });
         let mut events = Vec::new();
+        let mut times = Vec::new();
         while let Some(next) = cursor
             && (events.len() as u64) < position
         {
@@ -959,15 +1409,30 @@ where
                 .journal
                 .history_prefix(Some(next), 256)?
                 .ok_or(JournalError::Corrupt)?;
+            if page.times.len() != page.events.len() {
+                return Err(JournalError::Corrupt.into());
+            }
+            times.extend(page.times);
             events.extend(page.events);
             cursor = page.next;
         }
         events.truncate(position as usize);
-        let (genesis, rest) = events.split_first().ok_or(JournalError::Corrupt)?;
-        let mut view =
-            VerifiedAccount::from_genesis(anchor, genesis).map_err(OwnerError::Invalid)?;
-        let rest: Vec<&[u8]> = rest.iter().map(Vec::as_slice).collect();
-        view.apply_batch(&rest).map_err(OwnerError::Invalid)?;
+        let last = events.last().ok_or(JournalError::Corrupt)?;
+        let remembered = if position == head.position {
+            head
+        } else {
+            Head {
+                position,
+                hash: crate::crypto::hash(last),
+            }
+        };
+        let timed: Vec<_> = events
+            .iter()
+            .zip(times)
+            .map(|(bytes, time)| (bytes.as_slice(), time))
+            .collect();
+        let view = VerifiedAccount::replay_timed(anchor, &timed, remembered)
+            .map_err(OwnerError::Invalid)?;
         if view.head().position != position {
             return Err(OwnerError::Journal(JournalError::Corrupt));
         }
@@ -1082,6 +1547,190 @@ where
         result.map_err(OwnerError::Invalid)
     }
 
+    /// The personal key this device accepted: its initial seal, the delivery
+    /// its addition carried, or its latest accepted rotation, each opened at
+    /// its own verified position. A newer publication this device has not
+    /// accepted, or a staged proposal, is never returned.
+    pub async fn open_current_personal(
+        &mut self,
+        capability: &AccountCapability,
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        self.check(capability)?;
+        let accepted = self.journal.keyring_state()?.accepted;
+        self.open_accepted(capability, &accepted).await
+    }
+
+    /// Accept the RotatePersonal at `position`: open this device's seal from
+    /// its ordered `body`, then switch the accepted key and re-seal every local
+    /// keyring row to it in one commit. Native work holds no database writer;
+    /// the commit compares the head, accepted key and rows read before it, so
+    /// a concurrent change is `KeyringChanged` (retry), never overwritten.
+    /// A held base without keyring rows is `KeyringIncomplete` until its
+    /// keyring is initialized. Repeating the accepted rotation is idempotent.
+    pub async fn accept_rotation(
+        &mut self,
+        capability: &AccountCapability,
+        position: u64,
+        body: &[u8],
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        let mut head = self.verified(capability)?.head();
+        let mut state = self.journal.keyring_state()?;
+        if state.head.position > head.position {
+            // Another process committed later history: this view lags the
+            // durable head. Catch it up to that head before judging, or
+            // every retry would find the keyring changed again.
+            // A head that moved on again meanwhile is the same retry.
+            self.re_read_projection(state.head)
+                .map_err(|error| match error {
+                    OwnerError::Invalid(Error::WrongPredecessor) => {
+                        OwnerError::Journal(JournalError::KeyringChanged)
+                    }
+                    other => other,
+                })?;
+            head = self.verified(capability)?.head();
+            state = self.journal.keyring_state()?;
+        }
+        if state.head != head {
+            return Err(OwnerError::Journal(JournalError::KeyringChanged));
+        }
+        match &state.accepted {
+            AcceptedPersonal::Rotated {
+                position: p,
+                body: b,
+            } if *p == position => {
+                if b.as_slice() != body {
+                    return Err(OwnerError::Invalid(Error::InvalidCredentials));
+                }
+                return self.open_accepted(capability, &state.accepted).await;
+            }
+            AcceptedPersonal::Rotated { position: p, .. }
+            | AcceptedPersonal::Delivered { added_at: p, .. }
+                if *p > position =>
+            {
+                return Err(OwnerError::Invalid(Error::InvalidCredentials));
+            }
+            _ => {}
+        }
+        let view = self.rotation_at(capability, position)?;
+        let old = self.open_accepted(capability, &state.accepted).await?;
+        let new = self.open_rotation(capability, &view, body).await?;
+        let account = capability.account_id();
+        let rows = state
+            .rows
+            .iter()
+            .map(|row| {
+                let context = local_seal::LocalKeyContext {
+                    account,
+                    base: row.base,
+                    purpose: row.purpose,
+                    key_id: row.key_id,
+                };
+                let root = local_seal::open(&context, &old, &row.seal)
+                    .map_err(|_| OwnerError::Journal(JournalError::Corrupt))?;
+                Ok(KeyringRow {
+                    seal: local_seal::seal(&context, &new.public(), &root)
+                        .map_err(OwnerError::Invalid)?,
+                    ..row.clone()
+                })
+            })
+            .collect::<Result<Vec<_>, OwnerError>>()?;
+        self.check(capability)?;
+        let committed =
+            self.journal
+                .commit_accepted_rotation(&state, position, body, &rows, || {
+                    capability.is_current()
+                });
+        self.check(capability)?;
+        committed?;
+        Ok(new)
+    }
+
+    async fn open_accepted(
+        &mut self,
+        capability: &AccountCapability,
+        accepted: &AcceptedPersonal,
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        match accepted {
+            AcceptedPersonal::Initial => self.open_personal(capability).await,
+            AcceptedPersonal::Delivered { added_at, frame } => {
+                self.open_delivered_personal(capability, frame, *added_at)
+                    .await
+            }
+            AcceptedPersonal::Rotated { position, body } => {
+                // An accepted body matching the current verified publication can
+                // open against its indexed view, without replaying old history on
+                // every reopen. A newer, unaccepted publication needs the old
+                // historical view instead; never substitute its key for this one.
+                let current = self.verified(capability)?;
+                let view = if *current
+                    .personal_publication()
+                    .map_err(OwnerError::Invalid)?
+                    .device_digest()
+                    == personal::body_digest(body)
+                {
+                    current.clone()
+                } else {
+                    self.rotation_at(capability, *position)?
+                };
+                self.open_rotation(capability, &view, body).await
+            }
+        }
+    }
+
+    /// The verified account at `position`, only where the original there is a
+    /// RotatePersonal whose publication that history holds: a rotation that
+    /// took effect, not merely a signed event with the rotation tag.
+    fn rotation_at(
+        &self,
+        capability: &AccountCapability,
+        position: u64,
+    ) -> Result<VerifiedAccount, OwnerError> {
+        let view = self.verified_at(capability, position)?;
+        let page = self
+            .journal
+            .history_prefix(
+                Some(HistoryCursor {
+                    anchor: view.id(),
+                    cut: self.verified(capability)?.head(),
+                    next_position: position,
+                }),
+                1,
+            )?
+            .ok_or(JournalError::Corrupt)?;
+        let original = page.events.first().ok_or(JournalError::Corrupt)?;
+        if page.first_position != position || crate::crypto::hash(original) != view.head().hash {
+            return Err(JournalError::Corrupt.into());
+        }
+        let event = AccountEvent::decode(original).map_err(OwnerError::Invalid)?;
+        let Control::RotatePersonal { publication, .. } = &event.control else {
+            return Err(OwnerError::Invalid(Error::InvalidCredentials));
+        };
+        let held = view.personal_publication().map_err(OwnerError::Invalid)?;
+        if publication.public() != held.public()
+            || publication.device_digest() != held.device_digest()
+            || publication.recovery_digest() != held.recovery_digest()
+        {
+            return Err(OwnerError::Invalid(Error::InvalidCredentials));
+        }
+        Ok(view)
+    }
+
+    async fn open_rotation(
+        &mut self,
+        capability: &AccountCapability,
+        view: &VerifiedAccount,
+        body: &[u8],
+    ) -> Result<personal::PersonalKey, OwnerError> {
+        let device = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.device.clone())
+            .ok_or(OwnerError::NotActive)?;
+        let result = personal::open_rotation_for_device(view, body, &device, &mut self.store).await;
+        self.check(capability)?;
+        result.map_err(OwnerError::Invalid)
+    }
+
     fn check(&self, capability: &AccountCapability) -> Result<(), OwnerError> {
         let loaded = self.loaded.as_ref().ok_or(OwnerError::NotActive)?;
         if loaded.stopped {
@@ -1137,6 +1786,9 @@ where
 
         let record =
             prepare_record(&account, &recovery, password, &code).map_err(SetupError::Protocol)?;
+        // The device-local check of the chosen password, for a later change
+        // of password; kept with the pending setup until it is published.
+        let password_check = make_password_check(password).map_err(SetupError::Protocol)?;
         let record_event = account
             .prepare_recovery_record(device.keys.id(), record.digest())
             .map_err(SetupError::Protocol)?
@@ -1178,6 +1830,7 @@ where
             record: record.as_bytes().to_vec(),
             device_seal: publication.device_seal().to_vec(),
             recovery_seal: publication.recovery_seal().to_vec(),
+            password_check: Some(password_check),
         };
         let plaintext = material.encode();
         let blob = self.protector.seal(plaintext.expose())?;
@@ -1222,6 +1875,22 @@ where
         Ok(RecoveryCode::from_raw(material.code.expose()))
     }
 
+    /// The password check signup made, while the pending setup still holds
+    /// it, and the digest of the recovery record it belongs with. `None` for
+    /// a setup made before signup kept one, or once setup completed.
+    pub fn pending_password_check(
+        &mut self,
+    ) -> Result<Option<(PasswordCheck, [u8; 32])>, SetupError> {
+        let Some(record) = self.journal.pending_setup()? else {
+            return Ok(None);
+        };
+        let material = self.open_material(&record)?;
+        let digest = crate::recovery::record_checks(&material.record)
+            .map_err(SetupError::Protocol)?
+            .digest;
+        Ok(material.password_check.map(|check| (check, digest)))
+    }
+
     /// Encrypted private objects the account home must receive during setup: the
     /// recovery record and the two personal-key seals. This is not authority and
     /// not a verified head.
@@ -1259,7 +1928,16 @@ where
     /// originals survive deletion of the disposable pending blob. Only an exact head
     /// match commits verified history, and bytes already stored are not appended
     /// again, so a retry is idempotent.
-    pub fn confirm_home_ordered(&mut self, reported: Head) -> Result<(), SetupError> {
+    ///
+    /// `setup_evidence` is the home's caller-verified confirmations of positions
+    /// 2 and 3; `None` only for a verified legacy home head. Setup committed
+    /// untimed by an offline kit save receives these times once, so this
+    /// device judges maturity exactly as the home does.
+    pub fn confirm_home_ordered(
+        &mut self,
+        reported: Head,
+        setup_evidence: Option<[(crate::trust::ConfirmedTime, Vec<u8>); 2]>,
+    ) -> Result<(), SetupError> {
         let Some(record) = self.journal.pending_setup()? else {
             return Err(SetupError::NotStarted);
         };
@@ -1268,8 +1946,12 @@ where
         if head != reported {
             return Err(SetupError::HomeMismatch);
         }
-        if !self.local_history_committed(&material)? {
-            self.commit_local_history(&material, head)?;
+        match &setup_evidence {
+            Some(evidence) => self.commit_setup_times(&material, head, evidence)?,
+            None if !self.local_history_committed(&material)? => {
+                self.commit_local_history(&material, head)?;
+            }
+            None => {}
         }
         if record.kit_saved {
             self.protector.retire_kit_key(&record.blob)?;
@@ -1358,6 +2040,66 @@ where
         };
         authenticate_initial_objects(&account, &row).map_err(SetupError::Protocol)?;
         self.journal.retain_initial_bootstrap(&row, clear_pending)?;
+        Ok(())
+    }
+
+    /// Commit the setup prefix with the home's times, or attach them to the
+    /// prefix an offline kit save committed untimed. Stored times are final.
+    fn commit_setup_times(
+        &mut self,
+        material: &PendingMaterial,
+        head: Head,
+        evidence: &[(crate::trust::ConfirmedTime, Vec<u8>); 2],
+    ) -> Result<(), SetupError> {
+        let [record, key] = material.controls.as_slice() else {
+            return Err(SetupError::Corrupt);
+        };
+        if evidence.iter().any(|(_, proof)| proof.is_empty()) {
+            return Err(SetupError::Protocol(Error::MissingTime));
+        }
+        let times = [None, Some(evidence[0].0), Some(evidence[1].0)];
+        let events = [material.genesis.as_slice(), record, key];
+        let timed: Vec<_> = events.iter().copied().zip(times).collect();
+        let account = VerifiedAccount::replay_timed(material.anchor, &timed, head)
+            .map_err(SetupError::Protocol)?;
+        if !self.local_history_committed(material)? {
+            let evidence = [None, Some(evidence[0].clone()), Some(evidence[1].clone())];
+            self.journal.commit_timed_fenced(
+                material.anchor,
+                &events,
+                &evidence,
+                head,
+                false,
+                Some(&account),
+                |_| {},
+            )?;
+            return Ok(());
+        }
+        let stored = self
+            .journal
+            .history_prefix(None, 3)?
+            .ok_or(JournalError::Corrupt)?
+            .times;
+        if stored == times {
+            return Ok(());
+        }
+        self.journal.attach_setup_confirmations(
+            material.anchor,
+            head,
+            [record, key],
+            evidence,
+            &account,
+        )?;
+        // Refresh a loaded untimed view; capabilities stay valid.
+        if let Some(loaded) = self.loaded.as_mut() {
+            match self.journal.rebase_projection(account) {
+                Ok(account) => loaded.account = account,
+                Err(error) => {
+                    self.loaded = None;
+                    return Err(error.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1460,6 +2202,9 @@ struct PendingMaterial {
     record: Vec<u8>,
     device_seal: Vec<u8>,
     recovery_seal: Vec<u8>,
+    /// Absent in a setup sealed before signup made one. Appended last, so
+    /// an older reader of a newer blob ignores it.
+    password_check: Option<PasswordCheck>,
 }
 
 impl PendingMaterial {
@@ -1477,6 +2222,9 @@ impl PendingMaterial {
         put(&mut out, &self.record);
         put(&mut out, &self.device_seal);
         put(&mut out, &self.recovery_seal);
+        if let Some(check) = &self.password_check {
+            out.extend_from_slice(check.encode().expose());
+        }
         SecretBytes::from_vec(out)
     }
 
@@ -1499,14 +2247,25 @@ impl PendingMaterial {
             controls.push(reader.blob()?.to_vec());
         }
         let code = RecoveryCode::from_raw(&reader.array()?);
+        let record = reader.blob()?.to_vec();
+        let device_seal = reader.blob()?.to_vec();
+        let recovery_seal = reader.blob()?.to_vec();
+        let password_check = match reader.0.len() {
+            0 => None,
+            PASSWORD_CHECK_SIZE => {
+                Some(PasswordCheck::decode(reader.0).map_err(|_| SetupError::Corrupt)?)
+            }
+            _ => return Err(SetupError::Corrupt),
+        };
         Ok(Self {
             anchor,
             genesis,
             controls,
             code,
-            record: reader.blob()?.to_vec(),
-            device_seal: reader.blob()?.to_vec(),
-            recovery_seal: reader.blob()?.to_vec(),
+            record,
+            device_seal,
+            recovery_seal,
+            password_check,
         })
     }
 }

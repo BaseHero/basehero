@@ -130,6 +130,7 @@ impl Stack {
             "app_root": env["LOCAL_STACK_APP_ROOT"],
             "policy": policy.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "policy_signature": std::fs::read_to_string(dir.join("keys/policy.sig")).unwrap().trim(),
+            "recovery_key": env["LOCAL_STACK_RECOVERY_KEY"],
             "max_lifetime_secs": 86400,
             "max_uncertainty_secs": 0,
             "build_floor": 1,

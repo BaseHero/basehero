@@ -3,7 +3,10 @@
 use super::{AccountAuthority, ContainerId, Owner, OwnerError};
 use bh_crypto::random;
 use bh_storage::{DeviceDatabase, OpenError};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn open_error(error: OpenError) -> OwnerError {
     match error {
@@ -34,18 +37,77 @@ impl Owner {
     pub fn create_container(&self, dir: &Path) -> Result<ContainerId, OwnerError> {
         let directory = accounts(dir);
         fs::create_dir_all(&directory).map_err(OwnerError::Io)?;
-        let db = loop {
+        let (db, candidate_path) = loop {
             let name: String = random::<16>()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
             let candidate = directory.join(format!("{name}.sqlite"));
             match DeviceDatabase::create_container(&candidate).map_err(open_error)? {
-                Some(db) => break db,
+                Some(db) => break (db, candidate),
                 None => continue,
             }
         };
-        self.install(db, None, AccountAuthority::Unbound)
+        self.install(db, Some(candidate_path), None, AccountAuthority::Unbound)
+    }
+
+    /// The stable filename stem of container `id` (32 hex digits), the name
+    /// its files keep across restarts. It is not authority: the anchor and
+    /// signed history are.
+    pub fn container_name(&self, id: ContainerId) -> Result<String, OwnerError> {
+        self.container_path(id)?
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+            .ok_or(OwnerError::UnknownContainer)
+    }
+
+    /// Remove container `id`'s files: its database, write-ahead log, shared
+    /// memory and advisory lock. Call only after the account's authority has
+    /// ended and its clients stopped. An already-missing file succeeds, so a
+    /// crash between steps resumes; a real failure keeps the caller's marker.
+    pub fn remove_container(&self, id: ContainerId) -> Result<(), OwnerError> {
+        let path = {
+            // End every route and queued delivery into this container first.
+            self.deauthorize(id)?;
+            self.container_path(id)?
+        };
+        let mut registry = self.registry.lock().expect("owner registry lock");
+        // Dropping the entry releases this process's SQLite and lock handles.
+        let dropped = registry.containers.remove(&id).is_some();
+        registry.windows.retain(|_, route| route.container != id);
+        self.writers
+            .active
+            .lock()
+            .expect("writer leases")
+            .retain(|_, writer| writer.container != id);
+        self.deliveries
+            .lock()
+            .expect("delivery lock")
+            .retain(|_, queue| queue.pending.iter().all(|(container, _)| *container != id));
+        if !dropped {
+            return Ok(());
+        }
+        let files = [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+            path.with_extension("lock"),
+        ];
+        for file in files {
+            match fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(OwnerError::Io(error)),
+            }
+        }
+        // Make the removals durable before the caller clears its marker.
+        if let Some(dir) = path.parent() {
+            fs::File::open(dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(OwnerError::Io)?;
+        }
+        Ok(())
     }
 
     /// Call once per Owner. Each random-named file has its own result: a busy,
@@ -85,7 +147,8 @@ impl Owner {
                     return Ok(None);
                 }
                 let db = DeviceDatabase::open_container(&entry.path()).map_err(open_error)?;
-                self.install(db, None, AccountAuthority::Unbound).map(Some)
+                self.install(db, Some(entry.path()), None, AccountAuthority::Unbound)
+                    .map(Some)
             })();
             if let Some(result) = match result {
                 Ok(None) => None,

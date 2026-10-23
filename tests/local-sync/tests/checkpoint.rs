@@ -660,8 +660,9 @@ fn current_authority_refusal() {
         d.wake();
         count(&first_text(d).0, "content before the closure") == 1
     });
-    // The Mac confirms; its copy closes the base epoch. Wait for that copy's
-    // own Ack: the confirmation flag clears before it is ordered.
+    // The Mac confirms the removal; its copy is ordered as a base control.
+    // Wait for that copy's own Ack: the confirmation flag clears before it
+    // is ordered.
     let before_at = p
         .fold
         .frames()
@@ -683,30 +684,26 @@ fn current_authority_refusal() {
         &p.stack.dir,
         &format!("closure ordered after position {before_at}"),
     );
-    // Order 2: the second append, permitted before the removal, reaches the
-    // log after the closure: refused, kept, never resealed.
-    p.fold.faults(json!({"hold_appends": false}));
-    p.fold.wait(120, "the late append refused", |d| {
-        d.frames()
-            .iter()
-            .any(|f| f["in"] == "refused" && f["kind"] == "append" && f["reason"] == "Epoch")
-    });
-    // The Mac's own later work waits too: the base is closed.
-    p.mac.save("main", &note, "mac after the closure");
-    // Past every permit the Fold held.
+    // Order 2: the second append, permitted before the removal, never leaves
+    // the device: it verified its own removal, so it publishes nothing.
+    // Past every permit the Fold held, it still has published nothing.
     std::thread::sleep(std::time::Duration::from_secs(35));
+    p.fold.wait(180, "fold verified its removal", |d| {
+        d.wake();
+        let view = d.status();
+        view["view"]["account"] == "removed" && view["running"] == false
+    });
+    // The Mac's own later work goes under the new key, after the closure, with
+    // no prompt; reading its echo means it has read past the closure.
+    p.mac.save("main", &note, "mac after the closure");
+    p.mac.published(180, &note, "mac after the closure");
     let (main, side) = first_text(&mut p.mac);
     assert_eq!(count(&main, "content before the closure"), 1);
-    assert_eq!(count(&side, "content after the closure"), 0);
-    let mac = p.mac.note("main", &note);
     assert_eq!(
-        count(&mac.paragraphs, "mac after the closure"),
-        1,
-        "kept locally"
+        count(&side, "content after the closure"),
+        0,
+        "the removed device's late work never reached the Mac"
     );
-    assert_eq!(count(&mac.accepted, "mac after the closure"), 0);
-    assert!(p.mac.db().pending() >= 1, "kept, not published");
-    assert_eq!(p.mac.state(), "waiting-authorization");
     let frames = p.fold.frames();
     let late = after["event_id"].as_str().unwrap();
     let kept = packages_of(&p.fold, late);
@@ -725,12 +722,29 @@ fn current_authority_refusal() {
     // device's own authority may have ended.
     let kept_work = p.fold.db().pending();
     assert!(kept_work >= 1, "the late update still pending");
+    // It verified its removal: sync stopped, the account says removed, its
+    // windows' routes ended, and its unsent work is still there.
+    let removed = p.fold.status();
+    assert_eq!(removed["view"]["account"], "removed");
+    assert_eq!(removed["running"], false, "sync stopped");
+    let ended: Vec<&str> = removed["ended"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|window| window.as_str())
+        .collect();
+    for window in ["main", "fold-main", "other"] {
+        assert!(
+            ended.contains(&window),
+            "route ended for {window}: {ended:?}"
+        );
+    }
     log(
         &p.stack.dir,
         &format!("fold pending after its removal: {kept_work}"),
     );
     // Context: no stage or append used a permit issued after the removal.
-    // (An absence; the refusal itself is the probe above.)
+    // (An absence; the refused read above is the service-side evidence.)
     let late_permits: Vec<_> = frames
         .iter()
         .filter(|f| f["out"] == "stage" || f["out"] == "append")
@@ -769,8 +783,8 @@ fn packages_of(device: &support::Device, event: &str) -> support::Package {
 
 #[test]
 #[ignore = "needs tests/local-sync/run.sh"]
-fn forged_history_stops() {
-    let mut p = pair("forged_history_stops");
+fn corrupted_stored_head_is_not_served() {
+    let mut p = pair("corrupted_stored_head_is_not_served");
     let note = p.note.clone();
     let base = p.base_log();
     // Unauthenticated damage: a stored body's bytes changed, then missing.
@@ -824,88 +838,65 @@ fn forged_history_stops() {
     let ordered_before = ordered.len();
     assert!(ordered_before >= 2);
 
-    // Authenticated contradiction: the hosting service's stored head is
-    // replaced, so the next event it orders and receipts does not extend
-    // the head it receipted before.
-    let kept = p.fold.note("main", &note);
-    let (q, h, _, receipt_q) = p.fold.db().progress(&p.base);
+    // A corrupted stored head: the service's own order gate refuses to load
+    // the log, so it serves nothing new. The device waits and keeps its work;
+    // it does not stop, and nothing is ordered.
+    let kept = p.mac.note("main", &note);
+    let (q, h, _, _) = p.mac.db().progress(&p.base);
     p.fold.faults(json!({"offline": true}));
     p.stack.stop_part("edge");
+    let events_before = p.stack.storage("inspect", &base, json!([]))["events"]
+        .as_array()
+        .unwrap()
+        .len();
     let forged = "ab".repeat(32);
     let rewrite = p.stack.storage("rewriteHead", &base, json!([forged]));
     log(&p.stack.dir, &format!("head rewritten: {rewrite}"));
-    p.stack.start_part("edge");
+    // Save while the edge is down, so its reconnect publishes the work against
+    // the corrupted head rather than a background read racing the save.
+    let saved_ms = now_ms();
     p.mac.save("main", &note, "after the forged head");
-    p.mac.wait(180, "mac stopped", |d| d.state() == "stopped");
-    p.fold.faults(json!({"offline": false}));
-    p.fold.wait(180, "fold stopped", |d| {
-        d.wake();
-        d.state() == "stopped"
-    });
-    let (at, hash, stopped, _) = p.fold.db().progress(&p.base);
-    assert_eq!((at, &hash), (q, &h), "nothing past the verified head");
-    assert!(stopped.is_some(), "the stop is recorded");
-    // The evidence: two receipts under the pinned hosting root, for heads
-    // that cannot both be one history.
-    let frames = p.fold.frames();
-    let read = frames
-        .iter()
-        .rev()
-        .find(|f| f["in"] == "events" && f["commitments"].as_array().is_some_and(|c| !c.is_empty()))
-        .expect("the contradicting read");
-    let first = &read["commitments"][0];
-    assert_eq!(first["position"], q + 1);
-    assert_eq!(first["previous"], forged.as_str());
-    assert_ne!(first["previous"], h.as_str());
-    let last = read["commitments"].as_array().unwrap().last().unwrap();
-    let root = hosting_root(&p);
-    let later = bh_sync::receipt::verify(
-        &root,
-        bh_sync::BaseId(base_id(&p)),
-        &unhex(read["receipt"].as_str().unwrap()),
-    )
-    .expect("signed");
-    // The later receipt is for exactly the head the read ended at: q + 1.
-    assert_eq!(later.head().position as i64, q + 1);
-    assert_eq!(last["position"], q + 1);
-    assert_eq!(hex(&later.head().hash.0), last["hash"].as_str().unwrap());
-    let earlier =
-        bh_sync::receipt::verify(&root, bh_sync::BaseId(base_id(&p)), &receipt_q.unwrap())
-            .expect("signed");
-    assert_eq!(earlier.head().position as i64, q);
-    assert_eq!(hex(&earlier.head().hash.0), h);
-    log(
-        &p.stack.dir,
-        &format!(
-            "contradiction: receipt for ({q}, {h}) and receipt for ({}, {}) whose chain names {forged}",
-            later.head().position,
-            hex(&later.head().hash.0)
-        ),
+    p.stack.start_part("edge");
+    p.mac
+        .wait(180, "the append refused on the unreadable log", |d| {
+            d.wake();
+            d.frames().iter().any(|f| {
+                f["in"] == "refused"
+                    && f["kind"] == "append"
+                    && f["log"] == base.as_str()
+                    && f["reason"] == "Unavailable"
+                    && f["ms"].as_u64().is_some_and(|ms| ms > saved_ms)
+            })
+        });
+    assert_eq!(p.mac.state(), "waiting-authorization");
+    let (at, hash, stopped, _) = p.mac.db().progress(&p.base);
+    assert_eq!(
+        (at, &hash, stopped),
+        (q, &h, None),
+        "nothing past the verified head, no stop"
     );
-    // The stop keeps the verified state, also after a restart.
-    assert_eq!(p.fold.note("main", &note), kept);
-    let fold = p.fold.quit().restart();
-    p.fold = fold;
-    p.fold.call(json!({"op": "startup"}));
-    p.fold.call(json!({"op": "open"}));
-    p.fold
-        .wait(120, "still stopped", |d| d.state() == "stopped");
-    assert_eq!(p.fold.note("main", &note), kept);
-    log(&p.stack.dir, "forged_history_stops: passed");
+    p.stack.stop_part("edge");
+    let events_after = p.stack.storage("inspect", &base, json!([]))["events"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(events_after, events_before, "nothing ordered");
+    p.stack.start_part("edge");
+    // Its local text is kept, and nothing new is accepted from the unreadable
+    // log.
+    let waiting = p.mac.note("main", &note);
+    assert_eq!(
+        count(&waiting.paragraphs, "after the forged head"),
+        1,
+        "kept locally"
+    );
+    assert_eq!(count(&waiting.paragraphs, "body to damage"), 1);
+    assert_eq!(waiting.accepted, kept.accepted, "nothing accepted");
+    log(&p.stack.dir, "corrupted_stored_head_is_not_served: passed");
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-fn base_id(p: &support::Pair) -> [u8; 32] {
-    unhex(&p.base).try_into().unwrap()
-}
-fn hosting_root(p: &support::Pair) -> [u8; 32] {
-    let endpoint: Value =
-        serde_json::from_str(&std::fs::read_to_string(&p.stack.endpoint).unwrap()).unwrap();
-    unhex(endpoint["hosting_root"].as_str().unwrap())
-        .try_into()
-        .unwrap()
 }
 /// The body commitment this device last staged on the base log.
 fn last_staged(frames: &[Value], base: &str) -> String {

@@ -155,6 +155,36 @@ impl ActionGate {
         gate.armed.insert((key, message.to_vec()));
         true
     }
+    /// Host: the control `key` was just confirmed for was the device half
+    /// of a cosigned one, `device_message` signed alone, and `recovery` is
+    /// the recovery key's half: its one copy is of the finished `event`,
+    /// exactly the unsigned event `device_message` is the device half of,
+    /// then that device signature, then `recovery`. Changes nothing unless
+    /// `event` is exactly that and a live confirmed grant names that half.
+    pub fn cosigned(
+        &self,
+        key: [u8; 32],
+        device_message: &[u8],
+        recovery: &[u8; 64],
+        event: &[u8],
+    ) {
+        let Some(unsigned) = event.len().checked_sub(128) else {
+            return;
+        };
+        let (body, signatures) = event.split_at(unsigned);
+        let (device, recovered) = signatures.split_at(64);
+        if device_message != bh_account::owner::cosigned_device_message(body)
+            || recovered != recovery
+        {
+            return;
+        }
+        let mut gate = self.gate();
+        if let Some(Grant::Confirmed { event: granted, .. }) = gate.grants.get_mut(&key)
+            && *granted == [device_message, device].concat()
+        {
+            *granted = event.to_vec();
+        }
+    }
     /// Host: the armed copy of `message` will not be signed after all.
     pub fn disarm(&self, key: [u8; 32], message: &[u8]) {
         let mut gate = self.gate();
@@ -853,6 +883,44 @@ mod tests {
         .await;
         assert_eq!(result, Err(KeyStoreError::Unavailable));
         assert_eq!(store.signed.get(), 0);
+    }
+
+    /// A removal cosigned with the recovery key: the confirmation of this
+    /// device's half covers one copy of the finished control, and of no
+    /// control whose device half or body differs.
+    #[tokio::test(start_paused = true)]
+    async fn a_cosigned_controls_confirmation_covers_its_one_copy() {
+        const BODY: &[u8] = b"exact removal body";
+        let half = bh_account::owner::cosigned_device_message(BODY);
+        let recovery = [5; 64];
+        let event = [BODY, &SIGNATURE, &recovery].concat();
+        let gate = ActionGate::default();
+        let store = Store::new(&gate);
+        gate.open(KEY, ACCOUNT, 4);
+        assert_eq!(store.sign(KEY, &half).await, Ok(SIGNATURE));
+        // Neither another body, a body the half only ends with, another
+        // device signature nor another recovery half takes it over.
+        for other in [
+            [b"other body".as_slice(), &SIGNATURE, &recovery].concat(),
+            [&BODY[6..], &SIGNATURE, &recovery].concat(),
+            [BODY, &[6; 64], &recovery].concat(),
+            [BODY, &SIGNATURE, &[6; 64]].concat(),
+        ] {
+            gate.cosigned(KEY, &half, &recovery, &other);
+            assert!(!gate.arm(KEY, ACCOUNT, 4, &other, COPY));
+        }
+        assert!(!gate.arm(KEY, ACCOUNT, 4, &event, COPY));
+        gate.cosigned(KEY, &half, &recovery, &event);
+        assert!(!gate.arm(
+            KEY,
+            ACCOUNT,
+            4,
+            &[half.as_slice(), &SIGNATURE].concat(),
+            COPY
+        ));
+        assert!(gate.arm(KEY, ACCOUNT, 4, &event, COPY));
+        assert_eq!(store.sign(KEY, COPY).await, Ok(SIGNATURE));
+        assert_eq!(store.prompts.get(), 1, "the copy reuses the confirmation");
     }
 
     #[tokio::test(start_paused = true)]

@@ -2,6 +2,7 @@
 //! helpers to drive the service's application protocol after the channel.
 #![allow(dead_code)]
 
+pub mod claims;
 pub mod device;
 pub mod native;
 
@@ -16,16 +17,20 @@ use bh_account::{
     },
 };
 use bh_authz::{
-    Connection, EdgeError, EdgeReader, FixedClock, LogRead, PermitKeys, Service,
+    Connection, EdgeError, EdgeReader, FixedClock, HomeObjectsAck, LogRead, PermitKeys,
+    RecoveryHomeKey, Service,
     proto::{
         ACCOUNT_EPOCH, FromService, LogId, LogKind, MetadataKey, ToService, Want, account_log_id,
         account_log_wrap,
     },
 };
 use bh_sync::{
-    BaseId, BodyObject, Commitment, Digest, EventId, Head, OpaqueEvent, Route,
+    BaseId, BodyObject, Commitment, Digest, EventId, Head, OpaqueEvent, OrderState, Route,
+    evidence::{RecoveryKeyCertificate, certify_recovery_key},
+    home_objects,
     permit::{self, Permit, Scope},
     receipt,
+    wire::CoverageEndpoint,
 };
 use futures_util::future::BoxFuture;
 use std::{
@@ -316,6 +321,87 @@ impl Account {
     }
 }
 
+/// An account as signup leaves it, under `password` and a fresh code: its
+/// recovery record and personal key published, and the request that stores
+/// its home objects.
+pub struct Signup {
+    pub account: Account,
+    pub code: bh_account::recovery::RecoveryCode,
+    pub record: Vec<u8>,
+    pub recovery_seal: Vec<u8>,
+    pub store: ToService,
+}
+impl Signup {
+    pub fn new(device: &Device, password: &str) -> Self {
+        use bh_account::recovery;
+        let keys = recovery::RecoveryKeys::generate();
+        let draft = AccountEvent::genesis(device.keys.clone(), keys.public());
+        let genesis = draft
+            .finish(device.control.sign(draft.signing_bytes()))
+            .unwrap();
+        let id = AccountId::of_genesis(&genesis).unwrap();
+        let bytes = genesis.as_bytes().to_vec();
+        let mut account = Account {
+            verified: VerifiedAccount::from_genesis(id, &bytes).unwrap(),
+            log: LogId {
+                kind: LogKind::Account,
+                id: account_log_id(&bytes).unwrap(),
+            },
+            id,
+            originals: vec![bytes.clone()],
+            genesis: bytes,
+            personal: None,
+        };
+        let code = recovery::RecoveryCode::generate();
+        let record = recovery::prepare_record(
+            &account.verified,
+            &keys,
+            &recovery::Password::new(password).unwrap(),
+            &code,
+        )
+        .unwrap();
+        let draft = account
+            .verified
+            .prepare_recovery_record(device.id(), record.digest())
+            .unwrap();
+        account.accept(
+            draft
+                .finish(device.control.sign(draft.signing_bytes()))
+                .unwrap(),
+        );
+        let key = PersonalKey::generate();
+        let publication = personal::prepare_publication(&account.verified, &key).unwrap();
+        let draft = account
+            .verified
+            .publish_personal_key(
+                device.id(),
+                publication.public(),
+                publication.device_digest(),
+                publication.recovery_digest(),
+            )
+            .unwrap();
+        account.accept(
+            draft
+                .finish(device.control.sign(draft.signing_bytes()))
+                .unwrap(),
+        );
+        account.personal = Some(key);
+        let store = ToService::StoreHomeObjects {
+            prefix: account.verified.head(),
+            record: record.as_bytes().to_vec(),
+            device_seal: publication.device_seal().to_vec(),
+            recovery_seal: publication.recovery_seal().to_vec(),
+        };
+        Self {
+            account,
+            code,
+            record: record.as_bytes().to_vec(),
+            recovery_seal: publication.recovery_seal().to_vec(),
+            store,
+        }
+    }
+}
+
 /// An in-memory ordered log store standing in for the edge and its log
 /// objects: it verifies every permit at its clock against the pinned root and
 /// enforces what the log object does: a control's predecessor is the control
@@ -329,15 +415,37 @@ pub struct FakeEdge {
     logs: Mutex<HashMap<(u8, [u8; 32]), Log>>,
     pub down: AtomicBool,
     pub corrupt_receipt: AtomicBool,
+    pub corrupt_coverage_receipt: AtomicBool,
     pub omit_receipt: AtomicBool,
     pub corrupt_ordering: AtomicBool,
+    pub corrupt_body: AtomicBool,
+    pub fail_retire_once: AtomicBool,
     pub hide_batch: AtomicBool,
     /// Milliseconds the clock moves forward during each read.
     pub read_takes: AtomicU64,
     pub reads: AtomicU64,
-    /// Reads of a log's controls, under ReadControls permits.
+    /// Reads of a log's controls, under ReadControls or ReadControlRange
+    /// permits.
     pub control_reads: AtomicU64,
+    /// Rewrites the control rows a control read selects from, as a server
+    /// that omits or substitutes controls would. Endpoints stay genuine.
+    pub rewrite_controls: Mutex<Option<ControlRewrite>>,
+    /// Control reads carry no endpoint.
+    pub withhold_endpoint: AtomicBool,
+    pub malformed_endpoint: AtomicBool,
+    pub wrong_coverage_root: AtomicBool,
+    /// A bounded control read answers with the current endpoint, as a
+    /// server that does not hold a scan to its first one.
+    pub ignore_through: AtomicBool,
+    /// Ordered on the control route once the next control read is served.
+    pub append_after_control_read: Mutex<Option<(LogId, OpaqueEvent)>>,
+    /// Swap the final event after the first page was captured; a later
+    /// bounded page gets another independently signed root at that position.
+    pub fork_after_control_read: Mutex<Option<(LogId, usize, OpaqueEvent, Route)>>,
+    /// Home-object bundles stored, by account log.
+    pub home_objects: Mutex<HashMap<[u8; 32], Vec<u8>>>,
 }
+pub type ControlRewrite = Box<dyn Fn(&mut Vec<(Commitment, OpaqueEvent)>) + Send + Sync>;
 struct Log {
     entries: Vec<(Commitment, OpaqueEvent)>,
     epoch: [u8; 32],
@@ -378,12 +486,23 @@ impl FakeEdge {
             logs: Mutex::default(),
             down: AtomicBool::new(false),
             corrupt_receipt: AtomicBool::new(false),
+            corrupt_coverage_receipt: AtomicBool::new(false),
             omit_receipt: AtomicBool::new(false),
             corrupt_ordering: AtomicBool::new(false),
+            corrupt_body: AtomicBool::new(false),
+            fail_retire_once: AtomicBool::new(false),
             hide_batch: AtomicBool::new(false),
             read_takes: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             control_reads: AtomicU64::new(0),
+            rewrite_controls: Mutex::new(None),
+            withhold_endpoint: AtomicBool::new(false),
+            malformed_endpoint: AtomicBool::new(false),
+            wrong_coverage_root: AtomicBool::new(false),
+            ignore_through: AtomicBool::new(false),
+            append_after_control_read: Mutex::new(None),
+            fork_after_control_read: Mutex::new(None),
+            home_objects: Mutex::default(),
         })
     }
     fn verify(&self, signed: &[u8]) -> Result<Permit, String> {
@@ -420,6 +539,7 @@ impl FakeEdge {
             body,
             epoch,
             after,
+            attached,
         } = permit.scope
         else {
             return Err("scope".into());
@@ -438,7 +558,7 @@ impl FakeEdge {
         if let Some((ordered, _)) = entry
             .entries
             .iter()
-            .find(|(c, _)| c.event_id() == event.id())
+            .find(|(c, _)| c.event_id() == event.publication_id(route))
         {
             if ordered.event_digest() != digest || ordered.route() != route {
                 return Err("Conflict".into());
@@ -450,10 +570,18 @@ impl FakeEdge {
             None if epoch == [0; 32] || epoch != entry.epoch => return Err("Epoch".into()),
             _ => {}
         }
-        if body.is_some_and(|b| !entry.staged.contains_key(&b)) {
+        if [body, attached]
+            .into_iter()
+            .flatten()
+            .any(|b| !entry.staged.contains_key(&b))
+        {
             return Err("NotStaged".into());
         }
-        let ordered = Commitment::order(BaseId(log.id), entry.head(), event, route).unwrap();
+        let before = entry
+            .entries
+            .last()
+            .map_or(bh_sync::OrderState::EMPTY, |(c, _)| c.after());
+        let ordered = Commitment::order(BaseId(log.id), before, event, route).unwrap();
         entry.entries.push((ordered, event.clone()));
         if after.is_some() {
             entry.epoch = epoch;
@@ -475,6 +603,135 @@ impl FakeEdge {
             .unwrap()
             .get(&key(log))
             .map_or([0; 32], |l| l.epoch)
+    }
+    /// Keep only the log's first `len` entries: a server serving another
+    /// history from here on. Its receipts sign whatever it then holds.
+    pub fn truncate(&self, log: LogId, len: usize) {
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.entry(key(log)).or_default();
+        entry.entries.truncate(len);
+        entry.control = entry
+            .entries
+            .iter()
+            .rev()
+            .find(|(c, _)| c.route() == Route::Control)
+            .map_or(Head::EMPTY, |(c, _)| c.head());
+    }
+    /// Order an event as the log object would, with no permit: what another
+    /// history's server holds.
+    pub fn force_append(&self, log: LogId, event: &OpaqueEvent, route: Route) -> Commitment {
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.entry(key(log)).or_default();
+        let before = entry
+            .entries
+            .last()
+            .map_or(OrderState::EMPTY, |(c, _)| c.after());
+        let ordered = Commitment::order(BaseId(log.id), before, event, route).unwrap();
+        entry.entries.push((ordered, event.clone()));
+        if route == Route::Control {
+            entry.control = ordered.head();
+        }
+        ordered
+    }
+    /// Control rows after `after` up to the endpoint at `through`, or the
+    /// current one, as the log object captures them, and that endpoint
+    /// with a receipt for its head.
+    fn control_read(
+        &self,
+        log: LogId,
+        after: u64,
+        through: Option<u64>,
+    ) -> Result<LogRead, EdgeError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.control_reads.fetch_add(1, Ordering::SeqCst);
+        if self.down.load(Ordering::SeqCst) {
+            return Err(EdgeError::Unavailable);
+        }
+        self.clock.advance(self.read_takes.load(Ordering::SeqCst));
+        let through = through.filter(|_| !self.ignore_through.load(Ordering::SeqCst));
+        // The read answers from the log as it is now; later hooks change it
+        // after. Only a rewrite hook needs its own copy of the whole log:
+        // otherwise the page is read in place, so the fake's own work stays
+        // one page, whatever the log's length.
+        let rewrite = self.rewrite_controls.lock().unwrap();
+        let logs = self.logs.lock().unwrap();
+        let empty = Vec::new();
+        let all = logs.get(&key(log)).map_or(&empty, |e| &e.entries);
+        let target = through.unwrap_or_else(|| all.last().map_or(0, |(c, _)| c.after().position()));
+        let endpoint = if target == 0 {
+            Ok(OrderState::EMPTY)
+        } else {
+            all.iter()
+                .find(|(c, _)| c.after().position() == target)
+                .map(|(c, _)| c.after())
+                .ok_or(EdgeError::Refused)
+        };
+        let page = |controls: &mut dyn Iterator<Item = &(Commitment, OpaqueEvent)>| -> Vec<(Vec<u8>, Vec<u8>)> {
+            controls
+                .filter(|(c, _)| (after + 1..=target).contains(&c.after().position()))
+                .take(64)
+                .map(|(c, e)| (c.encode().to_vec(), e.encode()))
+                .collect()
+        };
+        let items = match rewrite.as_ref() {
+            Some(rewrite) => {
+                let mut controls: Vec<_> = all
+                    .iter()
+                    .filter(|(c, _)| c.route() == Route::Control)
+                    .cloned()
+                    .collect();
+                rewrite(&mut controls);
+                page(&mut controls.iter())
+            }
+            None => page(&mut all.iter().filter(|(c, _)| c.route() == Route::Control)),
+        };
+        drop(logs);
+        drop(rewrite);
+        if let Some((log, event)) = self.append_after_control_read.lock().unwrap().take() {
+            self.force_append(log, &event, Route::Control);
+        }
+        if let Some((log, before, event, route)) =
+            self.fork_after_control_read.lock().unwrap().take()
+        {
+            self.truncate(log, before);
+            self.force_append(log, &event, route);
+        }
+        let endpoint = endpoint?;
+        let receipt = (endpoint != OrderState::EMPTY).then(|| {
+            let wrong_root = SigningKey::generate();
+            let alternate = self.wrong_coverage_root.load(Ordering::SeqCst).then(|| {
+                receipt::verify_certificate(
+                    &wrong_root.public(),
+                    &receipt::certify(&wrong_root, self.receipt_key.public()),
+                )
+                .unwrap()
+            });
+            let mut signed = receipt::sign(
+                alternate.as_ref().unwrap_or(&self.receipt_cert),
+                &self.receipt_key,
+                BaseId(log.id),
+                endpoint.head(BaseId(log.id)),
+            )
+            .unwrap();
+            if self.corrupt_coverage_receipt.load(Ordering::SeqCst) {
+                signed[receipt::RECEIPT_LEN - 1] ^= 1;
+            }
+            signed
+        });
+        let coverage =
+            (!self.withhold_endpoint.load(Ordering::SeqCst)).then_some(CoverageEndpoint {
+                order: if self.malformed_endpoint.load(Ordering::SeqCst) {
+                    OrderState::EMPTY
+                } else {
+                    endpoint
+                },
+                receipt,
+            });
+        Ok(LogRead {
+            items,
+            receipt: None,
+            coverage,
+        })
     }
     /// Ordered `(commitment, event, body)` after `position`, as a device's
     /// pull receives them.
@@ -498,11 +755,39 @@ impl FakeEdge {
     }
 }
 impl EdgeReader for FakeEdge {
+    fn retire_home_objects(&self, signed: Vec<u8>) -> BoxFuture<'_, Result<(), EdgeError>> {
+        Box::pin(async move {
+            if self.down.load(Ordering::SeqCst)
+                || self.fail_retire_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(EdgeError::Unavailable);
+            }
+            let permit = self.verify(&signed).map_err(|_| EdgeError::Refused)?;
+            let Scope::RetireHomeObjects { log, prefix_digest } = permit.scope else {
+                return Err(EdgeError::Refused);
+            };
+            let mut objects = self.home_objects.lock().unwrap();
+            match objects.get(&log.id) {
+                Some(_) if prefix_digest != Digest([0; 32]) => {
+                    objects.remove(&log.id);
+                }
+                Some(_) => return Err(EdgeError::Refused),
+                None => {}
+            }
+            Ok(())
+        })
+    }
     fn read_log_with_receipt(&self, signed: Vec<u8>) -> BoxFuture<'_, Result<LogRead, EdgeError>> {
         Box::pin(async move {
             let permit = self.verify(&signed).map_err(|_| EdgeError::Refused)?;
             let log = match permit.scope {
                 Scope::ReadEvents { log, .. } => log,
+                Scope::ReadControls { log, after } => return self.control_read(log, after, None),
+                Scope::ReadControlRange {
+                    log,
+                    after,
+                    through,
+                } => return self.control_read(log, after, Some(through)),
                 _ => return Err(EdgeError::Refused),
             };
             let mut items = self.read_log(signed).await?;
@@ -534,7 +819,11 @@ impl EdgeReader for FakeEdge {
             {
                 bytes[receipt::RECEIPT_LEN - 1] ^= 1;
             }
-            Ok(LogRead { items, receipt })
+            Ok(LogRead {
+                items,
+                receipt,
+                coverage: None,
+            })
         })
     }
     fn read_log(
@@ -564,12 +853,46 @@ impl EdgeReader for FakeEdge {
                 .entries
                 .iter()
                 .filter(|(c, _)| {
-                    positions.contains(&c.head().position)
+                    // Selection needs only the position, not the global Head
+                    // hash for every preceding event in this synthetic log.
+                    positions.contains(&c.after().position())
                         && (!controls || c.route() == Route::Control)
                 })
                 .take(64)
                 .map(|(c, e)| (c.encode(), e.encode()))
                 .collect())
+        })
+    }
+    /// As the account home does: the exact bundle the permit names, once.
+    fn store_home_objects(
+        &self,
+        signed: Vec<u8>,
+        bundle: Vec<u8>,
+    ) -> BoxFuture<'_, Result<HomeObjectsAck, EdgeError>> {
+        Box::pin(async move {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(EdgeError::Unavailable);
+            }
+            let permit = self.verify(&signed).map_err(|_| EdgeError::Refused)?;
+            let Scope::StoreHomeObjects {
+                log,
+                prefix_digest,
+                bundle_digest,
+            } = permit.scope
+            else {
+                return Err(EdgeError::Refused);
+            };
+            if home_objects::digest(&bundle).ok() != Some(bundle_digest) {
+                return Err(EdgeError::Refused);
+            }
+            let mut stored = self.home_objects.lock().unwrap();
+            if stored.entry(log.id).or_insert(bundle.clone()) != &bundle {
+                return Err(EdgeError::Refused);
+            }
+            Ok(HomeObjectsAck {
+                prefix_digest,
+                bundle_digest,
+            })
         })
     }
     fn read_bodies(&self, signed: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, EdgeError>> {
@@ -584,22 +907,183 @@ impl EdgeReader for FakeEdge {
             };
             let logs = self.logs.lock().unwrap();
             let entry = logs.get(&key(log)).ok_or(EdgeError::Refused)?;
-            // Only ordered bodies are served.
+            // Only ordered bodies are served, and an account log's staging
+            // ones, which only the service's own permits can read.
             bodies
                 .iter()
                 .map(|b| {
-                    let ordered = entry
-                        .entries
-                        .iter()
-                        .any(|(_, e)| bh_sync::referenced_body(e).ok() == Some(*b));
+                    let ordered = log.kind == LogKind::Account
+                        || entry
+                            .entries
+                            .iter()
+                            .any(|(_, e)| bh_sync::referenced_body(e).ok() == Some(*b));
                     match entry.staged.get(b) {
-                        Some(bytes) if ordered => Ok(bytes.clone()),
+                        Some(bytes) if ordered => {
+                            let mut returned = bytes.clone();
+                            if self.corrupt_body.load(Ordering::SeqCst) {
+                                returned[0] ^= 3;
+                            }
+                            Ok(returned)
+                        }
                         _ => Err(EdgeError::Refused),
                     }
                 })
                 .collect()
         })
     }
+}
+
+/// Every durable row of one base's projection on the service's disk, byte
+/// for byte: its control record, binding and pending control, and its
+/// selected BASE copy generation's first uses and copy rows, whichever
+/// generation number holds them. Unselected candidate staging is not the
+/// base's projection.
+pub fn projection_rows(path: &std::path::Path, base: [u8; 32]) -> Vec<Vec<rusqlite::types::Value>> {
+    let db = rusqlite::Connection::open(path).unwrap();
+    let mut rows = vec![];
+    let mut collect = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        let mut statement = db.prepare(sql).unwrap();
+        let width = statement.column_count();
+        let generation = (0..width).find(|&i| statement.column_name(i).ok() == Some("generation"));
+        let mut query = statement.query(params).unwrap();
+        while let Some(row) = query.next().unwrap() {
+            rows.push(
+                (0..width)
+                    .map(|i| match generation == Some(i) {
+                        true => rusqlite::types::Value::Null,
+                        false => row.get::<_, rusqlite::types::Value>(i).unwrap(),
+                    })
+                    .collect(),
+            );
+        }
+    };
+    for table in [
+        "bases",
+        "base_controls",
+        "base_account_changes",
+        "base_pending",
+        "base_control_ids",
+    ] {
+        collect(
+            &format!("SELECT * FROM {table} WHERE base=?1 ORDER BY 1, 2"),
+            &[&base.as_slice()],
+        );
+    }
+    collect(
+        "SELECT * FROM projection_selected WHERE kind=2 AND source=?1",
+        &[&base.as_slice()],
+    );
+    let generation: Option<i64> = rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT generation FROM projection_selected WHERE kind=2 AND source=?1",
+            [base.as_slice()],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(generation) = generation {
+        // Its staged raw path is replay evidence a stop may pin, not
+        // authority: a rebuilt generation holds the whole path, an
+        // incrementally confirmed one only its registration's.
+        collect(
+            "SELECT * FROM base_ids WHERE base=?1 AND generation=?2 ORDER BY 3",
+            &[&base.as_slice(), &generation],
+        );
+        for table in [
+            "projection_sources",
+            "projection_current",
+            "projection_active",
+            "projection_devices",
+            "projection_keys",
+            "projection_times",
+            "projection_copies",
+        ] {
+            collect(
+                &format!(
+                    "SELECT * FROM {table} WHERE kind=2 AND source=?1 AND generation=?2 ORDER BY 5"
+                ),
+                &[&base.as_slice(), &generation],
+            );
+        }
+    }
+    rows
+}
+
+/// A base's durable authority, whichever generation holds its copy: its
+/// control record, binding and pending control, and its selected copy's
+/// current cut, summary and opening.
+pub fn base_authority(path: &std::path::Path, base: [u8; 32]) -> Vec<Vec<rusqlite::types::Value>> {
+    let db = rusqlite::Connection::open(path).unwrap();
+    let mut rows = vec![];
+    for sql in [
+        "SELECT * FROM bases WHERE base=?1",
+        "SELECT * FROM base_controls WHERE base=?1",
+        "SELECT * FROM base_pending WHERE base=?1",
+        "SELECT c.position, c.hash, c.summary, c.stopped, c.opening FROM projection_selected s
+         JOIN projection_current c ON (c.account,c.kind,c.source,c.generation)=(s.account,s.kind,s.source,s.generation)
+         WHERE s.kind=2 AND s.source=?1",
+    ] {
+        let mut statement = db.prepare(sql).unwrap();
+        let width = statement.column_count();
+        let mut query = statement.query([base.as_slice()]).unwrap();
+        while let Some(row) = query.next().unwrap() {
+            rows.push(
+                (0..width)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i).unwrap())
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+/// Each of a base's generations: its number, phase (0 staging, 1 published,
+/// 2 discarded) and how many rows of any table it still holds.
+pub fn base_generations(path: &std::path::Path, base: [u8; 32]) -> Vec<(i64, i64, i64)> {
+    let db = rusqlite::Connection::open(path).unwrap();
+    let rows = [
+        "base_raw",
+        "base_ids",
+        "projection_copies",
+        "projection_times",
+        "projection_devices",
+        "projection_keys",
+        "projection_active",
+        "projection_current",
+        "projection_sources",
+    ]
+    .map(|table| {
+        let scope = match table.starts_with("base_") {
+            true => "t.base=g.base",
+            false => "t.kind=2 AND t.source=g.base",
+        };
+        format!("(SELECT COUNT(*) FROM {table} t WHERE {scope} AND t.generation=g.generation)")
+    })
+    .join(" + ");
+    let mut statement = db
+        .prepare(&format!(
+            "SELECT g.generation, g.phase, {rows} FROM base_generations g WHERE g.base=?1 ORDER BY 1"
+        ))
+        .unwrap();
+    statement
+        .query_map([base.as_slice()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// A base's durable genesis status: 1 provisional, 2 accepted; None for
+/// no projection, or one recorded before canonical order.
+pub fn base_status(path: &std::path::Path, base: [u8; 32]) -> Option<i64> {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT status FROM base_controls WHERE base=?1",
+            [base.as_slice()],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
 }
 
 /// The hosting root, a permit key it certifies, a clock, an edge and a disk.
@@ -609,6 +1093,7 @@ pub struct Harness {
     pub clock: Arc<FixedClock>,
     pub edge: Arc<FakeEdge>,
     seed: [u8; 32],
+    recovery_seed: [u8; 32],
 }
 impl Harness {
     pub fn new() -> Self {
@@ -620,7 +1105,19 @@ impl Harness {
             root,
             clock,
             seed: bh_crypto::random(),
+            recovery_seed: bh_crypto::random(),
         }
+    }
+    /// The home's recovery key and its certificate under the hosting root.
+    pub fn recovery_key(&self) -> RecoveryHomeKey {
+        let key = KemKey::from_seed(&Secret::from_slice(&self.recovery_seed).unwrap());
+        let certificate = self.recovery_certificate();
+        RecoveryHomeKey::new(key, certificate, &self.root.public()).unwrap()
+    }
+    /// What a recovering device pins: the recovery key's certificate.
+    pub fn recovery_certificate(&self) -> RecoveryKeyCertificate {
+        let key = KemKey::from_seed(&Secret::from_slice(&self.recovery_seed).unwrap());
+        certify_recovery_key(&self.root, &key.public())
     }
     pub fn keys(&self) -> PermitKeys {
         let key = SigningKey::from_seed(&bh_crypto::Secret::from_slice(&self.seed).unwrap());
@@ -628,9 +1125,10 @@ impl Harness {
         PermitKeys::new(key, certificate).unwrap()
     }
     pub fn service(&self) -> Service {
-        Service::open(
+        Service::open_with_recovery(
             &self.dir.path().join("authz.sqlite"),
             self.keys(),
+            self.recovery_key(),
             self.clock.clone(),
             self.edge.clone(),
         )
@@ -664,6 +1162,7 @@ impl Harness {
             body: None,
             epoch: ACCOUNT_EPOCH,
             after: Some(self.edge.head(log)),
+            attached: None,
         });
         self.edge.append(&permit, &event).unwrap()
     }
@@ -673,6 +1172,10 @@ impl Harness {
         for original in &account.originals[known..] {
             self.order_account_event(account, original);
         }
+    }
+    /// The service's disk.
+    pub fn disk(&self) -> std::path::PathBuf {
+        self.dir.path().join("authz.sqlite")
     }
     pub fn permit(&self, signed: &[u8]) -> Permit {
         permit::verify(self.root.public(), signed, self.clock.now()).unwrap()
@@ -765,6 +1268,7 @@ pub async fn submit(
             log: account.log,
             event: original.to_vec(),
             delivery: None,
+            attachment: None,
         })
         .await;
     if let FromService::Permits { items } = &answer {
@@ -789,6 +1293,40 @@ pub fn order_genesis(harness: &Harness, answer: &FromService, genesis: &BaseGene
         .edge
         .append(items[1].as_ref().unwrap(), &genesis.descriptor)
         .unwrap();
+}
+/// Stage a rotation's padded body on the session's account log under a
+/// permit the session asks for, as a device does before it submits the
+/// rotation; the commitment that submission names.
+pub async fn stage_rotation(
+    harness: &Harness,
+    connection: &mut Connection,
+    log: LogId,
+    raw: &[u8],
+) -> Digest {
+    let body = bh_authz::proto::rotation_body(raw).unwrap();
+    stage_body(harness, connection, log, body.bytes()).await
+}
+/// Stage exact body bytes on `log` under a permit the session asks for.
+pub async fn stage_body(
+    harness: &Harness,
+    connection: &mut Connection,
+    log: LogId,
+    bytes: &[u8],
+) -> Digest {
+    let body = BodyObject::new(bytes.to_vec()).unwrap();
+    let permit = single_permit(
+        connection
+            .handle(ToService::Permits {
+                items: vec![Want::Stage {
+                    log,
+                    body: body.commitment(),
+                    len: bytes.len() as u32,
+                }],
+            })
+            .await,
+    );
+    harness.edge.stage(&permit, bytes).unwrap();
+    body.commitment()
 }
 pub fn single_permit(answer: FromService) -> Vec<u8> {
     let FromService::Permits { mut items } = answer else {

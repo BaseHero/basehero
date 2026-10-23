@@ -17,18 +17,27 @@
 #![allow(dead_code)]
 
 use bh_authz::{
-    ChannelConfig, Clock, ClockError, EdgeError, EdgeReader, PermitKeys, Service,
-    SyntheticAttestation, proto::ToService, proto::Want,
+    Attestation, ChannelConfig, Clock, ClockError, EdgeError, EdgeReader, PermitKeys, Service,
+    SyntheticAttestation,
+    proto::{FromService, ToService, Want},
 };
 use bh_confidential_attestation::synthetic;
-use bh_confidential_policy::{Policy, Role};
-use bh_crypto::SigningKey;
+use bh_confidential_channel::{
+    appraisal::{PolicyStore, Sample, StoredState},
+    handshake::ServerPending,
+    record::Opened,
+};
+use bh_confidential_policy::{Policy, Role, Snapshot};
+use bh_crypto::{SecretBytes, SigningKey};
 use bh_sync::{
     BaseId, BodyObject, Commitment, Digest, EventId, Head, OpaqueEvent, Route,
+    evidence::{
+        AcceptedHead, ConfirmationClaim, OrderingConfirmation, TimeBounds, original_digest,
+    },
     permit::{self, AppendAck, LogId, LogKind, Permit, PermitError, Scope},
     receipt::{self, CertifiedReceiptKey},
     referenced_body,
-    wire::{MAX_FRAME_LEN, Refusal, Request, Response},
+    wire::{CoverageEndpoint, MAX_FRAME_LEN, Refusal, Request, Response},
 };
 use bh_sync_client::{
     pairing::{Got, Put, Relay, Side},
@@ -36,7 +45,7 @@ use bh_sync_client::{
 };
 use futures_util::{SinkExt, StreamExt, future::BoxFuture};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -80,14 +89,31 @@ impl TestClock {
         let now = self.now();
         *self.still.lock().unwrap() = Some(now);
     }
+    /// Resume the fixture's runtime-driven home clock after holding its
+    /// confirmed bound behind a device's deadline.
+    pub fn resume(&self) {
+        *self.still.lock().unwrap() = None;
+    }
     /// Jump forward by `ms`, as a clock passing a deadline at once.
     pub fn advance(&self, ms: u64) {
         self.offset.fetch_add(ms, Ordering::SeqCst);
     }
 }
+impl bh_sync_client::DeviceClock for TestClock {
+    fn now_ms(&self) -> u64 {
+        self.now()
+    }
+}
 impl Clock for TestClock {
     fn now_ms(&self) -> Result<u64, ClockError> {
         Ok(self.now())
+    }
+    fn bounds_ms(&self) -> Result<bh_authz::Bounds, ClockError> {
+        let now = self.now();
+        Ok(bh_authz::Bounds {
+            earliest_ms: now,
+            latest_ms: now,
+        })
     }
 }
 
@@ -176,6 +202,8 @@ pub struct Counts {
     pub append: usize,
     /// Reads the service made through the edge.
     pub edge_reads: usize,
+    /// Device DATA reads of a base's controls, apart from event reads.
+    pub read_controls: usize,
 }
 impl std::ops::Sub for Counts {
     type Output = Self;
@@ -210,14 +238,15 @@ impl std::ops::Sub for Counts {
             subscribe,
             stage,
             append,
-            edge_reads
+            edge_reads,
+            read_controls
         )
     }
 }
 
 /// Live counters behind `Counts`.
 #[derive(Default)]
-struct Counters([AtomicUsize; 26]);
+struct Counters([AtomicUsize; 27]);
 #[derive(Clone, Copy)]
 enum Count {
     AuthzUp,
@@ -246,6 +275,7 @@ enum Count {
     Stage,
     Append,
     EdgeReads,
+    ReadControls,
 }
 impl Counters {
     fn add(&self, count: Count, n: usize) {
@@ -279,6 +309,7 @@ impl Counters {
             stage: v(Count::Stage),
             append: v(Count::Append),
             edge_reads: v(Count::EdgeReads),
+            read_controls: v(Count::ReadControls),
         }
     }
     /// Count one decoded request the service is about to handle.
@@ -296,6 +327,9 @@ impl Counters {
                             Want::Subscribe { .. } => Count::WantSubscribe,
                             Want::Presence { .. } => Count::WantPresence,
                             Want::ReadBatch { .. } => Count::ReadBatches,
+                            Want::ReadControls { .. }
+                            | Want::ReadDirectory { .. }
+                            | Want::StoreDirectoryEntry { .. } => Count::OtherRequests,
                         },
                         1,
                     );
@@ -360,6 +394,13 @@ pub struct HomeHold {
     pub release: oneshot::Sender<()>,
 }
 
+/// How `Hosted::tamper_confirmations` alters an ordering confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmTamper {
+    Root,
+    Challenge,
+}
+
 /// A one-shot fault on the next matching base-log request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofFault {
@@ -373,6 +414,9 @@ pub enum ProofFault {
     Commitment,
     Head,
 }
+
+/// A held base read: past which position, its arrival and its release.
+type ReadHold = (u64, oneshot::Sender<()>, oneshot::Receiver<()>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hook {
@@ -398,6 +442,13 @@ pub enum Hook {
     /// a genuine receipt for that head, and the next read of that position
     /// returns a commitment forged to name this event at that head.
     ForgeAck,
+    /// An account-log append is lost before it is ordered: the socket drops.
+    DropBeforeAccountAppend,
+    /// An account-log append commits, then the clock moves on by `ms`
+    /// before its Ack: the home confirms it later than its permit.
+    AdvanceAfterAccountAppend {
+        ms: u64,
+    },
 }
 
 struct Log {
@@ -411,7 +462,11 @@ struct Log {
     forged: Option<(Commitment, OpaqueEvent)>,
     /// Data reads serve these from a position on instead of the entries.
     served: Option<(u64, Vec<(Commitment, OpaqueEvent)>)>,
+    served_full_only: bool,
     home_objects: HashMap<Digest, (Digest, Vec<u8>)>,
+    /// The account directory, as the Worker's log object keeps it: each
+    /// entry id's version, body digest and exact bytes.
+    directory: std::collections::BTreeMap<[u8; 32], (u64, Digest, Vec<u8>)>,
 }
 impl Default for Log {
     fn default() -> Self {
@@ -424,13 +479,20 @@ impl Default for Log {
             ids: HashMap::new(),
             forged: None,
             served: None,
+            served_full_only: false,
             home_objects: HashMap::new(),
+            directory: std::collections::BTreeMap::new(),
         }
     }
 }
 impl Log {
     fn head(&self) -> Head {
         self.entries.last().map_or(Head::EMPTY, |(c, _)| c.head())
+    }
+    fn order(&self) -> bh_sync::OrderState {
+        self.entries
+            .last()
+            .map_or(bh_sync::OrderState::EMPTY, |(c, _)| c.after())
     }
 }
 fn key(log: LogId) -> (u8, [u8; 32]) {
@@ -471,6 +533,8 @@ pub struct Edge {
     read_batch_inflight: AtomicBool,
     /// Withhold account subscription hints while exercising receiver-led follow.
     pub suppress_account_notices: AtomicBool,
+    /// On signup account appends, fork only DATA wrappers while checker reads stay honest.
+    pub alter_account_second_on_append: AtomicBool,
     pub down: AtomicBool,
     pub changed: Notify,
     /// Connections attempted to the authorization route, up or down.
@@ -487,6 +551,34 @@ pub struct Edge {
     frozen: Mutex<Option<u64>>,
     /// Base reads starting past this position go unanswered.
     held: Mutex<Option<u64>>,
+    /// A device's metadata-only control reads are refused as unavailable;
+    /// the service's own checker reads are not.
+    pub refuse_control_reads: AtomicBool,
+    /// A device's next control read answers as of this position: a control
+    /// after it was appended after the read.
+    pub lag_next_control_read: Mutex<Option<u64>>,
+    /// DATA reads that asked for each body, answered or not.
+    body_asks: Mutex<HashMap<Digest, usize>>,
+    /// Each DATA request for a body: its commitment, the socket that sent it
+    /// and the connector's name, so a test can follow one client's link.
+    body_requests: Mutex<Vec<(Digest, usize, &'static str)>>,
+    /// DATA sockets served, each with a stable id for `body_requests`.
+    data_sockets: AtomicUsize,
+    /// The DATA sockets the edge serves now, by id.
+    data_sockets_live: Mutex<HashSet<usize>>,
+    /// Each DATA socket served: its connector's name, how many requests it
+    /// made, and how many of those were not account-evidence reads. One that
+    /// has only read account evidence is a single check's own link.
+    data_requests: Mutex<HashMap<usize, (&'static str, usize, usize)>>,
+    /// Refuse the next account-evidence DATA read as one the log object
+    /// cannot serve, and how many were refused.
+    refuse_evidence: AtomicBool,
+    evidence_refused: AtomicUsize,
+    /// Each device control read's log and the position it reads after.
+    pub control_reads: Mutex<Vec<(LogId, u64)>>,
+    /// The seen window clients started from now on keep their staged
+    /// controls within, if not the services' own.
+    pub seen_window: Mutex<Option<u64>>,
     /// Private-home storage is unreachable: nothing is stored.
     pub home_down: AtomicBool,
     /// Serve a wrongly marked final body on DATA without changing the
@@ -500,6 +592,7 @@ pub struct Edge {
     stage_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     valid_publish_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     body_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    read_hold: Mutex<Option<ReadHold>>,
     batch_reply_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     authz_reply_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     data_connect_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -511,6 +604,15 @@ pub struct Edge {
     /// Presence frames delivered to a joiner before its roster snapshot.
     presence_before_peers: std::sync::atomic::AtomicUsize,
     presence: Mutex<PresenceRoom>,
+    /// Directory pages read and entries stored by devices.
+    pub directory_reads: AtomicUsize,
+    pub directory_writes: AtomicUsize,
+    /// Every trust control's exact original a device submitted, and how many
+    /// times a device asked whether one was ordered.
+    pub submitted: Mutex<Vec<Vec<u8>>>,
+    pub confirm_asks: AtomicUsize,
+    /// How many times a device asked the home for its kit-used notices.
+    pub notice_reads: AtomicUsize,
 }
 
 enum Step {
@@ -561,6 +663,7 @@ impl Edge {
             refused_read_batches: Default::default(),
             read_batch_inflight: AtomicBool::new(false),
             suppress_account_notices: AtomicBool::new(false),
+            alter_account_second_on_append: AtomicBool::new(false),
             down: AtomicBool::new(false),
             changed: Notify::new(),
             authz_connects: Default::default(),
@@ -570,6 +673,17 @@ impl Edge {
             sockets: Mutex::default(),
             frozen: Mutex::default(),
             held: Mutex::default(),
+            refuse_control_reads: AtomicBool::new(false),
+            lag_next_control_read: Mutex::default(),
+            body_asks: Mutex::default(),
+            body_requests: Mutex::default(),
+            data_sockets: Default::default(),
+            data_sockets_live: Mutex::default(),
+            data_requests: Mutex::default(),
+            refuse_evidence: AtomicBool::new(false),
+            evidence_refused: Default::default(),
+            control_reads: Mutex::default(),
+            seen_window: Mutex::default(),
             home_down: AtomicBool::new(false),
             wrong_body_last: AtomicBool::new(false),
             wrong_body_index: AtomicBool::new(false),
@@ -578,6 +692,7 @@ impl Edge {
             stage_hold: Mutex::default(),
             valid_publish_hold: Mutex::default(),
             body_hold: Mutex::default(),
+            read_hold: Mutex::default(),
             batch_reply_hold: Mutex::default(),
             authz_reply_hold: Mutex::default(),
             data_connect_hold: Mutex::default(),
@@ -586,10 +701,32 @@ impl Edge {
             presence_frames: Default::default(),
             presence_before_peers: Default::default(),
             presence: Mutex::default(),
+            directory_reads: Default::default(),
+            directory_writes: Default::default(),
+            submitted: Mutex::default(),
+            confirm_asks: Default::default(),
+            notice_reads: Default::default(),
         })
     }
     pub fn root(&self) -> [u8; 32] {
         self.root.public()
+    }
+    /// The home's recovery key: derived from the hosting root's seed, so a
+    /// restarted service holds the same one.
+    pub fn recovery_key(&self) -> bh_crypto::KemKey {
+        let seed = bh_crypto::hash(
+            &[
+                b"fixture recovery key\0".as_slice(),
+                self.root.export_seed().expose(),
+            ]
+            .concat(),
+        );
+        bh_crypto::KemKey::from_seed(&bh_crypto::Secret::from_slice(&seed).unwrap())
+    }
+    /// The recovery key's certificate under the hosting root, as an app
+    /// build carries it.
+    pub fn recovery_certificate(&self) -> bh_sync::evidence::RecoveryKeyCertificate {
+        bh_sync::evidence::certify_recovery_key(&self.root, &self.recovery_key().public())
     }
     pub fn selected_reads(&self, log: LogId) -> Vec<(u64, u64)> {
         self.selected_reads
@@ -654,6 +791,17 @@ impl Edge {
         let (arrived, arrived_rx) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
         *self.body_hold.lock().unwrap() = Some((arrived, release_rx));
+        HomeHold {
+            arrived: arrived_rx,
+            release,
+        }
+    }
+    /// Hold the answer of the next base read that starts past `position`,
+    /// and every later request on that socket, until released.
+    pub fn hold_next_read_after(&self, position: u64) -> HomeHold {
+        let (arrived, arrived_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        *self.read_hold.lock().unwrap() = Some((position, arrived, release_rx));
         HomeHold {
             arrived: arrived_rx,
             release,
@@ -839,9 +987,93 @@ impl Edge {
             .insert(commitment, bytes);
         commitment
     }
-    /// Batch reads (more than one position) serve nothing past `position`
-    /// until thawed with `None`, as a lagging read path; single-position
-    /// reads, appends, Acks and head notices go on.
+    /// How many DATA reads asked for the body `commitment` names.
+    pub fn body_asks(&self, commitment: Digest) -> usize {
+        self.body_asks
+            .lock()
+            .unwrap()
+            .get(&commitment)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// How many DATA reads named `who` asked for the body `commitment` names.
+    pub fn body_asks_by(&self, commitment: Digest, who: &str) -> usize {
+        self.body_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(body, _, name)| *body == commitment && *name == who)
+            .count()
+    }
+    /// The distinct DATA sockets named `who` that asked for the body
+    /// `commitment` names: one while that client reuses its link, more once
+    /// it dropped and reopened it.
+    pub fn body_links_by(&self, commitment: Digest, who: &str) -> usize {
+        let mut sockets: Vec<usize> = Vec::new();
+        for (body, socket, name) in self.body_requests.lock().unwrap().iter() {
+            if *body == commitment && *name == who && !sockets.contains(socket) {
+                sockets.push(*socket);
+            }
+        }
+        sockets.len()
+    }
+    /// The distinct DATA sockets named `who` that asked for any of `bodies`:
+    /// one while that client read everything over the same link.
+    pub fn body_links_across(&self, bodies: &[Digest], who: &str) -> usize {
+        let requests = self.body_requests.lock().unwrap();
+        let mut sockets: Vec<usize> = Vec::new();
+        for (body, socket, name) in requests.iter() {
+            if *name == who && bodies.contains(body) && !sockets.contains(socket) {
+                sockets.push(*socket);
+            }
+        }
+        sockets.len()
+    }
+    /// The DATA sockets named `who` that have only ever read account
+    /// evidence: each is one check's own link, opened and released by it.
+    pub fn evidence_links(&self, who: &str) -> Vec<usize> {
+        let sockets = self.data_requests.lock().unwrap();
+        let mut links: Vec<usize> = sockets
+            .iter()
+            .filter(|(_, (name, requests, other))| *name == who && *requests > 0 && *other == 0)
+            .map(|(socket, _)| *socket)
+            .collect();
+        links.sort_unstable();
+        links
+    }
+    /// How many of those the edge is serving now.
+    pub fn live_evidence_links(&self, who: &str) -> usize {
+        let sockets = self.evidence_links(who);
+        let live = self.data_sockets_live.lock().unwrap();
+        sockets
+            .iter()
+            .filter(|socket| live.contains(socket))
+            .count()
+    }
+    /// Refuse the next account-evidence DATA read as unservable, so the
+    /// reading lane sees a network failure while its socket stays open.
+    pub fn refuse_next_evidence_read(&self) {
+        self.refuse_evidence.store(true, Ordering::SeqCst);
+    }
+    /// Account-evidence DATA reads refused as unservable.
+    pub fn evidence_refused(&self) -> usize {
+        self.evidence_refused.load(Ordering::SeqCst)
+    }
+    /// Serve `bytes` for the body `commitment` names, as an edge handing out
+    /// other bytes under an ordered body's commitment would.
+    pub fn serve_body_as(&self, log: LogId, commitment: Digest, bytes: Vec<u8>) {
+        self.logs
+            .lock()
+            .unwrap()
+            .entry(key(log))
+            .or_default()
+            .bodies
+            .insert(commitment, bytes);
+    }
+    /// Freeze only BASE-log event reads at `position`, not account history:
+    /// multi-position DATA reads are cut there, as is the service's base
+    /// checker read. Single-position DATA reads, appends, Acks and notices
+    /// continue. `None` thaws the base.
     pub fn freeze_reads(&self, position: Option<u64>) {
         *self.frozen.lock().unwrap() = position;
         self.changed.notify_waiters();
@@ -872,6 +1104,39 @@ impl Edge {
             .collect()
     }
     /// Remove an ordered body, as a lost object leaves the log; returns it.
+    /// The account directory as the home holds it: each entry id's version
+    /// and exact bytes.
+    pub fn directory(&self, log: LogId) -> Vec<([u8; 32], u64, Vec<u8>)> {
+        self.logs
+            .lock()
+            .unwrap()
+            .get(&key(log))
+            .map(|held| {
+                held.directory
+                    .iter()
+                    .map(|(entry, (version, _, bytes))| (*entry, *version, bytes.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Hold `bytes` under `entry` at `version` whatever was there, as a home
+    /// that rolled its directory back or was written by a test would.
+    pub fn put_directory_entry(&self, log: LogId, entry: [u8; 32], version: u64, bytes: Vec<u8>) {
+        let digest = Digest(bh_crypto::hash(&bytes));
+        self.logs
+            .lock()
+            .unwrap()
+            .entry(key(log))
+            .or_default()
+            .directory
+            .insert(entry, (version, digest, bytes));
+    }
+    /// Drop `entry` from the directory, as a home that lost it would.
+    pub fn remove_directory_entry(&self, log: LogId, entry: [u8; 32]) {
+        if let Some(held) = self.logs.lock().unwrap().get_mut(&key(log)) {
+            held.directory.remove(&entry);
+        }
+    }
     pub fn take_body(&self, log: LogId, body: Digest) -> Option<Vec<u8>> {
         self.logs
             .lock()
@@ -896,13 +1161,14 @@ impl Edge {
                 let commitment = BodyObject::new(body.clone()).unwrap().commitment();
                 entry.bodies.insert(commitment, body);
             }
-            let ordered = Commitment::order(BaseId(log.id), entry.head(), event, route).unwrap();
+            let ordered = Commitment::order(BaseId(log.id), entry.order(), event, route).unwrap();
             if route == Route::Control {
                 entry.control = ordered.head();
             }
-            entry
-                .ids
-                .insert(event.id(), (event.digest(), entry.entries.len()));
+            entry.ids.insert(
+                event.publication_id(route),
+                (event.digest(), entry.entries.len()),
+            );
             entry.entries.push((ordered, event.clone()));
             ordered.head()
         };
@@ -915,6 +1181,64 @@ impl Edge {
         let event = bh_authz::proto::account_log_wrap(original, None).unwrap();
         self.order(log, &event, None, Route::Control)
     }
+    /// A confirmation of the account original ordered at `position`, signed
+    /// now by a key certified under the hosting root, as a confirming
+    /// hosting service would sign it: for a test that stands in for a
+    /// device's own verified read. Its time and exact bytes, as the device
+    /// keeps them.
+    pub fn account_confirmation(
+        &self,
+        log: LogId,
+        position: u64,
+    ) -> (bh_account::ConfirmedTime, Vec<u8>) {
+        let logs = self.logs.lock().unwrap();
+        let entries = &logs.get(&key(log)).unwrap().entries;
+        let original = |at: u64| {
+            let (_, event) = &entries[at as usize - 1];
+            let (original, body) = bh_authz::proto::account_log_unwrap(event).unwrap();
+            (original.to_vec(), body)
+        };
+        let inner = |at: u64| Head {
+            position: at,
+            hash: Digest(bh_crypto::hash(&original(at).0)),
+        };
+        let (bytes, body) = original(position);
+        let now = self.clock.now();
+        let bounds = bh_sync::evidence::TimeBounds {
+            earliest_ms: now,
+            latest_ms: now,
+        };
+        let proof = bh_sync::evidence::OrderingConfirmation::sign(
+            &self.permit_key,
+            &self.permit_certificate,
+            bh_sync::evidence::ConfirmationClaim {
+                log,
+                original: bh_sync::evidence::original_digest(&bytes),
+                original_previous: inner(position - 1),
+                original_head: inner(position),
+                body,
+                ordered: entries[position as usize - 1].0.head(),
+                bounds,
+            },
+        );
+        let time = bh_account::ConfirmedTime {
+            earliest_ms: now,
+            latest_ms: now,
+        };
+        (time, proof.encode().to_vec())
+    }
+    /// Another independently certified statement of the exact same claim:
+    /// valid evidence on a retry must not overwrite the original proof bytes.
+    pub fn resign_account_confirmation(&self, bytes: &[u8]) -> Vec<u8> {
+        use bh_sync::evidence::OrderingConfirmation;
+        let old = OrderingConfirmation::decode(bytes).unwrap();
+        old.verify(&self.root.public()).unwrap();
+        let key = SigningKey::generate();
+        let certificate = permit::certify(&self.root, key.public());
+        OrderingConfirmation::sign(&key, &certificate, *old.claim())
+            .encode()
+            .to_vec()
+    }
     /// Until `serve_ordered`, data reads of an account log serve `originals`
     /// from `position` on, chained after what is ordered before it, instead
     /// of what the account home ordered there: an edge serving other bytes.
@@ -926,25 +1250,86 @@ impl Edge {
             let mut head = entry
                 .entries
                 .iter()
-                .map(|(c, _)| c.head())
-                .take_while(|h| h.position < position)
+                .map(|(c, _)| c.after())
+                .take_while(|state| state.position() < position)
                 .last()
-                .unwrap_or(Head::EMPTY);
+                .unwrap_or(bh_sync::OrderState::EMPTY);
             let mut served = Vec::new();
             for original in originals {
                 let event = bh_authz::proto::account_log_wrap(original, None).unwrap();
                 let ordered =
                     Commitment::order(BaseId(log.id), head, &event, Route::Control).unwrap();
-                head = ordered.head();
+                head = ordered.after();
                 served.push((ordered, event));
             }
             entry.served = Some((position, served));
+            entry.served_full_only = false;
         }
+        self.changed.notify_waiters();
+    }
+    /// Serve a page at a real position whose first canonical predecessor is
+    /// another (same-position) outer opening, as a forked home might.
+    pub fn serve_account_after(
+        &self,
+        log: LogId,
+        position: u64,
+        mut before: bh_sync::OrderState,
+        originals: &[Vec<u8>],
+    ) {
+        assert_eq!(before.position() + 1, position);
+        let mut served = Vec::new();
+        for original in originals {
+            let event = bh_authz::proto::account_log_wrap(original, None).unwrap();
+            let ordered =
+                Commitment::order(BaseId(log.id), before, &event, Route::Control).unwrap();
+            before = ordered.after();
+            served.push((ordered, event));
+        }
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.get_mut(&key(log)).unwrap();
+        entry.served = Some((position, served));
+        entry.served_full_only = false;
+        drop(logs);
+        self.changed.notify_waiters();
+    }
+    /// Serve genuine account originals, but replace the second wrapper's body
+    /// and recalculate its and later canonical openings at the data edge.
+    pub fn serve_account_with_altered_second_body(&self, log: LogId) {
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.get_mut(&key(log)).unwrap();
+        let mut before = entry.entries[0].0.after();
+        let served = entry.entries[1..]
+            .iter()
+            .enumerate()
+            .map(|(index, (_, event))| {
+                let (original, _) = bh_authz::proto::account_log_unwrap(event).unwrap();
+                let wrapped = bh_authz::proto::account_log_wrap(
+                    original,
+                    if index == 0 {
+                        Some(Digest([99; 32]))
+                    } else {
+                        None
+                    },
+                )
+                .unwrap();
+                let commitment =
+                    Commitment::order(BaseId(log.id), before, &wrapped, Route::Control).unwrap();
+                before = commitment.after();
+                (commitment, wrapped)
+            })
+            .collect();
+        entry.served = Some((2, served));
+        entry.served_full_only = true;
+        drop(logs);
         self.changed.notify_waiters();
     }
     /// Data reads serve the ordered log again.
     pub fn serve_ordered(&self, log: LogId) {
-        self.logs.lock().unwrap().get_mut(&key(log)).unwrap().served = None;
+        let mut logs = self.logs.lock().unwrap();
+        let entry = logs.get_mut(&key(log)).unwrap();
+        entry.served = None;
+        entry.served_full_only = false;
+        drop(logs);
         self.changed.notify_waiters();
     }
     /// Rewrite the log's last position with other history and extend it:
@@ -959,12 +1344,32 @@ impl Edge {
                 Route::Content => Route::Control,
                 Route::Control => Route::Content,
             };
-            let previous = entry.head();
+            let previous = entry.order();
             let other = Commitment::order(BaseId(log.id), previous, &event, route).unwrap();
             entry.entries.push((other, event.clone()));
             let next =
-                Commitment::order(BaseId(log.id), other.head(), &event, last.route()).unwrap();
+                Commitment::order(BaseId(log.id), other.after(), &event, last.route()).unwrap();
             entry.entries.push((next, event));
+        }
+        self.changed.notify_waiters();
+    }
+    /// Order the event at `position` on the other route and every later
+    /// event again after it: other history from there on, each head served
+    /// with a genuine receipt.
+    pub fn flip_route(&self, log: LogId, position: u64) {
+        {
+            let mut logs = self.logs.lock().unwrap();
+            let entry = logs.get_mut(&key(log)).unwrap();
+            let later = entry.entries.split_off(position as usize - 1);
+            for (index, (ordered, event)) in later.into_iter().enumerate() {
+                let route = match (index, ordered.route()) {
+                    (0, Route::Content) => Route::Control,
+                    (0, Route::Control) => Route::Content,
+                    (_, route) => route,
+                };
+                let next = Commitment::order(BaseId(log.id), entry.order(), &event, route).unwrap();
+                entry.entries.push((next, event));
+            }
         }
         self.changed.notify_waiters();
     }
@@ -987,6 +1392,55 @@ impl Edge {
             PermitError::Expired => Refusal::Expired,
             _ => Refusal::Malformed,
         })
+    }
+    /// One log-object capture: select sparse controls and the full-order
+    /// endpoint under the same log lock. `through` fixes an earlier endpoint;
+    /// without it the captured log's current last entry is the endpoint.
+    fn sparse_control_snapshot(
+        &self,
+        log: LogId,
+        after: u64,
+        through: Option<u64>,
+    ) -> Result<(bh_authz::LogItems, CoverageEndpoint), EdgeError> {
+        if log.kind != LogKind::Base {
+            return Err(EdgeError::Refused);
+        }
+        let frozen = *self.frozen.lock().unwrap();
+        let logs = self.logs.lock().unwrap();
+        let entries = logs
+            .get(&key(log))
+            .map(|entry| entry.entries.as_slice())
+            .unwrap_or(&[]);
+        let target = through.unwrap_or(entries.len() as u64);
+        let opening = if target == 0 {
+            bh_sync::OrderState::EMPTY
+        } else {
+            entries
+                .get(usize::try_from(target - 1).map_err(|_| EdgeError::Unavailable)?)
+                .ok_or(EdgeError::Unavailable)?
+                .0
+                .after()
+        };
+        let items = entries
+            .iter()
+            .filter(|(c, _)| {
+                c.route() == Route::Control
+                    && c.head().position > after
+                    && c.head().position <= target
+                    && frozen.is_none_or(|at| c.head().position <= at)
+            })
+            .take(64)
+            .map(|(c, e)| (c.encode(), e.encode()))
+            .collect();
+        Ok((
+            items,
+            CoverageEndpoint {
+                order: opening,
+                receipt: (target > 0)
+                    .then(|| self.receipt(log, opening.head(BaseId(log.id))))
+                    .flatten(),
+            },
+        ))
     }
     fn receipt(&self, log: LogId, head: Head) -> Option<[u8; receipt::RECEIPT_LEN]> {
         (log.kind == LogKind::Base).then(|| {
@@ -1024,7 +1478,7 @@ impl Edge {
                         });
                         let frozen = *self.frozen.lock().unwrap();
                         let last = match frozen {
-                            Some(at) if last > first => last.min(at),
+                            Some(at) if log.kind == LogKind::Base && last > first => last.min(at),
                             _ => last,
                         };
                         let mut logs = self.logs.lock().unwrap();
@@ -1037,6 +1491,7 @@ impl Edge {
                                 let served = l
                                     .served
                                     .as_ref()
+                                    .filter(|_| !l.served_full_only || last - first == 63)
                                     .map_or((u64::MAX, &[][..]), |(from, served)| {
                                         (*from, served.as_slice())
                                     });
@@ -1059,7 +1514,56 @@ impl Edge {
                         let receipt = items.last().and_then(|(c, _)| {
                             self.receipt(log, Commitment::decode(c).unwrap().head())
                         });
-                        Step::Frames(vec![Response::Events { id, items, receipt }], deadline)
+                        let frames = vec![Response::Events {
+                            id,
+                            items,
+                            receipt,
+                            coverage: None,
+                        }];
+                        if log.kind == LogKind::Base
+                            && let Some((_, arrived, release)) = self
+                                .read_hold
+                                .lock()
+                                .unwrap()
+                                .take_if(|(at, ..)| first > *at)
+                        {
+                            let _ = arrived.send(());
+                            return Step::HeldReply(frames, deadline, release);
+                        }
+                        Step::Frames(frames, deadline)
+                    }
+                    scope @ (Scope::ReadControls { .. } | Scope::ReadControlRange { .. }) => {
+                        if self.refuse_control_reads.load(Ordering::SeqCst) {
+                            return refuse(id, Refusal::Unavailable);
+                        }
+                        let (log, after, through) = match scope {
+                            Scope::ReadControls { log, after } => (log, after, None),
+                            Scope::ReadControlRange {
+                                log,
+                                after,
+                                through,
+                            } => (log, after, Some(through)),
+                            _ => unreachable!(),
+                        };
+                        self.control_reads.lock().unwrap().push((log, after));
+                        let through = match self.lag_next_control_read.lock().unwrap().take() {
+                            Some(at) => Some(through.map_or(at, |t| t.min(at))),
+                            None => through,
+                        };
+                        let (items, coverage) =
+                            match self.sparse_control_snapshot(log, after, through) {
+                                Ok(snapshot) => snapshot,
+                                Err(_) => return refuse(id, Refusal::Unavailable),
+                            };
+                        Step::Frames(
+                            vec![Response::Events {
+                                id,
+                                items,
+                                receipt: None,
+                                coverage: Some(coverage),
+                            }],
+                            deadline,
+                        )
                     }
                     Scope::ReadBodies { log, bodies } => {
                         self.mark("body read at object");
@@ -1068,6 +1572,7 @@ impl Edge {
                         let mut frames = Vec::new();
                         let count = bodies.len();
                         for (index, body) in bodies.iter().enumerate() {
+                            *self.body_asks.lock().unwrap().entry(*body).or_default() += 1;
                             match logs.get(&key(log)).and_then(|l| l.bodies.get(body)) {
                                 Some(bytes) => frames.push(Response::Body {
                                     id,
@@ -1222,6 +1727,7 @@ impl Edge {
                     body,
                     epoch,
                     after,
+                    attached,
                 } = permit.scope
                 else {
                     return refuse(id, Refusal::Scope);
@@ -1236,14 +1742,19 @@ impl Edge {
                 if event.digest() != digest {
                     return refuse(id, Refusal::Malformed);
                 }
+                let route = if after.is_some() {
+                    Route::Control
+                } else {
+                    Route::Content
+                };
                 if log.kind == LogKind::Base {
                     let mut refusing = self.refusing.lock().unwrap();
-                    if !refusing.contains_key(&event.id())
+                    if !refusing.contains_key(&event.publication_id(route))
                         && let Some(reason) = self.refuse_next.lock().unwrap().take()
                     {
-                        refusing.insert(event.id(), reason);
+                        refusing.insert(event.publication_id(route), reason);
                     }
-                    if let Some(reason) = refusing.get(&event.id()) {
+                    if let Some(reason) = refusing.get(&event.publication_id(route)) {
                         return refuse(id, *reason);
                     }
                 }
@@ -1257,15 +1768,18 @@ impl Edge {
                                 | Hook::ForgeAck
                         )
                     }),
-                    LogKind::Account => {
-                        self.take_hook(|h| matches!(h, Hook::DropAfterAccountAppend { .. }))
-                    }
+                    LogKind::Account => self.take_hook(|h| {
+                        matches!(
+                            h,
+                            Hook::DropAfterAccountAppend { .. }
+                                | Hook::DropBeforeAccountAppend
+                                | Hook::AdvanceAfterAccountAppend { .. }
+                        )
+                    }),
                 };
-                let route = if after.is_some() {
-                    Route::Control
-                } else {
-                    Route::Content
-                };
+                if hook == Some(Hook::DropBeforeAccountAppend) {
+                    return Step::Drop;
+                }
                 let head = {
                     let mut logs = self.logs.lock().unwrap();
                     let entry = logs.entry(key(log)).or_default();
@@ -1278,7 +1792,7 @@ impl Edge {
                         // The forgery chains from the genuine predecessor of
                         // the head it claims; only its hash is not its own.
                         let head = entry.head();
-                        let previous = entry.entries[entry.entries.len() - 2].0.head();
+                        let previous = entry.entries[entry.entries.len() - 2].0.after();
                         let mut bytes = Commitment::order(BaseId(log.id), previous, &event, route)
                             .unwrap()
                             .encode();
@@ -1286,7 +1800,7 @@ impl Edge {
                         entry.forged = Some((Commitment::decode(&bytes).unwrap(), event.clone()));
                         let ack = AppendAck {
                             log,
-                            event: event.id(),
+                            event: event.publication_id(route),
                             head,
                             receipt: self.receipt(log, head),
                         };
@@ -1300,7 +1814,9 @@ impl Edge {
                     }
                     // An exact retry gets the original result before any
                     // predecessor or epoch check.
-                    if let Some((original, index)) = entry.ids.get(&event.id()).copied() {
+                    if let Some((original, index)) =
+                        entry.ids.get(&event.publication_id(route)).copied()
+                    {
                         let (ordered, _) = &entry.entries[index];
                         if original != digest || ordered.route() != route {
                             return refuse(id, Refusal::Conflict);
@@ -1317,24 +1833,36 @@ impl Edge {
                             _ => {}
                         }
                         // Only a staging body can be ordered: an ordered one
-                        // never belongs to a second event.
-                        if let Some(body) = body {
-                            let Some(bytes) = entry.staged.remove(&body) else {
-                                return refuse(id, Refusal::NotStaged);
-                            };
+                        // never belongs to a second event. A control's
+                        // attached body is ordered with its own.
+                        let bodies: Vec<_> = body.into_iter().chain(attached).collect();
+                        if bodies.iter().any(|b| !entry.staged.contains_key(b)) {
+                            return refuse(id, Refusal::NotStaged);
+                        }
+                        for body in bodies {
+                            let bytes = entry.staged.remove(&body).expect("checked staged");
                             entry.bodies.insert(body, bytes);
                         }
                         let ordered =
-                            Commitment::order(BaseId(log.id), entry.head(), &event, route).unwrap();
+                            Commitment::order(BaseId(log.id), entry.order(), &event, route)
+                                .unwrap();
                         if after.is_some() {
                             entry.control = ordered.head();
                             entry.epoch = epoch;
                         }
-                        entry.ids.insert(event.id(), (digest, entry.entries.len()));
+                        entry
+                            .ids
+                            .insert(event.publication_id(route), (digest, entry.entries.len()));
                         entry.entries.push((ordered, event.clone()));
                         ordered.head()
                     }
                 };
+                if log.kind == LogKind::Account
+                    && self.alter_account_second_on_append.load(Ordering::SeqCst)
+                    && self.entries(log).len() >= 2
+                {
+                    self.serve_account_with_altered_second_body(log);
+                }
                 self.changed.notify_waiters();
                 match hook {
                     Some(
@@ -1347,11 +1875,12 @@ impl Edge {
                         return Step::Drop;
                     }
                     Some(Hook::WithholdAck) => self.clock.advance(31_000),
+                    Some(Hook::AdvanceAfterAccountAppend { ms }) => self.clock.advance(ms),
                     _ => {}
                 }
                 let ack = AppendAck {
                     log,
-                    event: event.id(),
+                    event: event.publication_id(route),
                     head,
                     receipt: self.receipt(log, head),
                 };
@@ -1406,6 +1935,81 @@ impl Edge {
             }
             // Served by `serve_data`, which keeps it running.
             Request::Subscribe { id, .. } => refuse(id, Refusal::Unavailable),
+            Request::StoreDirectoryEntry { id, permit, body } => {
+                let permit = match self.verify(&permit) {
+                    Ok(p) => p,
+                    Err(reason) => return refuse(id, reason),
+                };
+                let Scope::StoreDirectoryEntry {
+                    log,
+                    entry,
+                    version,
+                    body: digest,
+                    len,
+                } = permit.scope
+                else {
+                    return refuse(id, Refusal::Scope);
+                };
+                if body.is_empty() || body.len() != len as usize || body.len() > 65_536 {
+                    return refuse(id, Refusal::Malformed);
+                }
+                if Digest(bh_crypto::hash(&body)) != digest {
+                    return refuse(id, Refusal::Scope);
+                }
+                self.directory_writes.fetch_add(1, Ordering::SeqCst);
+                let mut logs = self.logs.lock().unwrap();
+                let held = logs.entry(key(log)).or_default();
+                // As the Worker: a higher version replaces, the same version
+                // with the same body is ok, anything else conflicts.
+                match held.directory.get(&entry) {
+                    Some((current, held_digest, _))
+                        if *current > version
+                            || (*current == version && *held_digest != digest) =>
+                    {
+                        return refuse(id, Refusal::Conflict);
+                    }
+                    Some((current, _, _)) if *current == version => {}
+                    _ => {
+                        held.directory.insert(entry, (version, digest, body));
+                    }
+                }
+                Step::Frames(
+                    vec![Response::DirectoryEntryStored { id }],
+                    permit.deadline_ms,
+                )
+            }
+            Request::ReadDirectory { id, permit, after } => {
+                let permit = match self.verify(&permit) {
+                    Ok(p) => p,
+                    Err(reason) => return refuse(id, reason),
+                };
+                let Scope::ReadDirectory { log } = permit.scope else {
+                    return refuse(id, Refusal::Scope);
+                };
+                self.directory_reads.fetch_add(1, Ordering::SeqCst);
+                let logs = self.logs.lock().unwrap();
+                let rows: Vec<Vec<u8>> = logs
+                    .get(&key(log))
+                    .map(|held| {
+                        held.directory
+                            .iter()
+                            .filter(|(entry, _)| after.is_none_or(|after| **entry > after))
+                            .take(65)
+                            .map(|(_, (_, _, bytes))| bytes.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let more = rows.len() > 64;
+                Step::Frames(
+                    vec![Response::Directory {
+                        id,
+                        entries: rows.into_iter().take(64).collect(),
+                        more,
+                    }],
+                    permit.deadline_ms,
+                )
+            }
+            Request::RetireHomeObjects { id, .. } => refuse(id, Refusal::Unavailable),
             Request::PresenceJoin { id, .. } | Request::Presence { id, .. } => {
                 refuse(id, Refusal::Unavailable)
             }
@@ -1498,7 +2102,7 @@ impl Edge {
                     let changed = if fault == ProofFault::Descriptor {
                         let mut envelope = event.envelope().to_vec();
                         envelope[40] ^= 1;
-                        OpaqueEvent::new(event.id(), envelope).unwrap()
+                        OpaqueEvent::new(event.nonce(), envelope).unwrap()
                     } else {
                         event.clone()
                     };
@@ -1508,7 +2112,7 @@ impl Edge {
                         Route::Content
                     };
                     let forged =
-                        Commitment::order(BaseId(log.id), original.previous(), &changed, route)
+                        Commitment::order(BaseId(log.id), original.before(), &changed, route)
                             .unwrap();
                     commitment = forged.encode();
                     ack.head = forged.head();
@@ -1616,6 +2220,13 @@ impl Edge {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (mut sink, mut stream) = ws.split();
+        let socket = self.data_sockets.fetch_add(1, Ordering::SeqCst) + 1;
+        self.data_sockets_live.lock().unwrap().insert(socket);
+        self.data_requests
+            .lock()
+            .unwrap()
+            .insert(socket, (who, 0, 0));
+        let _live = LiveData(self.clone(), socket);
         let presence_socket = self.presence_socket();
         let window: Arc<Window> = Arc::new((Mutex::new(INITIAL_WINDOW as i64), Notify::new()));
         let (requests, mut queue) = mpsc::unbounded_channel::<(tokio::time::Instant, Request)>();
@@ -1670,16 +2281,37 @@ impl Edge {
                             .map(|p| p.scope)
                             {
                                 Ok(Scope::ReadBodies { .. }) => Count::ReadBodies,
+                                Ok(Scope::ReadControls { .. } | Scope::ReadControlRange { .. }) => {
+                                    Count::ReadControls
+                                }
                                 _ => Count::ReadEvents,
                             },
                             _ => Count::OtherRequests,
                         },
                         usize::from(!matches!(request, Request::StoreHomeObjects { .. })),
                     );
-                    if let Request::Append { event, .. } | Request::Publish { event, .. } = &request
+                    let arriving = match &request {
+                        Request::Append { event, permit, .. } => Some((event, permit)),
+                        Request::Publish {
+                            event,
+                            append_permit,
+                            ..
+                        } => Some((event, append_permit)),
+                        _ => None,
+                    };
+                    if let Some((event, signed)) = arriving
                         && let Ok(event) = OpaqueEvent::decode(event)
+                        && let Ok(permit) = edge.verify(signed)
+                        && let Scope::Append { after, .. } = permit.scope
                     {
-                        edge.note(Seen::Arrived { event: event.id() });
+                        let route = if after.is_some() {
+                            Route::Control
+                        } else {
+                            Route::Content
+                        };
+                        edge.note(Seen::Arrived {
+                            event: event.publication_id(route),
+                        });
                     }
                     if let Request::Credit { bytes } = request {
                         *window.0.lock().unwrap() += i64::from(bytes);
@@ -1748,6 +2380,49 @@ impl Edge {
                 _ => one_way,
             };
             let now = tokio::time::Instant::now();
+            // A lane that opens a socket for one piece of work is named by
+            // its requests: one that only reads account evidence is the
+            // removal lane's link, used by one check at a time.
+            let evidence = match &request {
+                Request::Read { permit, .. } => self.verify(permit).is_ok_and(|permit| {
+                    matches!(
+                        permit.scope,
+                        Scope::ReadEvents { log, .. } if log.kind == LogKind::Account
+                    )
+                }),
+                _ => false,
+            };
+            {
+                let mut sockets = self.data_requests.lock().unwrap();
+                let entry = sockets.entry(socket).or_insert((who, 0, 0));
+                entry.1 += 1;
+                entry.2 += usize::from(!evidence);
+            }
+            if evidence && self.refuse_evidence.swap(false, Ordering::SeqCst) {
+                self.evidence_refused.fetch_add(1, Ordering::SeqCst);
+                let Request::Read { id, .. } = &request else {
+                    unreachable!("only a read carries evidence")
+                };
+                let _ = out.send((
+                    now,
+                    Response::Refused {
+                        id: *id,
+                        reason: Refusal::Unavailable,
+                    },
+                ));
+                continue;
+            }
+            // Bodies name the content link that read them; an account-evidence
+            // socket asks for events only, so no evidence lane joins this.
+            if let Request::Read { permit, .. } = &request
+                && let Ok(permit) = self.verify(permit)
+                && let Scope::ReadBodies { bodies, .. } = permit.scope
+            {
+                let mut requests = self.body_requests.lock().unwrap();
+                for body in bodies {
+                    requests.push((body, socket, who));
+                }
+            }
             if let Request::PresenceJoin { id, permit } = &request {
                 match self.verify(permit) {
                     Ok(Permit {
@@ -1875,6 +2550,15 @@ impl Edge {
 
 type Window = (Mutex<i64>, Notify);
 
+/// A DATA socket the edge is serving: its live entry ends with the socket,
+/// including when the task that serves it is aborted.
+struct LiveData(Arc<Edge>, usize);
+impl Drop for LiveData {
+    fn drop(&mut self) {
+        self.0.data_sockets_live.lock().unwrap().remove(&self.1);
+    }
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1890,6 +2574,9 @@ fn kind(request: &Request) -> &'static str {
         Request::Publish { .. } => "Publish",
         Request::Subscribe { .. } => "Subscribe",
         Request::StoreHomeObjects { .. } => "StoreHomeObjects",
+        Request::ReadDirectory { .. } => "ReadDirectory",
+        Request::StoreDirectoryEntry { .. } => "StoreDirectoryEntry",
+        Request::RetireHomeObjects { .. } => "RetireHomeObjects",
         Request::Credit { .. } => "Credit",
         Request::PresenceJoin { .. } => "PresenceJoin",
         Request::Presence { .. } => "Presence",
@@ -1903,6 +2590,9 @@ fn answer(response: &Response) -> &'static str {
         Response::Acked { .. } => "Acked",
         Response::Published { .. } => "Published",
         Response::HomeObjectsStored { .. } => "HomeObjectsStored",
+        Response::Directory { .. } => "Directory",
+        Response::DirectoryEntryStored { .. } => "DirectoryEntryStored",
+        Response::HomeObjectsRetired { .. } => "HomeObjectsRetired",
         Response::Head { .. } => "Head notice",
         Response::Refused { .. } => "Refused",
         Response::Presence { .. } => "Presence",
@@ -1918,6 +2608,9 @@ fn id_of(response: &Response) -> u32 {
         | Response::Acked { id, .. }
         | Response::Published { id, .. }
         | Response::HomeObjectsStored { id, .. }
+        | Response::Directory { id, .. }
+        | Response::DirectoryEntryStored { id }
+        | Response::HomeObjectsRetired { id }
         | Response::Head { id, .. }
         | Response::Refused { id, .. }
         | Response::Presence { id, .. }
@@ -2414,12 +3107,38 @@ impl EdgeReader for Edge {
     ) -> BoxFuture<'_, Result<bh_authz::LogRead, EdgeError>> {
         Box::pin(self.through_edge(move || {
             let permit = self.verify(&signed).map_err(|_| EdgeError::Refused)?;
-            let Scope::ReadEvents { log, first, last } = permit.scope else {
-                return Err(EdgeError::Refused);
+            let (log, first, last, sparse) = match permit.scope {
+                Scope::ReadEvents { log, first, last } => (log, first, last, None),
+                Scope::ReadControls { log, after } => {
+                    (log, after.saturating_add(1), u64::MAX, Some((after, None)))
+                }
+                Scope::ReadControlRange {
+                    log,
+                    after,
+                    through,
+                } => (
+                    log,
+                    after.saturating_add(1),
+                    through,
+                    Some((after, Some(through))),
+                ),
+                _ => return Err(EdgeError::Refused),
             };
-            self.selected_reads.lock().unwrap().push((log, first, last));
+            // The selected-read trace measures finite read windows used by
+            // cursor/resume tests; an unbounded control probe is not one.
+            if !matches!(sparse, Some((_, None))) {
+                self.selected_reads.lock().unwrap().push((log, first, last));
+            }
             if log.kind == LogKind::Base {
                 self.mark("checker selects base events");
+            }
+            if let Some((after, through)) = sparse {
+                let (items, coverage) = self.sparse_control_snapshot(log, after, through)?;
+                return Ok(bh_authz::LogRead {
+                    items,
+                    receipt: None,
+                    coverage: Some(coverage),
+                });
             }
             let items = self.read_log_now(signed)?;
             let receipt = if let Some((last, _)) = items.last() {
@@ -2430,7 +3149,11 @@ impl EdgeReader for Edge {
             } else {
                 None
             };
-            Ok(bh_authz::LogRead { items, receipt })
+            Ok(bh_authz::LogRead {
+                items,
+                receipt,
+                coverage: None,
+            })
         }))
     }
     fn store_home_objects(
@@ -2498,10 +3221,23 @@ impl EdgeReader for Edge {
                 return Err(EdgeError::Refused);
             };
             let logs = self.logs.lock().unwrap();
-            let ordered = logs.get(&key(log)).ok_or(EdgeError::Refused)?;
+            let entry = logs.get(&key(log)).ok_or(EdgeError::Refused)?;
+            // Ordered bodies, and an account log's staging ones, which only
+            // the service's own permits can read.
             bodies
                 .iter()
-                .map(|b| ordered.bodies.get(b).cloned().ok_or(EdgeError::Refused))
+                .map(|b| {
+                    entry
+                        .bodies
+                        .get(b)
+                        .or_else(|| {
+                            (log.kind == LogKind::Account)
+                                .then(|| entry.staged.get(b))
+                                .flatten()
+                        })
+                        .cloned()
+                        .ok_or(EdgeError::Refused)
+                })
                 .collect()
         }))
     }
@@ -2515,7 +3251,14 @@ impl Edge {
             // Up to 64 control-route events after a control read's position.
             let (log, controls, first, last) = match permit.scope {
                 Scope::ReadEvents { log, first, last } => (log, false, first, last),
-                Scope::ReadControls { log, after } => (log, true, after + 1, u64::MAX),
+                Scope::ReadControls { log, after } => {
+                    (log, true, after.saturating_add(1), u64::MAX)
+                }
+                Scope::ReadControlRange {
+                    log,
+                    after,
+                    through,
+                } => (log, true, after.saturating_add(1), through),
                 _ => return Err(EdgeError::Refused),
             };
             let frozen = *self.frozen.lock().unwrap();
@@ -2545,10 +3288,61 @@ fn seconds() -> u64 {
 }
 
 /// The edge, the real authorization service and its attested channel.
+struct FixtureNoPolicy;
+impl PolicyStore for FixtureNoPolicy {
+    type Error = ();
+    fn load(&mut self) -> Result<StoredState, ()> {
+        Err(())
+    }
+    fn save(&mut self, _: &Snapshot) -> Result<(), ()> {
+        Err(())
+    }
+}
+
 pub struct Hosted {
     pub edge: Arc<Edge>,
     relay: Arc<FakeRelay>,
     service: Mutex<Service>,
+    /// Held by a restart from the moment it retires the current service until
+    /// its replacement is in place, and by a connecting client while it binds
+    /// and registers one, so no connection binds the instance being retired.
+    restart: tokio::sync::Mutex<()>,
+    /// Only this account receives test-root-certified alternate answers.
+    hostile_account: Mutex<Option<LogId>>,
+    /// Keep claiming the same served alternate head on later empty pages.
+    consistent_served: AtomicBool,
+    omit_account: Mutex<Option<(LogId, u64, u64)>>,
+    corrupt_accepted: Mutex<Option<(LogId, bool)>>,
+    refuse_permits: AtomicBool,
+    refuse_authenticate: AtomicBool,
+    forced_not_active: AtomicUsize,
+    /// Conceal ordinary NotActive replies while leaving public evidence intact,
+    /// to exercise the removal lane's deadline timer without a refusal wake.
+    mask_not_active: AtomicBool,
+    wrong_predecessor: Mutex<Option<(LogId, u64)>>,
+    ahead_corruption: Mutex<Option<(LogId, u64, bool)>>,
+    first_page_claim: Mutex<Option<(LogId, u64, Vec<u8>)>>,
+    matched_page_claim: Mutex<Option<(LogId, u64, Vec<u8>)>>,
+    foreign_root: Mutex<Option<LogId>>,
+    other_challenge: Mutex<Option<LogId>>,
+    /// Answers to `ConfirmControl` still to be lost after the service
+    /// handled them, and how the next ones are altered.
+    lose_confirm_answers: AtomicUsize,
+    /// Answers to `SubmitControl` still to be lost after the service
+    /// handled them.
+    lose_submit_answers: AtomicUsize,
+    /// Answers to `Recover` still to be lost after the service judged
+    /// them.
+    lose_recover_answers: AtomicUsize,
+    /// A full notice page is answered; every subsequent notice read loses
+    /// its connection before an answer, including retries.
+    drop_notices_after_first: AtomicBool,
+    notice_requests: AtomicUsize,
+    confirm_tamper: Mutex<Option<ConfirmTamper>>,
+    /// Refuse every `SubmitControl` for this reason, unhandled.
+    refuse_submits: Mutex<Option<bh_authz::proto::Refusal>>,
+    /// How a released recovery answer is altered before a device sees it.
+    recovery_tamper: Mutex<Option<RecoveryTamper>>,
     pub policy_root: SigningKey,
     config: ChannelConfig,
     dir: tempfile::TempDir,
@@ -2580,17 +3374,768 @@ impl Hosted {
             edge,
             relay: Arc::default(),
             service: Mutex::new(service),
+            restart: tokio::sync::Mutex::new(()),
+            hostile_account: Mutex::new(None),
+            consistent_served: AtomicBool::new(false),
+            omit_account: Mutex::new(None),
+            corrupt_accepted: Mutex::new(None),
+            refuse_permits: AtomicBool::new(false),
+            refuse_authenticate: AtomicBool::new(false),
+            forced_not_active: AtomicUsize::new(0),
+            mask_not_active: AtomicBool::new(false),
+            wrong_predecessor: Mutex::new(None),
+            ahead_corruption: Mutex::new(None),
+            first_page_claim: Mutex::new(None),
+            matched_page_claim: Mutex::new(None),
+            foreign_root: Mutex::new(None),
+            other_challenge: Mutex::new(None),
+            lose_confirm_answers: AtomicUsize::new(0),
+            lose_submit_answers: AtomicUsize::new(0),
+            lose_recover_answers: AtomicUsize::new(0),
+            drop_notices_after_first: AtomicBool::new(false),
+            notice_requests: AtomicUsize::new(0),
+            confirm_tamper: Mutex::new(None),
+            refuse_submits: Mutex::new(None),
+            recovery_tamper: Mutex::new(None),
             policy_root,
             config,
             dir,
         })
     }
+    pub fn omit_account_confirmation(&self, log: LogId, position: u64) {
+        assert_eq!(log.kind, LogKind::Account);
+        self.omit_account_proof_range(log, position, position);
+    }
+    pub fn omit_account_proof_range(&self, log: LogId, first: u64, last: u64) {
+        assert_eq!(log.kind, LogKind::Account);
+        assert!(first >= 2 && first <= last);
+        *self.omit_account.lock().unwrap() = Some((log, first, last));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn refuse_permits_not_active(&self, refuse: bool) {
+        self.refuse_permits.store(refuse, Ordering::SeqCst);
+    }
+    pub fn refuse_authenticate_not_active(&self, refuse: bool) {
+        self.refuse_authenticate.store(refuse, Ordering::SeqCst);
+    }
+    pub fn forced_not_active_count(&self) -> usize {
+        self.forced_not_active.load(Ordering::SeqCst)
+    }
+    pub fn mask_not_active(&self) {
+        self.mask_not_active.store(true, Ordering::SeqCst);
+        self.close_fixture_connections();
+    }
+    pub fn corrupt_accepted_account(&self, log: LogId, bad_hash: bool) {
+        assert_eq!(log.kind, LogKind::Account);
+        *self.corrupt_accepted.lock().unwrap() = Some((log, bad_hash));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn wrong_account_predecessor(&self, log: LogId, position: u64) {
+        *self.wrong_predecessor.lock().unwrap() = Some((log, position));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn corrupt_ahead_account_claim(&self, log: LogId, position: u64, bad_hash: bool) {
+        *self.ahead_corruption.lock().unwrap() = Some((log, position, bad_hash));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn corrupt_terminal_account_claim(&self, log: LogId, position: u64, bad_hash: bool) {
+        *self.ahead_corruption.lock().unwrap() = Some((log, position, bad_hash));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn first_account_page_claim(&self, log: LogId, position: u64, proof: Vec<u8>) {
+        *self.first_page_claim.lock().unwrap() = Some((log, position, proof));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn matched_account_page_claim(&self, log: LogId, position: u64, proof: Vec<u8>) {
+        *self.matched_page_claim.lock().unwrap() = Some((log, position, proof));
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    /// Account confirmations re-signed by a key certified under another
+    /// hosting root, claims unchanged.
+    pub fn foreign_root_account_confirmations(&self, log: LogId) {
+        *self.foreign_root.lock().unwrap() = Some(log);
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    /// The honest accepted head, signed for a challenge the reader never sent.
+    pub fn accepted_account_head_for_other_challenge(&self, log: LogId) {
+        *self.other_challenge.lock().unwrap() = Some(log);
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    /// The service's next `ConfirmControl` answer is lost on its way back:
+    /// the socket drops once the service has handled it.
+    pub fn lose_next_confirm_answer(&self) {
+        self.lose_confirm_answers.fetch_add(1, Ordering::SeqCst);
+        self.close_fixture_connections();
+    }
+    /// The service's next `SubmitControl` answer is lost on its way back:
+    /// the socket drops once the service has handled it.
+    pub fn lose_next_submit_answer(&self) {
+        self.lose_submit_answers.fetch_add(1, Ordering::SeqCst);
+        self.close_fixture_connections();
+    }
+    /// The service's next `Recover` answer is lost on its way back: the
+    /// socket drops once the service has judged the claim.
+    /// Seed successive home notices for a test of a full read page. No
+    /// device or account change is ordered by this fixture operation.
+    pub fn seed_notices(&self, account: bh_account::AccountId, from_ms: u64, count: u64) {
+        let mut db = rusqlite::Connection::open(self.dir.path().join("authz-0.sqlite")).unwrap();
+        let tx = db.transaction().unwrap();
+        for offset in 0..count {
+            tx.execute(
+                "INSERT INTO recovery_notices(account,time_ms) VALUES(?1,?2)",
+                rusqlite::params![account.0.as_slice(), (from_ms + offset) as i64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    pub fn drop_notices_after_first(&self) {
+        self.notice_requests.store(0, Ordering::SeqCst);
+        self.drop_notices_after_first.store(true, Ordering::SeqCst);
+        self.close_fixture_connections();
+    }
+    pub fn notice_attempts(&self) -> usize {
+        self.notice_requests.load(Ordering::SeqCst)
+    }
+    pub fn lose_next_recover_answer(&self) {
+        self.lose_recover_answers.fetch_add(1, Ordering::SeqCst);
+        self.close_fixture_connections();
+    }
+    /// Alter every `ConfirmControl` answer from now on, or stop altering.
+    pub fn tamper_confirmations(&self, tamper: Option<ConfirmTamper>) {
+        *self.confirm_tamper.lock().unwrap() = tamper;
+        self.close_fixture_connections();
+    }
+    /// Alter every released recovery answer, as a home that lies about the
+    /// account's objects would.
+    pub fn tamper_recovery(&self, tamper: Option<RecoveryTamper>) {
+        *self.recovery_tamper.lock().unwrap() = tamper;
+        self.close_fixture_connections();
+    }
+    /// Refuse every trust control submitted from now on for `reason`, as a
+    /// home that will not order them, or stop refusing.
+    pub fn refuse_submits(&self, reason: Option<bh_authz::proto::Refusal>) {
+        *self.refuse_submits.lock().unwrap() = reason;
+        self.close_fixture_connections();
+    }
+    fn intercepting(&self) -> bool {
+        self.mask_not_active.load(Ordering::SeqCst)
+            || self.hostile_account.lock().unwrap().is_some()
+            || self.lose_confirm_answers.load(Ordering::SeqCst) > 0
+            || self.lose_submit_answers.load(Ordering::SeqCst) > 0
+            || self.lose_recover_answers.load(Ordering::SeqCst) > 0
+            || self.drop_notices_after_first.load(Ordering::SeqCst)
+            || self.confirm_tamper.lock().unwrap().is_some()
+            || self.refuse_submits.lock().unwrap().is_some()
+            || self.recovery_tamper.lock().unwrap().is_some()
+    }
+    pub fn restore_account_confirmations(&self) {
+        *self.omit_account.lock().unwrap() = None;
+        *self.corrupt_accepted.lock().unwrap() = None;
+        *self.wrong_predecessor.lock().unwrap() = None;
+        *self.ahead_corruption.lock().unwrap() = None;
+        *self.first_page_claim.lock().unwrap() = None;
+        *self.matched_page_claim.lock().unwrap() = None;
+        *self.foreign_root.lock().unwrap() = None;
+        *self.other_challenge.lock().unwrap() = None;
+        *self.hostile_account.lock().unwrap() = None;
+        self.close_fixture_connections();
+    }
+    /// The hostile home certifies the edge's served alternate account bytes
+    /// for this log only. Normal traffic still uses the real Service.
+    pub fn confirm_served_account(&self, log: LogId) {
+        assert_eq!(log.kind, LogKind::Account);
+        *self.hostile_account.lock().unwrap() = Some(log);
+        self.close_fixture_connections();
+    }
+    pub fn keep_served_account_head(&self) {
+        self.consistent_served.store(true, Ordering::SeqCst);
+    }
+    pub fn confirm_ordered_account(&self) {
+        *self.hostile_account.lock().unwrap() = None;
+        self.close_fixture_connections();
+    }
+    fn close_fixture_connections(&self) {
+        for task in self.edge.sockets.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+    /// A scoped test-only attested channel: the real Connection handles all
+    /// requests; only its selected account evidence is replaced by coherent
+    /// evidence of the alternate DATA bytes, certified by this fixture root.
+    async fn serve_hostile_connection(
+        &self,
+        mut ws: WebSocketStream<tokio::io::DuplexStream>,
+        service: Service,
+    ) -> Result<(), ()> {
+        let start = std::time::Instant::now();
+        let now = move || start.elapsed().as_millis() as u64;
+        let hello = ws.next().await.ok_or(())?.map_err(|_| ())?.into_data();
+        let pending =
+            ServerPending::<FixtureNoPolicy>::accept_hello(&hello, self.config.app_root, now())
+                .map_err(|_| ())?;
+        let evidence = SyntheticAttestation
+            .evidence(pending.report_data())
+            .await
+            .map_err(|_| ())?;
+        let (proof, pending) = pending
+            .attach_evidence(
+                &self.config.policy,
+                &self.config.policy_signature,
+                &evidence.quote,
+                &evidence.collateral,
+                &evidence.event_log,
+                now(),
+            )
+            .map_err(|_| ())?;
+        ws.send(Message::Binary(proof.into()))
+            .await
+            .map_err(|_| ())?;
+        let encapsulation = ws.next().await.ok_or(())?.map_err(|_| ())?.into_data();
+        let (finish, pending) = pending
+            .accept_encapsulation(&encapsulation, now())
+            .map_err(|_| ())?;
+        ws.send(Message::Binary(finish.into()))
+            .await
+            .map_err(|_| ())?;
+        let confirm = ws.next().await.ok_or(())?.map_err(|_| ())?.into_data();
+        let mut session = pending
+            .accept_finish(&confirm, move || Sample {
+                system_seconds: None,
+                monotonic_ms: now(),
+            })
+            .map_err(|_| ())?;
+        let (mut connection, challenge) = service.connect(session.binding().map_err(|_| ())?);
+        ws.send(Message::Binary(
+            session
+                .seal(SecretBytes::from_vec(challenge.encode().map_err(|_| ())?))
+                .map_err(|_| ())?
+                .into(),
+        ))
+        .await
+        .map_err(|_| ())?;
+        while let Some(frame) = ws.next().await {
+            let frame = frame.map_err(|_| ())?;
+            if matches!(frame, Message::Close(_)) {
+                break;
+            }
+            let Message::Binary(bytes) = frame else {
+                continue;
+            };
+            let Opened::Data(plain) = session.open(&bytes).map_err(|_| ())? else {
+                break;
+            };
+            let request = ToService::decode(plain.expose()).map_err(|_| ())?;
+            if matches!(request, ToService::ReadNotices { .. })
+                && self.drop_notices_after_first.load(Ordering::SeqCst)
+                && self.notice_requests.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                return Err(());
+            }
+            let answer = if (matches!(request, ToService::Permits { .. })
+                && self.refuse_permits.load(Ordering::SeqCst))
+                || (matches!(request, ToService::Authenticate { .. })
+                    && self.refuse_authenticate.load(Ordering::SeqCst))
+            {
+                self.forced_not_active.fetch_add(1, Ordering::SeqCst);
+                FromService::Refused {
+                    reason: bh_authz::proto::Refusal::NotActive,
+                }
+            } else if let (ToService::SubmitControl { event, .. }, Some(reason)) =
+                (&request, *self.refuse_submits.lock().unwrap())
+            {
+                self.edge.submitted.lock().unwrap().push(event.clone());
+                FromService::Refused { reason }
+            } else {
+                connection.handle(request.clone()).await
+            };
+            let answer = self.hostile_answer(&request, answer);
+            // Keep ordinary sessions from sending the NotActive signal in
+            // the timer-only removal test. Unauthenticated is still a
+            // refusal, and does not falsify the public account evidence.
+            let answer = if self.mask_not_active.load(Ordering::SeqCst)
+                && matches!(
+                    answer,
+                    FromService::Refused {
+                        reason: bh_authz::proto::Refusal::NotActive
+                    }
+                ) {
+                FromService::Refused {
+                    reason: bh_authz::proto::Refusal::Unauthenticated,
+                }
+            } else {
+                answer
+            };
+            let lost = match request {
+                ToService::ConfirmControl { .. } => Some(&self.lose_confirm_answers),
+                ToService::SubmitControl { .. } => Some(&self.lose_submit_answers),
+                ToService::Recover { .. } => Some(&self.lose_recover_answers),
+                _ => None,
+            };
+            if lost.is_some_and(|lost| {
+                lost.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            }) {
+                return Err(());
+            }
+            let sealed = session
+                .seal(SecretBytes::from_vec(answer.encode().map_err(|_| ())?))
+                .map_err(|_| ())?;
+            ws.send(Message::Binary(sealed.into()))
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+    fn hostile_answer(&self, request: &ToService, honest: FromService) -> FromService {
+        if let (ToService::Recover { .. }, FromService::Recovery(answer)) = (request, &honest)
+            && let Some(tamper) = self.recovery_tamper.lock().unwrap().as_ref()
+        {
+            let mut answer = answer.clone();
+            tamper(&mut answer);
+            return FromService::Recovery(answer);
+        }
+        if let ToService::ConfirmControl { log, challenge, .. } = request {
+            return self.tampered_confirmation(*log, challenge, honest);
+        }
+        let ToService::ReadAccountEvidence {
+            genesis,
+            first,
+            last,
+            challenge,
+        } = request
+        else {
+            return honest;
+        };
+        let Some(log) = *self.hostile_account.lock().unwrap() else {
+            return honest;
+        };
+        if bh_authz::proto::account_log_id(genesis).ok() != Some(log.id) {
+            return honest;
+        }
+        let FromService::AccountEvidence {
+            events_permit,
+            mut confirmations,
+            head: honest_head,
+        } = honest
+        else {
+            return honest;
+        };
+        if let Some((selected, position)) = *self.wrong_predecessor.lock().unwrap()
+            && selected == log
+            && *first <= position
+            && position <= *last
+        {
+            let index = confirmations
+                .iter()
+                .position(|p| {
+                    OrderingConfirmation::decode(p)
+                        .unwrap()
+                        .claim()
+                        .original_head
+                        .position
+                        == position
+                })
+                .unwrap();
+            let old = OrderingConfirmation::decode(&confirmations[index]).unwrap();
+            let mut claim = *old.claim();
+            claim.original_previous.hash.0[0] ^= 1;
+            let proof = OrderingConfirmation::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                claim,
+            );
+            confirmations[index] = proof.encode().to_vec();
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                *challenge,
+                claim.original_head,
+                proof.commitment(),
+                claim.bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if let Some((selected, position, bad_hash)) = *self.ahead_corruption.lock().unwrap()
+            && selected == log
+            && (*last < position || *first > position)
+        {
+            let claim =
+                AcceptedHead::verify(&honest_head, &self.edge.root(), log, challenge).unwrap();
+            assert_eq!(claim.original_head.position, position);
+            let mut original_head = claim.original_head;
+            let mut evidence = claim.evidence;
+            if bad_hash {
+                original_head.hash.0[0] ^= 1;
+            } else {
+                evidence[0] ^= 1;
+            }
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                *challenge,
+                original_head,
+                evidence,
+                claim.bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if let Some((selected, position, ref bytes)) = *self.first_page_claim.lock().unwrap()
+            && selected == log
+            && *last < position
+        {
+            let proof = OrderingConfirmation::decode(bytes).unwrap();
+            proof.verify(&self.edge.root()).unwrap();
+            assert_eq!(proof.claim().original_head.position, position);
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                *challenge,
+                proof.claim().original_head,
+                proof.commitment(),
+                proof.claim().bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if let Some((selected, position, ref bytes)) = *self.matched_page_claim.lock().unwrap()
+            && selected == log
+            && *first <= position
+            && position <= *last
+        {
+            let proof = OrderingConfirmation::decode(bytes).unwrap();
+            proof.verify(&self.edge.root()).unwrap();
+            assert_eq!(proof.claim().original_head.position, position);
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                *challenge,
+                proof.claim().original_head,
+                proof.commitment(),
+                proof.claim().bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if *self.foreign_root.lock().unwrap() == Some(log) {
+            let root = SigningKey::generate();
+            let key = SigningKey::generate();
+            let certificate = permit::certify(&root, key.public());
+            let confirmations = confirmations
+                .iter()
+                .map(|bytes| {
+                    let old = OrderingConfirmation::decode(bytes).unwrap();
+                    OrderingConfirmation::sign(&key, &certificate, *old.claim())
+                        .encode()
+                        .to_vec()
+                })
+                .collect();
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head: honest_head,
+            };
+        }
+        if *self.other_challenge.lock().unwrap() == Some(log) {
+            let claim =
+                AcceptedHead::verify(&honest_head, &self.edge.root(), log, challenge).unwrap();
+            let mut other = *challenge;
+            other[0] ^= 1;
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                other,
+                claim.original_head,
+                claim.evidence,
+                claim.bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if let Some((selected, bad_hash)) = *self.corrupt_accepted.lock().unwrap()
+            && selected == log
+        {
+            let claim =
+                AcceptedHead::verify(&honest_head, &self.edge.root(), log, challenge).unwrap();
+            let mut original_head = claim.original_head;
+            let mut evidence = claim.evidence;
+            if bad_hash {
+                original_head.hash.0[0] ^= 1;
+            } else {
+                evidence[0] ^= 1;
+            }
+            let head = AcceptedHead::sign(
+                &self.edge.permit_key,
+                &self.edge.permit_certificate,
+                log,
+                *challenge,
+                original_head,
+                evidence,
+                claim.bounds,
+            );
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head,
+            };
+        }
+        if let Some((selected, withheld_first, withheld_last)) = *self.omit_account.lock().unwrap()
+            && selected == log
+            && *first <= withheld_last
+            && *last >= withheld_first
+        {
+            confirmations.retain(|bytes| {
+                !(withheld_first..=withheld_last).contains(
+                    &OrderingConfirmation::decode(bytes)
+                        .unwrap()
+                        .claim()
+                        .original_head
+                        .position,
+                )
+            });
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head: honest_head,
+            };
+        }
+        let (from, served) = {
+            let logs = self.edge.logs.lock().unwrap();
+            let Some((from, served)) = logs.get(&key(log)).and_then(|state| state.served.as_ref())
+            else {
+                return FromService::AccountEvidence {
+                    events_permit,
+                    confirmations,
+                    head: honest_head,
+                };
+            };
+            (*from, served.clone())
+        };
+        let follow_served = self.consistent_served.load(Ordering::SeqCst) && *first > from;
+        if !(*first <= from && from <= *last) && !follow_served {
+            // Non-targeted reads are ordinary real-service responses.
+            return FromService::AccountEvidence {
+                events_permit,
+                confirmations,
+                head: honest_head,
+            };
+        }
+        assert_eq!(
+            served.len(),
+            1,
+            "scoped hostile fixture serves exactly one successor"
+        );
+        let (outer, wrapper) = &served[0];
+        let (original, body) = bh_authz::proto::account_log_unwrap(wrapper).unwrap();
+        let position = outer.head().position;
+        assert_eq!(position, from);
+        // Even the deliberately unsupported version has the fixed signed
+        // header: 23-byte domain, two 2-byte versions, position, predecessor.
+        let previous = Head {
+            position: position - 1,
+            hash: Digest(original[35..67].try_into().expect("signed predecessor")),
+        };
+        let inner = Head {
+            position,
+            hash: Digest(bh_crypto::hash(original)),
+        };
+        let at = self.edge.clock.now();
+        let bounds = TimeBounds {
+            earliest_ms: at,
+            latest_ms: at,
+        };
+        let confirmation = OrderingConfirmation::sign(
+            &self.edge.permit_key,
+            &self.edge.permit_certificate,
+            ConfirmationClaim {
+                log,
+                original: original_digest(original),
+                original_previous: previous,
+                original_head: inner,
+                body,
+                ordered: outer.head(),
+                bounds,
+            },
+        );
+        if follow_served {
+            // This is an empty later page. Re-sign the same alternate head
+            // instead of switching back to the honest account at this seam.
+            confirmations.clear();
+        } else {
+            confirmations.retain(|p| {
+                OrderingConfirmation::decode(p)
+                    .unwrap()
+                    .claim()
+                    .original_head
+                    .position
+                    != position
+            });
+            confirmations.push(confirmation.encode().to_vec());
+        }
+        let head = AcceptedHead::sign(
+            &self.edge.permit_key,
+            &self.edge.permit_certificate,
+            log,
+            *challenge,
+            inner,
+            confirmation.commitment(),
+            bounds,
+        );
+        FromService::AccountEvidence {
+            events_permit,
+            confirmations,
+            head,
+        }
+    }
+    /// A `ConfirmControl` answer as `tamper_confirmations` alters it: the
+    /// confirmation re-signed under another hosting root, or the accepted
+    /// head signed for a challenge the device never sent.
+    fn tampered_confirmation(
+        &self,
+        log: LogId,
+        challenge: &[u8; 32],
+        honest: FromService,
+    ) -> FromService {
+        let tamper = *self.confirm_tamper.lock().unwrap();
+        let (Some(tamper), FromService::Confirmed { confirmation, head }) = (tamper, &honest)
+        else {
+            return honest;
+        };
+        match tamper {
+            ConfirmTamper::Root => {
+                let old = OrderingConfirmation::decode(confirmation).unwrap();
+                let root = SigningKey::generate();
+                let key = SigningKey::generate();
+                let certificate = permit::certify(&root, key.public());
+                FromService::Confirmed {
+                    confirmation: OrderingConfirmation::sign(&key, &certificate, *old.claim())
+                        .encode()
+                        .to_vec(),
+                    head: head.clone(),
+                }
+            }
+            ConfirmTamper::Challenge => {
+                let claim = AcceptedHead::verify(head, &self.edge.root(), log, challenge).unwrap();
+                let mut other = *challenge;
+                other[0] ^= 1;
+                FromService::Confirmed {
+                    confirmation: confirmation.clone(),
+                    head: AcceptedHead::sign(
+                        &self.edge.permit_key,
+                        &self.edge.permit_certificate,
+                        log,
+                        other,
+                        claim.original_head,
+                        claim.evidence,
+                        claim.bounds,
+                    ),
+                }
+            }
+        }
+    }
+    /// Provision a fixture device from the real service's confirmed account
+    /// history. Production admission uses the bounded network reader instead.
+    pub async fn confirmed_account(&self, log: LogId) -> Vec<bh_sync_client::TimedOriginal> {
+        use bh_authz::proto::FromService;
+        use bh_sync::evidence::{AcceptedHead, OrderingConfirmation};
+        let entries = self.edge.entries(log);
+        let genesis = bh_authz::proto::account_log_unwrap(&entries[0].1)
+            .unwrap()
+            .0
+            .to_vec();
+        let service = self.service.lock().unwrap().clone();
+        let (mut connection, _) = service.connect([0; 32]);
+        let mut history = Vec::new();
+        for chunk in entries.chunks(64) {
+            let first = chunk[0].0.head().position;
+            let last = chunk.last().unwrap().0.head().position;
+            let challenge = bh_crypto::random();
+            let answer = connection
+                .handle(ToService::ReadAccountEvidence {
+                    genesis: genesis.clone(),
+                    first,
+                    last,
+                    challenge,
+                })
+                .await;
+            let FromService::AccountEvidence {
+                confirmations,
+                head,
+                ..
+            } = answer
+            else {
+                panic!("fixture account evidence refused: {answer:?}");
+            };
+            AcceptedHead::verify(&head, &self.edge.root(), log, &challenge).unwrap();
+            let mut proofs = confirmations.into_iter();
+            for (commitment, wrapper) in chunk {
+                let (original, body) = bh_authz::proto::account_log_unwrap(wrapper).unwrap();
+                let evidence = if commitment.head().position == 1 {
+                    None
+                } else {
+                    let bytes = proofs.next().expect("every original confirmed");
+                    let proof = OrderingConfirmation::decode(&bytes).unwrap();
+                    let claim = proof.verify_for(&self.edge.root(), original, body).unwrap();
+                    assert_eq!(claim.log, log);
+                    assert_eq!(claim.ordered, commitment.head());
+                    Some((
+                        bh_account::ConfirmedTime {
+                            earliest_ms: claim.bounds.earliest_ms,
+                            latest_ms: claim.bounds.latest_ms,
+                        },
+                        bytes,
+                    ))
+                };
+                history.push((original.to_vec(), evidence));
+            }
+            assert!(proofs.next().is_none());
+        }
+        history
+    }
+
     fn service(edge: &Arc<Edge>, path: &std::path::Path) -> Service {
         let permit_key = SigningKey::generate();
         let certificate = permit::certify(&edge.root, permit_key.public());
-        let service = Service::open(
+        let service = Service::open_with_recovery(
             path,
             PermitKeys::new(permit_key, certificate).unwrap(),
+            bh_authz::RecoveryHomeKey::new(
+                edge.recovery_key(),
+                edge.recovery_certificate(),
+                &edge.root(),
+            )
+            .unwrap(),
             edge.clock.clone(),
             edge.clone(),
         )
@@ -2598,6 +4143,18 @@ impl Hosted {
         let counted = edge.clone();
         service.observe(Arc::new(move |message| {
             counted.counters.request(message);
+            match message {
+                ToService::SubmitControl { event, .. } => {
+                    counted.submitted.lock().unwrap().push(event.clone())
+                }
+                ToService::ConfirmControl { .. } => {
+                    counted.confirm_asks.fetch_add(1, Ordering::SeqCst);
+                }
+                ToService::ReadNotices { .. } => {
+                    counted.notice_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
             counted.mark(match message {
                 ToService::Permits { .. } => "service: Permits request begins",
                 ToService::ReadBatch { .. } => "service: ReadBatch request begins",
@@ -2606,6 +4163,23 @@ impl Hosted {
         }));
         service
     }
+    /// Restart the authorization service on its current protected disk,
+    /// preserving recovery tries and acknowledged account history.
+    pub async fn restart_service(&self) {
+        let _restart = self.restart.lock().await;
+        let tasks: Vec<_> = self.edge.sockets.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        let path = self.dir.path().join("authz-0.sqlite");
+        assert!(path.exists());
+        *self.service.lock().unwrap() = Self::service(&self.edge, &path);
+        self.edge.presence.lock().unwrap().sockets.clear();
+    }
+
     /// Replace the authorization service with one on an empty disk, as a
     /// restore that lost its base registry leaves it, and end every open
     /// connection.
@@ -2621,6 +4195,37 @@ impl Hosted {
         // Every presence socket lived only in that service's log object.
         self.edge.presence.lock().unwrap().sockets.clear();
     }
+    /// Lose the base registry only, preserving acknowledged account history
+    /// and its exact confirmations. An empty account disk would re-confirm
+    /// old entries at new times, a different failure from a missing base.
+    pub async fn restart_service_without_bases(&self) {
+        // A client reconnecting during the restart waits here and binds the
+        // replacement, as it would from a process that stopped accepting
+        // connections before it exited.
+        let _restart = self.restart.lock().await;
+        let tasks: Vec<_> = self.edge.sockets.lock().unwrap().drain(..).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        let path = self.dir.path().join("authz-0.sqlite");
+        assert!(path.exists());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             DELETE FROM base_pending;
+             DELETE FROM base_account_changes;
+             DELETE FROM base_controls;
+             DELETE FROM bases;
+             COMMIT;",
+        )
+        .unwrap();
+        *self.service.lock().unwrap() = Self::service(&self.edge, &path);
+        self.edge.presence.lock().unwrap().sockets.clear();
+    }
+
     /// Stop accepting connections and end every open one.
     pub fn go_down(&self) {
         self.edge.down.store(true, Ordering::SeqCst);
@@ -2693,6 +4298,8 @@ pub struct FakeRelay {
 }
 /// How a relay alters a message it serves.
 pub type Tamper = Box<dyn Fn(&mut Vec<u8>) + Send + Sync>;
+/// How a home alters a recovery answer it serves.
+pub type RecoveryTamper = Box<dyn Fn(&mut bh_authz::proto::RecoveryAnswer) + Send + Sync>;
 struct Pairing {
     created: tokio::time::Instant,
     show: Vec<Vec<u8>>,
@@ -2814,19 +4421,31 @@ impl Connector for Connect {
             let config = bh_sync_client::transport::socket_config();
             let server =
                 WebSocketStream::from_raw_socket(server, WsRole::Server, Some(config)).await;
+            // Binding is atomic with respect to a restart, including being
+            // registered for the restart's drain, so a client that connects
+            // while the service is retired takes its replacement instead.
+            let restart = match route {
+                Path::Authz => Some(self.0.restart.lock().await),
+                Path::Data => None,
+            };
             let task = match route {
                 Path::Data => tokio::spawn(self.0.edge.clone().serve_data(server, self.1)),
                 Path::Authz => {
                     let hosted = self.0.clone();
                     let service = hosted.service.lock().unwrap().clone();
                     tokio::spawn(async move {
-                        let _ = service
-                            .serve_connection(server, &hosted.config, &SyntheticAttestation)
-                            .await;
+                        if hosted.intercepting() {
+                            let _ = hosted.serve_hostile_connection(server, service).await;
+                        } else {
+                            let _ = service
+                                .serve_connection(server, &hosted.config, &SyntheticAttestation)
+                                .await;
+                        }
                     })
                 }
             };
             self.0.edge.sockets.lock().unwrap().push(task);
+            drop(restart);
             let client =
                 WebSocketStream::from_raw_socket(client, WsRole::Client, Some(config)).await;
             let latency = *self.0.edge.latency.lock().unwrap();

@@ -164,6 +164,7 @@ async fn run(phase: &str, dir: &Path) {
                 body: None,
                 epoch: [0; 32],
                 after: Some(Head::EMPTY),
+                attached: None,
             },
         );
         assert!(matches!(
@@ -186,11 +187,16 @@ async fn run(phase: &str, dir: &Path) {
         last: 1,
     };
     // Every account-log event, its genesis included, is a control.
-    let expected = Commitment::order(BaseId(log.id), Head::EMPTY, &wrapped, Route::Control)
-        .unwrap()
-        .encode();
+    let expected = Commitment::order(
+        BaseId(log.id),
+        bh_sync::OrderState::EMPTY,
+        &wrapped,
+        Route::Control,
+    )
+    .unwrap()
+    .encode();
     assert!(
-        matches!(data(edge, read(sign(dir, read_scope()))).await, Response::Events { id: 2, items, receipt: None } if items.len() == 1 && items[0].1 == wrapped.encode() && items[0].0 == expected),
+        matches!(data(edge, read(sign(dir, read_scope()))).await, Response::Events { id: 2, items, receipt: None, coverage: None } if items.len() == 1 && items[0].1 == wrapped.encode() && items[0].0 == expected),
         "persisted account log and head"
     );
 

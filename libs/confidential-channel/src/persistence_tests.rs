@@ -323,6 +323,40 @@ fn hello_root_role_and_nonce_are_exact_and_each_server_hello_has_new_keys() {
 }
 
 #[test]
+fn hello_authenticates_only_peers_built_in_the_same_flag_mode() {
+    use crate::handshake::{ClientHello, ServerPending};
+    let mem = Arc::new(Mutex::new((StoredState::Fresh, 0, false)));
+    let root = SigningKey::from_seed(&Secret::from_slice(&[7; 32]).unwrap()).public();
+    crate::test_clock::clock_at(1);
+    let hello = ClientHello::new(context(&mem)).unwrap();
+    assert!(ServerPending::<Memory>::accept_hello(hello.frame(), root, 1).is_ok());
+    let mut other_mode = hello.frame().to_vec();
+    let flagged_root = bh_crypto::hash(
+        &[
+            b"bh flags root v1\0".as_slice(),
+            &root,
+            &bh_crypto::hash(b"removal wait\x005 minutes\0"),
+        ]
+        .concat(),
+    );
+    let opposite = if bh_flags::off_default().is_empty() {
+        flagged_root
+    } else {
+        root
+    };
+    other_mode[44..76].copy_from_slice(&bh_crypto::hash(&opposite));
+    assert!(matches!(
+        ServerPending::<Memory>::accept_hello(&other_mode, root, 1),
+        Err(Error::Authentication)
+    ));
+    if bh_flags::off_default().is_empty() {
+        assert_eq!(&hello.frame()[44..76], &bh_crypto::hash(&root));
+    } else {
+        assert_eq!(&hello.frame()[44..76], &bh_crypto::hash(&flagged_root));
+    }
+}
+
+#[test]
 fn synthetic_five_messages_and_bidirectional_records() {
     use crate::{
         handshake::{ClientHello, ServerPending},

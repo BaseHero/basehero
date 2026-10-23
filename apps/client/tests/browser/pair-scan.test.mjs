@@ -25,6 +25,7 @@ async function page(browser, origin, native = true, android = true) {
   if (!native) await view.addInitScript(() => { delete window.__TAURI_INTERNALS__.metadata; });
   await view.goto(origin + '/');
   if (!android) await view.getByRole('button', { name: 'I already have an account' }).click();
+  await view.getByRole('button', { name: 'Use my other device' }).click();
   await view.getByRole('heading', { name: 'Join your account' }).waitFor();
   return view;
 }

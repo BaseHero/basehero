@@ -236,7 +236,10 @@ pub struct ServerPending<S: PolicyStore> {
 impl<S: PolicyStore> ServerPending<S> {
     pub fn accept_hello(hello: &[u8], app_root: [u8; 32], now_ms: u64) -> Result<Self, Error> {
         let (kind, body) = wire::parse(hello)?;
-        if kind != 1 || body[32] != 1 || body[33..65] != bh_crypto::hash(&app_root) {
+        if kind != 1
+            || body[32] != 1
+            || body[33..65] != bh_crypto::hash(&bh_flags::bind_root(app_root))
+        {
             return Err(Error::Authentication);
         }
         Ok(Self {

@@ -162,7 +162,8 @@ empty, missing a field or does not parse fails the build:
   "max_lifetime_secs": 86400,
   "max_uncertainty_secs": 0,
   "build_floor": 1760000000,
-  "appraisal": "hardware"
+  "appraisal": "hardware",
+  "recovery_key": "<hex of the home's recovery-key certificate, signed by hosting_root>"
 }
 ```
 

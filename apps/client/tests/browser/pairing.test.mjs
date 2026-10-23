@@ -363,6 +363,7 @@ for (const engine of browserMatrix) {
         }]);
         await v.getByRole("button", { name: "Create my account" }).waitFor();
         await v.getByRole("button", { name: "I already have an account" }).click();
+        await v.getByRole("button", { name: "Use my other device" }).click();
         await v.getByRole("heading", { name: /Join your account/ }).waitFor();
         assert.equal(await v.locator("#pair-scan").count(), 1, "the scan slot");
         // Joining makes no claim about this device's cloud sync.
@@ -388,7 +389,7 @@ for (const engine of browserMatrix) {
       } finally { await browser.close(); await server.close(); }
     });
 
-    test("Android's first run goes straight to joining and a scan joins the same way", async () => {
+    test("Android's first run offers joining and a scan joins the same way", async () => {
       const server = await startUiServer();
       const browser = await launchBrowser(engine);
       try {
@@ -396,11 +397,13 @@ for (const engine of browserMatrix) {
           window.__bhIpc.handle("pairing_join", () => ({ ticket: "t2" }));
           window.__bhIpc.handle("pairing_join_status", () => ({ state: "waiting-approval" }));
         }], { userAgent: ANDROID, viewport: { width: 412, height: 915 } });
+        await v.getByRole("heading", { name: "Welcome back" }).waitFor();
+        await v.getByRole("button", { name: "Use my other device" }).click();
         await v.getByRole("heading", { name: /Join your account/ }).waitFor();
         assert.equal(await v.locator("main .label").first().textContent(), "WELCOME");
         assert.equal(await v.locator("footer").textContent(), "");
         assert.equal(await v.getByRole("button", { name: "Create my account" }).count(), 0);
-        assert.equal(await v.getByRole("button", { name: "Back" }).count(), 0);
+        assert.equal(await v.getByRole("button", { name: "Back" }).count(), 1);
         // The camera seam: a scanner fills #pair-scan and hands over the text.
         await v.evaluate((code) => document.getElementById("pair-scan")
           .dispatchEvent(new CustomEvent("bh-pair-code", { detail: { code } })), QR);
@@ -420,6 +423,7 @@ for (const engine of browserMatrix) {
           window.__bhIpc.handle("pairing_join_status", () => window.__bhModel.joinStatus);
         }]);
         await v.getByRole("button", { name: "I already have an account" }).click();
+        await v.getByRole("button", { name: "Use my other device" }).click();
         await v.getByLabel("Pairing code").fill(QR);
         await v.getByRole("button", { name: "Join" }).click();
         await v.getByText(/was not added/).waitFor();

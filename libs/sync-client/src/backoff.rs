@@ -22,6 +22,22 @@ impl Backoff {
     }
 }
 
+/// Whether `key`'s retry may run at `now`: once at once, then after 1 s
+/// doubling to 60 s. `next` holds each key's next time and delay.
+pub(crate) fn permit<K: std::hash::Hash + Eq>(
+    next: &mut std::collections::HashMap<K, (tokio::time::Instant, Duration)>,
+    key: K,
+    now: tokio::time::Instant,
+) -> bool {
+    let entry = next.entry(key).or_insert((now, Duration::from_secs(1)));
+    if now < entry.0 {
+        return false;
+    }
+    entry.0 = now + entry.1;
+    entry.1 = (entry.1 * 2).min(Duration::from_secs(60));
+    true
+}
+
 /// `base` scaled by a factor in [0.8, 1.2] chosen by `random`.
 fn jittered(base: u64, random: u64) -> Duration {
     let spread = base / 5;

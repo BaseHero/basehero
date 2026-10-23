@@ -95,6 +95,11 @@ run_test() {
 run_test cancelledCreationLeavesNothing no
 run_test abortedCreationLeavesNothing no
 run_test ordinaryReceiverAndPendingRoundTrip
+run_test deleteKeysErasesCreatedKeys
+run_test deleteKeysIsIdempotent
+run_test deleteKeysLeavesAnotherHandle
+run_test deleteKeysRejectsInvalidHandle no
+run_test deleteKeysReportsFailureWhenARecordCannotBeDeleted
 run_test protectedReadRequiresAuthentication
 run_test invalidMetadataAtCreationRollsBack no
 run_test missingMetadataDoesNotRepairIt

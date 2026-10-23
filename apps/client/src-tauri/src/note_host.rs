@@ -1941,13 +1941,25 @@ fn decode_request(hex: &str) -> Option<[u8; 16]> {
 
 pub fn builder() -> tauri::Builder<tauri::Wry> {
     let owner = Arc::new(Owner::default());
+    let sync = bh_host::sync::SyncHost::new(crate::sync_host::configured(), Arc::clone(&owner));
+    let accounts = crate::account_host::account_host(Arc::clone(&owner)).into_state();
+    accounts.set_device_model(String::from_utf8_lossy(&crate::pairing_host::device_label()));
+    // A verified removal stops its client, then erases this account on this
+    // device. The registry keeps the final screen for `screen()`; the other
+    // accounts keep their owners and routes.
+    sync.set_erase({
+        let accounts = accounts.clone();
+        std::sync::Arc::new(move |id| {
+            let accounts = accounts.clone();
+            Box::pin(async move {
+                let _ = accounts.erase_removed(id).await;
+            })
+        })
+    });
     let builder = tauri::Builder::default()
-        .manage(NoteHost::with_owner(Arc::clone(&owner)))
-        .manage(bh_host::sync::SyncHost::new(
-            crate::sync_host::configured(),
-            Arc::clone(&owner),
-        ))
-        .manage(crate::account_host::account_host(owner).into_state())
+        .manage(NoteHost::with_owner(owner))
+        .manage(sync)
+        .manage(accounts)
         .manage(bh_host::pairing::PairingHost::default())
         .invoke_handler(tauri::generate_handler![
             note_binding,
@@ -1983,6 +1995,19 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             crate::mac_update::commands::update_not_now,
             crate::mac_update::commands::update_install,
             crate::window_layout::window_sidebar,
+            crate::about::app_about,
+            crate::devices_host::devices_kit_screen,
+            crate::devices_host::devices_view,
+            crate::devices_host::devices_request_removal,
+            crate::devices_host::devices_cancel_removal,
+            crate::devices_host::devices_remove_now,
+            crate::devices_host::devices_remove_self,
+            crate::devices_host::account_change_password,
+            crate::devices_host::account_confirm_new_kit,
+            crate::devices_host::alerts_list,
+            crate::devices_host::account_recover,
+            crate::devices_host::account_check_code,
+            crate::devices_host::account_recovery_status,
         ])
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
@@ -2030,7 +2055,12 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     .map_err(|error| format!("Quit cannot wait for saving ({error:?})"))?;
                 crate::mac_update::install(app);
             }
-            let _ = app;
+            #[cfg(target_os = "macos")]
+            crate::native::notify::enable();
+            crate::alerts_host::start(
+                app.handle().clone(),
+                &app.state::<crate::account_host::SharedAccountHost>(),
+            );
             Ok(())
         });
     // A crashed page's writing is gone; its drain fails at once.

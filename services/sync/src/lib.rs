@@ -7,7 +7,7 @@
 
 use bh_sync::{
     AccessError, BaseId, BodyObject, Commitment, Digest, EventId, GateState, Head, OpaqueEvent,
-    Operation, SignedApproval, TimeWindow, plan_consumption, referenced_body,
+    Operation, OrderState, Route, SignedApproval, TimeWindow, plan_consumption, referenced_body,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::Path;
@@ -15,7 +15,8 @@ use std::path::Path;
 #[cfg(test)]
 mod commit_test;
 
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
+const ORDER_FORMAT: i64 = 2;
 
 /// No request-controlled time or callback can be used as a production clock.
 /// To prove commit-before-expiry, `latest` must bound the remaining transaction
@@ -57,7 +58,10 @@ impl Database {
     /// Provision exactly one new base with a gate supplied by trusted initialization.
     /// Not a way to re-establish authority after a restart.
     pub fn create(path: &Path, initial: GateState) -> Result<Self, Refusal> {
-        if initial.head != Head::EMPTY || initial.sequence != 0 {
+        if initial.head != Head::EMPTY
+            || initial.order != OrderState::EMPTY
+            || initial.sequence != 0
+        {
             return Err(Refusal::Unavailable);
         }
         let mut connection = connect(path)?;
@@ -70,7 +74,8 @@ impl Database {
         tx.execute_batch(
             "CREATE TABLE gate (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-            base BLOB NOT NULL, position INTEGER NOT NULL, chain_hash BLOB NOT NULL,
+            base BLOB NOT NULL, order_format INTEGER, opening BLOB,
+            position INTEGER NOT NULL, chain_hash BLOB NOT NULL,
             incarnation BLOB NOT NULL, sequence INTEGER NOT NULL, checker_key BLOB NOT NULL,
             last_approval BLOB, last_ack BLOB
         );
@@ -86,9 +91,10 @@ impl Database {
         )
         .map_err(sql)?;
         tx.execute(
-            "INSERT INTO gate VALUES (1, ?1, 0, ?2, ?3, 0, ?4, NULL, NULL)",
+            "INSERT INTO gate VALUES (1, ?1, 2, ?2, 0, ?3, ?4, 0, ?5, NULL, NULL)",
             params![
                 initial.base.0.as_slice(),
+                initial.order.encode().as_slice(),
                 initial.head.hash.0.as_slice(),
                 initial.incarnation.as_slice(),
                 initial.checker_key.as_slice()
@@ -126,7 +132,12 @@ impl Database {
     }
 
     pub fn state(&self) -> Result<GateState, Refusal> {
-        gate(&self.connection)
+        // Read the gate and the actual indexed tail from one SQLite snapshot.
+        let tx = self.connection.unchecked_transaction().map_err(sql)?;
+        let state = gate(&tx)?;
+        check_head(&tx, state)?;
+        tx.commit().map_err(sql)?;
+        Ok(state)
     }
 
     pub fn last_outcome(&self) -> Result<Option<LastOutcome>, Refusal> {
@@ -184,7 +195,12 @@ impl Database {
         check_head(&tx, before)?;
         let existing = match operation {
             Operation::Append(event) => {
-                lookup(&tx, before, Some(event.id()), None)?.map(|(c, _)| c)
+                let route = if event.digest().0 == before.base.0 {
+                    Route::Control
+                } else {
+                    Route::Content
+                };
+                lookup(&tx, before, Some(event.publication_id(route)), None)?.map(|(c, _)| c)
             }
             _ => None,
         };
@@ -214,7 +230,7 @@ impl Database {
                     }
                     tx.execute("INSERT INTO events (base, event_id, position, event_digest, commitment, body)
                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![before.base.0.as_slice(),
-                        event.id().0.as_slice(), number(commitment.head().position)?,
+                        commitment.event_id().0.as_slice(), number(commitment.head().position)?,
                         event.digest().0.as_slice(), commitment.encode(), event.encode()]).map_err(sql)?;
                 }
                 Outcome::Ack(ack)
@@ -261,18 +277,21 @@ impl Database {
         // even though IMMEDIATE serializes local writers. Never UPDATE by sequence alone.
         let changed = tx
             .execute(
-                "UPDATE gate SET position=?1, chain_hash=?2, sequence=?3,
-            last_approval=?4, last_ack=?5 WHERE singleton=1 AND base=?6 AND position=?7
-            AND chain_hash=?8 AND incarnation=?9 AND sequence=?10 AND checker_key=?11",
+                "UPDATE gate SET position=?1, chain_hash=?2, opening=?3, sequence=?4,
+            last_approval=?5, last_ack=?6 WHERE singleton=1 AND base=?7 AND position=?8
+            AND chain_hash=?9 AND opening=?10 AND order_format=2
+            AND incarnation=?11 AND sequence=?12 AND checker_key=?13",
                 params![
                     number(plan.next.head.position)?,
                     plan.next.head.hash.0.as_slice(),
+                    plan.next.order.encode().as_slice(),
                     number(plan.next.sequence)?,
                     approval.encode(),
                     plan.ack.map(|c| c.encode()),
                     before.base.0.as_slice(),
                     number(before.head.position)?,
                     before.head.hash.0.as_slice(),
+                    before.order.encode().as_slice(),
                     before.incarnation.as_slice(),
                     number(before.sequence)?,
                     before.checker_key.as_slice()
@@ -330,36 +349,59 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, Refusal> {
     .map_err(sql)
 }
 fn gate(conn: &Connection) -> Result<GateState, Refusal> {
-    let (base, position, hash, incarnation, sequence, key): (Vec<u8>, i64, Vec<u8>, Vec<u8>, i64, Vec<u8>) =
-        conn.query_row("SELECT base, position, chain_hash, incarnation, sequence, checker_key FROM gate WHERE singleton=1", [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).map_err(sql)?;
+    type GateRow = (
+        Vec<u8>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+    );
+    let (base, format, opening, position, hash, incarnation, sequence, key): GateRow =
+        conn.query_row("SELECT base, order_format, opening, position, chain_hash, incarnation, sequence, checker_key FROM gate WHERE singleton=1", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).map_err(sql)?;
+    if format != Some(ORDER_FORMAT) {
+        return Err(Refusal::Unavailable);
+    }
+    let base = BaseId(array(base)?);
+    let order = OrderState::decode(&opening.ok_or(Refusal::Unavailable)?)
+        .map_err(|_| Refusal::Unavailable)?;
+    let head = Head {
+        position: positive(position)?,
+        hash: Digest(array(hash)?),
+    };
+    if order.head(base) != head {
+        return Err(Refusal::Unavailable);
+    }
     Ok(GateState {
-        base: BaseId(array(base)?),
-        head: Head {
-            position: positive(position)?,
-            hash: Digest(array(hash)?),
-        },
+        base,
+        order,
+        head,
         incarnation: array(incarnation)?,
         sequence: positive(sequence)?,
         checker_key: array(key)?,
     })
 }
-fn check_head(tx: &Transaction<'_>, state: GateState) -> Result<(), Refusal> {
-    if state.head == Head::EMPTY {
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
-            .map_err(sql)?;
-        return if count == 0 {
-            Ok(())
-        } else {
-            Err(Refusal::Unavailable)
-        };
-    }
-    let (commitment, _) = lookup_position(tx, state, state.head.position)?;
-    if commitment.head() == state.head {
-        Ok(())
-    } else {
-        Err(Refusal::Unavailable)
+fn check_head(conn: &Connection, state: GateState) -> Result<(), Refusal> {
+    // The gate's own position is not the tail: a consistent earlier gate
+    // beside later rows must refuse even for stage/read and at open.
+    let tail = conn.query_row(
+        "SELECT position,event_id,event_digest,commitment,body FROM events ORDER BY position DESC LIMIT 1",
+        [], record,
+    ).optional().map_err(sql)?;
+    match tail {
+        None if state.head == Head::EMPTY => Ok(()),
+        Some(row) if positive(row.0)? == state.head.position && state.head != Head::EMPTY => {
+            let (commitment, _) = validate(conn, state, row)?;
+            if commitment.head() == state.head && commitment.after() == state.order {
+                Ok(())
+            } else {
+                Err(Refusal::Unavailable)
+            }
+        }
+        _ => Err(Refusal::Unavailable),
     }
 }
 fn lookup(
@@ -404,16 +446,6 @@ fn stored_body(
         })
         .transpose()
 }
-fn lookup_position(
-    tx: &Transaction<'_>,
-    state: GateState,
-    position: u64,
-) -> Result<(Commitment, Vec<u8>), Refusal> {
-    let row = tx.query_row(
-        "SELECT position, event_id, event_digest, commitment, body FROM events WHERE base=?1 AND position=?2",
-        params![state.base.0.as_slice(), number(position)?], record).map_err(sql)?;
-    validate(tx, state, row)
-}
 type Record = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     Ok((
@@ -425,7 +457,7 @@ fn record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     ))
 }
 fn validate(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     state: GateState,
     row: Record,
 ) -> Result<(Commitment, Vec<u8>), Refusal> {
@@ -437,17 +469,17 @@ fn validate(
         || position > state.head.position
         || commitment.base() != state.base
         || commitment.head().position != position
-        || array::<32>(indexed_id)? != event.id().0
+        || array::<32>(indexed_id)? != commitment.event_id().0
         || array::<32>(indexed_digest)? != event.digest().0
-        || commitment.event_id() != event.id()
+        || commitment.event_id() != event.publication_id(commitment.route())
         || commitment.verify_body(&event).is_err()
     {
         return Err(Refusal::Unavailable);
     }
     let previous = if position == 1 {
-        Head::EMPTY
+        OrderState::EMPTY
     } else {
-        let bytes: Vec<u8> = tx
+        let bytes: Vec<u8> = conn
             .query_row(
                 "SELECT commitment FROM events WHERE base=?1 AND position=?2",
                 params![state.base.0.as_slice(), number(position - 1)?],
@@ -458,14 +490,14 @@ fn validate(
         if prior.base() != state.base || prior.head().position != position - 1 {
             return Err(Refusal::Unavailable);
         }
-        prior.head()
+        prior.after()
     };
-    // Canonical for the route it was stored under; the route itself is checked
-    // by whoever applies the event.
+    // The opening cannot be reconstructed from a Head; compare the actual
+    // preceding commitment (or EMPTY) to the stored inline opening.
     let canonical = Commitment::order(state.base, previous, &event, commitment.route())
         .map_err(|_| Refusal::Unavailable)?;
     if commitment != canonical
-        || (position == state.head.position && commitment.head() != state.head)
+        || (position == state.head.position && commitment.after() != state.order)
     {
         return Err(Refusal::Unavailable);
     }
