@@ -2,11 +2,18 @@
 import type { AppInfo } from '../generated/AppInfo';
 import type { CommandError } from '../generated/CommandError';
 import type { UpdateInfo } from '../generated/UpdateInfo';
-export type { AppInfo, CommandError, UpdateInfo };
+import type { SearchHit } from '../generated/SearchHit';
+import type { SearchResult } from '../generated/SearchResult';
+import type { ChatSummary } from '../generated/ChatSummary';
+import type { ChatMessage } from '../generated/ChatMessage';
+export type { AppInfo, CommandError, UpdateInfo, SearchHit, SearchResult, ChatSummary, ChatMessage };
 export type AccountId = string;
 export type BaseId = string;
 export type ObjectId = string;
 export type DeviceId = string;
+export type ApprovalId = string;
+export type ApprovalRequest = { id: ApprovalId; deviceId: DeviceId; createdAt: number; expiresAt: number };
+export type OpenedRequest = { id: ApprovalId };
 export type BaseRef = { account: AccountId; base: BaseId };
 export class BackendError extends Error {
   constructor(public kind: string, message: string) { super(message); this.name = 'BackendError'; }
@@ -18,7 +25,6 @@ export type ObjectSummary = { id: ObjectId; title: string; parent: ObjectId | nu
 export type ItemKind = 'note' | 'folder' | 'project';
 export type NewItem = { kind: ItemKind; parent: ObjectId | null; after: ObjectId | null; name: string | null };
 export type SyncState = { pending: number; online: boolean; lastSyncedAt: number | null };
-export type SearchResult = { base: BaseId; baseName: string; hit: { id: ObjectId; ty: ItemKind; title: string; snippet: string } };
 export type AppEvent = { kind: 'account' | 'base' | 'hero' | 'Account' | 'Base' | 'Hero'; account: AccountId; base?: BaseId; chat?: ObjectId; event: unknown };
 export type NoteOpened = { session: number; state: Uint8Array; readOnly: boolean };
 export type SignUpForm = { invite: string; email: string; password: string; deviceName: string };
@@ -28,10 +34,20 @@ export type SignedUp = { account: AccountSummary; kit: string };
 export interface Backend {
   appInfo(): Promise<AppInfo>;
   accounts(): Promise<AccountSummary[]>;
+  resetDevice(): Promise<void>;
   signUp(form: SignUpForm): Promise<SignedUp>;
   signInStart(form: SignInForm): Promise<string>;
   signInWithKit(pending: string, kit: string): Promise<AccountSummary>;
   signInCancel(pending: string): Promise<void>;
+  approvalStart(pending: string): Promise<ApprovalId>;
+  approvalDigits(pending: string): Promise<string>;
+  approvalWait(pending: string): Promise<AccountSummary>;
+  approvalCancel(pending: string): Promise<void>;
+  approvalUseKit(pending: string, kit: string): Promise<AccountSummary>;
+  approvalRequests(account: AccountId): Promise<ApprovalRequest[]>;
+  approvalOpen(account: AccountId, id: ApprovalId): Promise<OpenedRequest>;
+  approvalApprove(account: AccountId, id: ApprovalId, digits: string): Promise<DeviceId>;
+  approvalDecline(account: AccountId, id: ApprovalId): Promise<void>;
   signOut(account: AccountId): Promise<void>;
   newKit(account: AccountId, password: string): Promise<string>;
   kitSaved(account: AccountId): Promise<boolean>;
@@ -48,8 +64,16 @@ export interface Backend {
   deleteObject(r: BaseRef, id: ObjectId): Promise<void>;
   restoreObject(r: BaseRef, id: ObjectId): Promise<void>;
   trash(r: BaseRef): Promise<ObjectSummary[]>;
-  search(account: AccountId, base: BaseId, text: string, limit: number): Promise<SearchResult[]>;
+  search(account: AccountId, base: BaseId | null, text: string, limit: number): Promise<SearchResult[]>;
   syncState(r: BaseRef): Promise<SyncState>;
+  heroChats(account: AccountId, base: BaseId): Promise<ChatSummary[]>;
+  heroChatFor(account: AccountId, base: BaseId, project: ObjectId | null): Promise<ObjectId>;
+  heroNewChat(account: AccountId, base: BaseId): Promise<ObjectId>;
+  heroMessages(account: AccountId, base: BaseId, chat: ObjectId): Promise<ChatMessage[]>;
+  heroSend(account: AccountId, base: BaseId, chat: ObjectId, text: string, focus: ObjectId | null): Promise<ObjectId>;
+  heroStop(account: AccountId, base: BaseId, chat: ObjectId): Promise<void>;
+  heroAnswer(account: AccountId, base: BaseId, chat: ObjectId, allow: boolean): Promise<void>;
+  heroRetry(account: AccountId, base: BaseId, chat: ObjectId): Promise<void>;
   noteOpen(r: BaseRef, note: ObjectId, onUpdate: (update: Uint8Array) => void): Promise<NoteOpened>;
   noteApply(session: number, update: Uint8Array): Promise<void>;
   noteClose(session: number): Promise<void>;

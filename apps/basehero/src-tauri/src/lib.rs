@@ -2,11 +2,16 @@
 mod android_tls;
 pub mod commands;
 pub mod error;
+pub mod hero;
+pub mod notes;
 pub mod secrets;
 pub mod state;
 pub mod update;
 pub mod views;
+pub mod windows;
 
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
 use tauri::Manager;
 
 #[tauri::command]
@@ -14,11 +19,105 @@ fn app_info() -> views::AppInfo {
     commands::app_info()
 }
 
+// Async, so a slow key store doesn't freeze the window.
+#[tauri::command(async)]
+fn reset_device(
+    app: tauri::AppHandle,
+    startup: tauri::State<'_, state::Startup>,
+) -> Result<(), error::CommandError> {
+    startup.reset(&app)
+}
+
 #[tauri::command]
 fn accounts(
     startup: tauri::State<'_, state::Startup>,
 ) -> Result<Vec<bh_core::AccountSummary>, error::CommandError> {
     commands::account::accounts(startup.state()?)
+}
+
+#[tauri::command]
+async fn sign_up(
+    startup: tauri::State<'_, state::Startup>,
+    form: views::SignUpForm,
+) -> Result<views::SignedUp, error::CommandError> {
+    commands::account::sign_up(startup.state()?, form).await
+}
+
+#[tauri::command]
+async fn sign_in_start(
+    startup: tauri::State<'_, state::Startup>,
+    form: views::SignInForm,
+) -> Result<String, error::CommandError> {
+    commands::account::sign_in_start(startup.state()?, form).await
+}
+
+#[tauri::command]
+async fn sign_in_with_kit(
+    startup: tauri::State<'_, state::Startup>,
+    pending: String,
+    kit: String,
+) -> Result<bh_core::AccountSummary, error::CommandError> {
+    let kit = views::SecretString::from(kit);
+    commands::account::sign_in_with_kit(startup.state()?, &pending, &kit).await
+}
+
+#[tauri::command]
+fn sign_in_cancel(
+    startup: tauri::State<'_, state::Startup>,
+    pending: String,
+) -> Result<(), error::CommandError> {
+    commands::account::sign_in_cancel(startup.state()?, &pending)
+}
+
+#[tauri::command]
+async fn sign_out(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<(), error::CommandError> {
+    commands::account::sign_out(startup.state()?, account).await
+}
+
+#[tauri::command]
+async fn new_kit(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    password: String,
+) -> Result<views::SecretString, error::CommandError> {
+    let password = views::SecretString::from(password);
+    commands::account::new_kit(startup.state()?, account, &password).await
+}
+
+#[tauri::command]
+fn kit_saved(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<bool, error::CommandError> {
+    commands::account::kit_saved(startup.state()?, account)
+}
+
+#[tauri::command]
+fn set_kit_saved(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<(), error::CommandError> {
+    commands::account::set_kit_saved(startup.state()?, account)
+}
+
+#[tauri::command]
+async fn devices(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<Vec<bh_core::DeviceSummary>, error::CommandError> {
+    commands::account::devices(startup.state()?, account).await
+}
+
+#[tauri::command]
+async fn remove_device(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    device: bh_core::DeviceId,
+) -> Result<(), error::CommandError> {
+    commands::account::remove_device(startup.state()?, account, device).await
 }
 
 fn context() -> tauri::Context<tauri::Wry> {
@@ -81,22 +180,131 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let builder = builder
         .plugin(update::plugin())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        .menu(windows::menu)
+        .on_menu_event(windows::menu_event)
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window
+                    .app_handle()
+                    .emit_to(window.label(), "bh:close-requested", ());
+            }
+            tauri::WindowEvent::Destroyed => {
+                if let Some(startup) = window.app_handle().try_state::<state::Startup>()
+                    && let Ok(state) = startup.state()
+                {
+                    state.notes.close_window(window.label());
+                }
+            }
+            _ => {}
+        });
     builder
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                app.manage(windows::QuitState::default());
+                windows::install_dock_quit(app.handle());
+            }
             app.manage(state::Startup::open(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
             accounts,
+            reset_device,
+            sign_up,
+            sign_in_start,
+            sign_in_with_kit,
+            sign_in_cancel,
+            commands::approval::ipc::approval_start,
+            commands::approval::ipc::approval_digits,
+            commands::approval::ipc::approval_wait,
+            commands::approval::ipc::approval_cancel,
+            commands::approval::ipc::approval_use_kit,
+            commands::approval::ipc::approval_requests,
+            commands::approval::ipc::approval_open,
+            commands::approval::ipc::approval_approve,
+            commands::approval::ipc::approval_decline,
+            sign_out,
+            new_kit,
+            kit_saved,
+            set_kit_saved,
+            devices,
+            remove_device,
+            commands::note::note_open,
+            commands::note::note_apply,
+            commands::note::note_close,
+            commands::base::ipc::bases,
+            commands::base::ipc::create_base,
+            commands::base::ipc::children,
+            commands::base::ipc::get_object,
+            commands::base::ipc::create_object,
+            commands::base::ipc::rename_object,
+            commands::base::ipc::move_object,
+            commands::base::ipc::delete_object,
+            commands::base::ipc::restore_object,
+            commands::base::ipc::trash,
+            commands::base::ipc::search,
+            commands::base::ipc::sync_state,
+            hero::ipc::hero_chats,
+            hero::ipc::hero_chat_for,
+            hero::ipc::hero_new_chat,
+            hero::ipc::hero_messages,
+            hero::ipc::hero_send,
+            hero::ipc::hero_stop,
+            hero::ipc::hero_answer,
+            hero::ipc::hero_retry,
             update::update_check,
             update::update_install,
+            windows::open_window,
+            windows::close_window,
+            #[cfg(target_os = "macos")]
+            windows::window_drained,
             #[cfg(debug_assertions)]
             commands::dev_probe::dev_model_probe
         ])
-        .run(context)
-        .expect("failed to start BaseHero");
+        .build(context)
+        .expect("failed to start BaseHero")
+        .run(|app, event| {
+            match event {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // None with no windows is the last-window-close policy. A
+                        // programmatic exit must drain, including other callers of app.exit.
+                        if code.is_none() && app.webview_windows().is_empty() {
+                            api.prevent_exit();
+                        } else if code != Some(tauri::RESTART_EXIT_CODE)
+                            && !windows::quit_approved(app)
+                        {
+                            api.prevent_exit();
+                            windows::request_quit(app);
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = (code, api);
+                }
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen {
+                    has_visible_windows: false,
+                    ..
+                } => {
+                    if let Err(error) = windows::open(app, "") {
+                        eprintln!("Could not reopen BaseHero: {}", error.message);
+                    }
+                }
+                // Stop the core's threads before the process exits; see `Core::shutdown`.
+                tauri::RunEvent::Exit => {
+                    if let Some(startup) = app.try_state::<state::Startup>()
+                        && let Ok(state) = startup.state()
+                    {
+                        state.core.shutdown();
+                    }
+                }
+                _ => {}
+            }
+        });
 }
 
 #[cfg(test)]

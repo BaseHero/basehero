@@ -30,7 +30,7 @@ test('the status bar shows offline and waiting changes, then synced', async ({ p
 
 test('a sync that needs an update says so', async ({ page }) => {
   const r = await signedIn(page);
-  await page.evaluate(r => window.__fake.emit({ kind: 'base', account: r.account, base: r.base, event: 'NeedsUpdate' }), r);
+  await page.evaluate(r => window.__fake.emit({ kind: 'base', account: r.account, base: r.base, event: 'needsUpdate' }), r);
   await expect(page.getByRole('alert')).toHaveText('This version of BaseHero is too old to sync. Update it.');
 });
 

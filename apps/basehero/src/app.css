@@ -48,19 +48,28 @@ a { color: var(--text); }
 .location-bar .plate { border: 1px solid var(--line-strong); padding: .45rem .7rem; background: var(--yellow); color: var(--on-yellow); }
 .note-area { display: flex; gap: 1rem; }
 .note-content { min-width: 0; flex: 1; }
-.hero-container { width: min(30%, 300px); border-left: 1px solid var(--line); padding: 1rem; }
+.hero-container { width: clamp(300px, 30%, 380px); flex: none; border-left: 1px solid var(--line); padding: 1rem; }
 .hero-panel p { font-size: .8rem; }
 .move-dialog, .trash, .item-menu { border: 1px solid var(--line-strong); background: var(--panel); padding: 1rem; margin: .5rem 0; }
 .move-dialog > button { display: block; width: 100%; text-align: left; }
 .move-dialog button.selected { background: var(--yellow); color: var(--on-yellow); }
-.drawer-button, .close-drawer, .hero-toggle { display: none; }
+.drawer-button, .close-drawer, .hero-toggle, .hero-close { display: none; }
+/* Each screen moves focus to its heading for screen readers; that's not a control, so no ring. */
+main h1[tabindex="-1"]:focus { outline: none; }
 @media (max-width: 839px) {
   .tree-panel { display: none; position: fixed; z-index: 10; inset: 3.5rem auto 0 0; width: min(280px, 90vw); overflow: auto; box-shadow: 8px 0 20px var(--grid); }
   .tree-panel.drawer-open { display: block; }
-  .drawer-button, .close-drawer, .hero-toggle { display: inline-block; }
-  .hero-container { display: none; }
-  .hero-container.hero-open { display: block; position: fixed; z-index: 10; right: 0; bottom: 0; width: min(100%, 340px); height: 50vh; background: var(--panel); border: 1px solid var(--line); }
+  .drawer-button, .close-drawer { display: inline-block; }
   .content-panel { padding: .8rem; }
+}
+/* Beside the tree and the note, Hero would be too narrow to read, as on an unfolded
+   Fold: below this width it opens as a sheet instead. */
+@media (max-width: 1099px) {
+  .hero-toggle { display: inline-block; align-self: flex-start; }
+  .hero-container { display: none; }
+  .hero-container.hero-open { display: flex; flex-direction: column; position: fixed; z-index: 10; top: 3.5rem; right: 0; bottom: 0; width: min(100%, 380px); padding: .5rem; background: var(--panel); border-left: 1px solid var(--line); box-shadow: -8px 0 20px var(--grid); }
+  .hero-container.hero-open .hero-close { display: block; align-self: flex-end; }
+  .hero-container.hero-open .hero-panel { flex: 1; min-height: 0; }
 }
 @media print {
   body, .entry-grid, .entry-panel, .kit-code { color: #000; background: #fff; background-image: none; }

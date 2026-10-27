@@ -12,6 +12,8 @@ pub(crate) const NOTE: &str = "core.note";
 pub(crate) const FOLDER: &str = "core.folder";
 pub(crate) const PROJECT: &str = "core.project";
 pub(crate) const TYPE: &str = "core.type";
+pub(crate) const CHAT: &str = "core.chat";
+pub(crate) const MESSAGE: &str = "core.message";
 
 /// A type's name and version, such as `core.note` version 1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -73,6 +75,8 @@ pub enum FieldKind {
     DateTime,
     Ref,
     Json,
+    /// Encrypted field that is never indexed by search or exposed by Hero's tools.
+    Secret,
 }
 
 fn field(name: &str, kind: FieldKind, required: bool) -> FieldDef {
@@ -99,6 +103,32 @@ pub(crate) fn core_def(ty: &TypeRef) -> Option<TypeDef> {
         NOTE => ("A note", None, vec![]),
         FOLDER => named("A folder"),
         PROJECT => named("A project"),
+        CHAT => (
+            "A Hero chat",
+            Some("title"),
+            vec![
+                field("title", FieldKind::Text, false),
+                field("project", FieldKind::Ref, false),
+                field("allowed", FieldKind::Json, false),
+                field("denied", FieldKind::Json, false),
+            ],
+        ),
+        MESSAGE => (
+            "A message in a Hero chat",
+            None,
+            vec![
+                field("role", FieldKind::Text, true),
+                field("text", FieldKind::Text, false),
+                field("at", FieldKind::DateTime, true),
+                field("device", FieldKind::Text, false),
+                field("state", FieldKind::Text, true),
+                field("error", FieldKind::Text, false),
+                field("focus", FieldKind::Ref, false),
+                field("steps", FieldKind::Json, false),
+                field("created", FieldKind::Json, false),
+                field("ask", FieldKind::Json, false),
+            ],
+        ),
         TYPE => (
             "A record type's definition",
             None,
@@ -134,6 +164,17 @@ pub(crate) fn validate(def: &TypeDef, fields: &Map<String, Value>) -> Result<(),
             Some(_) => {}
         }
     }
+    if def.name == MESSAGE
+        && (!matches!(
+            fields.get("role").and_then(Value::as_str),
+            Some("user" | "hero")
+        ) || !matches!(
+            fields.get("state").and_then(Value::as_str),
+            Some("done" | "working" | "stopped" | "failed" | "asking")
+        ))
+    {
+        return Err(Error::invalid("invalid Hero message role or state"));
+    }
     Ok(())
 }
 
@@ -149,6 +190,7 @@ fn matches_kind(kind: FieldKind, value: &Value) -> bool {
             s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         }),
         FieldKind::Json => true,
+        FieldKind::Secret => value.is_string(),
     }
 }
 
@@ -424,7 +466,8 @@ mod tests {
     fn core_types_are_version_1() {
         assert!(core_def(&TypeRef::new(NOTE, 1)).is_some());
         assert!(core_def(&TypeRef::new(NOTE, 2)).is_none());
-        assert!(core_def(&TypeRef::new("core.chat", 1)).is_none());
+        assert!(core_def(&TypeRef::new("core.chat", 1)).is_some());
+        assert!(core_def(&TypeRef::new("core.message", 1)).is_some());
         assert_eq!(
             core_def(&TypeRef::new(FOLDER, 1)).unwrap().title_field,
             Some("name".into())

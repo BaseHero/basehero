@@ -38,12 +38,15 @@ pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 fn http_client(tls: &rustls::ClientConfig) -> reqwest::Client {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls.clone())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .expect("HTTP client")
+        .timeout(Duration::from_secs(60));
+    // Local workerd resets reused HTTP connections under parallel test load.
+    // No idle connections in test builds; release clients retain their pool.
+    #[cfg(any(test, feature = "test-support"))]
+    let builder = builder.pool_max_idle_per_host(0);
+    builder.build().expect("HTTP client")
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -70,6 +73,14 @@ pub struct Fault {
 #[cfg(feature = "test-support")]
 pub(crate) type Faults = Arc<std::sync::Mutex<Vec<Fault>>>;
 
+#[cfg(feature = "test-support")]
+pub(crate) struct ApprovalPostGate {
+    pub entered: tokio::sync::oneshot::Sender<()>,
+    pub release: tokio::sync::oneshot::Receiver<()>,
+}
+#[cfg(feature = "test-support")]
+pub(crate) type ApprovalPostPause = Arc<std::sync::Mutex<Option<ApprovalPostGate>>>;
+
 /// One client per account or sign-in, so its connections belong to the
 /// runtime that uses it.
 #[derive(Clone)]
@@ -77,33 +88,59 @@ pub(crate) struct Api {
     server: Url,
     token: Option<Arc<Zeroizing<String>>>,
     http: reqwest::Client,
+    on_revoked: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     tls: Arc<rustls::ClientConfig>,
     #[cfg(feature = "test-support")]
     faults: Faults,
     #[cfg(feature = "test-support")]
+    approval_post_pause: ApprovalPostPause,
+    #[cfg(feature = "test-support")]
     counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    #[cfg(feature = "test-support")]
+    held_account_get: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
 impl Api {
     pub(crate) fn new(server: Url, token: Option<String>) -> Self {
+        Self::new_secret(server, token.map(Zeroizing::new))
+    }
+
+    pub(crate) fn new_secret(server: Url, token: Option<Zeroizing<String>>) -> Self {
         let tls = tls_config();
         Self {
             server,
-            token: token.map(|t| Arc::new(Zeroizing::new(t))),
+            token: token.map(Arc::new),
             http: http_client(&tls),
+            on_revoked: None,
             #[cfg(test)]
             tls,
             #[cfg(feature = "test-support")]
             faults: Faults::default(),
             #[cfg(feature = "test-support")]
+            approval_post_pause: ApprovalPostPause::default(),
+            #[cfg(feature = "test-support")]
             counts: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_account_get: Arc::default(),
+        }
+    }
+
+    pub(crate) fn with_revocation(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_revoked = Some(Arc::new(callback));
+        self
+    }
+
+    pub(crate) fn revoked(&self) {
+        if let Some(callback) = &self.on_revoked {
+            callback();
         }
     }
 
     #[cfg(feature = "test-support")]
-    pub(crate) fn with_faults(mut self, faults: Faults) -> Self {
+    pub(crate) fn with_faults(mut self, faults: Faults, pause: ApprovalPostPause) -> Self {
         self.faults = faults;
+        self.approval_post_pause = pause;
         self
     }
 
@@ -112,7 +149,7 @@ impl Api {
         let mut faults = self.faults.lock().unwrap();
         let Some(fault) = faults.iter_mut().find(|f| {
             f.method == method.as_str()
-                && f.path == path
+                && (f.path == path || (f.path.ends_with('/') && path.starts_with(f.path)))
                 && f.lost_reply == lost_reply
                 && f.times > 0
         }) else {
@@ -122,9 +159,23 @@ impl Api {
         Err(Error::Network("injected fault".into()))
     }
 
+    /// Hold one account GET after it starts, until the test releases the permit.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_account_get(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_account_get.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn count(&self, path: &str) -> usize {
-        *self.counts.lock().unwrap().get(path).unwrap_or(&0)
+        self.counts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.starts_with(path))
+            .map(|(_, count)| *count)
+            .sum()
     }
 
     pub(crate) fn token(&self) -> Option<Zeroizing<String>> {
@@ -171,11 +222,30 @@ impl Api {
                 .entry(path.to_string())
                 .or_default() += 1;
             self.fault(&method, path, false)?;
+            if method == Method::GET && path == "v1/account" {
+                let held = self.held_account_get.lock().unwrap().take();
+                if let Some(held) = held {
+                    held.acquire().await.expect("test hold is open").forget();
+                }
+            }
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+        // Only changes and reads can be repeated after an ambiguous transport failure.
+        // A change resent after another device compacts its object may be stored twice;
+        // applying it again changes nothing. Other POSTs may have applied.
+        let repeat = method == Method::GET
+            || (method == Method::POST
+                && path.starts_with("v1/bases/")
+                && path.ends_with("/changes"));
+        let retry = if repeat { request.try_clone() } else { None };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) if retry.is_some() => retry
+                .expect("cloneable JSON request")
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.without_url().to_string()))?,
+            Err(e) => return Err(Error::Network(e.without_url().to_string())),
+        };
         let status = response.status();
         match response
             .headers()
@@ -197,10 +267,17 @@ impl Api {
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(|_| Error::Network("malformed response".into()))
         } else {
-            Err(match serde_json::from_slice::<ErrorBody>(&bytes) {
+            let error = match serde_json::from_slice::<ErrorBody>(&bytes) {
                 Ok(body) => map_error(status, &body.error, body.message),
                 Err(_) => map_error(status, "", status.to_string()),
-            })
+            };
+            // A failed removal is confirmed separately with GET /v1/me.
+            if error == Error::Revoked
+                && !(method == Method::DELETE && path.starts_with("v1/devices/"))
+            {
+                self.revoked();
+            }
+            Err(error)
         }
     }
 
@@ -210,6 +287,13 @@ impl Api {
         id: ApprovalId,
         request: Bytes,
     ) -> Result<ApprovalCreate, Error> {
+        #[cfg(feature = "test-support")]
+        let gate = { self.approval_post_pause.lock().unwrap().take() };
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
         self.call(
             Method::POST,
             "v1/approvals",
@@ -300,9 +384,20 @@ impl Api {
     pub(crate) async fn approvals_live(
         &self,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
+        self.live("v1/approvals/live").await
+    }
+
+    pub(crate) async fn base_live(
+        &self,
+        base: BaseId,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
+        self.live(&format!("v1/bases/{base}/live")).await
+    }
+
+    async fn live(&self, path: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
         let mut url = self
             .server
-            .join("v1/approvals/live")
+            .join(path)
             .map_err(|_| Error::invalid("server address"))?;
         url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| Error::invalid("server address"))?;
@@ -330,17 +425,35 @@ impl Api {
         }
         #[cfg(feature = "test-support")]
         {
-            *self
-                .counts
-                .lock()
-                .unwrap()
-                .entry("v1/approvals/live".into())
-                .or_default() += 1;
+            *self.counts.lock().unwrap().entry(path.into()).or_default() += 1;
         }
-        connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls_config())))
-            .await
-            .map(|(socket, _)| socket)
-            .map_err(|e| Error::Network(e.to_string()))
+        match connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(Connector::Rustls(tls_config())),
+        )
+        .await
+        {
+            Ok((socket, _)) => Ok(socket),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = response.status();
+                let code = response
+                    .body()
+                    .as_deref()
+                    .and_then(|body| serde_json::from_slice::<ErrorBody>(body).ok())
+                    .map(|body| body.error);
+                if status == StatusCode::UNAUTHORIZED && code.as_deref() == Some("revoked") {
+                    self.revoked();
+                    Err(Error::Revoked)
+                } else {
+                    Err(Error::Network(format!(
+                        "live connection refused ({status})"
+                    )))
+                }
+            }
+            Err(e) => Err(Error::Network(e.to_string())),
+        }
     }
 
     pub(crate) async fn signup(&self, body: &SignupRequest) -> Result<SignupResponse, Error> {
@@ -387,12 +500,65 @@ impl Api {
             .await
     }
 
-    #[allow(dead_code, reason = "used once app devices are connected")]
+    pub(crate) async fn create_base(&self, body: &BasesRequest) -> Result<BasesResponse, Error> {
+        self.call(Method::POST, "v1/bases", Some(body)).await
+    }
+
+    pub(crate) async fn base_key(&self, base: BaseId) -> Result<BaseKeyResponse, Error> {
+        self.call(Method::GET, &format!("v1/bases/{base}/key"), None::<&()>)
+            .await
+    }
+
+    pub(crate) async fn changes(
+        &self,
+        base: BaseId,
+        body: &ChangesRequest,
+    ) -> Result<ChangesResponse, Error> {
+        self.call(
+            Method::POST,
+            &format!("v1/bases/{base}/changes"),
+            Some(body),
+        )
+        .await
+    }
+
+    pub(crate) async fn since(&self, base: BaseId, after: u64) -> Result<SinceResponse, Error> {
+        self.call(
+            Method::GET,
+            &format!("v1/bases/{base}/since?after={after}"),
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch(
+        &self,
+        base: BaseId,
+        body: &FetchRequest,
+    ) -> Result<FetchResponse, Error> {
+        self.call(Method::POST, &format!("v1/bases/{base}/fetch"), Some(body))
+            .await
+    }
+
+    pub(crate) async fn grant(
+        &self,
+        base: BaseId,
+        device: DeviceId,
+        body: &GrantRequest,
+    ) -> Result<(), Error> {
+        self.call::<serde_json::Value>(
+            Method::PUT,
+            &format!("v1/bases/{base}/grants/{device}"),
+            Some(body),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn add_device(&self, body: &DevicesRequest) -> Result<DevicesResponse, Error> {
         self.call(Method::POST, "v1/devices", Some(body)).await
     }
 
-    #[allow(dead_code, reason = "used once devices can be removed")]
     pub(crate) async fn delete_device(&self, id: DeviceId) -> Result<DeleteDeviceResponse, Error> {
         self.call(Method::DELETE, &format!("v1/devices/{id}"), None::<&()>)
             .await
@@ -466,7 +632,7 @@ fn map_error(status: StatusCode, code: &str, message: String) -> Error {
         "bad_request" => Error::Invalid(message),
         "unauthorized" => Error::Unauthorized,
         "bad_credentials" => Error::BadCredentials,
-        "revoked" => Error::Revoked,
+        "revoked" if status == StatusCode::UNAUTHORIZED => Error::Revoked,
         "pending" => Error::Pending,
         "forbidden" => Error::Forbidden,
         "read_only" => Error::ReadOnly,
@@ -624,6 +790,116 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn idempotent_change_post_recovers_when_the_server_closes_without_a_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = [0; 8192];
+                let length = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                assert!(request.starts_with("POST /v1/bases/"), "{request}");
+                assert!(request.contains("/changes HTTP/1.1"), "{request}");
+                if attempt == 0 {
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                } else {
+                    let body = r#"{"results":[],"head":0}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nBH-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let api = Api::new(url, None);
+        let result = api
+            .changes(BaseId::random(), &ChangesRequest { changes: vec![] })
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_recovers_when_the_server_closes_without_a_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 8192];
+                let length = stream.read(&mut bytes).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&bytes[..length]).starts_with("GET /v1/me HTTP/1.1")
+                );
+                if attempt == 0 {
+                    stream.shutdown(std::net::Shutdown::Both).unwrap();
+                } else {
+                    let body = r#"{"accountId":"00000000000000000000000000000001","deviceId":"00000000000000000000000000000002","kind":"full","bases":[]}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nBH-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+        });
+        let api = Api::new(url, None);
+        assert_eq!(api.me().await.unwrap().kind, DeviceKind::Full);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_401_revoked_answer_triggers_local_removal() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            for (status, code) in [(401, "unauthorized"), (503, "revoked"), (401, "revoked")] {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("test server accept failed: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = [0; 8192];
+                let _ = stream.read(&mut bytes).unwrap();
+                let body =
+                    serde_json::json!({ "error": code, "message": "unavailable" }).to_string();
+                write!(stream, "HTTP/1.1 {status} Error\r\nBH-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let removals = Arc::new(AtomicUsize::new(0));
+        let count = removals.clone();
+        let api = Api::new(url, None).with_revocation(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(api.me().await.unwrap_err(), Error::Unauthorized);
+        assert_eq!(removals.load(Ordering::SeqCst), 0);
+        assert!(matches!(api.me().await.unwrap_err(), Error::Network(_)));
+        assert_eq!(removals.load(Ordering::SeqCst), 0);
+        assert_eq!(api.me().await.unwrap_err(), Error::Revoked);
+        assert_eq!(removals.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
     }
 
     #[test]

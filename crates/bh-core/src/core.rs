@@ -1,20 +1,23 @@
 //! `Core`, sign-up and sign-in.
 
-use crate::account::{self, Account, AccountSummary, DeviceKind};
+use crate::account::{self, Account, AccountSummary, AppCredentials, DeviceKind};
 use crate::client::Api;
 use crate::envelope;
 use crate::keys::{self, DEFAULT_KDF, PasswordSecret, RecoveryKit};
 use crate::secrets::SecretStore;
 use crate::store::{AccountDb, AccountRow};
 use crate::{Clock, Error};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_crypto::Secret;
 use bh_proto::{
     AccountId, ActivateRequest, Bytes, DeviceId, LoginParamsResponse, LoginRequest, SignupRequest,
 };
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -38,15 +41,100 @@ pub struct SignIn {
     pub device_name: String,
 }
 
-/// Shuts the runtime down without blocking, so a `Core` may be dropped inside
-/// any executor, including its own.
-struct Runtime(Option<tokio::runtime::Runtime>);
+/// The core's runtime. Stopping it, by [`Core::shutdown`] or when the last
+/// handle drops, waits up to five seconds for its threads to finish their current
+/// step. Stopping never blocks the runtime's own threads, so a `Core` may be
+/// dropped inside any executor; exit still waits for any store in use (see
+/// [`crate::store::Pass`]), so a process may exit right after.
+struct Runtime {
+    runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    threads: Arc<Threads>,
+}
+
+/// How many of a runtime's threads are running.
+#[derive(Default)]
+struct Threads {
+    running: Mutex<usize>,
+    changed: Condvar,
+}
+
+thread_local! {
+    /// The runtime this thread belongs to, if it is one of a core's threads.
+    static CORE_RUNTIME: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How long starting or stopping waits for the runtime's threads.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// The runtime's worker threads.
+const WORKERS: usize = 2;
+
+impl Runtime {
+    fn build() -> Result<Runtime, Error> {
+        let threads = Arc::new(Threads::default());
+        let id = Arc::as_ptr(&threads) as usize;
+        let (started, stopped) = (threads.clone(), threads.clone());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(WORKERS)
+            .thread_name("bh-core")
+            .on_thread_start(move || {
+                CORE_RUNTIME.set(id);
+                *started.running.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                started.changed.notify_all();
+            })
+            .on_thread_stop(move || {
+                *stopped.running.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                stopped.changed.notify_all();
+            })
+            .enable_all()
+            .build()?;
+        // Count the workers before anything can stop the runtime, so stopping
+        // never misses a worker that hasn't started yet.
+        let running = threads.running.lock().unwrap_or_else(|e| e.into_inner());
+        drop(
+            threads
+                .changed
+                .wait_timeout_while(running, STOP_WAIT, |n| *n < WORKERS),
+        );
+        Ok(Runtime {
+            runtime: Mutex::new(Some(runtime)),
+            threads,
+        })
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        let runtime = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        runtime.as_ref().expect("a new runtime").handle().clone()
+    }
+
+    fn stop(&self) {
+        let Some(runtime) = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        runtime.shutdown_background();
+        if CORE_RUNTIME.get() == Arc::as_ptr(&self.threads) as usize {
+            return;
+        }
+        let running = self
+            .threads
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .threads
+            .changed
+            .wait_timeout_while(running, STOP_WAIT, |n| *n > 0);
+    }
+}
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
-            runtime.shutdown_background();
-        }
+        self.stop();
     }
 }
 
@@ -59,13 +147,21 @@ pub(crate) struct Shared {
     #[allow(dead_code, reason = "used by the approval exchange")]
     pub clock: Clock,
     pub(crate) accounts: Mutex<Weak<Mutex<BTreeMap<AccountId, Account>>>>,
-    _runtime: Runtime,
+    /// Serializes the account check, local writes and failure cleanup across sign-ins.
+    install_lock: tokio::sync::Mutex<()>,
+    runtime: Runtime,
     /// Held while this core is open, so no other process uses its stores.
     _lock: std::fs::File,
     #[cfg(feature = "test-support")]
     test: Mutex<TestDevice>,
     #[cfg(feature = "test-support")]
-    faults: crate::client::Faults,
+    pub faults: crate::client::Faults,
+    #[cfg(feature = "test-support")]
+    pub(crate) fail_next_erase: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-support")]
+    pub(crate) hold_erase: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    #[cfg(feature = "test-support")]
+    approval_post_pause: crate::client::ApprovalPostPause,
 }
 
 #[cfg(feature = "test-support")]
@@ -92,7 +188,14 @@ impl Shared {
     pub(crate) fn api(&self, server: Url, token: Option<String>) -> Api {
         let api = Api::new(server, token);
         #[cfg(feature = "test-support")]
-        let api = api.with_faults(self.faults.clone());
+        let api = api.with_faults(self.faults.clone(), self.approval_post_pause.clone());
+        api
+    }
+
+    fn api_secret(&self, server: Url, token: Option<Zeroizing<String>>) -> Api {
+        let api = Api::new_secret(server, token);
+        #[cfg(feature = "test-support")]
+        let api = api.with_faults(self.faults.clone(), self.approval_post_pause.clone());
         api
     }
 
@@ -121,6 +224,14 @@ impl Core {
         Self::open_with_clock(config, Clock::system())
     }
 
+    /// Stops the core's background work, such as sync, and waits up to five
+    /// seconds for it to finish its current step, so the process can exit
+    /// cleanly. Call it as an app quits; the core can't sync afterwards.
+    /// Dropping the last handle to the core does the same.
+    pub fn shutdown(&self) {
+        self.shared.runtime.stop();
+    }
+
     pub fn open_with_clock(config: CoreConfig, clock: Clock) -> Result<Core, Error> {
         std::fs::create_dir_all(&config.data_dir)?;
         let lock = std::fs::File::create(config.data_dir.join(".lock"))?;
@@ -131,23 +242,26 @@ impl Core {
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("bh-core")
-            .enable_all()
-            .build()?;
+        let runtime = Runtime::build()?;
         let shared = Arc::new(Shared {
             data_dir: config.data_dir,
             secrets: config.secrets,
-            handle: runtime.handle().clone(),
+            handle: runtime.handle(),
             clock,
             accounts: Mutex::new(Weak::new()),
-            _runtime: Runtime(Some(runtime)),
+            install_lock: tokio::sync::Mutex::new(()),
+            runtime,
             _lock: lock,
             #[cfg(feature = "test-support")]
             test: Mutex::default(),
             #[cfg(feature = "test-support")]
             faults: Default::default(),
+            #[cfg(feature = "test-support")]
+            fail_next_erase: Default::default(),
+            #[cfg(feature = "test-support")]
+            hold_erase: Default::default(),
+            #[cfg(feature = "test-support")]
+            approval_post_pause: Default::default(),
         });
         let accounts = Arc::new(Mutex::new(BTreeMap::new()));
         *shared.accounts.lock().unwrap() = Arc::downgrade(&accounts);
@@ -163,13 +277,26 @@ impl Core {
                 continue;
             };
             let path = entry.path().join("account.sqlite");
-            let Some(key) = shared.secrets.get(&format!("acct.{id}.dbkey"))? else {
+            let key = shared.secrets.get(&format!("acct.{id}.dbkey"))?;
+            let erasing = entry.path().join(".erasing").exists() || key.is_none();
+            if erasing {
+                let bases = if let Some(key) = key.as_ref().filter(|_| path.exists()) {
+                    let _pass = crate::store::Pass::new();
+                    AccountDb::open(&path, key)?
+                        .bases()?
+                        .into_iter()
+                        .map(|b| b.id)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                account::erase_disk(&shared, id, &bases)?;
                 continue;
-            };
+            }
             if !path.exists() {
                 continue;
             }
-            let db = AccountDb::open(&path, &key)?;
+            let db = AccountDb::open(&path, &key.unwrap())?;
             let account = Account::load(shared.clone(), db)?;
             accounts.lock().unwrap().insert(id, account);
         }
@@ -195,6 +322,73 @@ impl Core {
             .get(&id)
             .cloned()
             .ok_or(Error::NotFound)
+    }
+
+    /// Installs credentials returned by a full device's app connection. Needs
+    /// the network to fetch only the bases this app was granted.
+    pub async fn install_app(&self, creds: AppCredentials) -> Result<Account, Error> {
+        let core = self.clone();
+        self.shared
+            .run(async move {
+                // Like a sign-in, an app install checks, writes and inserts under one lock.
+                let _install = core.shared.install_lock.lock().await;
+                if core
+                    .accounts
+                    .lock()
+                    .unwrap()
+                    .contains_key(&creds.account_id)
+                {
+                    return Err(Error::invalid("already signed in"));
+                }
+                let app_key = Zeroizing::new(
+                    URL_SAFE_NO_PAD
+                        .decode(creds.app_key.as_bytes())
+                        .map_err(|_| Error::invalid("app key"))?,
+                );
+                let key =
+                    Secret::<32>::from_slice(&app_key).map_err(|_| Error::invalid("app key"))?;
+                let api = core
+                    .shared
+                    .api_secret(creds.server.clone(), Some(creds.token.clone()));
+                let me = api.me().await?;
+                if (me.account_id, me.device_id, me.kind)
+                    != (creds.account_id, creds.device_id, bh_proto::DeviceKind::App)
+                {
+                    return Err(Error::Forbidden);
+                }
+                let id = creds.account_id;
+                let secrets = &core.shared.secrets;
+                secrets.put(&format!("acct.{id}.appkey"), key.expose())?;
+                secrets.put(&format!("acct.{id}.token"), creds.token.as_bytes())?;
+                let db_key = Zeroizing::new(bh_crypto::random::<32>().to_vec());
+                secrets.put(&format!("acct.{id}.dbkey"), &db_key)?;
+                let db =
+                    AccountDb::open(&core.shared.account_dir(id).join("account.sqlite"), &db_key)?;
+                {
+                    let _pass = crate::store::Pass::new();
+                    db.set_account(&AccountRow {
+                        id,
+                        email: creds.email,
+                        server: creds.server,
+                        kind: DeviceKind::App,
+                        device_id: creds.device_id,
+                    })?;
+                }
+                let account = Account::load(core.shared.clone(), db)?;
+                if let Err(error) = account.refresh().await {
+                    // This attempt installed the files, but must not be restored as a
+                    // signed-in account on the next open or block an immediate retry.
+                    drop(account);
+                    std::fs::remove_dir_all(core.shared.account_dir(id))?;
+                    for suffix in ["appkey", "token", "dbkey"] {
+                        secrets.delete(&format!("acct.{id}.{suffix}"))?;
+                    }
+                    return Err(error);
+                }
+                core.accounts.lock().unwrap().insert(id, account.clone());
+                Ok(account)
+            })
+            .await
     }
 
     pub async fn sign_up(&self, req: SignUp) -> Result<(Account, RecoveryKit), Error> {
@@ -244,6 +438,7 @@ impl Core {
                 device_id,
             })
             .await?;
+        let _install = self.shared.install_lock.lock().await;
         let account = self.install(
             AccountRow {
                 id: account_id,
@@ -322,6 +517,9 @@ impl Core {
         account_key: &Secret<32>,
     ) -> Result<Account, Error> {
         let id = row.id;
+        if self.accounts.lock().unwrap().contains_key(&id) {
+            return Err(Error::invalid("already signed in"));
+        }
         let secrets = &self.shared.secrets;
         secrets.put(&format!("acct.{id}.key"), account_key.expose())?;
         secrets.put(&format!("acct.{id}.token"), token.as_bytes())?;
@@ -334,10 +532,40 @@ impl Core {
             }
         };
         let db = AccountDb::open(&self.shared.account_dir(id).join("account.sqlite"), &db_key)?;
-        db.set_account(&row)?;
+        {
+            let _pass = crate::store::Pass::new();
+            db.set_account(&row)?;
+        }
         let account = Account::load(self.shared.clone(), db)?;
         self.accounts.lock().unwrap().insert(id, account.clone());
         Ok(account)
+    }
+
+    /// Removes an incomplete sign-in install only if this attempt owns the local account.
+    fn remove_partial_install(&self, id: AccountId, device_id: DeviceId) -> Result<(), Error> {
+        let mut accounts = self.accounts.lock().unwrap();
+        if accounts
+            .get(&id)
+            .is_some_and(|account| account.device_id() != device_id)
+        {
+            return Ok(());
+        }
+        accounts.remove(&id);
+        let secrets = &self.shared.secrets;
+        let mut failure = None;
+        for suffix in ["key", "token", "dbkey"] {
+            if let Err(error) = secrets.delete(&format!("acct.{id}.{suffix}")) {
+                failure.get_or_insert(error);
+            }
+        }
+        match std::fs::remove_dir_all(self.shared.account_dir(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failure.get_or_insert(error.into());
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Test kit only: names the device when a sign-up or sign-in leaves the name empty.
@@ -348,8 +576,39 @@ impl Core {
 
     /// Test kit only: injects `fault` into this core's requests.
     #[cfg(feature = "test-support")]
+    pub fn test_hold_next_erase(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.shared.hold_erase.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_next_erase(&self) {
+        self.shared
+            .fail_next_erase
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn inject_fault(&self, fault: crate::client::Fault) {
         self.shared.faults.lock().unwrap().push(fault);
+    }
+
+    /// Test kit only: hold the next approval post until the caller releases it.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_approval_post(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.shared.approval_post_pause.lock().unwrap() = Some(crate::client::ApprovalPostGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
     }
 
     /// Test kit only: keeps `guard` (such as a temporary directory) alive as long as the core.
@@ -418,6 +677,14 @@ impl std::fmt::Debug for PendingSignIn {
 }
 
 impl PendingSignIn {
+    pub(crate) fn clock(&self) -> Clock {
+        self.core.shared.clock.clone()
+    }
+
+    pub(crate) async fn is_complete(&self) -> bool {
+        *self.completion.lock().await
+    }
+
     /// Opens the account key with the kit and activates this device. A wrong
     /// kit leaves the sign-in usable; after success this returns
     /// `Err(Error::Invalid("signed in"))`.
@@ -491,22 +758,275 @@ impl PendingSignIn {
                     .is_ok_and(|me| me.device_id == self.device_id) => {}
             Err(e) => return Err(e),
         }
-        let token = self.api.token().ok_or(Error::Unauthorized)?;
-        let account = self.core.install(
-            AccountRow {
-                id: self.account_id,
-                email: self.email,
-                server: self.server,
-                kind: DeviceKind::Full,
-                device_id: self.device_id,
-            },
-            token,
-            account_key,
-        )?;
-        let (device_id, name) = (self.device_id, self.device_name);
-        account
-            .update_data(move |data| account::set_device_name(data, device_id, &name))
-            .await?;
-        Ok(account)
+        let core = self.core.clone();
+        let id = self.account_id;
+        // Keep this lock until either the install and name write finish, or
+        // their cleanup does. No competing attempt may touch these files.
+        let _install = core.shared.install_lock.lock().await;
+        // A different pending sign-in may have installed this account while we
+        // waited for approval. Keep its local credentials and database; write
+        // this activated device's name through that account before refusing a
+        // second local installation.
+        if let Ok(existing) = core.account(id)
+            && existing.device_id() != self.device_id
+        {
+            let (device_id, name) = (self.device_id, self.device_name);
+            existing
+                .update_data(move |data| account::set_device_name(data, device_id, &name))
+                .await?;
+            return Err(Error::invalid("already signed in"));
+        }
+        let install = async {
+            let token = self.api.token().ok_or(Error::Unauthorized)?;
+            let account = core.install(
+                AccountRow {
+                    id,
+                    email: self.email,
+                    server: self.server,
+                    kind: DeviceKind::Full,
+                    device_id: self.device_id,
+                },
+                token,
+                account_key,
+            )?;
+            let (device_id, name) = (self.device_id, self.device_name);
+            account
+                .update_data(move |data| account::set_device_name(data, device_id, &name))
+                .await?;
+            Ok(account)
+        }
+        .await;
+        if install.is_err() {
+            core.remove_partial_install(id, self.device_id)?;
+        }
+        install
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::FileSecretStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    /// Spawns a synchronous step, like a store write, and waits until it begins.
+    fn step_in_progress(runtime: &Runtime) -> Arc<AtomicBool> {
+        let finished = Arc::new(AtomicBool::new(false));
+        let (started, begun) = mpsc::channel();
+        let done = finished.clone();
+        runtime.handle().spawn(async move {
+            started.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            done.store(true, Ordering::SeqCst);
+        });
+        begun.recv_timeout(Duration::from_secs(30)).unwrap();
+        finished
+    }
+
+    #[test]
+    fn a_new_runtime_counts_its_workers_and_stopping_waits_for_all() {
+        let runtime = Runtime::build().unwrap();
+        let threads = runtime.threads.clone();
+        assert_eq!(*threads.running.lock().unwrap(), WORKERS);
+        drop(runtime);
+        assert_eq!(*threads.running.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn stopping_waits_for_a_step_in_progress() {
+        let runtime = Runtime::build().unwrap();
+        let finished = step_in_progress(&runtime);
+        drop(runtime);
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stopping_from_an_async_context_also_waits() {
+        let runtime = Runtime::build().unwrap();
+        let finished = step_in_progress(&runtime);
+        drop(runtime);
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_core_thread_can_drop_the_last_handle() {
+        let runtime = Arc::new(Runtime::build().unwrap());
+        let (hand_over, take) = mpsc::channel::<Arc<Runtime>>();
+        let (dropped, done) = mpsc::channel();
+        runtime.handle().spawn(async move {
+            let last = loop {
+                if let Ok(last) = take.try_recv() {
+                    break last;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let started = std::time::Instant::now();
+            drop(last);
+            dropped.send(started.elapsed()).unwrap();
+        });
+        hand_over.send(runtime).unwrap();
+        let waited = done.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a core thread waited {waited:?} on itself"
+        );
+    }
+
+    const EXIT_CHILD: &str = "BH_CORE_EXIT_CHILD";
+    const STORE_CHILD: &str = "BH_CORE_STORE_EXIT_CHILD";
+    const PAGES: &str = "CREATE TABLE pages (payload BLOB)";
+
+    /// An encrypted store large enough that reading it takes a while.
+    fn pages(dir: &std::path::Path) {
+        let db = crate::store::open_encrypted(&dir.join("pages.sqlite"), &[1; 32]).unwrap();
+        db.execute(PAGES, []).unwrap();
+        for _ in 0..128 {
+            db.execute("INSERT INTO pages VALUES (?)", [vec![42u8; 8192]])
+                .unwrap();
+        }
+    }
+
+    /// Runs `test` in 12 child processes with `child` set to `dir`, and lists
+    /// the runs that didn't exit cleanly within 30 s.
+    fn children(test: &str, child: &str, dir: &std::path::Path) -> Vec<String> {
+        (0..12)
+            .filter_map(|run| {
+                let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test])
+                    .env(child, dir)
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let status = loop {
+                    if let Some(status) = process.try_wait().unwrap() {
+                        break status.to_string();
+                    }
+                    if std::time::Instant::now() > deadline {
+                        process.kill().unwrap();
+                        process.wait().unwrap();
+                        break "hung".to_string();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                (status != "exit status: 0").then(|| format!("run {run}: {status}"))
+            })
+            .collect()
+    }
+
+    /// The symptom behind this rule: a process that drops its core and exits while
+    /// a core thread is reading an encrypted store must not crash.
+    #[test]
+    fn exiting_right_after_dropping_the_core_is_safe() {
+        if let Some(dir) = std::env::var_os(EXIT_CHILD) {
+            exit_while_reading(std::path::Path::new(&dir));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        pages(dir.path());
+        let failed = children(
+            "core::tests::exiting_right_after_dropping_the_core_is_safe",
+            EXIT_CHILD,
+            dir.path(),
+        );
+        assert!(failed.is_empty(), "children exited badly: {failed:?}");
+    }
+
+    /// Exit waits for a store in use on any thread, such as a core thread that
+    /// dropped the last handle, so it couldn't wait for itself, or an app command.
+    #[test]
+    fn exiting_while_any_thread_uses_a_store_is_safe() {
+        if let Some(dir) = std::env::var_os(STORE_CHILD) {
+            exit_while_in_use(std::path::Path::new(&dir));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        pages(dir.path());
+        let failed = children(
+            "core::tests::exiting_while_any_thread_uses_a_store_is_safe",
+            STORE_CHILD,
+            dir.path(),
+        );
+        assert!(failed.is_empty(), "children exited badly: {failed:?}");
+    }
+
+    const LATE_CHILD: &str = "BH_CORE_LATE_EXIT_CHILD";
+
+    /// Once exit has begun, dropping a store on any thread, or using one on the
+    /// exiting thread, as a later exit handler might, never hangs.
+    #[test]
+    fn stores_dropped_or_used_while_exiting_never_hang() {
+        if let Some(dir) = std::env::var_os(LATE_CHILD) {
+            let dir = std::path::Path::new(&dir);
+            let here = crate::store::AccountDb::open(&dir.join("here.sqlite"), &[1; 32]).unwrap();
+            let there = crate::store::AccountDb::open(&dir.join("there.sqlite"), &[1; 32]).unwrap();
+            crate::store::test_begin_exit();
+            std::thread::spawn(move || drop(there)).join().unwrap();
+            drop(here);
+            drop(crate::store::Pass::new());
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let failed = children(
+            "core::tests::stores_dropped_or_used_while_exiting_never_hang",
+            LATE_CHILD,
+            dir.path(),
+        );
+        assert!(failed.is_empty(), "children exited badly: {failed:?}");
+    }
+
+    fn exit_while_in_use(dir: &std::path::Path) -> ! {
+        let db = crate::store::open_encrypted(&dir.join("pages.sqlite"), &[1; 32]).unwrap();
+        db.execute_batch("PRAGMA cache_size = 2").unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let (started, begun) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut started = Some(started);
+            let read = |db: &rusqlite::Connection| -> rusqlite::Result<()> {
+                let mut read = db.prepare("SELECT payload FROM pages")?;
+                let mut rows = read.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            };
+            loop {
+                // A failed read means exit freed SQLCipher's state under it. The
+                // exit status can't show a panic on this thread, so abort.
+                if read(&crate::store::in_use(&db)).is_err() {
+                    std::process::abort();
+                }
+                if let Some(started) = started.take() {
+                    started.send(()).unwrap();
+                }
+            }
+        });
+        begun.recv_timeout(Duration::from_secs(30)).unwrap();
+        std::process::exit(0);
+    }
+
+    fn exit_while_reading(dir: &std::path::Path) -> ! {
+        let core = Core::open(CoreConfig {
+            data_dir: dir.join("core"),
+            secrets: Arc::new(FileSecretStore::new(dir.join("secrets")).unwrap()),
+        })
+        .unwrap();
+        let path = dir.join("pages.sqlite");
+        let (started, begun) = mpsc::channel();
+        core.shared.handle.spawn(async move {
+            let db = crate::store::open_encrypted(&path, &[1; 32]).unwrap();
+            db.execute_batch("PRAGMA cache_size = 2").unwrap();
+            let mut started = Some(started);
+            loop {
+                {
+                    let mut read = db.prepare("SELECT payload FROM pages").unwrap();
+                    let mut rows = read.query([]).unwrap();
+                    while rows.next().unwrap().is_some() {}
+                }
+                if let Some(started) = started.take() {
+                    started.send(()).unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        begun.recv_timeout(Duration::from_secs(30)).unwrap();
+        drop(core);
+        std::process::exit(0);
     }
 }

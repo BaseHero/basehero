@@ -28,6 +28,7 @@
   let creating = $state<ItemKind | null>(null);
   let name = $state('');
   let error = $state('');
+  let mac = $state(false);
   let current = $state<ObjectSummary | null>(null);
   let project = $state<ObjectId | null>(null);
   $effect(() => {
@@ -51,6 +52,7 @@
   onMount(() => {
     let active = true;
     void getBackend().bases(r.account).then(bases => { if (active) baseName = bases.find(base => base.id === r.base)?.name ?? 'Base'; }).catch(e => error = errorMessage(e));
+    void getBackend().appInfo().then(info => { if (active) mac = info.platform === 'macos'; });
     void model.expand(null).catch(e => error = errorMessage(e));
     let unsubscribe = () => {};
     void getBackend().onEvent(event => {
@@ -127,7 +129,9 @@
       {#if creating}
         <form class="create-item" onsubmit={create}><label>Name<input bind:value={name} required /></label><button class="primary" type="submit">Create</button><button type="button" onclick={() => creating = null}>Cancel</button></form>
       {/if}
-      <Tree {model} onopen={open} onmenu={item => { menu = item; noteMenu = false; }} />
+      <Tree {model} {mac} onopen={open} onmenu={item => { menu = item; noteMenu = false; }} onnewwindow={note => {
+        void getBackend().openWindow(`#/a/${r.account}/b/${r.base}/n/${note}`).catch(cause => error = errorMessage(cause));
+      }} />
       <button onclick={() => trashOpen = !trashOpen}>Trash</button>
     </aside>
     <section class="content-panel">
@@ -143,8 +147,11 @@
             {#if noteMenu}<div class="item-menu"><NoteFiles {r} {id} /><NoteHistory {r} {id} /></div>{/if}
             {#key id}<NoteEditor {r} {id} readOnly={false} onnavigate={(ref, target) => { if (ref.account === r.account) location.hash = `#/a/${ref.account}/b/${ref.base}/n/${target}`; }} {onleave} {retryleave} />{/key}
           </div>
-          <div class:hero-open={heroOpen} class="hero-container"><HeroPanel account={r.account} base={r.base} focus={id} {project} /></div>
-          <button class="hero-toggle" onclick={() => heroOpen = !heroOpen}>Hero</button>
+          <div class:hero-open={heroOpen} class="hero-container">
+            <button class="hero-close" onclick={() => heroOpen = false}>Close Hero</button>
+            <HeroPanel account={r.account} base={r.base} focus={id} {project} />
+          </div>
+          <button class="hero-toggle" aria-expanded={heroOpen} onclick={() => heroOpen = !heroOpen}>Hero</button>
         </div>
       {:else}
         <p>Select a note, folder or project, or create one to start.</p>

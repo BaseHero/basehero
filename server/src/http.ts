@@ -22,6 +22,8 @@ export type Env = {
   CHANGE_RATE_WINDOW_MS?: string;
   /** How long the relay keeps an approval open; tests shorten it. */
   APPROVAL_TTL_MS?: string;
+  /** Tests shorten the maximum age of a live socket before broadcast closes it. */
+  LIVE_SOCKET_MAX_AGE_MS?: string;
   LOGIN_RATE_LIMITER?: { limit(input: { key: string }): Promise<{ success: boolean }> };
 };
 export type Result<T = object> = { status: number; body: T | ErrorBody };
@@ -106,6 +108,7 @@ export type AccountRpc = {
   credentials(principal: Principal, input: import('./proto/gen/CredentialsRequest').CredentialsRequest): Promise<Result>;
   addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string): Promise<Result>;
   removeDevice(principal: Principal, deviceId: string): Promise<Result>;
+  failRemovalOnce(principal: Principal): Promise<Result>;
   addBase(principal: Principal, baseId: string): Promise<void>;
   grantApp(principal: Principal, baseId: string, deviceId: string): Promise<Result>;
   ungrantApp(principal: Principal, baseId: string, deviceId: string): Promise<Result>;

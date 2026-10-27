@@ -3,21 +3,33 @@
 
 use crate::objects::ObjectSummary;
 use crate::types::TypeRef;
-use crate::{DeviceKind, Error};
-use bh_proto::{AccountId, DeviceId, ObjectId};
+use crate::{DeviceKind, Error, Mode};
+use bh_proto::{AccountId, BaseId, ChangeId, DeviceId, ObjectId};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::{Condvar, Mutex, MutexGuard, Once};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Opens a SQLCipher database with a raw 32-byte key and checks the key works.
 pub(crate) fn open_encrypted(path: &Path, key: &[u8]) -> Result<Connection, Error> {
+    let _pass = Pass::new();
     if key.len() != 32 {
         return Err(Error::Storage("database key has the wrong length".into()));
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // SQLite marks itself initialized before SQLCipher's own initializer has run, so
+    // two first opens at once can key a database before SQLCipher is ready, and
+    // that key fails. Finish initializing once, before any connection opens.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    // SAFETY: sqlite3_initialize takes no arguments and is safe to call at any time.
+    INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_initialize();
+    });
     let connection = Connection::open(path)?;
     let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
     let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{hex}'\";"));
@@ -27,9 +39,128 @@ pub(crate) fn open_encrypted(path: &Path, key: &[u8]) -> Result<Connection, Erro
     connection
         .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
         .map_err(|_| Error::Crypto)?;
+    wait_at_exit();
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(connection)
+}
+
+/// SQLCipher frees its state when the process exits, so a thread still using a
+/// store then crashes it. Each use of a store holds a pass: [`in_use`] for a
+/// store behind its lock, [`Pass::new`] while a store is opened, or used before
+/// its lock exists. At exit, a handler waits up to five seconds for the passes
+/// held; afterwards other threads wait for the process to end instead of
+/// starting a use, and a store dropped then is left open rather than closed.
+pub(crate) struct Pass(());
+
+struct Passes {
+    held: usize,
+    /// The thread running exit, once it has begun.
+    exiting: Option<std::thread::ThreadId>,
+}
+
+static PASSES: (Mutex<Passes>, Condvar) = (
+    Mutex::new(Passes {
+        held: 0,
+        exiting: None,
+    }),
+    Condvar::new(),
+);
+
+impl Pass {
+    pub(crate) fn new() -> Pass {
+        let (passes, changed) = &PASSES;
+        let mut passes = passes.lock().unwrap_or_else(|e| e.into_inner());
+        while passes
+            .exiting
+            .is_some_and(|exiting| exiting != std::thread::current().id())
+        {
+            passes = changed.wait(passes).unwrap_or_else(|e| e.into_inner());
+        }
+        passes.held += 1;
+        Pass(())
+    }
+
+    /// A pass, unless exit has begun; never waits.
+    fn unless_exiting() -> Option<Pass> {
+        let mut passes = PASSES.0.lock().unwrap_or_else(|e| e.into_inner());
+        if passes.exiting.is_some() {
+            return None;
+        }
+        passes.held += 1;
+        Some(Pass(()))
+    }
+}
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        let (passes, changed) = &PASSES;
+        passes.lock().unwrap_or_else(|e| e.into_inner()).held -= 1;
+        changed.notify_all();
+    }
+}
+
+extern "C" fn wait_for_passes() {
+    let (passes, changed) = &PASSES;
+    let mut passes = passes.lock().unwrap_or_else(|e| e.into_inner());
+    passes.exiting = Some(std::thread::current().id());
+    let _ = changed.wait_timeout_while(passes, Duration::from_secs(5), |p| p.held > 0);
+}
+
+/// Begins exit as the handler does, without exiting.
+#[cfg(test)]
+pub(crate) fn test_begin_exit() {
+    wait_for_passes();
+}
+
+/// Closes a store's connection, or leaves it open once exit has begun.
+fn close(connection: &mut ManuallyDrop<Connection>) {
+    if let Some(_pass) = Pass::unless_exiting() {
+        // SAFETY: each store calls this once, from its `drop`.
+        unsafe { ManuallyDrop::drop(connection) }
+    }
+}
+
+/// Registers the exit handler once. Exit handlers run in reverse order, so it's
+/// registered after the first store is keyed, when SQLCipher and OpenSSL have
+/// registered theirs.
+fn wait_at_exit() {
+    unsafe extern "C" {
+        fn atexit(handler: extern "C" fn()) -> std::ffi::c_int;
+    }
+    static REGISTER: Once = Once::new();
+    // SAFETY: the handler is a plain function that lives for the whole process.
+    REGISTER.call_once(|| unsafe {
+        atexit(wait_for_passes);
+    });
+}
+
+/// A store behind its lock, with a pass for as long as it's held.
+pub(crate) struct InUse<'a, T> {
+    store: MutexGuard<'a, T>,
+    _pass: Pass,
+}
+
+/// Locks a store, then takes a pass, so no use starts once exit has begun.
+pub(crate) fn in_use<T>(store: &Mutex<T>) -> InUse<'_, T> {
+    let store = store.lock().unwrap_or_else(|e| e.into_inner());
+    InUse {
+        store,
+        _pass: Pass::new(),
+    }
+}
+
+impl<T> std::ops::Deref for InUse<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.store
+    }
+}
+
+impl<T> std::ops::DerefMut for InUse<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.store
+    }
 }
 
 /// Runs each migration after the database's `user_version`. A database from a
@@ -65,10 +196,33 @@ const ACCOUNT_MIGRATIONS: &[&str] = &[
         json TEXT NOT NULL
     );
 ",
+    "CREATE TABLE approvals_answered (commitment BLOB PRIMARY KEY, at INTEGER NOT NULL);",
+    // Version 2 already stores answered approvals on main; add bases in version 3.
     "
-    CREATE TABLE approvals_answered (commitment BLOB PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE TABLE bases (
+        base_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        wrapper BLOB NOT NULL,
+        mode TEXT NOT NULL,
+        added_at INTEGER NOT NULL
+    );
 ",
+    "CREATE TABLE hidden_bases (
+        base_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL,
+        wrapper BLOB NOT NULL
+    );",
 ];
+
+/// A base this device may open: its key as the server's wrapper, which only
+/// this account's (or app's) key opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseRow {
+    pub id: BaseId,
+    pub epoch: u32,
+    pub wrapper: Vec<u8>,
+    pub mode: Mode,
+}
 
 pub(crate) struct AccountRow {
     pub id: AccountId,
@@ -78,13 +232,21 @@ pub(crate) struct AccountRow {
     pub device_id: DeviceId,
 }
 
-pub(crate) struct AccountDb(Connection);
+/// The account database. Use it through `Account::db`, or hold a [`Pass`].
+pub(crate) struct AccountDb(ManuallyDrop<Connection>);
+
+impl Drop for AccountDb {
+    fn drop(&mut self) {
+        close(&mut self.0);
+    }
+}
 
 impl AccountDb {
     pub(crate) fn open(path: &Path, key: &[u8]) -> Result<Self, Error> {
+        let _pass = Pass::new();
         let mut connection = open_encrypted(path, key)?;
         migrate(&mut connection, ACCOUNT_MIGRATIONS)?;
-        Ok(Self(connection))
+        Ok(Self(ManuallyDrop::new(connection)))
     }
 
     pub(crate) fn set_account(&self, row: &AccountRow) -> Result<(), Error> {
@@ -136,12 +298,110 @@ impl AccountDb {
             .optional()?)
     }
 
+    /// Records a commitment before any response is sent; duplicates remain forever.
+    pub(crate) fn claim_approval(&self, commitment: &[u8; 32], at: u64) -> Result<bool, Error> {
+        Ok(self.0.execute(
+            "INSERT OR IGNORE INTO approvals_answered (commitment, at) VALUES (?, ?)",
+            params![commitment.as_slice(), at.min(i64::MAX as u64) as i64],
+        )? == 1)
+    }
+
     pub(crate) fn set_account_data(&self, version: u64, json: &str) -> Result<(), Error> {
         self.0.execute(
-            "INSERT OR REPLACE INTO account_data (id, version, json) VALUES (1, ?, ?)",
+            "INSERT INTO account_data (id, version, json) VALUES (1, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET version = excluded.version, json = excluded.json
+             WHERE excluded.version > account_data.version",
             params![version as i64, json],
         )?;
         Ok(())
+    }
+
+    /// Adds a base or updates its key and mode.
+    pub(crate) fn put_base(&self, row: &BaseRow, added_at: i64) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO bases (base_id, epoch, wrapper, mode, added_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (base_id) DO UPDATE SET epoch = excluded.epoch,
+                 wrapper = excluded.wrapper, mode = excluded.mode",
+            params![
+                row.id.to_string(),
+                row.epoch,
+                row.wrapper,
+                mode_text(row.mode),
+                added_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remembers an unopened account wrapper without storing a base name or key.
+    #[allow(dead_code, reason = "used by upcoming hidden account operations")]
+    pub(crate) fn remember_hidden(
+        &self,
+        base: BaseId,
+        epoch: u32,
+        wrapper: &[u8],
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO hidden_bases (base_id, epoch, wrapper) VALUES (?, ?, ?)
+             ON CONFLICT (base_id) DO UPDATE SET epoch = excluded.epoch, wrapper = excluded.wrapper",
+            params![base.to_string(), epoch, wrapper],
+        )?;
+        Ok(())
+    }
+
+    /// Returns locally indexed wrappers without decrypting them.
+    #[allow(dead_code, reason = "used by upcoming hidden account operations")]
+    pub(crate) fn hidden_wrappers(&self) -> Result<Vec<(BaseId, u32, Vec<u8>)>, Error> {
+        let mut statement = self
+            .0
+            .prepare("SELECT base_id, epoch, wrapper FROM hidden_bases ORDER BY base_id")?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, epoch, wrapper) = row?;
+            Ok((parse_id(&id)?, epoch, wrapper))
+        })
+        .collect()
+    }
+
+    pub(crate) fn bases(&self) -> Result<Vec<BaseRow>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT base_id, epoch, wrapper, mode FROM bases ORDER BY added_at, base_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, epoch, wrapper, mode) = row?;
+            Ok(BaseRow {
+                id: parse_id(&id)?,
+                epoch,
+                wrapper,
+                mode: match mode.as_str() {
+                    "rw" => Mode::ReadWrite,
+                    "ro" => Mode::ReadOnly,
+                    _ => return Err(corrupt("base mode")),
+                },
+            })
+        })
+        .collect()
+    }
+}
+
+fn mode_text(mode: Mode) -> &'static str {
+    match mode {
+        Mode::ReadWrite => "rw",
+        Mode::ReadOnly => "ro",
     }
 }
 
@@ -192,12 +452,50 @@ const BASE_MIGRATIONS: &[&str] = &[
 "#,
     // Queries by type. `objects_by_parent` already serves lookups by parent.
     "CREATE INDEX objects_by_type ON objects (type);",
+    "DELETE FROM set_aside WHERE seq IS NOT NULL AND id NOT IN
+        (SELECT min(id) FROM set_aside WHERE seq IS NOT NULL GROUP BY object_id, seq);
+     CREATE UNIQUE INDEX set_aside_unique ON set_aside (object_id, seq) WHERE seq IS NOT NULL;",
+    // Main's version 4 holds raw future changes; early search stores used
+    // version 4 for FTS. Both layouts migrate to version 5.
+    "CREATE TABLE IF NOT EXISTS future_changes (
+        object_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        state INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        body BLOB NOT NULL,
+        PRIMARY KEY (object_id, seq)
+    );",
+    "CREATE TABLE IF NOT EXISTS future_changes (
+        object_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        state INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        body BLOB NOT NULL,
+        PRIMARY KEY (object_id, seq)
+    );
+     DELETE FROM set_aside WHERE seq IS NOT NULL AND id NOT IN
+         (SELECT min(id) FROM set_aside WHERE seq IS NOT NULL GROUP BY object_id, seq);
+     CREATE UNIQUE INDEX IF NOT EXISTS set_aside_unique ON set_aside (object_id, seq) WHERE seq IS NOT NULL;
+     CREATE VIRTUAL TABLE IF NOT EXISTS object_search USING fts5(object_id UNINDEXED, title, body);"
 ];
 
 /// Types that never show in the folder tree or the trash.
 const HIDDEN: &str = "type NOT IN ('core.type', 'core.base')";
 
-const SUMMARY: &str = "object_id, type, type_version, parent, position, deleted, title, fields, updated_at, updated_by";
+pub(crate) const SUMMARY: &str = "object_id, type, type_version, parent, position, deleted, title, fields, updated_at, updated_by";
+
+/// A change recorded before it's sent. It covers its object's outbox rows up
+/// to `outbox_max_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SendingRow {
+    pub change_id: ChangeId,
+    pub object_id: ObjectId,
+    /// A `state` change rather than an `update`.
+    pub state: bool,
+    pub body: Vec<u8>,
+    pub covers: Option<u64>,
+    pub outbox_max_id: i64,
+}
 
 /// An object's stored state and the columns derived from it.
 pub(crate) struct ObjectRow {
@@ -240,30 +538,114 @@ fn hex(id: Option<ObjectId>) -> Option<String> {
 
 /// A base's store: object state and summaries, the outbox of local updates,
 /// changes being sent, changes set aside, and sync state.
-pub(crate) struct BaseDb(Connection);
+/// Use it through `Base::db`, or hold a [`Pass`].
+pub(crate) struct BaseDb(ManuallyDrop<Connection>, bool);
+
+impl Drop for BaseDb {
+    fn drop(&mut self) {
+        close(&mut self.0);
+    }
+}
 
 impl BaseDb {
     pub(crate) fn open(path: &Path, key: &[u8]) -> Result<Self, Error> {
+        let _pass = Pass::new();
         let mut connection = open_encrypted(path, key)?;
-        migrate(&mut connection, BASE_MIGRATIONS)?;
-        Ok(Self(connection))
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // FTS must be created and populated before its version is committed.
+        // Older stores stop at version 4 until the base can decode their objects.
+        if version < 5 {
+            migrate(&mut connection, &BASE_MIGRATIONS[..4])?;
+        } else {
+            migrate(&mut connection, BASE_MIGRATIONS)?;
+        }
+        Ok(Self(ManuallyDrop::new(connection), version < 5))
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.0
+    }
+
+    pub(crate) fn needs_search_backfill(&self) -> bool {
+        self.1
+    }
+
+    /// Creates and fills FTS in the same transaction as its version bump.
+    pub(crate) fn migrate_search(
+        &mut self,
+        backfill: impl FnOnce(&mut BaseDb) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.batch(|db| {
+            db.0.execute_batch(BASE_MIGRATIONS[4])?;
+            backfill(db)?;
+            db.0.execute_batch("PRAGMA user_version = 5")?;
+            Ok(())
+        })?;
+        self.1 = false;
+        migrate(&mut self.0, BASE_MIGRATIONS)
+    }
+
+    pub(crate) fn objects_for_backfill(&self) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
+        let mut stmt = self.0.prepare("SELECT object_id, state FROM objects")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|r| {
+            let (id, state) = r?;
+            Ok((parse_id(&id)?, state))
+        })
+        .collect()
+    }
+
+    /// Writes an object's search text in the same transaction as its state.
+    pub(crate) fn put_search(&self, id: ObjectId, title: &str, body: &str) -> Result<(), Error> {
+        // The objects rowid is stable across upserts. FTS indexes rowid but
+        // not its UNINDEXED object_id column, so this avoids a full scan on
+        // every edit in a large base.
+        self.0.execute(
+            "DELETE FROM object_search WHERE rowid = (SELECT rowid FROM objects WHERE object_id = ?)",
+            [id.to_string()],
+        )?;
+        self.0.execute(
+            "INSERT INTO object_search (rowid, object_id, title, body)
+             VALUES ((SELECT rowid FROM objects WHERE object_id = ?), ?, ?, ?)",
+            params![id.to_string(), id.to_string(), title, body],
+        )?;
+        Ok(())
+    }
+
+    /// Updates a record's derived title without changing its source state.
+    pub(crate) fn put_title(&self, id: ObjectId, title: &str) -> Result<(), Error> {
+        self.0.execute(
+            "UPDATE objects SET title = ? WHERE object_id = ?",
+            params![title, id.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Writes an object's state and summary and, for local edits, their
-    /// updates to the outbox, in one transaction. `confirmed_seq` is kept.
-    pub(crate) fn put(&mut self, row: &ObjectRow, outbox: &[&[u8]]) -> Result<(), Error> {
+    /// updates to the outbox, in one transaction. `confirmed_seq` is set when
+    /// `confirmed` is given and kept otherwise.
+    pub(crate) fn put(
+        &mut self,
+        row: &ObjectRow,
+        outbox: &[&[u8]],
+        confirmed: Option<u64>,
+    ) -> Result<(), Error> {
         let s = &row.summary;
         let fields = serde_json::to_string(&s.fields).expect("JSON map");
-        let tx = self.0.transaction()?;
+        // A savepoint, so it also works inside `batch`.
+        let tx = self.0.savepoint()?;
         tx.execute(
             "INSERT INTO objects (object_id, type, type_version, parent, position, deleted, title,
-                 fields, state, updated_at, updated_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fields, state, updated_at, updated_by, confirmed_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?12, 0))
              ON CONFLICT (object_id) DO UPDATE SET type = excluded.type,
                  type_version = excluded.type_version, parent = excluded.parent,
                  position = excluded.position, deleted = excluded.deleted, title = excluded.title,
                  fields = excluded.fields, state = excluded.state, updated_at = excluded.updated_at,
-                 updated_by = excluded.updated_by",
+                 updated_by = excluded.updated_by,
+                 confirmed_seq = coalesce(?12, confirmed_seq)",
             params![
                 s.id.to_string(),
                 s.ty.name,
@@ -276,6 +658,7 @@ impl BaseDb {
                 row.state,
                 s.updated_at,
                 s.updated_by.map(|d| d.to_string()),
+                confirmed.map(|c| c as i64),
             ],
         )?;
         for update in outbox {
@@ -286,6 +669,31 @@ impl BaseDb {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Runs `work` in one transaction, which commits only if it succeeds.
+    pub(crate) fn batch<T>(
+        &mut self,
+        work: impl FnOnce(&mut BaseDb) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.0.execute_batch("SAVEPOINT bh_batch")?;
+        match work(self) {
+            Ok(value) => match self.0.execute_batch("RELEASE bh_batch") {
+                Ok(()) => Ok(value),
+                Err(e) => {
+                    let _ = self
+                        .0
+                        .execute_batch("ROLLBACK TO bh_batch; RELEASE bh_batch");
+                    Err(e.into())
+                }
+            },
+            Err(e) => {
+                let _ = self
+                    .0
+                    .execute_batch("ROLLBACK TO bh_batch; RELEASE bh_batch");
+                Err(e)
+            }
+        }
     }
 
     /// An object's type and stored state.
@@ -323,7 +731,7 @@ impl BaseDb {
             .transpose()
     }
 
-    fn summaries(
+    pub(crate) fn summaries(
         &self,
         sql: &str,
         params: impl rusqlite::Params,
@@ -424,6 +832,260 @@ impl BaseDb {
         .collect()
     }
 
+    /// The highest seq up to which this device has applied every change to
+    /// the object, or `None` for an object it doesn't have.
+    pub(crate) fn confirmed(&self, id: ObjectId) -> Result<Option<u64>, Error> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT confirmed_seq FROM objects WHERE object_id = ?",
+                [id.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|c| c as u64))
+    }
+
+    /// Whether this object has raw changes requiring a newer core.
+    pub(crate) fn needs_update(&self, id: ObjectId) -> Result<bool, Error> {
+        Ok(self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM future_changes WHERE object_id = ?)",
+            [id.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether any object in this base needs a newer core.
+    pub(crate) fn has_future(&self) -> Result<bool, Error> {
+        Ok(self
+            .0
+            .query_row("SELECT EXISTS(SELECT 1 FROM future_changes)", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// Preserve the exact incoming envelope without decoding, merging or rewriting it.
+    pub(crate) fn keep_future(
+        &self,
+        id: ObjectId,
+        seq: u64,
+        state: bool,
+        device: DeviceId,
+        body: &[u8],
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR IGNORE INTO future_changes (object_id, seq, state, device_id, body)
+             VALUES (?, ?, ?, ?, ?)",
+            params![id.to_string(), seq as i64, state, device.to_string(), body],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn future_bodies(&self, id: ObjectId) -> Result<Vec<Vec<u8>>, Error> {
+        let mut statement = self
+            .0
+            .prepare("SELECT body FROM future_changes WHERE object_id = ? ORDER BY seq")?;
+        statement
+            .query_map([id.to_string()], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn set_confirmed(&self, id: ObjectId, seq: u64) -> Result<(), Error> {
+        self.0.execute(
+            "UPDATE objects SET confirmed_seq = ? WHERE object_id = ?",
+            params![seq as i64, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The newest outbox row's ID, or 0.
+    pub(crate) fn outbox_end(&self) -> Result<i64, Error> {
+        Ok(self
+            .0
+            .query_row("SELECT coalesce(max(id), 0) FROM outbox", [], |r| r.get(0))?)
+    }
+
+    /// The objects with outbox rows up to `end`, the one waiting longest first.
+    pub(crate) fn outbox_objects(&self, end: i64) -> Result<Vec<ObjectId>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT object_id FROM outbox WHERE id <= ? GROUP BY object_id ORDER BY min(id)",
+        )?;
+        let rows = statement.query_map([end], |r| r.get::<_, String>(0))?;
+        rows.map(|row| parse_id(&row?)).collect()
+    }
+
+    /// An object's outbox rows up to `end`, oldest first, as long as their
+    /// updates total at most `budget` bytes, and always at least one.
+    pub(crate) fn outbox_rows(
+        &self,
+        id: ObjectId,
+        end: i64,
+        budget: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT id, \"update\" FROM outbox WHERE object_id = ? AND id <= ? ORDER BY id",
+        )?;
+        let mut rows = statement.query(params![id.to_string(), end])?;
+        let (mut out, mut total) = (Vec::new(), 0);
+        while let Some(row) = rows.next()? {
+            let update: Vec<u8> = row.get(1)?;
+            total += update.len();
+            if total > budget && !out.is_empty() {
+                break;
+            }
+            out.push((row.get(0)?, update));
+        }
+        Ok(out)
+    }
+
+    /// The changes being sent, in the order they were made.
+    pub(crate) fn sending(&self) -> Result<Vec<SendingRow>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT change_id, object_id, kind, body, covers, outbox_max_id FROM sending ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (change_id, object_id, kind, body, covers, outbox_max_id) = row?;
+            Ok(SendingRow {
+                change_id: parse_id(&change_id)?,
+                object_id: parse_id(&object_id)?,
+                state: match kind.as_str() {
+                    "update" => false,
+                    "state" => true,
+                    _ => return Err(corrupt("change kind")),
+                },
+                body,
+                covers: covers.map(|c| c as u64),
+                outbox_max_id,
+            })
+        })
+        .collect()
+    }
+
+    /// Records a batch of changes before it's sent, so a retry resends them unchanged.
+    pub(crate) fn start_sending(&mut self, batch: &[SendingRow]) -> Result<(), Error> {
+        let tx = self.0.transaction()?;
+        for c in batch {
+            tx.execute(
+                "INSERT INTO sending (change_id, object_id, kind, body, covers, outbox_max_id)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    c.change_id.to_string(),
+                    c.object_id.to_string(),
+                    if c.state { "state" } else { "update" },
+                    c.body,
+                    c.covers.map(|c| c as i64),
+                    c.outbox_max_id
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets changes the server has stored, with the outbox rows they
+    /// covered, and advances each object's `confirmed_seq` where given.
+    pub(crate) fn sent(&mut self, changes: &[(&SendingRow, Option<u64>)]) -> Result<(), Error> {
+        let tx = self.0.transaction()?;
+        for (change, confirm) in changes {
+            let id = change.object_id.to_string();
+            tx.execute(
+                "DELETE FROM outbox WHERE object_id = ? AND id <= ?",
+                params![id, change.outbox_max_id],
+            )?;
+            tx.execute(
+                "DELETE FROM sending WHERE change_id = ?",
+                [change.change_id.to_string()],
+            )?;
+            if let Some(seq) = confirm {
+                tx.execute(
+                    "UPDATE objects SET confirmed_seq = ? WHERE object_id = ?",
+                    params![*seq as i64, id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// How many objects have changes waiting to be sent.
+    pub(crate) fn pending(&self) -> Result<u64, Error> {
+        Ok(self.0.query_row(
+            "SELECT count(*) FROM (SELECT object_id FROM outbox UNION SELECT object_id FROM sending)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Keeps a change that failed to decrypt, decode or apply.
+    pub(crate) fn set_aside(
+        &self,
+        id: ObjectId,
+        seq: u64,
+        body: &[u8],
+        error: &str,
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR IGNORE INTO set_aside (object_id, seq, body, error, at) VALUES (?, ?, ?, ?, ?)",
+            params![
+                id.to_string(),
+                seq as i64,
+                body,
+                error,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The set-aside changes' objects, seqs and errors.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_aside_rows(&self) -> Result<Vec<(ObjectId, u64, String)>, Error> {
+        let mut statement = self
+            .0
+            .prepare("SELECT object_id, seq, error FROM set_aside ORDER BY id")?;
+        let rows = statement.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get(2)?))
+        })?;
+        rows.map(|row| {
+            let (id, seq, error) = row?;
+            Ok((parse_id(&id)?, seq as u64, error))
+        })
+        .collect()
+    }
+
+    /// A number kept in the `sync` table, such as the base head caught up to.
+    pub(crate) fn sync_value(&self, key: &str) -> Result<Option<u64>, Error> {
+        Ok(self
+            .0
+            .query_row("SELECT value FROM sync WHERE key = ?", [key], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|v| v as u64))
+    }
+
+    pub(crate) fn set_sync_value(&self, key: &str, value: u64) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO sync (key, value) VALUES (?, ?)",
+            params![key, value as i64],
+        )?;
+        Ok(())
+    }
+
     /// The outbox, oldest first.
     #[cfg(feature = "test-support")]
     pub(crate) fn outbox(&self) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
@@ -445,7 +1107,7 @@ mod tests {
     use serde_json::{Map, Value};
 
     #[test]
-    fn a_base_store_is_encrypted_at_version_2_and_writes_state_with_its_outbox() {
+    fn a_base_store_is_encrypted_at_version_4_and_writes_state_with_its_outbox() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("base.sqlite");
         let mut db = BaseDb::open(&path, &[1; 32]).unwrap();
@@ -464,9 +1126,12 @@ mod tests {
             },
             state: vec![1, 2, 3],
         };
-        db.put(&row, &[&[9]]).unwrap();
+        db.put(&row, &[&[9]], None).unwrap();
         row.summary.deleted = true;
-        db.put(&row, &[]).unwrap();
+        db.put(&row, &[], Some(4)).unwrap();
+        assert_eq!(db.confirmed(id).unwrap(), Some(4));
+        db.put(&row, &[], None).unwrap();
+        assert_eq!(db.confirmed(id).unwrap(), Some(4));
         assert_eq!(db.summary(id).unwrap().unwrap(), row.summary);
         assert_eq!(db.state(id).unwrap().unwrap().1, vec![1, 2, 3]);
         assert_eq!(db.trash().unwrap().len(), 1);
@@ -478,7 +1143,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         drop(db);
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.windows(12).any(|w| w == b"plain-marker"));
@@ -486,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_base_store_migrates_to_version_2_and_keeps_its_objects() {
+    fn a_version_1_base_store_migrates_to_version_4_and_keeps_its_objects() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("base.sqlite");
         let mut connection = open_encrypted(&path, &[1; 32]).unwrap();
@@ -504,7 +1169,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         assert_eq!(
             db.summary(ObjectId([5; 16])).unwrap().unwrap().title,
             "kept"
@@ -545,7 +1210,124 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn older_account_response_cannot_replace_current_app_readers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        let current = r#"{"apps":{"reader":{"bases":{"health":"ro"}}}}"#;
+        let older = r#"{"apps":{}}"#;
+        db.set_account_data(2, current).unwrap();
+        db.set_account_data(1, older).unwrap();
+        let (version, json) = db.account_data().unwrap().unwrap();
         assert_eq!(version, 2);
+        assert_eq!(json.as_str(), current);
+        db.set_account_data(2, older).unwrap();
+        assert_eq!(db.account_data().unwrap().unwrap().1.as_str(), current);
+    }
+
+    #[test]
+    fn main_version_2_account_store_migrates_without_losing_approvals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("account.sqlite");
+        let mut connection = open_encrypted(&path, &[1; 32]).unwrap();
+        migrate(&mut connection, &ACCOUNT_MIGRATIONS[..2]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO approvals_answered (commitment, at) VALUES (?, 123)",
+                [&[4u8; 32][..]],
+            )
+            .unwrap();
+        drop(connection);
+        let db = AccountDb::open(&path, &[1; 32]).unwrap();
+        assert!(db.bases().unwrap().is_empty());
+        let count: u32 =
+            db.0.query_row("SELECT count(*) FROM approvals_answered", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(count, 1);
+        let version: u32 =
+            db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn the_hidden_index_survives_reopening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("account.sqlite");
+        let id = BaseId([2; 16]);
+        let db = AccountDb::open(&path, &[1; 32]).unwrap();
+        db.remember_hidden(id, 1, &[7; 77]).unwrap();
+        db.remember_hidden(id, 1, &[7; 77]).unwrap();
+        drop(db);
+        let db = AccountDb::open(&path, &[1; 32]).unwrap();
+        assert_eq!(db.hidden_wrappers().unwrap(), vec![(id, 1, vec![7; 77])]);
+        assert!(db.bases().unwrap().is_empty());
+        let version: u32 =
+            db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn the_account_database_keeps_bases_with_their_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        let mut row = BaseRow {
+            id: BaseId([3; 16]),
+            epoch: 1,
+            wrapper: vec![1, 2, 3],
+            mode: Mode::ReadOnly,
+        };
+        db.put_base(&row, 5).unwrap();
+        row.mode = Mode::ReadWrite;
+        db.put_base(&row, 9).unwrap();
+        assert_eq!(db.bases().unwrap(), vec![row]);
+    }
+
+    #[test]
+    fn sent_changes_forget_the_outbox_rows_they_cover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = BaseDb::open(&tmp.path().join("base.sqlite"), &[1; 32]).unwrap();
+        let id = ObjectId([5; 16]);
+        let row = ObjectRow {
+            summary: ObjectSummary {
+                id,
+                ty: TypeRef::new("core.note", 1),
+                parent: None,
+                position: "V".into(),
+                deleted: false,
+                title: String::new(),
+                fields: Map::new(),
+                updated_at: 1,
+                updated_by: None,
+            },
+            state: vec![0, 0],
+        };
+        db.put(&row, &[&[1], &[2]], None).unwrap();
+        let end = db.outbox_end().unwrap();
+        assert_eq!(db.outbox_rows(id, end - 1, usize::MAX).unwrap().len(), 1);
+        let covered = db.outbox_rows(id, end, 1).unwrap();
+        assert_eq!(covered.len(), 1, "a budget still takes one row");
+        let change = SendingRow {
+            change_id: ChangeId([7; 16]),
+            object_id: id,
+            state: false,
+            body: vec![9],
+            covers: None,
+            outbox_max_id: covered[0].0,
+        };
+        db.start_sending(std::slice::from_ref(&change)).unwrap();
+        db.put(&row, &[&[3]], None).unwrap();
+        assert_eq!(db.sending().unwrap(), vec![change.clone()]);
+        assert_eq!(db.pending().unwrap(), 1);
+        db.sent(&[(&change, Some(12))]).unwrap();
+        assert!(db.sending().unwrap().is_empty());
+        assert_eq!(db.confirmed(id).unwrap(), Some(12));
+        let left: Vec<Vec<u8>> = db.outbox().unwrap().into_iter().map(|(_, u)| u).collect();
+        assert_eq!(left, [vec![2], vec![3]]);
     }
 
     #[test]
@@ -564,11 +1346,36 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         let count: u32 =
             db.0.query_row("SELECT count(*) FROM approvals_answered", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_version_2_base_migrates_duplicate_set_aside_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("base.sqlite");
+        let mut connection = open_encrypted(&path, &[1; 32]).unwrap();
+        migrate(&mut connection, &BASE_MIGRATIONS[..2]).unwrap();
+        connection.execute("INSERT INTO set_aside (object_id, seq, body, error, at) VALUES (?, 1, x'01', 'failed', 1)", [ObjectId([3; 16]).to_string()]).unwrap();
+        connection.execute("INSERT INTO set_aside (object_id, seq, body, error, at) VALUES (?, 1, x'02', 'again', 2)", [ObjectId([3; 16]).to_string()]).unwrap();
+        drop(connection);
+        let db = BaseDb::open(&path, &[1; 32]).unwrap();
+        assert_eq!(db.set_aside_rows().unwrap().len(), 1);
+        db.set_aside(ObjectId([3; 16]), 1, &[3], "again").unwrap();
+        assert_eq!(db.set_aside_rows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_change_without_a_local_row_is_set_aside_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = BaseDb::open(&tmp.path().join("base.sqlite"), &[1; 32]).unwrap();
+        let id = ObjectId([3; 16]);
+        db.set_aside(id, 1, &[1], "failed").unwrap();
+        db.set_aside(id, 1, &[2], "again").unwrap();
+        assert_eq!(db.set_aside_rows().unwrap().len(), 1);
     }
 
     #[test]

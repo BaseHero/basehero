@@ -34,6 +34,26 @@ test('typing saves through the backend and survives a reload', async ({ page }) 
   await expect(page.locator('.ProseMirror')).toHaveText('Ferry at 9');
 });
 
+test('a native quit drain request saves the editor before acknowledging', async ({ page }) => {
+  await open(page);
+  await page.locator('.ProseMirror').click();
+  await page.keyboard.type('Last keystrokes');
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('bh:drain-requested', { detail: { requestId: 42 } })));
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __bhDrainAcks?: { requestId: number; ok: boolean }[] }).__bhDrainAcks)).toEqual([{ requestId: 42, ok: true }]);
+  expect(await page.evaluate(id => window.__fake.noteText(id), note)).toBe('Last keystrokes');
+});
+
+test('a failed quit drain keeps the window open and gives a copyable warning', async ({ page }) => {
+  await open(page);
+  await page.evaluate(() => { window.__fake.noteApply = async () => { throw new Error('disk unavailable'); }; });
+  await page.locator('.ProseMirror').click();
+  await page.keyboard.type('Keep this text');
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('bh:drain-requested', { detail: { requestId: 43 } })));
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __bhDrainAcks?: { requestId: number; ok: boolean }[] }).__bhDrainAcks)).toEqual([{ requestId: 43, ok: false }]);
+  await expect(page.getByRole('alert')).toContainText('Could not save your notes.');
+  await expect(page.locator('.ProseMirror')).toHaveText('Keep this text');
+});
+
 test('leaving during composition saves its final text before changing notes', async ({ page }) => {
   await open(page);
   const destination = 'dddddddddddddddddddddddddddddddd';
@@ -132,12 +152,12 @@ test('Link to a note searches and inserts an internal note link', async ({ page 
   await expect(page.locator('.ProseMirror a')).toHaveAttribute('href', `https://basehero.com/open/${r.base}/${target}`);
 });
 
-test('a note of a newer version is read-only', async ({ page }) => {
+test('a newer note cannot open and plainly asks for an update', async ({ page }) => {
   await page.goto('/');
   await page.evaluate(id => window.__fake.seedNewerNote(id), note);
-  await open(page);
-  await expect(page.locator('.ProseMirror')).toHaveAttribute('contenteditable', 'false');
-  await expect(page.getByText('Update BaseHero to edit this note.')).toBeVisible();
+  await page.goto(`/#/a/${r.account}/b/${r.base}/n/${note}`);
+  await expect(page.locator('.ProseMirror')).toHaveCount(0);
+  await expect(page.getByRole('alert')).toHaveText('This note needs a newer version of BaseHero. Update the app to open it.');
 });
 
 test('pasted content cannot run script', async ({ page }) => {

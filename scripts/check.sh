@@ -14,8 +14,12 @@ for stage in "$@"; do
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
       cargo fmt --all -- --check
-      cargo clippy --workspace --exclude basehero-app --exclude bh-mac-keychain-helper --all-targets -- -D warnings
-      cargo test --workspace --exclude basehero-app --exclude bh-mac-keychain-helper
+      cargo clippy --workspace --exclude basehero-app --exclude bh-mac-keychain-helper --all-targets --features bh-cli/test-support -- -D warnings
+      # Exercise the real bh binary with its debug-only scripted model hook.
+      cargo test --workspace --exclude basehero-app --exclude bh-mac-keychain-helper --features bh-cli/test-support
+      node scripts/check-docs.mjs
+      node --test scripts/check-docs.test.mjs
+      RUSTDOCFLAGS="-D warnings" cargo doc -p bh-core -p bh-docs --no-deps
       git diff --exit-code -- server/src/proto/gen
       git diff --exit-code -- apps/basehero/src/lib/generated
       if git ls-files -z -- . ':!website' ':!**/gen/schemas/**' ':!scripts/check.sh' |
@@ -25,6 +29,9 @@ for stage in "$@"; do
       fi
       ;;
     app|app-webkit)
+      # Core integration tests start the local Worker before the UI stage.
+      [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
+        (cd server && npm ci --no-audit --no-fund)
       # Parallel worktrees run UI tests at once, so the web server takes a free port.
       export BH_TEST_PORT="${BH_TEST_PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}"
       python3 -m unittest scripts/test_release_scripts.py
@@ -50,9 +57,22 @@ for stage in "$@"; do
       ;;
     android)
       scripts/android-emulator.sh
+      # The Android cross shell has only Android libsodium; the host CLI
+      # needs the native library from the default development shell.
+      nix develop --command cargo build -p bh-cli
+      (cd apps/basehero && npm ci --no-audit --no-fund)
       scripts/android-dev.sh install
-      # One emulator and one app: test files take turns.
-      node --test --test-concurrency=1 apps/basehero/tests/android/*.test.mjs
+      # The disposable emulator starts each suite with a new local account.
+      adb -s emulator-5580 shell pm clear app.basehero
+      # One emulator and one app: test files take turns. The approval runner
+      # creates a disposable dev approver and isolates its CLI credentials.
+      for file in lib keys shell model notes fold ime hero update approval; do
+        if [ "$file" = approval ]; then
+          node apps/basehero/tests/android/run-approval.mjs
+        else
+          node --test "apps/basehero/tests/android/$file.test.mjs"
+        fi
+      done
       ;;
     server)
       (cd server && npm ci && npx tsc --noEmit)

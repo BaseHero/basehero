@@ -3,4 +3,20 @@
 /**
  * A request's public metadata. Reading it does not answer the request.
  */
-export type ApprovalRequest = { id: string, deviceId: string, createdAt: number, expiresAt: number, };
+export type ApprovalRequest = { 
+/**
+ * The exchange identifier.
+ */
+id: string, 
+/**
+ * The pending device.
+ */
+deviceId: string, 
+/**
+ * Server time for display only.
+ */
+createdAt: number, 
+/**
+ * Server time for display only; device deadlines use their own clock.
+ */
+expiresAt: number, };

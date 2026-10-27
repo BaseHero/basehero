@@ -1,8 +1,9 @@
 <script lang="ts">
   import { getBackend } from '../lib/backend';
-  import type { BaseSummary, SearchResult } from '../lib/backend/types';
+  import type { SearchResult } from '../lib/backend/types';
   let { account, base, query, open }: { account: string; base: string | null; query: string; open: (result: SearchResult) => void } = $props();
-  let groups = $state<{ base: BaseSummary; results: SearchResult[] }[]>([]);
+  let groups = $state<{ base: string; name: string; results: SearchResult[] }[]>([]);
+  const label = (name: string) => ({ 'core.note': 'Note', 'core.folder': 'Folder', 'core.project': 'Project' })[name as 'core.note' | 'core.folder' | 'core.project'] ?? name;
   let error = $state('');
   $effect(() => {
     const text = query.trim();
@@ -12,10 +13,13 @@
     if (text) {
       void (async () => {
         try {
-          const bases = await getBackend().bases(account);
-          const sorted = [...bases].sort((a, b) => Number(b.id === base) - Number(a.id === base));
-          const results = await Promise.all(sorted.map(async item => ({ base: item, results: await getBackend().search(account, item.id, text, 50) })));
-          if (active) groups = results.filter(group => group.results.length > 0);
+          const results = await getBackend().search(account, base, text, 50);
+          const grouped = new Map<string, { base: string; name: string; results: SearchResult[] }>();
+          for (const result of results) {
+            if (!grouped.has(result.base)) grouped.set(result.base, { base: result.base, name: result.baseName, results: [] });
+            grouped.get(result.base)!.results.push(result);
+          }
+          if (active) groups = [...grouped.values()];
         } catch { if (active) error = 'Search is unavailable. Try again.'; }
       })();
     }
@@ -24,12 +28,12 @@
 </script>
 <main class="workspace"><h1>Search</h1>
   {#if error}<p role="alert">{error}</p>{/if}
-  {#each groups as group (group.base.id)}
-    <section data-search-base={group.base.id}>
-      <h2>{group.base.name}</h2>
+  {#each groups as group (group.base)}
+    <section data-search-base={group.base}>
+      <h2>{group.name}</h2>
       <ul>{#each group.results as result (result.hit.id)}
         <li><a href={`#/a/${account}/b/${result.base}/n/${result.hit.id}`} onclick={(event) => { event.preventDefault(); open(result); }}>{result.hit.title}</a>
-          <small>{result.hit.ty}</small>{#if result.hit.snippet}<p>{result.hit.snippet}</p>{/if}</li>
+          <small>{label(result.hit.ty.name)}</small>{#if result.hit.snippet}<p>{result.hit.snippet}</p>{/if}</li>
       {/each}</ul>
     </section>
   {/each}

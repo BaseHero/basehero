@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "BaseHero main window",
-  "windows": ["main"],
+  "windows": ["main", "w-*"],
   "permissions": [
     "core:default",
     {

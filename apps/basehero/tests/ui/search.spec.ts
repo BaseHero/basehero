@@ -32,6 +32,15 @@ test('search finds this base first, then others, and opens a hit', async ({ page
   await expect(groups).toHaveCount(2);
   await expect(groups.nth(0)).toHaveAttribute('data-search-base', personal);
   await expect(groups.nth(1)).toHaveAttribute('data-search-base', work);
+  await expect(groups.nth(0).getByRole('heading', { name: 'Personal' })).toBeVisible();
+  await expect(groups.nth(1).getByRole('heading', { name: 'Work' })).toBeVisible();
+  await expect(groups.nth(0).getByRole('link', { name: 'Meeting notes' })).toHaveCount(1);
+  await expect(groups.nth(0).getByRole('link', { name: 'Meeting folder' })).toHaveCount(0);
+  await expect(groups.nth(1).getByRole('link', { name: 'Meeting folder' })).toHaveCount(1);
+  await expect(groups.nth(1).getByRole('link', { name: 'Meeting notes' })).toHaveCount(0);
+  expect(await page.evaluate(() => window.__fake.calls.filter(call => call.startsWith('search ')))).toHaveLength(1);
+  await expect(groups.nth(0).locator('li small')).toHaveText('Note');
+  await expect(groups.nth(1).locator('li small')).toHaveText('Folder');
   await groups.nth(0).getByRole('link', { name: 'Meeting notes' }).click();
   await expect(page).toHaveURL(new RegExp(`#/a/${id}/b/${personal}/n/`));
   await expect(page.locator('.ProseMirror')).toBeVisible();
@@ -52,6 +61,7 @@ test('search opens folders and projects as notes in the matching base', async ({
   await page.getByRole('link', { name: 'Personal' }).click();
   await page.getByRole('searchbox', { name: 'Search' }).fill('Receipts');
   await page.getByRole('searchbox', { name: 'Search' }).press('Enter');
+  await expect(page.locator('[data-search-base] li small')).toHaveText(['Folder', 'Project']);
   await page.getByRole('link', { name: 'Receipts folder' }).click();
   await expect(page).toHaveURL(new RegExp(`#/a/${id}/b/${base}/n/`));
   await expect(page.locator('.ProseMirror')).toBeVisible();
@@ -72,7 +82,7 @@ test('search displays markup-like hit text literally', async ({ page }) => {
     await window.__fake.createObject({ account, base: base.id }, { kind: 'note', parent: null, after: null, name: '<img src=x onerror=alert(1)>' });
     const search = window.__fake.search.bind(window.__fake);
     window.__fake.search = async (...args) => (await search(...args)).map(result => ({
-      ...result, hit: { ...result.hit, snippet: '<b>bold</b>' },
+      ...result, hit: { ...result.hit, ty: { name: 'example.custom', version: 2 }, snippet: '<b>bold</b>' },
     }));
   }, id);
   await page.getByRole('link', { name: 'Personal' }).click();
@@ -81,6 +91,7 @@ test('search displays markup-like hit text literally', async ({ page }) => {
   const result = page.locator('[data-search-base] li');
   await expect(result.getByRole('link')).toHaveText('<img src=x onerror=alert(1)>');
   await expect(result.locator('p')).toHaveText('<b>bold</b>');
+  await expect(result.locator('small')).toHaveText('example.custom');
   await expect(result.locator('img, b')).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).__pwned)).toBeUndefined();
 });

@@ -5,11 +5,12 @@ import type { ChangesResponse } from './proto/gen/ChangesResponse';
 import type { GrantMode } from './proto/gen/GrantMode';
 import type { SinceResponse } from './proto/gen/SinceResponse';
 import type { Env, Principal, Result } from './http';
-import { fail } from './http';
+import { answer, b64, fail } from './http';
 
 /** Bodies above this go to R2; SQLite-backed objects cap a value at 2 MB. */
 export const INLINE_MAX = 1024 * 1024;
 const FETCH_MAX = 16 * 1024 * 1024;
+const LIVE_SOCKET_MAX_AGE_MS = 15 * 60_000;
 
 export type NewChange = { changeId: string; objectId: string; kind: 'update' | 'state'; body: Uint8Array; covers: number; keep: boolean };
 /** A body stored inline, or the R2 key the Worker reads it from. */
@@ -40,10 +41,17 @@ function buffer(value: Uint8Array): ArrayBuffer {
  * Every method takes the caller's principal from the Worker, never from the client.
  */
 export class BaseDO extends DurableObject<Env> {
+  private dropNext = new Set<string>();
+  private failNextDeviceClose = false;
+  private missNextFetch = new Set<string>();
+  private shortNextFetch = new Set<string>();
+  private holdNextReply = new Set<string>();
+  private heldReply = new Set<string>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS access (principal TEXT PRIMARY KEY, mode TEXT NOT NULL, epoch INTEGER NOT NULL, wrapper TEXT NOT NULL)');
+    sql.exec('CREATE TABLE IF NOT EXISTS removed_devices (device_id TEXT PRIMARY KEY)');
     // prev_head is kept so a repeated change gets its original result, which the client invariant relies on.
     sql.exec('CREATE TABLE IF NOT EXISTS changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, change_id TEXT NOT NULL UNIQUE, object_id TEXT NOT NULL, kind TEXT NOT NULL, body BLOB, r2_key TEXT, size INTEGER NOT NULL, covers INTEGER, keep INTEGER NOT NULL, prev_head INTEGER NOT NULL, device_id TEXT NOT NULL, at INTEGER NOT NULL)');
     sql.exec('CREATE INDEX IF NOT EXISTS changes_by_object ON changes (object_id, seq)');
@@ -56,9 +64,12 @@ export class BaseDO extends DurableObject<Env> {
   }
   // A full device of a member account uses the account's row; an app device also needs its own.
   private member(p: Principal): AccessRow | null {
-    if (p.status !== 'active') return null;
+    if (p.status !== 'active' || this.removed(p.deviceId)) return null;
     const account = this.access(`acct:${p.accountId}`);
     return account && p.kind === 'app' ? this.access(`dev:${p.deviceId}`) : account;
+  }
+  private removed(deviceId: string): boolean {
+    return this.sql.exec('SELECT device_id FROM removed_devices WHERE device_id = ?', deviceId).toArray().length !== 0;
   }
   private denied(p: Principal, write = false): Result<never> | null {
     if (p.status === 'pending') return fail(403, 'pending');
@@ -68,7 +79,7 @@ export class BaseDO extends DurableObject<Env> {
     return null;
   }
   private owns(p: Principal): boolean {
-    return p.kind === 'full' && p.status === 'active' && this.access(`acct:${p.accountId}`) !== null;
+    return p.kind === 'full' && p.status === 'active' && !this.removed(p.deviceId) && this.access(`acct:${p.accountId}`) !== null;
   }
   private head(): number {
     return this.sql.exec<{ head: number }>('SELECT COALESCE(MAX(head), 0) AS head FROM objects').one().head;
@@ -97,7 +108,29 @@ export class BaseDO extends DurableObject<Env> {
   revoke(p: Principal, deviceId: string): Result {
     if (!this.owns(p)) return fail(403, 'forbidden');
     this.sql.exec('DELETE FROM access WHERE principal = ?', `dev:${deviceId}`);
+    this.closeDevice(deviceId);
     return { status: 200, body: {} };
+  }
+  /** A removed account device may still have an open socket on this base. */
+  closeDevice(deviceId: string, removed = false): void {
+    if (this.failNextDeviceClose) {
+      this.failNextDeviceClose = false;
+      throw new Error('test closeDevice failure');
+    }
+    if (removed) this.sql.exec('INSERT OR IGNORE INTO removed_devices VALUES (?)', deviceId);
+    for (const ws of this.ctx.getWebSockets(`dev:${deviceId}`)) {
+      try {
+        if (removed) ws.send(JSON.stringify({ t: 'revoked' }));
+        ws.close(4001, 'revoked');
+      } catch { /* already closed */ }
+    }
+    // Full devices also have sockets opened before principal tags were added.
+    for (const ws of this.ctx.getWebSockets(deviceId)) {
+      try {
+        if (removed) ws.send(JSON.stringify({ t: 'revoked' }));
+        ws.close(4001, 'revoked');
+      } catch { /* already closed */ }
+    }
   }
 
   private decide(c: NewChange): Decision {
@@ -135,6 +168,26 @@ export class BaseDO extends DurableObject<Env> {
     });
     // Only delete R2 bodies after their SQL transaction committed.
     deletes.push(...replacedKeys);
+    const live = JSON.stringify({
+      t: 'change', seq, objectId: c.objectId, prevHead: object.head, kind: c.kind,
+      changeId: c.changeId, deviceId, ...(c.body.length <= 64 * 1024 ? { body: b64(c.body) } : {}),
+    });
+    for (const ws of this.ctx.getWebSockets()) {
+      const [receiver, principal] = this.ctx.getTags(ws);
+      // A socket is authenticated only at upgrade. Grants can change later.
+      const openedAt = (ws.deserializeAttachment() as { openedAt: number } | null)?.openedAt ?? 0;
+      const maxAge = Number(this.env.LIVE_SOCKET_MAX_AGE_MS ?? LIVE_SOCKET_MAX_AGE_MS);
+      if (Date.now() - openedAt >= maxAge) {
+        try { ws.close(4000, 'reconnect'); } catch { /* already closed */ }
+        continue;
+      }
+      if (!receiver || this.removed(receiver) || !this.access(principal ?? `dev:${receiver}`)) {
+        try { ws.close(4001, 'revoked'); } catch { /* already closed */ }
+        continue;
+      }
+      if (receiver && this.dropNext.delete(receiver)) continue;
+      try { ws.send(live); } catch { /* reconnect catches up from the stored head */ }
+    }
     return { changeId: c.changeId, seq, prevHead: object.head, tail, stale: false };
   }
   async changes(p: Principal, changes: NewChange[]): Promise<Result<ChangesResponse>> {
@@ -175,6 +228,39 @@ export class BaseDO extends DurableObject<Env> {
       }
     }
   }
+  /** Test-only: omit one notification for this device while still committing it. */
+  dropNextLive(deviceId: string): void { this.dropNext.add(deviceId); }
+  /** Test-only: fail a base's next device-removal RPC before marking it removed. */
+  failNextClose(): void { this.failNextDeviceClose = true; }
+  /** Test-only: simulate a missing R2 body on the next fetch. */
+  missNextFetchBody(deviceId: string): void { this.missNextFetch.add(deviceId); }
+  /** Test-only: simulate a truncated fetch with an unaccounted object. */
+  shortNextFetchBody(deviceId: string): void { this.shortNextFetch.add(deviceId); }
+  /** Test-only: hold the Worker reply, not the DO, so other sockets can catch up. */
+  holdChangeReply(deviceId: string): void { this.holdNextReply.add(deviceId); }
+  takeHeldReply(deviceId: string): boolean {
+    if (!this.holdNextReply.delete(deviceId)) return false;
+    this.heldReply.add(deviceId);
+    return true;
+  }
+  replyHeld(deviceId: string): boolean { return this.heldReply.has(deviceId); }
+  releaseChangeReply(deviceId: string): void { this.heldReply.delete(deviceId); }
+  /** Test-only: count sockets retained by this base's Durable Object. */
+  liveCount(): number { return this.ctx.getWebSockets().length; }
+  /** The Worker checked the token; the DO checks current membership before accepting. */
+  async fetch(request: Request): Promise<Response> {
+    const p: Principal = {
+      accountId: request.headers.get('BH-Account') ?? '', deviceId: request.headers.get('BH-Device') ?? '',
+      kind: request.headers.get('BH-Kind') === 'app' ? 'app' : 'full', status: request.headers.get('BH-Status') ?? '',
+    };
+    const denied = this.denied(p);
+    if (denied) return answer(denied);
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [p.deviceId, p.kind === 'app' ? `dev:${p.deviceId}` : `acct:${p.accountId}`, `dev:${p.deviceId}`]);
+    server.serializeAttachment({ openedAt: Date.now() });
+    return new Response(null, { status: 101, webSocket: client, headers: { 'BH-Protocol': '1' } });
+  }
+  webSocketMessage(): void { /* clients send only pings */ }
   since(p: Principal, after: number, limit: number): Result<SinceResponse> {
     const denied = this.denied(p);
     if (denied) return denied;
@@ -185,6 +271,8 @@ export class BaseDO extends DurableObject<Env> {
   fetchObjects(p: Principal, objectIds: string[]): Result<Fetched> {
     const denied = this.denied(p);
     if (denied) return denied;
+    if (this.missNextFetch.delete(p.deviceId)) return { status: 200, body: { objects: [], more: objectIds } };
+    const short = this.shortNextFetch.delete(p.deviceId);
     const objects: FetchedObject[] = [];
     let total = 0;
     for (const [i, objectId] of objectIds.entries()) {
@@ -203,7 +291,7 @@ export class BaseDO extends DurableObject<Env> {
         updates: updates.map(u => ({ seq: u.seq, deviceId: u.device_id, body: stored(u) })),
       });
     }
-    return { status: 200, body: { objects, more: [] } };
+    return { status: 200, body: { objects: short ? objects.slice(0, 1) : objects, more: [] } };
   }
   /** Test-only view of what is stored for an object. */
   stored(p: Principal, objectId: string): Result<Stored> {

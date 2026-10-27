@@ -25,6 +25,21 @@ pub fn master_key(_app: &tauri::AppHandle) -> Result<Zeroizing<[u8; 32]>, Comman
     android::master_key()
 }
 
+#[cfg(target_os = "macos")]
+pub fn delete_master_key(app: &tauri::AppHandle) -> Result<(), CommandError> {
+    mac::delete_master_key(&app.config().identifier)
+}
+
+#[cfg(target_os = "android")]
+pub fn delete_master_key(_app: &tauri::AppHandle) -> Result<(), CommandError> {
+    android::delete_master_key()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
+pub fn delete_master_key(_app: &tauri::AppHandle) -> Result<(), CommandError> {
+    Ok(())
+}
+
 /// Sealed files under `data_dir/secrets`, or plain files without a master key,
 /// which only Linux development builds accept.
 pub fn store(
@@ -54,6 +69,8 @@ pub fn check_canary(store: &dyn SecretStore) -> Result<(), CommandError> {
         Ok(Some(_)) => Err(CommandError::key_unavailable(
             "the master key doesn't open this device's secrets: canary mismatch",
         )),
+        // Secrets from a newer BaseHero open after updating; they aren't lost.
+        Err(e @ bh_core::Error::NeedsUpdate) => Err(e.into()),
         Err(e) => Err(CommandError::key_unavailable(format!(
             "the master key doesn't open this device's secrets: {e}"
         ))),
@@ -92,12 +109,8 @@ mod tests {
         sealed[0] = 2;
         std::fs::write(path, sealed).unwrap();
         let error = check_canary(&*secrets).unwrap_err();
-        assert_eq!(error.kind, "KeyUnavailable");
-        assert!(
-            error
-                .message
-                .contains("a newer version of BaseHero is needed")
-        );
+        // Not a key error: updating opens these secrets, so reset isn't offered.
+        assert_eq!(error.kind, "NeedsUpdate");
     }
 
     #[test]

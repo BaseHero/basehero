@@ -9,6 +9,41 @@ use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn raw_changes_retry_when_the_local_worker_drops_the_http_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-")
+                .await
+                .unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.write_all(b"HTTP/1.1 200 OK\r\nBH-Protocol: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let device = RawDevice {
+            account_id: String::new(),
+            device_id: String::new(),
+            token: String::new(),
+            server: Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
+            bypass: String::new(),
+        };
+        let (status, body) = device
+            .post("/v1/bases/test/changes", serde_json::json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({}));
+        server.await.unwrap();
+    }
+}
+
 /// The password every test account signs up with.
 pub const TEST_PASSWORD: &str = "correct horse battery staple";
 
@@ -41,6 +76,10 @@ impl RawDevice {
         payload: Value,
         authenticated: bool,
     ) -> (StatusCode, Value) {
+        let repeat = method == Method::GET
+            || (method == Method::POST
+                && path.starts_with("/v1/bases/")
+                && path.ends_with("/changes"));
         let mut request = reqwest::Client::new()
             .request(method, self.server.join(path).expect("protocol path"))
             .header("BH-Protocol", "1")
@@ -48,7 +87,15 @@ impl RawDevice {
         if authenticated {
             request = request.bearer_auth(&self.token);
         }
-        let response = request.json(&payload).send().await.expect("raw request");
+        let request = request.json(&payload);
+        // Local workerd occasionally drops an HTTP connection under parallel test load.
+        // Only replay reads and the change POST, whose change IDs make it idempotent.
+        let retry = if repeat { request.try_clone() } else { None };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) if retry.is_some() => retry.unwrap().send().await.expect("raw request retry"),
+            Err(error) => panic!("raw request: {error}"),
+        };
         let status = response.status();
         assert_eq!(response.headers()["BH-Protocol"], "1");
         (status, response.json().await.expect("raw JSON"))

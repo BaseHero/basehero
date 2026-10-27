@@ -10,6 +10,18 @@ pub fn master_key(identifier: &str) -> Result<Zeroizing<[u8; 32]>, CommandError>
     load_or_create(&helper_path()?, None, identifier).map(|(key, _)| key)
 }
 
+pub fn delete_master_key(identifier: &str) -> Result<(), CommandError> {
+    let item = Item::Ordinary(Sha256::digest(format!("{identifier}.master")).into());
+    let mut helper = Helper::spawn(&helper_path()?, None)
+        .map_err(|e| CommandError::key_unavailable(format!("Keychain helper: {e}")))?;
+    match helper.delete(item) {
+        Ok(()) | Err(-25300) => Ok(()),
+        Err(code) => Err(CommandError::key_unavailable(format!(
+            "Keychain status {code}"
+        ))),
+    }
+}
+
 fn helper_path() -> Result<PathBuf, CommandError> {
     std::env::current_exe()
         .ok()

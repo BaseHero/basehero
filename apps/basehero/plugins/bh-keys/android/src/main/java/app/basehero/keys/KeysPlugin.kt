@@ -42,6 +42,14 @@ class KeysPlugin(private val context: Context) {
         }
     }
 
+    /** Remove the wrapped master key and its Keystore wrapping entry, never touching account data. */
+    @Synchronized fun deleteMasterKey() {
+        if (file.exists() && !file.delete()) throw IllegalStateException("couldn't delete the master key file")
+        val temporary = File(file.path + ".tmp")
+        if (temporary.exists() && !temporary.delete()) throw IllegalStateException("couldn't delete the temporary master key")
+        keyStore.deleteEntry(ALIAS)
+    }
+
     // Replaces any key left by an earlier first run that stopped before its file was stored.
     private fun newWrappingKey(): SecretKey {
         val spec = KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)

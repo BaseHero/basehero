@@ -13,7 +13,7 @@ type Live = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const REQUEST_BYTES: usize = 1282;
 const RESPONSE_BYTES: usize = 1186;
-const REVEAL_BYTES: usize = 95;
+const REVEAL_BYTES: usize = 50;
 const TRANSFER_BYTES: usize = 95;
 
 fn path(id: &str) -> String {

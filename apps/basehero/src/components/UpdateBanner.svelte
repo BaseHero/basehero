@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getBackend } from '../lib/backend';
+  import { drainAll } from '../lib/editor/host';
   import type { UpdateInfo } from '../lib/backend/types';
 
   let update = $state<UpdateInfo | null>(null);
@@ -32,10 +33,13 @@
     if (installing) return;
     installing = true;
     error = '';
+    let saved = false;
     try {
+      await drainAll();
+      saved = true;
       await backend.updateInstall();
     } catch {
-      error = 'Could not install the update. Try again.';
+      error = saved ? 'Could not install the update. Try again.' : 'Could not save your notes. The update was not installed. Try again.';
     } finally {
       installing = false;
     }

@@ -33,6 +33,28 @@ impl Events {
         }
     }
 
+    pub fn count(&self, pred: impl Fn(&AppEvent) -> bool) -> usize {
+        self.seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| pred(event))
+            .count()
+    }
+
+    pub fn wait_for_count(&self, count: usize, pred: impl Fn(&AppEvent) -> bool) {
+        let (seen, arrived) = &*self.seen;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = seen.lock().unwrap();
+        while seen.iter().filter(|e| pred(e)).count() < count {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .expect("no matching event within 5 s");
+            seen = arrived.wait_timeout(seen, left).unwrap().0;
+        }
+    }
+
     pub fn data_dir(&self) -> &Path {
         self.dir.path()
     }

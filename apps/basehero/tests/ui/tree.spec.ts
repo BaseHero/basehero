@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 
-async function setup(page: Page) {
-  await page.goto('/');
+async function setup(page: Page, platform?: string) {
+  await page.goto(platform ? `/?platform=${platform}` : '/');
   const r = await page.evaluate(async () => {
     const account = await window.__fake.signUp({ invite: 'WELCOME', email: 'dan@example.com', password: 'password', deviceName: 'Mac' });
     const base = await window.__fake.createBase(account.account.id, 'Personal');
@@ -39,6 +39,23 @@ test('create a folder, a project, a note and a note inside that note, and see th
   await create(page, 'Note', 'Camera kit');
   const rows = page.locator('[data-testid="tree-row"]');
   await expect(rows).toHaveText(['Trips', 'Winter photography', 'Packing', 'Camera kit']);
+});
+
+test('the new-window action stays off non-Mac platforms', async ({ page }) => {
+  await setup(page);
+  await create(page, 'Note', 'Packing');
+  await expect(page.getByRole('button', { name: 'Open Packing in New Window' })).toHaveCount(0);
+});
+
+test('a note opens in another window at its own route', async ({ page }) => {
+  const r = await setup(page, 'macos');
+  await create(page, 'Note', 'Packing');
+  const note = await page.evaluate(ref => window.__fake.children(ref, null).then(items => items.find(item => item.title === 'Packing')!.id), r);
+  await page.getByRole('button', { name: 'Open Packing in New Window' }).click();
+  await expect.poll(() => page.evaluate(() => window.__fake.calls.filter(call => call.startsWith('openWindow ')))).toEqual([
+    `openWindow #/a/${r.account}/b/${r.base}/n/${note}`,
+  ]);
+  await expect(page).toHaveURL(new RegExp(`#/a/${r.account}/b/${r.base}$`));
 });
 
 test('the location bar opens Search and Devices routes', async ({ page }) => {

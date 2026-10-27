@@ -3,3 +3,29 @@ name = "bh-cli"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[features]
+test-support = ["bh-core/test-support", "dep:bh-models"]
+
+[[bin]]
+name = "bh"
+path = "src/main.rs"
+
+[dependencies]
+bh-core = { path = "../bh-core" }
+bh-models = { path = "../bh-models", features = ["testing"], optional = true }
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+reqwest = { workspace = true, features = ["json"] }
+rpassword = "7"
+rustls = { workspace = true, features = ["ring"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+yrs = "0.28"
+
+[dev-dependencies]
+assert_cmd = "2"
+bh-testkit = { path = "../bh-testkit" }
+tempfile = "3"

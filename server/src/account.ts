@@ -13,7 +13,7 @@ import type { Step } from './approvals';
 type AccountRow = { email: string; salt: string; kdf: string; verifier_salt: string; verifier: string; envelope: string; activation_hash: string; data: string | null; data_version: number; failed_logins: number; window_start: number };
 type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number };
 
-export class AccountDO extends DurableObject {
+export class AccountDO extends DurableObject<Env> {
   private approvals: Approvals;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -128,9 +128,22 @@ export class AccountDO extends DurableObject {
     this.ctx.storage.sql.exec('INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?)', deviceId, 'app', 'active', tokenHash, now, now);
     return { status: 200, body: { token } };
   }
-  removeDevice(principal: Principal, deviceId: string): Result {
+  private failNextRemoval = false;
+  failRemovalOnce(principal: Principal): Result {
+    if (principal.kind !== 'full') return fail(403, 'forbidden');
+    this.failNextRemoval = true;
+    return { status: 200, body: {} };
+  }
+  async removeDevice(principal: Principal, deviceId: string): Promise<Result> {
     if (principal.kind !== 'full' && principal.deviceId !== deviceId) return fail(403, 'forbidden');
     if (!this.ctx.storage.sql.exec('SELECT device_id FROM devices WHERE device_id = ?', deviceId).toArray().length) return fail(404, 'not_found');
+    if (this.failNextRemoval) {
+      this.failNextRemoval = false;
+      return fail(502, 'bad_gateway', 'pre-revocation fault');
+    }
+    // Use the account's base list for both full devices and granted apps. It also
+    // covers a grant whose device_bases entry was already removed by a revoke.
+    const bases = this.accountBases();
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("UPDATE devices SET status = 'revoked' WHERE device_id = ?", deviceId);
       this.ctx.storage.sql.exec('DELETE FROM device_bases WHERE device_id = ?', deviceId);
@@ -138,6 +151,11 @@ export class AccountDO extends DurableObject {
     this.approvals.close(deviceId);
     this.approvals.drop(deviceId);
     this.approvals.failAnswered(deviceId);
+    const results = await Promise.allSettled(bases.map(baseId => {
+      const base = this.env.BASE.get(this.env.BASE.idFromName(baseId)) as unknown as { closeDevice(id: string, removed: boolean): Promise<void> };
+      return base.closeDevice(deviceId, true);
+    }));
+    if (results.some(result => result.status === 'rejected')) return fail(502, 'bad_gateway');
     return { status: 200, body: {} };
   }
   addBase(principal: Principal, baseId: string): void {

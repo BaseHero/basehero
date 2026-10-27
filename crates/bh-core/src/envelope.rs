@@ -19,7 +19,8 @@ pub(crate) enum Purpose {
     AccountKey = 6,
     AccountData = 7,
     ApprovalTransfer = 8,
-    ApprovalDeviceName = 9,
+    ApprovalDeviceName = 9, // Reserved: the approval reveal no longer carries a name.
+    HiddenBaseKey = 10,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

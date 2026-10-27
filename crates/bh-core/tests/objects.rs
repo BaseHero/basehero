@@ -342,26 +342,14 @@ fn an_object_of_a_newer_type_version_is_left_untouched() {
         base.set_fields(id, fields(json!({ "x": 1 }))),
         Err(Error::NeedsUpdate)
     ));
-    let opened = base.note(id).unwrap();
-    assert!(matches!(
-        opened.apply(11, &insert_text("hi")),
-        Err(Error::NeedsUpdate)
-    ));
+    assert!(matches!(base.note(id), Err(Error::NeedsUpdate)));
+    assert!(matches!(base.get(id), Err(Error::NeedsUpdate)));
     assert!(matches!(base.delete(id), Err(Error::NeedsUpdate)));
     assert!(matches!(
         base.move_to(id, None, None),
         Err(Error::NeedsUpdate)
     ));
-    assert_eq!(opened.text(), "");
     assert_eq!(base.test_outbox().len(), outbox);
-    let shown = base.get(id).unwrap().unwrap();
-    assert_eq!(
-        shown.ty,
-        TypeRef {
-            name: "core.note".into(),
-            version: 2
-        }
-    );
     assert_eq!(ids(base.children(None).unwrap()), vec![id]);
 }
 

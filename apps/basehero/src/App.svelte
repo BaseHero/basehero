@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getBackend } from './lib/backend';
   import type { AccountSummary, BaseRef, SearchResult, SignedUp } from './lib/backend/types';
   import { SyncStatus } from './lib/sync.svelte';
@@ -10,6 +12,7 @@
   import KeyError from './screens/KeyError.svelte';
   import { errorMessage } from './lib/errors';
   import { session } from './lib/session.svelte';
+  import { drainAll } from './lib/editor/host';
   import Base from './screens/Base.svelte';
   import Bases from './screens/Bases.svelte';
   import Welcome from './screens/Welcome.svelte';
@@ -18,6 +21,7 @@
   import Kit from './screens/Kit.svelte';
   import SignIn from './screens/SignIn.svelte';
   import PendingSignIn from './screens/PendingSignIn.svelte';
+  import ApprovalRequests from './components/ApprovalRequests.svelte';
 
   type Screen = 'welcome' | 'signup' | 'kit' | 'signin' | 'pending' | 'account' | 'search' | 'devices' | 'removed';
   let screen = $state<Screen>('welcome');
@@ -34,6 +38,7 @@
   let searchText = $state('');
   let query = $state('');
   let platform = $state('linux');
+  let quitSaveError = $state('');
   let searchField = $state<HTMLInputElement>();
   const sync = new SyncStatus();
   const removedAccounts = new Set<string>();
@@ -176,13 +181,28 @@
     } catch (cause) { newKitError = errorMessage(cause); }
     finally { newPassword = ''; newKitBusy = false; }
   }
-  async function cancelPending() {
+  async function cancelPending(destination: 'welcome' | 'signin' = 'welcome') {
     const id = pending;
     pending = null;
-    void navigate('welcome');
+    void navigate(destination);
     if (id !== null) {
-      try { await getBackend().signInCancel(id); } catch { /* A cancelled request cannot be retried here. */ }
+      try { await getBackend().approvalCancel(id); } catch { /* A cancelled request cannot be retried here. */ }
+      try { await getBackend().signInCancel(id); } catch { /* A cancelled sign-in cannot be retried here. */ }
     }
+  }
+  async function resetDevice() {
+    await getBackend().resetDevice();
+    session.account = null;
+    signedUp = null;
+    pending = null;
+    knownAccounts = [];
+    accountsLoaded = true;
+    currentBase = null;
+    sync.clear();
+    history.replaceState(null, '', '/');
+    hash = '';
+    screen = 'welcome';
+    keyError = null;
   }
   function startupError(cause: unknown): { kind: string; message: string } {
     // The native startup path returns CommandError; don't stringify arbitrary
@@ -216,6 +236,41 @@
       keyError = startupError(cause);
     });
     let unsubscribe: (() => void) | undefined;
+    let unlistenClose: (() => void) | undefined;
+    let unlistenDrain: (() => void) | undefined;
+    let closing = false;
+    async function drainForQuit(requestId: number) {
+      let ok = false;
+      try {
+        await drainAll();
+        ok = true;
+      } catch {
+        quitSaveError = 'Could not save your notes. Copy your text and try again.';
+      }
+      if (import.meta.env.MODE === 'fake') {
+        const testWindow = window as typeof window & { __bhDrainAcks?: { requestId: number; ok: boolean }[] };
+        (testWindow.__bhDrainAcks ??= []).push({ requestId, ok });
+      } else {
+        await invoke('window_drained', { requestId, ok });
+      }
+    }
+    const fakeDrain = (event: Event) => { void drainForQuit((event as CustomEvent<{ requestId: number }>).detail.requestId); };
+    if (import.meta.env.MODE === 'fake') window.addEventListener('bh:drain-requested', fakeDrain);
+    else void listen<{ requestId: number }>('bh:drain-requested', event => {
+      void drainForQuit(event.payload.requestId);
+    }).then(stop => { if (active) unlistenDrain = stop; else stop(); });
+    // Native CloseRequested is prevented until this window's route guard saves its editor.
+    if (import.meta.env.MODE !== 'fake') {
+      void listen('bh:close-requested', async () => {
+        if (closing) return;
+        closing = true;
+        try {
+          if (await guardLeave()) await invoke('close_window');
+        } catch (cause) {
+          console.error('Could not close window after saving', cause);
+        } finally { closing = false; }
+      }).then(stop => { if (active) unlistenClose = stop; else stop(); });
+    }
     void getBackend().onEvent(event => {
       if (!active || event.account !== session.account?.id) return;
       if (event.kind.toLowerCase() === 'account' && event.event === 'Removed') {
@@ -232,7 +287,7 @@
         history.replaceState(null, '', '/');
         screen = 'removed';
       } else if (event.kind.toLowerCase() === 'base' && event.base === currentBase) {
-        if (event.event === 'NeedsUpdate' || (typeof event.event === 'object' && event.event !== null && 'NeedsUpdate' in event.event)) sync.needsUpdate = true;
+        if (event.event === 'needsUpdate' || event.event === 'NeedsUpdate' || (typeof event.event === 'object' && event.event !== null && 'NeedsUpdate' in event.event)) sync.needsUpdate = true;
         else { const r = ref(); if (r) void sync.refresh(getBackend(), r); }
       }
     }).then(stop => { if (active) unsubscribe = stop; else stop(); });
@@ -278,6 +333,9 @@
     return () => {
       active = false;
       unsubscribe?.();
+      unlistenClose?.();
+      unlistenDrain?.();
+      window.removeEventListener('bh:drain-requested', fakeDrain);
       window.removeEventListener('keydown', shortcut);
       delete window.__bhBack;
       window.removeEventListener('popstate', pop);
@@ -296,7 +354,7 @@
     <a href={`#/a/${session.account.id}/devices`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/devices`); }}>Devices</a></nav>
 {/if}
 {#if keyError}
-  <KeyError kind={keyError.kind} message={keyError.message} />
+  <KeyError kind={keyError.kind} message={keyError.message} onreset={resetDevice} />
 {:else if route?.[2] && knownRoute && (screen === 'account' || screen === 'welcome')}
   {#key `${route[1]}:${route[2]}`}<Base r={{ account: route[1], base: route[2] }} id={route[3] ?? null}
     {onleave} retryleave={() => { if (requestedHash) void requestRoute(requestedHash); }} />{/key}
@@ -311,7 +369,7 @@
 {:else if screen === 'signin'}
   <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onback={() => void navigate('welcome')} />
 {:else if screen === 'pending' && pending !== null}
-  <PendingSignIn {pending} onapproved={entered} oncancel={cancelPending} />
+  <PendingSignIn {pending} onapproved={entered} oncancel={() => void cancelPending()} onrestart={() => void cancelPending('signin')} />
 {:else if screen === 'removed'}
   <Removed oncontinue={() => void navigate('welcome')} />
 {:else if session.account && (screen === 'account' || (knownRoute && (screen === 'search' || screen === 'devices')))}
@@ -334,12 +392,15 @@
         </form>
       {/if}
     {/if}
+    <ApprovalRequests account={session.account.id} />
     <Bases account={session.account.id} onopen={base => void requestRoute(`#/a/${session.account!.id}/b/${base}`)} />
   </section></main>
   {/if}
 {/if}
+{#if quitSaveError}<p role="alert" class="quit-save-error">{quitSaveError}</p>{/if}
 <UpdateBanner />
 <style>
+  .quit-save-error { position: fixed; z-index: 1000; bottom: 1rem; left: 1rem; padding: 1rem; background: var(--bar); color: var(--on-bar); }
   .location-bar { display: flex; align-items: center; gap: 1rem; min-height: 3.5rem; padding: .5rem 1rem; background: var(--bar); color: var(--on-bar); position: relative; }
   .location-bar a { color: var(--on-bar); font-weight: 600; }
   .location-bar form { flex: 1; display: block; }

@@ -25,6 +25,7 @@ pub struct LocalServer {
     tinfoil_upstream: Option<Url>,
 }
 
+#[cfg(target_os = "linux")]
 fn birth(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
@@ -32,6 +33,25 @@ fn birth(pid: u32) -> Option<String> {
         return None;
     }
     Some(fields.get(19)?.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn child_ps(pid: u32, field: &str) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", field])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn birth(pid: u32) -> Option<String> {
+    child_ps(pid, "lstart=")
 }
 
 impl LocalServer {
@@ -113,8 +133,10 @@ impl LocalServer {
         });
         self.child = Some(child);
         self.birth = Some(born);
+        // Bundling and launching workerd can exceed 30 s when parallel checks
+        // contend for CPU; this bounds startup, not any HTTP/test wait.
         let line = receiver
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(120))
             .expect("Worker did not become ready")
             .expect("Worker stdout failed");
         let observed: serde_json::Value = serde_json::from_str(&line).expect("Worker URL line");
@@ -183,16 +205,31 @@ impl LocalServer {
             return false;
         };
         let pid = child.id();
-        birth(pid).as_ref() == Some(expected)
-            && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
+        if birth(pid).as_ref() != Some(expected) {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
                 cmd.windows(b"scripts/local-server.mjs".len())
                     .any(|w| w == b"scripts/local-server.mjs")
-            })
-            && std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+            }) && std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
                 let expected = format!("BH_LOCAL_SERVER_LAUNCH_ID={}", self.marker);
                 env.split(|b| *b == 0)
                     .any(|entry| entry == expected.as_bytes())
             })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            // Both creation time and command must still match this child before
+            // closing its stdin or sending a signal to its PID.
+            (unsafe { kill(pid as i32, 0) == 0 })
+                && child_ps(pid, "command=")
+                    .is_some_and(|cmd| cmd.contains("scripts/local-server.mjs"))
+        }
     }
 
     fn stop(&mut self) {

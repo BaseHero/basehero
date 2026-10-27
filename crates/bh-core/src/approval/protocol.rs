@@ -29,8 +29,7 @@ const TRANSFER: u8 = 4;
 const HEADER: usize = 2 + 16;
 const REQUEST_LEN: usize = HEADER + 16 + XWING_PUBLIC_BYTES + 32;
 const RESPONSE_LEN: usize = HEADER + 16 + XWING_CIPHERTEXT_BYTES + 32;
-const NAME_MAX: usize = 64;
-const REVEAL_MIN: usize = HEADER + 32 + envelope::OVERHEAD;
+const REVEAL_LEN: usize = HEADER + 32;
 const TRANSFER_LEN: usize = HEADER + envelope::OVERHEAD + 32;
 
 fn bad() -> Error {
@@ -208,11 +207,9 @@ pub enum Message {
         ct: Box<[u8; XWING_CIPHERTEXT_BYTES]>,
         r_approver: [u8; 32],
     },
-    /// `name` is the device name sealed under the transfer key.
     Reveal {
         approval: ApprovalId,
         r_new: [u8; 32],
-        name: Vec<u8>,
     },
     /// `account_key` is the account key sealed under the transfer key.
     Transfer {
@@ -236,11 +233,7 @@ impl Message {
                 ct,
                 r_approver,
             } => (RESPONSE, approval, [&approver.0, &ct[..], r_approver]),
-            Self::Reveal {
-                approval,
-                r_new,
-                name,
-            } => (REVEAL, approval, [r_new, name, &[]]),
+            Self::Reveal { approval, r_new } => (REVEAL, approval, [r_new, &[], &[]]),
             Self::Transfer {
                 approval,
                 account_key,
@@ -280,13 +273,10 @@ impl Message {
                 ct: Box::new(array(&body[16..16 + XWING_CIPHERTEXT_BYTES])),
                 r_approver: array(&body[16 + XWING_CIPHERTEXT_BYTES..]),
             }),
-            REVEAL if (REVEAL_MIN..=REVEAL_MIN + NAME_MAX).contains(&bytes.len()) => {
-                Ok(Self::Reveal {
-                    approval,
-                    r_new: array(&body[..32]),
-                    name: body[32..].to_vec(),
-                })
-            }
+            REVEAL if fixed(REVEAL_LEN) => Ok(Self::Reveal {
+                approval,
+                r_new: array(body),
+            }),
             TRANSFER if fixed(TRANSFER_LEN) => Ok(Self::Transfer {
                 approval,
                 account_key: body.to_vec(),
@@ -307,15 +297,6 @@ fn aad(purpose: Purpose, ids: &Ids) -> Aad {
         object: ids.new.0,
         epoch: 1,
     }
-}
-
-/// The UTF-8 name cut to at most 64 bytes on a character boundary.
-fn cut(name: &str) -> &str {
-    let mut end = name.len().min(NAME_MAX);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
 }
 
 fn end<T>(reason: EndReason) -> Result<T, Error> {
@@ -371,7 +352,6 @@ impl NewSide {
     pub fn on_response(
         &mut self,
         response: &[u8],
-        device_name: &str,
         now_ms: u64,
     ) -> Result<(Vec<u8>, Digits), Error> {
         let state = mem::replace(&mut self.state, NewState::Ended(EndReason::BadMessage));
@@ -415,15 +395,9 @@ impl NewSide {
         }
         .encode();
         let (digits, transfer_key) = derive(&shared, &transcript);
-        let name = envelope::seal(
-            &transfer_key,
-            &aad(Purpose::ApprovalDeviceName, &self.ids),
-            cut(device_name).as_bytes(),
-        );
         let reveal = Message::Reveal {
             approval: self.ids.approval,
             r_new: *r_new,
-            name,
         }
         .encode();
         self.state = NewState::Revealed { transfer_key };
@@ -533,9 +507,8 @@ impl ApproverSide {
         self.ids.new
     }
 
-    /// Checks the commitment and derives the digits; returns the new device's
-    /// name, an unverified label until the digits match.
-    pub fn on_reveal(&mut self, reveal: &[u8], now_ms: u64) -> Result<String, Error> {
+    /// Checks the commitment and derives the digits.
+    pub fn on_reveal(&mut self, reveal: &[u8], now_ms: u64) -> Result<(), Error> {
         let state = mem::replace(&mut self.state, ApproverState::Ended(EndReason::BadMessage));
         let shared = match state {
             ApproverState::Ended(reason) => {
@@ -549,7 +522,7 @@ impl ApproverSide {
             ApproverState::Revealed { .. } => return end(EndReason::BadMessage),
             ApproverState::Responded { shared } => shared,
         };
-        let Message::Reveal { r_new, name, .. } = Message::parse(reveal, self.ids.approval)? else {
+        let Message::Reveal { r_new, .. } = Message::parse(reveal, self.ids.approval)? else {
             return Err(bad());
         };
         let opened = commitment(&self.ids, &self.pk, &r_new);
@@ -567,18 +540,11 @@ impl ApproverSide {
         }
         .encode();
         let (digits, transfer_key) = derive(&shared, &transcript);
-        let name = envelope::open(
-            &transfer_key,
-            &aad(Purpose::ApprovalDeviceName, &self.ids),
-            &name,
-        )
-        .map_err(|_| bad())?;
-        let name = String::from_utf8(name.to_vec()).map_err(|_| bad())?;
         self.state = ApproverState::Revealed {
             digits,
             transfer_key,
         };
-        Ok(name)
+        Ok(())
     }
 
     /// Steps 5–7: compares the typed digits and, only if they match, seals the
@@ -617,7 +583,6 @@ impl ApproverSide {
 mod tests {
     use super::*;
 
-    const NAME: &str = "Dan - Fold";
     const START: u64 = 1_000;
     const RESPOND: u64 = 50_000;
 
@@ -651,39 +616,36 @@ mod tests {
         new: NewSide,
         approver: ApproverSide,
         digits: Digits,
-        name: String,
         reveal: Vec<u8>,
         response: Vec<u8>,
     }
 
-    fn to_reveal(ids: Ids, name: &str) -> Revealed {
+    fn to_reveal(ids: Ids) -> Revealed {
         let account = ids.account;
         let approval = ids.approval;
         let (mut new, request) = NewSide::start(ids, START);
         let (mut approver, response) =
             ApproverSide::respond(account, DeviceId::random(), approval, &request, RESPOND)
                 .unwrap();
-        let (reveal, digits) = new.on_response(&response, name, START + 1).unwrap();
-        let name = approver.on_reveal(&reveal, RESPOND + 1).unwrap();
+        let (reveal, digits) = new.on_response(&response, START + 1).unwrap();
+        let _: () = approver.on_reveal(&reveal, RESPOND + 1).unwrap();
         Revealed {
             ids,
             new,
             approver,
             digits,
-            name,
             reveal,
             response,
         }
     }
 
-    /// An honest exchange: the new device's digits, the name the approver
-    /// read, the account key sent and the account key received.
-    fn honest() -> (Digits, String, Secret<32>, Secret<32>) {
-        let r = to_reveal(ids(), NAME);
+    /// An honest exchange: both devices agree on the digits and account key.
+    fn honest() -> (Digits, Secret<32>, Secret<32>) {
+        let r = to_reveal(ids());
         let ak = Secret::<32>::random();
         let transfer = r.approver.confirm(&r.digits, &ak, RESPOND + 2).unwrap();
         let received = r.new.on_transfer(&transfer, START + 2).unwrap();
-        (r.digits, r.name, ak, received)
+        (r.digits, ak, received)
     }
 
     fn other_digits(digits: &Digits) -> Digits {
@@ -693,9 +655,8 @@ mod tests {
 
     #[test]
     fn an_honest_exchange_gives_both_sides_the_same_digits_and_key() {
-        let (digits, name, sent, received) = honest();
+        let (digits, sent, received) = honest();
         assert_eq!(digits.as_str().len(), 6);
-        assert_eq!(name, NAME);
         assert_eq!(sent.expose(), received.expose());
     }
 
@@ -783,7 +744,7 @@ mod tests {
 
     #[test]
     fn wrong_digits_end_the_exchange() {
-        let r = to_reveal(ids(), NAME);
+        let r = to_reveal(ids());
         let wrong = other_digits(&r.digits);
         let result = r
             .approver
@@ -801,8 +762,7 @@ mod tests {
             ApproverSide::respond(account, DeviceId::random(), approval, &request, RESPOND)
                 .unwrap();
         assert_eq!(
-            late.on_response(&response, NAME, START + TTL_MS)
-                .unwrap_err(),
+            late.on_response(&response, START + TTL_MS).unwrap_err(),
             ended(EndReason::Expired)
         );
 
@@ -812,9 +772,7 @@ mod tests {
         let (mut approver, response) =
             ApproverSide::respond(account, DeviceId::random(), approval, &request, RESPOND)
                 .unwrap();
-        let (reveal, digits) = new
-            .on_response(&response, NAME, START + TTL_MS - 1)
-            .unwrap();
+        let (reveal, digits) = new.on_response(&response, START + TTL_MS - 1).unwrap();
         approver.on_reveal(&reveal, RESPOND + 1).unwrap();
         let transfer = approver
             .confirm(&digits, &Secret::<32>::random(), RESPOND + 2)
@@ -824,7 +782,7 @@ mod tests {
             ended(EndReason::Expired)
         );
 
-        let r = to_reveal(ids(), NAME);
+        let r = to_reveal(ids());
         let transfer = r
             .approver
             .confirm(&r.digits, &Secret::<32>::random(), RESPOND + 2)
@@ -838,13 +796,13 @@ mod tests {
         let (mut approver, response) =
             ApproverSide::respond(account, DeviceId::random(), approval, &request, RESPOND)
                 .unwrap();
-        let (reveal, _) = new.on_response(&response, NAME, START + 1).unwrap();
+        let (reveal, _) = new.on_response(&response, START + 1).unwrap();
         assert_eq!(
             approver.on_reveal(&reveal, RESPOND + TTL_MS).unwrap_err(),
             ended(EndReason::Expired)
         );
 
-        let r = to_reveal(ids(), NAME);
+        let r = to_reveal(ids());
         assert_eq!(
             r.approver
                 .confirm(&r.digits, &Secret::<32>::random(), RESPOND + TTL_MS)
@@ -855,9 +813,9 @@ mod tests {
 
     #[test]
     fn the_new_device_takes_one_response() {
-        let mut r = to_reveal(ids(), NAME);
+        let mut r = to_reveal(ids());
         assert_eq!(
-            r.new.on_response(&r.response, NAME, START + 2).unwrap_err(),
+            r.new.on_response(&r.response, START + 2).unwrap_err(),
             ended(EndReason::BadMessage)
         );
     }
@@ -874,38 +832,11 @@ mod tests {
             ApproverSide::respond(ids_.account, approver_id, ids_.approval, &request, RESPOND)
                 .unwrap();
 
-        // It learns the real rN from the new device's reveal, then reveals to
-        // the approving device with a name that opens under its own key, so
-        // only the commitment can refuse it.
-        let (reveal, _) = new.on_response(&response, NAME, START + 1).unwrap();
-        let Ok(Message::Response { ct, r_approver, .. }) = Message::parse(&response, ids_.approval)
-        else {
-            unreachable!()
-        };
-        let r_new: [u8; 32] = reveal[18..50].try_into().unwrap();
-        let transcript = Transcript {
-            ids: &ids_,
-            approver: approver_id,
-            pk: &swapped.public(),
-            commitment: &request[1250..].try_into().unwrap(),
-            ct: &ct,
-            r_approver: &r_approver,
-            r_new: &r_new,
-        }
-        .encode();
-        let (_, transfer_key) = derive(&decapsulate(&swapped, &ct).unwrap(), &transcript);
-        let forged = Message::Reveal {
-            approval: ids_.approval,
-            r_new,
-            name: envelope::seal(
-                &transfer_key,
-                &aad(Purpose::ApprovalDeviceName, &ids_),
-                NAME.as_bytes(),
-            ),
-        }
-        .encode();
+        // It learns the real rN from the new device's reveal, then sends
+        // that value to the approving device; the commitment must refuse it.
+        let (reveal, _) = new.on_response(&response, START + 1).unwrap();
         assert_eq!(
-            approver.on_reveal(&forged, RESPOND + 1).unwrap_err(),
+            approver.on_reveal(&reveal, RESPOND + 1).unwrap_err(),
             ended(EndReason::BadMessage)
         );
     }
@@ -934,10 +865,10 @@ mod tests {
                 ApproverSide::respond(account, approver_id, approval, &fake_request, RESPOND)
                     .unwrap();
 
-            let (reveal, digits) = new.on_response(&fake_response, NAME, START + 1).unwrap();
+            let (reveal, digits) = new.on_response(&fake_response, START + 1).unwrap();
             fake_approver.on_reveal(&reveal, RESPOND + 1).unwrap();
             let (fake_reveal, approver_digits) =
-                fake_new.on_response(&response, NAME, START + 1).unwrap();
+                fake_new.on_response(&response, START + 1).unwrap();
             approver.on_reveal(&fake_reveal, RESPOND + 1).unwrap();
 
             assert_ne!(digits, approver_digits);
@@ -952,7 +883,7 @@ mod tests {
 
     #[test]
     fn messages_from_another_session_are_refused() {
-        let x = to_reveal(ids(), NAME);
+        let x = to_reveal(ids());
         let x_transfer = x
             .approver
             .confirm(&x.digits, &Secret::<32>::random(), RESPOND + 2)
@@ -962,7 +893,7 @@ mod tests {
         let ids_ = ids();
         let (mut y_new, _) = NewSide::start(ids_, START);
         assert_eq!(
-            y_new.on_response(&x.response, NAME, START + 1).unwrap_err(),
+            y_new.on_response(&x.response, START + 1).unwrap_err(),
             ended(EndReason::BadMessage)
         );
 
@@ -979,12 +910,12 @@ mod tests {
         );
 
         // A transfer from X to Y's new device, as is and with Y's header.
-        let y = to_reveal(ids(), NAME);
+        let y = to_reveal(ids());
         assert_eq!(
             err(y.new.on_transfer(&x_transfer, START + 2)),
             ended(EndReason::BadMessage)
         );
-        let y = to_reveal(ids(), NAME);
+        let y = to_reveal(ids());
         let mut rewritten = x_transfer.clone();
         rewritten[2..18].copy_from_slice(&y.ids.approval.0);
         assert_eq!(
@@ -1006,9 +937,8 @@ mod tests {
             RESPOND,
         )
         .unwrap();
-        let (reveal, _) = new.on_response(&response, NAME, START + 1).unwrap();
-        // The commitment and the name's key both bind the account, so the
-        // approving device refuses the reveal...
+        let (reveal, _) = new.on_response(&response, START + 1).unwrap();
+        // The commitment binds the account, so the approving device refuses the reveal...
         assert_eq!(
             approver.on_reveal(&reveal, RESPOND + 1).unwrap_err(),
             ended(EndReason::BadMessage)
@@ -1081,7 +1011,7 @@ mod tests {
                 .unwrap();
         response[18..34].copy_from_slice(&new_id.0);
         assert_eq!(
-            new.on_response(&response, NAME, START + 1).unwrap_err(),
+            new.on_response(&response, START + 1).unwrap_err(),
             ended(EndReason::BadMessage)
         );
     }
@@ -1092,7 +1022,7 @@ mod tests {
         let (account, approval) = (ids_.account, ids_.approval);
         let (mut new, request) = NewSide::start(ids_, START);
         assert_eq!(
-            new.on_response(&request, NAME, START + 1).unwrap_err(),
+            new.on_response(&request, START + 1).unwrap_err(),
             ended(EndReason::BadMessage)
         );
         assert!(matches!(
@@ -1135,15 +1065,14 @@ mod tests {
     }
 
     #[test]
-    fn the_device_name_is_sealed_under_the_transfer_key() {
-        let r = to_reveal(ids(), NAME);
-        assert!(!r.reveal.windows(NAME.len()).any(|w| w == NAME.as_bytes()));
-
-        let long = format!("x{}y", "é".repeat(49));
-        assert_eq!(long.len(), 100);
-        let r = to_reveal(ids(), &long);
-        assert!(r.name.len() <= 64);
-        assert_eq!(r.name, format!("x{}", "é".repeat(31)));
-        assert!(long.starts_with(&r.name));
+    fn the_reveal_has_only_the_fixed_length_random_value() {
+        let r = to_reveal(ids());
+        assert_eq!(r.reveal.len(), REVEAL_LEN);
+        let mut trailing = r.reveal;
+        trailing.push(0);
+        assert!(matches!(
+            Message::parse(&trailing, r.ids.approval),
+            Err(Error::ApprovalEnded(EndReason::BadMessage))
+        ));
     }
 }

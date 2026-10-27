@@ -327,7 +327,12 @@ async fn oversized_bodies_and_fetches_are_refused() {
     refused(
         base.try_post(
             base.device(),
-            vec![update(&x, &random(5 * MIB)), update(&x, &random(5 * MIB))],
+            // Exceed the decoded 8 MiB limit without tripping the separate
+            // Content-Length guard, which rejects before reading the upload.
+            vec![
+                update(&x, &random(4 * MIB)),
+                update(&x, &random(4 * MIB + 1)),
+            ],
         )
         .await,
         StatusCode::PAYLOAD_TOO_LARGE,

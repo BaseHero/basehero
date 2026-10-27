@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getBackend } from '../lib/backend';
-  import type { BaseRef, ObjectId } from '../lib/backend/types';
+  import { BackendError, type BaseRef, type ObjectId } from '../lib/backend/types';
   import { createNoteEditor } from '../lib/editor/editor.mjs';
   import { noteHost, trackEditor } from '../lib/editor/host';
   import '../lib/editor/editor.css';
@@ -31,7 +31,11 @@
       }
       return opened;
     });
-    void opening.catch(e => { error = String(e); });
+    void opening.catch(e => {
+      error = e instanceof BackendError && e.kind === 'NeedsUpdate'
+        ? 'This note needs a newer version of BaseHero. Update the app to open it.'
+        : String(e);
+    });
     const unregister = onleave(async () => {
       // An unsuccessful open has no session or edits to drain. The visible
       // open error stays until leaving, but must not trap navigation.

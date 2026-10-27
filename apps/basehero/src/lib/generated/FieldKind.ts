@@ -4,4 +4,4 @@
  * `Date` is `YYYY-MM-DD`, `DateTime` RFC 3339 with an offset, and `Ref` an
  * object ID in hex.
  */
-export type FieldKind = "text" | "number" | "integer" | "bool" | "date" | "dateTime" | "ref" | "json";
+export type FieldKind = "text" | "number" | "integer" | "bool" | "date" | "dateTime" | "ref" | "json" | "secret";

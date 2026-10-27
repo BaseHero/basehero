@@ -141,6 +141,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (raw.kind !== 'app') throw new HttpError(400, 'bad_request');
     const value = token(principal.accountId);
     result = await account.addDevice(principal, deviceId, value, hex(await sha(value)));
+  } else if (request.method === 'POST' && path === '/v1/devices/fail-next-removal' && testBypass(request, env)) {
+    result = await account.failRemovalOnce(principal);
   } else if (request.method === 'DELETE' && path.startsWith('/v1/devices/')) {
     result = await account.removeDevice(principal, id(path.slice('/v1/devices/'.length)));
   } else throw new HttpError(404, 'not_found');

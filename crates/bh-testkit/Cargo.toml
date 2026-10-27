@@ -6,6 +6,10 @@ publish = false
 
 [dependencies]
 bh-core = { path = "../bh-core", features = ["test-support"] }
+bh-crypto = { path = "../bh-crypto" }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde_json.workspace = true
 base64.workspace = true
 getrandom.workspace = true
@@ -14,6 +18,7 @@ tokio-tungstenite = "0.28"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 tempfile = "3"
+yrs = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]

@@ -169,6 +169,30 @@ pub(crate) fn account_data_key(account_key: &Secret<32>) -> Secret<32> {
     bh_crypto::kdf(account_key, b"bhacdat1", 1)
 }
 
+/// The associated data of an account's base key wrapper.
+pub(crate) fn account_wrapper_aad(base: &bh_proto::BaseId, epoch: u32) -> Aad {
+    Aad {
+        purpose: Purpose::BaseKeyForAccount,
+        base: base.0,
+        object: [0; 16],
+        epoch,
+    }
+}
+
+/// The associated data of an app device's base key wrapper.
+pub(crate) fn app_wrapper_aad(
+    base: &bh_proto::BaseId,
+    device: &bh_proto::DeviceId,
+    epoch: u32,
+) -> Aad {
+    Aad {
+        purpose: Purpose::BaseKeyForApp,
+        base: base.0,
+        object: device.0,
+        epoch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

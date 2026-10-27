@@ -20,6 +20,15 @@ type BaseRpc = {
   since(p: Principal, after: number, limit: number): Promise<Result>;
   fetchObjects(p: Principal, objectIds: string[]): Promise<Result<Fetched>>;
   stored(p: Principal, objectId: string): Promise<Result<Stored>>;
+  dropNextLive(deviceId: string): Promise<void>;
+  failNextClose(): Promise<void>;
+  missNextFetchBody(deviceId: string): Promise<void>;
+  shortNextFetchBody(deviceId: string): Promise<void>;
+  holdChangeReply(deviceId: string): Promise<void>;
+  takeHeldReply(deviceId: string): Promise<boolean>;
+  replyHeld(deviceId: string): Promise<boolean>;
+  releaseChangeReply(deviceId: string): Promise<void>;
+  liveCount(): Promise<number>;
 };
 function baseStub(env: Env, baseId: string): BaseRpc {
   return env.BASE.get(env.BASE.idFromName(id(baseId))) as unknown as BaseRpc;
@@ -72,7 +81,14 @@ async function changes(request: Request, env: Env, baseId: string): Promise<Resp
   if (raw.changes.length > CHANGES_MAX) throw new HttpError(413, 'too_large');
   const input = raw.changes.map(change);
   if (input.reduce((n, c) => n + c.body.length, 0) > CHANGES_BODY_MAX) throw new HttpError(413, 'too_large');
-  return answer(await baseStub(env, baseId).changes(principal, input));
+  const base = baseStub(env, baseId);
+  const result = await base.changes(principal, input);
+  if (testBypass(request, env) && await base.takeHeldReply(principal.deviceId)) {
+    while (await base.replyHeld(principal.deviceId)) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+  return answer(result);
 }
 async function fetchObjects(request: Request, env: Env, baseId: string): Promise<Response> {
   const principal = await requireDevice(request, env);
@@ -109,12 +125,53 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
     if (request.method !== 'POST') throw new HttpError(404, 'not_found');
     return create(request, env);
   }
-  const match = /^\/v1\/bases\/([^/]+)\/(key|changes|since|fetch|stored|grants\/([^/]+))$/.exec(path);
+  const match = /^\/v1\/bases\/([^/]+)\/(key|changes|since|fetch|stored|live|drop-next-live|miss-next-fetch|short-next-fetch|hold-change-reply|release-change-reply|live-count|fail-next-device-close|grants\/([^/]+))$/.exec(path);
   if (!match) throw new HttpError(404, 'not_found');
   const baseId = id(match[1]);
   const action = match[3] === undefined ? match[2] : 'grants';
   const method = request.method;
   const base = baseStub(env, baseId);
+  if (action === 'live' && method === 'GET') {
+    const principal = await requireDevice(request, env);
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') throw new HttpError(400, 'bad_request');
+    return env.BASE.get(env.BASE.idFromName(baseId)).fetch('https://base/live', { headers: {
+      Upgrade: 'websocket', 'BH-Device': principal.deviceId, 'BH-Account': principal.accountId,
+      'BH-Kind': principal.kind, 'BH-Status': principal.status,
+    } });
+  }
+  if (action === 'fail-next-device-close' && method === 'POST' && testBypass(request, env)) {
+    const principal = await requireDevice(request, env);
+    const access = await base.key(principal);
+    if (principal.kind !== 'full' || access.status !== 200) return answer({ status: 403, body: { error: 'forbidden', message: 'forbidden' } });
+    await base.failNextClose();
+    return json({});
+  }
+  if (action === 'drop-next-live' && method === 'POST' && testBypass(request, env)) {
+    const principal = await requireDevice(request, env);
+    await base.dropNextLive(principal.deviceId);
+    return json({});
+  }
+  if ((action === 'miss-next-fetch' || action === 'short-next-fetch') && method === 'POST' && testBypass(request, env)) {
+    const principal = await requireDevice(request, env);
+    const access = await base.key(principal);
+    if (access.status !== 200) return answer(access);
+    if (action === 'miss-next-fetch') await base.missNextFetchBody(principal.deviceId);
+    else await base.shortNextFetchBody(principal.deviceId);
+    return json({});
+  }
+  if ((action === 'hold-change-reply' || action === 'release-change-reply') && method === 'POST' && testBypass(request, env)) {
+    const principal = await requireDevice(request, env);
+    const access = await base.key(principal);
+    if (access.status !== 200) return answer(access);
+    if (action === 'hold-change-reply') await base.holdChangeReply(principal.deviceId);
+    else await base.releaseChangeReply(principal.deviceId);
+    return json({});
+  }
+  if (action === 'live-count' && method === 'GET' && testBypass(request, env)) {
+    const principal = await requireDevice(request, env);
+    const access = await base.key(principal);
+    return access.status === 200 ? json({ count: await base.liveCount() }) : answer(access);
+  }
   if (action === 'key' && method === 'GET') return answer(await base.key(await requireDevice(request, env)));
   if (action === 'changes' && method === 'POST') return changes(request, env, baseId);
   if (action === 'fetch' && method === 'POST') return fetchObjects(request, env, baseId);

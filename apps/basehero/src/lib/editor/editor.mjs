@@ -418,6 +418,23 @@ export async function createNoteEditor(root, host, options={}) {
   // selection update establishes a newer intention than the saved anchor.
   const onUserIntent=()=>{if(android)pendingRestoration=null;};
   const onScroll=()=>relayout();
+  // A tap can reopen the keyboard without moving the caret: no selection
+  // update then fires. Check its final viewport after the IME animation.
+  let tapMarginTimer=null;
+  const onEditorTap=()=>{
+    if (!android) return;
+    clearTimeout(tapMarginTimer);
+    tapMarginTimer=setTimeout(()=>{
+      if (!editor || closed) return;
+      const area=scroller(),bounds=area.getBoundingClientRect();
+      const caret=editor.view.coordsAtPos(editor.state.selection.head);
+      const bottom=Math.min(bounds.bottom,visualViewport.height);
+      // Scroll offsets are rounded by WebView, so aim two pixels beyond the
+      // required eight-pixel clearance.
+      if (caret.top<bottom && caret.bottom>bottom-10) area.scrollTop+=caret.bottom-bottom+10;
+      noteView();
+    },350);
+  };
   const onSelectionIntent=()=>{if(android)pendingRestoration=null;queueMicrotask(noteView);};
   const pointerDown=event=>{if(content.contains(event.target)){pointerSelecting=true;bubble.hidden=true;}};
   const pointerUp=()=>{if(pointerSelecting){pointerSelecting=false;placeBubble();}};
@@ -426,6 +443,7 @@ export async function createNoteEditor(root, host, options={}) {
   window.addEventListener('mouseup',pointerUp,true);
   window.addEventListener('scroll',onScroll,true);
   window.addEventListener('resize',relayout);
+  content.addEventListener('pointerup',onEditorTap);
   if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
     window.addEventListener(type,onUserIntent,{capture:true,passive:true});
   // The native Edit menu's Undo and Redo arrive as history input events.
@@ -831,6 +849,7 @@ export async function createNoteEditor(root, host, options={}) {
       pending.close();mirror?.destroy();doc.destroy();doc=null;fragment=null;
       document.removeEventListener('mousedown',outside,true);document.removeEventListener('mousedown',pointerDown,true);
       window.removeEventListener('mouseup',pointerUp,true);window.removeEventListener('scroll',onScroll,true);window.removeEventListener('resize',relayout);
+      content.removeEventListener('pointerup',onEditorTap);clearTimeout(tapMarginTimer);
       if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
         window.removeEventListener(type,onUserIntent,true);
       linkInput.value='';bubble.replaceChildren();linkPop.replaceChildren();content.replaceChildren();status.textContent='';

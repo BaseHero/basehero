@@ -19,10 +19,9 @@ pub fn configure_context(context: &mut tauri::Context<tauri::Wry>) {
     // The headless Mac update proof uses an HTTP loopback test server. Never
     // permit insecure transport for the production GitHub endpoint.
     if matches!(option_env!("BH_UPDATE_ENDPOINT"), Some(endpoint) if endpoint.starts_with("http://127.0.0.1:"))
+        && let Some(config) = context.config_mut().plugins.0.get_mut("updater")
     {
-        if let Some(config) = context.config_mut().plugins.0.get_mut("updater") {
-            config["dangerousInsecureTransportProtocol"] = serde_json::json!(true);
-        }
+        config["dangerousInsecureTransportProtocol"] = serde_json::json!(true);
     }
 }
 

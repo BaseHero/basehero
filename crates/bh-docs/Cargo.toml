@@ -1,0 +1,15 @@
+[package]
+name = "bh-docs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bh-core = { path = "../bh-core" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+tempfile = "3"

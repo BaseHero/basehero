@@ -199,9 +199,14 @@
       );
 
       # Android static libraries are opt-in; app tooling will add the SDK and NDK.
-      packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
-        libsodiumAndroidAarch64 = androidSodium system "aarch64";
-        libsodiumAndroidX86_64 = androidSodium system "x86_64";
-      });
+      packages = nixpkgs.lib.genAttrs systems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        { libsodium = pkgs.libsodium; }
+        // nixpkgs.lib.optionalAttrs (builtins.elem system [ "x86_64-linux" "aarch64-linux" ]) {
+          libsodiumAndroidAarch64 = androidSodium system "aarch64";
+          libsodiumAndroidX86_64 = androidSodium system "x86_64";
+        });
     };
 }
