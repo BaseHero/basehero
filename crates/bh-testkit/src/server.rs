@@ -232,7 +232,8 @@ impl LocalServer {
         }
     }
 
-    fn stop(&mut self) {
+    /// Stops the verified local Worker, preserving its port and persisted data for restart.
+    pub fn stop(&mut self) {
         if self.child.is_none() {
             return;
         }
@@ -279,6 +280,7 @@ impl Drop for LocalServer {
 macro_rules! local_only {
     () => {
         if std::env::var_os("BH_TEST_SERVER").is_some() {
+            eprintln!("local-only test skipped remotely ({}:{})", file!(), line!());
             return;
         }
     };

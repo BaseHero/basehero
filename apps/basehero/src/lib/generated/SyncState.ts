@@ -4,4 +4,16 @@
  * What a base's sync is doing. `pending` counts objects with changes not yet
  * on the server.
  */
-export type SyncState = { pending: number, online: boolean, lastSyncedAt: number | null, };
+export type SyncState = { 
+/**
+ * Number of objects with unsent changes.
+ */
+pending: number, 
+/**
+ * Whether the sync task currently has a connection.
+ */
+online: boolean, 
+/**
+ * Millisecond timestamp of the last completed catch-up, if any.
+ */
+lastSyncedAt: number | null, };

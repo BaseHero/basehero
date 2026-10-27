@@ -7,6 +7,7 @@ import { handleBases } from './bases';
 import { handleApprovals } from './approvals';
 import type { Env, Result } from './http';
 import { gatewayStub, handleModels } from './gateway';
+import { accountUsage, monthQuery, storageRow } from './usage';
 export { GatewayDO } from './gateway_do';
 export { AccountDO } from './account';
 export { BaseDO } from './base';
@@ -48,6 +49,16 @@ async function fakeParams(env: Env, email: string) {
   const hash = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(email)));
   return { salt: b64(hash.slice(0, 16)), kdf: { opsLimit: 3, memLimitKib: 65536 } };
 }
+async function listedBytes(env: Env, prefix: string): Promise<number> {
+  let total = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.FILES.list({ prefix, cursor });
+    for (const object of page.objects) total += object.size;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return total;
+}
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (request.headers.get('BH-Protocol') !== '1') throw new HttpError(426, 'needs_update', 'Protocol version 1 is required');
@@ -56,6 +67,36 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json(response);
   }
   if (request.method === 'POST' && path === '/v1/models/tinfoil/v1/chat/completions') return handleModels(request, env, ctx);
+  if (request.method === 'GET' && path === '/v1/usage') {
+    const principal = await requireDevice(request, env);
+    if (principal.kind !== 'full') throw new HttpError(403, 'forbidden');
+    const pinned = env.ALLOW_TEST_BYPASS === '1' && env.GATEWAY_NOW_MS !== undefined ? Number(env.GATEWAY_NOW_MS) : Date.now();
+    const month = monthQuery(new URL(request.url).searchParams.get('month'), pinned);
+    if (month === null) throw new HttpError(400, 'bad_request');
+    const gateway = gatewayStub(env, principal.accountId);
+    const [usage, bases] = await Promise.all([
+      gateway.report(), accountStub(env, principal.accountId).usageBases(principal),
+    ]);
+    const report = accountUsage(usage.days, usage.breakdown, month);
+    const current = new Date(pinned).toISOString().slice(0, 7);
+    // A slow or failing base delays or fails the entire usage reply. Each R2 list
+    // reads up to 1,000 objects, so very large bases take longer and cost more per read.
+    const storage = await Promise.all(bases.map(async baseId => {
+      const stub = env.BASE.get(env.BASE.idFromName(baseId)) as unknown as { storageBytes(): Promise<number> };
+      const [sqlite, bodies, parts] = await Promise.all([
+        stub.storageBytes(), listedBytes(env, `b/${baseId}/`), listedBytes(env, `f/${baseId}/`),
+      ]);
+      return storageRow(baseId, { sqlite, r2: bodies + parts }, current);
+    }));
+    report.months.push(...storage);
+    return json(report);
+  }
+  if (request.method === 'POST' && path === '/v1/admin/test/legacy-usage' && env.ALLOW_TEST_BYPASS === '1') {
+    if (!operator(request, env)) throw new HttpError(401, 'unauthorized');
+    const accountId = id(new URL(request.url).searchParams.get('account'));
+    await gatewayStub(env, accountId).seedLegacyDay();
+    return json({});
+  }
   if (request.method === 'GET' && path === '/v1/admin/usage') {
     if (!operator(request, env)) throw new HttpError(401, 'unauthorized');
     const accountId = id(new URL(request.url).searchParams.get('account'));

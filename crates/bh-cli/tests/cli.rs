@@ -262,6 +262,104 @@ fn two_homes_share_a_note_through_the_cli() {
     assert_eq!(hits[0]["title"], "Ferry at 9");
 }
 
+#[test]
+fn bh_export_writes_a_base_another_home_made() {
+    let server = LocalServer::start();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let url = server.url().to_string();
+    let invite = run(
+        a.path(),
+        &["admin", "invite", "--server", &url],
+        None,
+        Some(server.operator_token()),
+    );
+    let signup = run(
+        a.path(),
+        &[
+            "signup",
+            "--server",
+            &url,
+            "--invite",
+            invite["code"].as_str().unwrap(),
+            "--email",
+            "export-cli@example.com",
+            "--name",
+            "Laptop",
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    run(
+        b.path(),
+        &[
+            "signin",
+            "--server",
+            &url,
+            "--email",
+            "export-cli@example.com",
+            "--name",
+            "Desktop",
+            "--kit",
+            signup["kit"].as_str().unwrap(),
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let base = run(a.path(), &["base", "create", "Travel"], None, None);
+    let id = base["id"].as_str().unwrap();
+    let note = run(
+        a.path(),
+        &["note", "new", "--base", id, "Ferry"],
+        None,
+        None,
+    );
+    let payload = a.path().join("ticket.txt");
+    fs::write(&payload, b"a plain ticket").unwrap();
+    let added = run(
+        a.path(),
+        &[
+            "file",
+            "add",
+            "--base",
+            id,
+            "--parent",
+            note["id"].as_str().unwrap(),
+            payload.to_str().unwrap(),
+        ],
+        None,
+        None,
+    );
+    assert!(added["id"].as_str().is_some());
+    run(a.path(), &["sync"], None, None);
+    run(b.path(), &["sync"], None, None);
+    let dir = b.path().join("export");
+    let result = run(
+        b.path(),
+        &["export", "--base", id, "--out", dir.to_str().unwrap()],
+        None,
+        None,
+    );
+    assert_eq!(result["missingFiles"], json!([]));
+    assert_eq!(
+        fs::read(dir.join("notes/Ferry/ticket.txt")).unwrap(),
+        b"a plain ticket"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("notes/Ferry.md")).unwrap(),
+        "Ferry\n"
+    );
+    assert!(serde_json::from_slice::<Value>(&fs::read(dir.join("manifest.json")).unwrap()).is_ok());
+}
+
+#[test]
+fn bh_export_help_says_hidden_bases_need_unlock() {
+    let home = TempDir::new().unwrap();
+    let result = output(home.path(), &["export", "--help"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("--unlock"));
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn hero_ask_prints_the_reply_and_created_notes() {

@@ -91,6 +91,10 @@ export class AccountDO extends DurableObject<Env> {
   private accountBases(): string[] {
     return this.ctx.storage.sql.exec<{ base_id: string }>('SELECT base_id FROM bases ORDER BY base_id').toArray().map(b => b.base_id);
   }
+  /** Server-side IDs only; the caller is authenticated by the Worker. */
+  usageBases(principal: Principal): string[] {
+    return principal.kind === 'full' && principal.status === 'active' ? this.accountBases() : [];
+  }
   me(principal: Principal): Result<MeResponse> {
     const bases = principal.kind === 'full' ? this.accountBases() : this.bases(principal.deviceId);
     return { status: 200, body: { accountId: principal.accountId, deviceId: principal.deviceId, kind: principal.kind, bases } };

@@ -5,4 +5,24 @@ import type { FieldDef } from "./FieldDef";
  * A record type. A definition with an existing name and version may only add
  * optional fields or change `doc` text; anything else is a new version.
  */
-export type TypeDef = { name: string, version: number, doc: string, titleField: string | null, fields: Array<FieldDef>, };
+export type TypeDef = { 
+/**
+ * Fully qualified name for records of this type.
+ */
+name: string, 
+/**
+ * Definition version used when writing new records.
+ */
+version: number, 
+/**
+ * Description of the type, also available to Hero.
+ */
+doc: string, 
+/**
+ * Field used as the object's display title, if any.
+ */
+titleField: string | null, 
+/**
+ * Fields checked on local edits; unknown fields are retained.
+ */
+fields: Array<FieldDef>, };

@@ -1,29 +1,46 @@
 use crate::ModelError;
 use serde_json::Value;
 
+/// A tool requested by the model; arguments are JSON text to validate before use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
+    /// Identifier used by a tool-result message.
     pub id: String,
+    /// Requested tool name.
     pub name: String,
+    /// JSON-encoded arguments.
     pub arguments: String,
 }
+/// Decoded model completion with optional text, tool calls and token usage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
+    /// Assistant text, when provided.
     pub text: Option<String>,
+    /// Tool calls to process, if any.
     pub tool_calls: Vec<ToolCall>,
+    /// Reason generation stopped.
     pub finish: Finish,
+    /// Token usage, if returned.
     pub usage: Option<Usage>,
 }
+/// Model's reason for ending a completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
+    /// Natural stop.
     Stop,
+    /// Assistant requested tools.
     ToolCalls,
+    /// Output reached a length limit.
     Length,
+    /// Another provider finish reason.
     Other,
 }
+/// Tokens reported by the provider for one request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
+    /// Input token count.
     pub prompt: u64,
+    /// Generated token count.
     pub completion: u64,
 }
 

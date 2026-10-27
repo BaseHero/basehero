@@ -48,6 +48,9 @@ pub struct Digits([u8; 6]);
 
 impl Digits {
     /// Six ASCII digits; spaces and hyphens are ignored, anything else is refused.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] unless the input contains exactly six digits.
     pub fn parse(typed: &str) -> Result<Digits, Error> {
         let mut digits = Digits([0; 6]);
         let mut count = 0;
@@ -67,6 +70,7 @@ impl Digits {
         Ok(digits)
     }
 
+    /// Returns six ASCII digits without the display separator.
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.0).expect("digits are ASCII")
     }
@@ -128,8 +132,11 @@ pub fn digits_from(material: &Secret<32>) -> Digits {
 /// The exchange's identities, fixed by the new device's request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ids {
+    /// Account being signed in.
     pub account: AccountId,
+    /// Exchange identifier.
     pub approval: ApprovalId,
+    /// Device requesting approval.
     pub new: DeviceId,
 }
 
@@ -151,16 +158,24 @@ pub fn commitment(ids: &Ids, pk: &[u8; XWING_PUBLIC_BYTES], r_new: &[u8; 32]) ->
 
 /// Everything both devices saw; the digits and transfer key depend on all of it.
 pub struct Transcript<'a> {
+    /// Fixed exchange identities.
     pub ids: &'a Ids,
+    /// Device answering the request.
     pub approver: DeviceId,
+    /// New device's public encapsulation key.
     pub pk: &'a [u8; XWING_PUBLIC_BYTES],
+    /// New device's original commitment.
     pub commitment: &'a [u8; 32],
+    /// Approver's encapsulated ciphertext.
     pub ct: &'a [u8; XWING_CIPHERTEXT_BYTES],
+    /// Random value chosen by the approver.
     pub r_approver: &'a [u8; 32],
+    /// Random value revealed by the new device.
     pub r_new: &'a [u8; 32],
 }
 
 impl Transcript<'_> {
+    /// Encodes every length-delimited exchange input for key derivation.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = b"bh.v1.approval-transcript".to_vec();
         out.extend_from_slice(&1u32.to_be_bytes());
@@ -195,30 +210,46 @@ pub fn derive(shared: &Secret<32>, transcript: &[u8]) -> (Digits, Secret<32>) {
 
 /// The four messages, binary and opaque to the server.
 pub enum Message {
+    /// New device's first, committed request.
     Request {
+        /// Exchange identifier.
         approval: ApprovalId,
+        /// New device ID.
         new: DeviceId,
+        /// Public encapsulation key.
         pk: Box<[u8; XWING_PUBLIC_BYTES]>,
+        /// Commitment to the public key and hidden random value.
         commitment: [u8; 32],
     },
+    /// Approver's one-time response.
     Response {
+        /// Exchange identifier.
         approval: ApprovalId,
+        /// Approving device ID.
         approver: DeviceId,
+        /// Encapsulated shared secret.
         ct: Box<[u8; XWING_CIPHERTEXT_BYTES]>,
+        /// Approver's random value.
         r_approver: [u8; 32],
     },
+    /// New device reveals its committed random value.
     Reveal {
+        /// Exchange identifier.
         approval: ApprovalId,
+        /// Random value committed in the request.
         r_new: [u8; 32],
     },
-    /// `account_key` is the account key sealed under the transfer key.
+    /// Account key sealed under the transfer key.
     Transfer {
+        /// Exchange identifier.
         approval: ApprovalId,
+        /// Sealed account key.
         account_key: Vec<u8>,
     },
 }
 
 impl Message {
+    /// Encodes this message in the version-one binary format.
     pub fn encode(&self) -> Vec<u8> {
         let (kind, approval, parts): (u8, &ApprovalId, [&[u8]; 3]) = match self {
             Self::Request {
@@ -249,6 +280,10 @@ impl Message {
 
     /// Another format is `NeedsUpdate`; a wrong kind, length or approval is
     /// `ApprovalEnded(BadMessage)`.
+    ///
+    /// # Errors
+    /// Returns [`Error::NeedsUpdate`] for an unsupported format or
+    /// [`Error::ApprovalEnded`] for a malformed message or wrong exchange.
     pub fn parse(bytes: &[u8], approval: ApprovalId) -> Result<Message, Error> {
         match bytes.first() {
             Some(&FORMAT) => {}
@@ -349,6 +384,10 @@ impl NewSide {
     }
 
     /// Step 3: takes the one response; returns the reveal and the digits to show.
+    ///
+    /// # Errors
+    /// Returns [`Error::ApprovalEnded`] for an expired, repeated or malformed
+    /// exchange, or [`Error::NeedsUpdate`] for an unsupported message format.
     pub fn on_response(
         &mut self,
         response: &[u8],
@@ -405,6 +444,10 @@ impl NewSide {
     }
 
     /// Step 7: opens the account key from the transfer.
+    ///
+    /// # Errors
+    /// Returns [`Error::ApprovalEnded`] for an expired, malformed or ended
+    /// exchange, or [`Error::NeedsUpdate`] for an unsupported message format.
     pub fn on_transfer(self, transfer: &[u8], now_ms: u64) -> Result<Secret<32>, Error> {
         let transfer_key = match self.state {
             NewState::Ended(reason) => return end(reason),
@@ -453,6 +496,10 @@ enum ApproverState {
 impl ApproverSide {
     /// Step 2: the one encapsulation for this request's commitment. The caller
     /// records `commitment()` before sending the response.
+    ///
+    /// # Errors
+    /// Returns [`Error::ApprovalEnded`] for a malformed request or
+    /// [`Error::NeedsUpdate`] for an unsupported format.
     pub fn respond(
         account: AccountId,
         me: DeviceId,
@@ -499,15 +546,21 @@ impl ApproverSide {
         Ok((side, response))
     }
 
+    /// Returns the commitment to claim before responding.
     pub fn commitment(&self) -> [u8; 32] {
         self.commitment
     }
 
+    /// Returns the device requesting approval.
     pub fn new_device(&self) -> DeviceId {
         self.ids.new
     }
 
     /// Checks the commitment and derives the digits.
+    ///
+    /// # Errors
+    /// Returns [`Error::ApprovalEnded`] for an expired, repeated or malformed
+    /// exchange, or [`Error::NeedsUpdate`] for an unsupported message format.
     pub fn on_reveal(&mut self, reveal: &[u8], now_ms: u64) -> Result<(), Error> {
         let state = mem::replace(&mut self.state, ApproverState::Ended(EndReason::BadMessage));
         let shared = match state {
@@ -549,6 +602,10 @@ impl ApproverSide {
 
     /// Steps 5–7: compares the typed digits and, only if they match, seals the
     /// account key for the new device. A mismatch ends the exchange.
+    ///
+    /// # Errors
+    /// Returns [`Error::ApprovalEnded`] for wrong digits or an expired,
+    /// incomplete or ended exchange.
     pub fn confirm(
         self,
         typed: &Digits,

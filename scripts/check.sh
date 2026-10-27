@@ -7,9 +7,21 @@ if (( $# == 0 )); then
   set -- rust server scale
 fi
 
+# The local Worker runs every Durable Object on one thread, which also waits for
+# each storage fsync. On a shared Linux host another job's disk write-back can
+# hold one fsync for 30 s, so tests that start it keep their files in memory.
+memory_tmp() {
+  if [ -z "${memory_dir:-}" ] && [ -d /dev/shm ]; then
+    memory_dir=$(mktemp -d /dev/shm/bh-check.XXXXXX)
+    trap 'rm -rf "$memory_dir"' EXIT
+    export TMPDIR=$memory_dir
+  fi
+}
+
 for stage in "$@"; do
   case "$stage" in
     rust)
+      memory_tmp
       # The test kit runs the Worker locally, so its npm packages must be installed.
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
@@ -29,6 +41,7 @@ for stage in "$@"; do
       fi
       ;;
     app|app-webkit)
+      memory_tmp
       # Core integration tests start the local Worker before the UI stage.
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
@@ -66,7 +79,7 @@ for stage in "$@"; do
       adb -s emulator-5580 shell pm clear app.basehero
       # One emulator and one app: test files take turns. The approval runner
       # creates a disposable dev approver and isolates its CLI credentials.
-      for file in lib keys shell model notes fold ime hero update approval; do
+      for file in lib keys shell model notes fold ime hero update approval kit hidden; do
         if [ "$file" = approval ]; then
           node apps/basehero/tests/android/run-approval.mjs
         else
@@ -74,12 +87,34 @@ for stage in "$@"; do
         fi
       done
       ;;
+    remote)
+      token_file="$HOME/.config/basehero/dev-operator-token"
+      if [ ! -s "$token_file" ]; then
+        printf 'Missing dev operator token: %s\n' "$token_file" >&2
+        exit 1
+      fi
+      remote_home=$(mktemp -d)
+      (
+        trap 'rm -rf "$remote_home"' EXIT
+        env -u GH_TOKEN -u GITHUB_TOKEN \
+          HOME="$remote_home" GH_CONFIG_DIR="$remote_home/gh" \
+          XDG_CONFIG_HOME="$remote_home/config" \
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+          BH_TEST_SERVER=https://dev-api.basehero.com \
+          BH_TEST_OPERATOR_TOKEN="$(<"$token_file")" \
+          cargo test -p bh-core --features test-support -- --nocapture
+      )
+      ;;
     server)
       (cd server && npm ci && npx tsc --noEmit)
       node --test scripts/deploy.test.mjs
       ;;
     scale)
-      # The scale stage gains checks when its components are added.
+      memory_tmp
+      [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
+        (cd server && npm ci --no-audit --no-fund)
+      cargo test --release -p bh-core --test scale -- --nocapture --test-threads=1
+      du -sh "$TMPDIR" # Fixture footprint before the check's in-memory directory is removed.
       ;;
     *)
       printf 'Unknown check stage: %s\n' "$stage" >&2

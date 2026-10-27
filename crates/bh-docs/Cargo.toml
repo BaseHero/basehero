@@ -9,6 +9,7 @@ publish = false
 bh-core = { path = "../bh-core" }
 serde_json.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rusqlite = { version = "0.41", features = ["bundled"] }

@@ -62,12 +62,16 @@ const KIT_CHARS: usize = 26;
 pub struct RecoveryKit(Zeroizing<[u8; 16]>);
 
 impl RecoveryKit {
+    /// Generates a fresh random kit; keep it for account recovery.
     pub fn generate() -> Self {
         Self(Zeroizing::new(bh_crypto::random::<16>()))
     }
 
     /// Ignores case, spaces and hyphens, and reads I and L as 1 and O as 0.
     /// Anything else that isn't a kit is `BadKit`.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadKit`] for malformed text.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let mut bytes = Zeroizing::new([0u8; 16]);
         let (mut bits, mut acc, mut count, mut index) = (0u32, 0u32, 0usize, 0usize);
@@ -101,6 +105,7 @@ impl RecoveryKit {
         Ok(Self(bytes))
     }
 
+    /// Formats the kit in groups for the person to save; do not log it.
     pub fn display(&self) -> String {
         let mut chars = Zeroizing::new(Vec::with_capacity(KIT_CHARS));
         let (mut acc, mut bits) = (0u32, 0u32);

@@ -19,6 +19,11 @@
     let stop = () => {};
     let editor: Awaited<ReturnType<typeof createNoteEditor>> | undefined;
     const host = noteHost(getBackend(), r, id);
+    async function dispose(opened: Awaited<ReturnType<typeof createNoteEditor>>) {
+      try { await opened.drain(Date.now() + 30_000); }
+      catch { /* A removed route cannot keep its editor alive to retry. */ }
+      finally { stop(); opened.close(); editor = undefined; }
+    }
     const opening = createNoteEditor(root, host, {
       baseId: r.base,
       get readOnly() { return readOnly || host.readOnly; },
@@ -26,9 +31,7 @@
     }).then(opened => {
       editor = opened;
       stop = trackEditor(opened);
-      if (cancelled) {
-        void opened.drain(Date.now() + 30_000).then(saved => { if (saved) { stop(); opened.close(); } });
-      }
+      if (cancelled) void dispose(opened);
       return opened;
     });
     void opening.catch(e => {
@@ -59,12 +62,7 @@
     return () => {
       unregister();
       cancelled = true;
-      if (editor) {
-        const closing = editor;
-        void closing.drain(Date.now() + 30_000).then(saved => {
-          if (saved) { stop(); closing.close(); }
-        });
-      }
+      if (editor) void dispose(editor);
     };
   });
 </script>

@@ -7,8 +7,7 @@ async function account(page: Page): Promise<string> {
   await page.getByLabel('Email').fill('dan@example.com');
   await page.getByLabel('Password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Later' }).click();
   await expect(page.getByRole('link', { name: 'Personal' })).toBeVisible();
   return page.evaluate(() => window.__fake.accounts().then(accounts => accounts[0].id));
 }

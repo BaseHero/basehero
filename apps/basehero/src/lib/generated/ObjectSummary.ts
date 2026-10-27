@@ -7,4 +7,40 @@ import type { TypeRef } from "./TypeRef";
  * its own parent, or the top level when that parent isn't here (yet) or the
  * object has the lowest ID in a cycle of moves.
  */
-export type ObjectSummary = { id: string, ty: TypeRef, parent: string | null, position: string, deleted: boolean, title: string, fields: { [key in string]: JsonValue }, updatedAt: number, updatedBy: string | null, };
+export type ObjectSummary = { 
+/**
+ * Stable object ID.
+ */
+id: string, 
+/**
+ * Stored type name and version.
+ */
+ty: TypeRef, 
+/**
+ * Effective parent for display, or the top level.
+ */
+parent: string | null, 
+/**
+ * Sort key among siblings.
+ */
+position: string, 
+/**
+ * Whether the object is in the trash.
+ */
+deleted: boolean, 
+/**
+ * Display title computed from the record type or document.
+ */
+title: string, 
+/**
+ * JSON fields, including any not defined by this version.
+ */
+fields: { [key in string]: JsonValue }, 
+/**
+ * Last local update time in milliseconds.
+ */
+updatedAt: number, 
+/**
+ * Device responsible for the last applied change, when known.
+ */
+updatedBy: string | null, };

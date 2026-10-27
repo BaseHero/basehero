@@ -4,6 +4,7 @@ import type { ChangeResult } from './proto/gen/ChangeResult';
 import type { ChangesResponse } from './proto/gen/ChangesResponse';
 import type { GrantMode } from './proto/gen/GrantMode';
 import type { SinceResponse } from './proto/gen/SinceResponse';
+import type { VersionsResponse } from './proto/gen/VersionsResponse';
 import type { Env, Principal, Result } from './http';
 import { answer, b64, fail } from './http';
 
@@ -21,7 +22,8 @@ export type FetchedObject = {
   updates: { seq: number; deviceId: string; body: StoredBody }[];
 };
 export type Fetched = { objects: FetchedObject[]; more: string[] };
-export type Stored = { changes: { seq: number; kind: string; keep: boolean }[] };
+export type Stored = { changes: { seq: number; kind: string; keep: boolean; inR2: boolean }[] };
+export type StoredVersion = { seq: number; covers: number; deviceId: string; at: number; body: StoredBody };
 export type Created = 'created' | 'yours' | 'taken';
 
 type AccessRow = { mode: GrantMode; epoch: number; wrapper: string };
@@ -77,6 +79,10 @@ export class BaseDO extends DurableObject<Env> {
     if (!row) return fail(403, 'forbidden');
     if (write && row.mode !== 'rw') return fail(403, 'read_only');
     return null;
+  }
+  /** Apply exactly the same grant and device checks as change and fetch routes. */
+  fileAccess(p: Principal, write: boolean): Result {
+    return this.denied(p, write) ?? { status: 200, body: {} };
   }
   private owns(p: Principal): boolean {
     return p.kind === 'full' && p.status === 'active' && !this.removed(p.deviceId) && this.access(`acct:${p.accountId}`) !== null;
@@ -137,10 +143,18 @@ export class BaseDO extends DurableObject<Env> {
     const old = this.sql.exec<{ seq: number; prev_head: number; object_id: string }>('SELECT seq, prev_head, object_id FROM changes WHERE change_id = ?', c.changeId).toArray()[0];
     if (old) return { result: { changeId: c.changeId, seq: old.seq, prevHead: old.prev_head, tail: this.object(old.object_id).tail, stale: false } };
     const object = this.object(c.objectId);
-    if (c.kind === 'state' && !(c.covers > object.state_covers && c.covers <= object.head)) {
+    // Known limit: a writer may keep any number of states at the same covers.
+    if (c.kind === 'state' && !(c.covers <= object.head &&
+      (c.covers > object.state_covers || (c.keep && c.covers > 0 && c.covers === object.state_covers)))) {
       return { result: { changeId: c.changeId, seq: null, prevHead: object.head, tail: object.tail, stale: true } };
     }
     return { object, seq: this.head() + 1 };
+  }
+  /** SQLite size billed for this base. Does not hold the DO while usage is read. */
+  storageBytes(): number {
+    // Local workerd shrinks databaseSize after compaction of an inline change;
+    // whether deployed Cloudflare storage does the same remains unverified.
+    return this.ctx.storage.sql.databaseSize;
   }
   /** Stores one change; synchronous, so its reads and writes can't interleave with another request. */
   private apply(deviceId: string, c: NewChange, r2Key: string | null, deletes: string[]): ChangeResult {
@@ -196,7 +210,7 @@ export class BaseDO extends DurableObject<Env> {
     const results: ChangeResult[] = [];
     const deletes: string[] = [];
     try {
-      if (!changes.some(c => c.body.length > INLINE_MAX)) {
+      if (!changes.some(c => c.keep || c.body.length > INLINE_MAX)) {
         // One synchronous span: no other request runs between a read and the write that depends on it.
         for (const c of changes) results.push(this.apply(p.deviceId, c, null, deletes));
       } else {
@@ -207,9 +221,22 @@ export class BaseDO extends DurableObject<Env> {
         await this.ctx.blockConcurrencyWhile(async () => {
           try {
             for (const c of changes) {
-              const decision = c.body.length > INLINE_MAX ? this.decide(c) : null;
+              const decision = c.keep || c.body.length > INLINE_MAX ? this.decide(c) : null;
               const r2Key = decision && 'seq' in decision ? `b/${this.ctx.id.name}/${c.objectId}/${decision.seq}` : null;
-              if (r2Key) await this.env.FILES.put(r2Key, c.body);
+              if (r2Key) {
+                const written = await this.env.FILES.put(r2Key, c.body, { onlyIf: { etagDoesNotMatch: '*' } });
+                if (!written) {
+                  // A failed SQL write may have left this key behind. Reuse it only for
+                  // an identical retry; never replace an existing opaque body. Known limit:
+                  // if a different change for this object then takes the same sequence
+                  // number, the batch fails until another change moves the sequence on.
+                  const existing = await this.env.FILES.get(r2Key);
+                  const bytes = existing && new Uint8Array(await existing.arrayBuffer());
+                  if (!bytes || bytes.length !== c.body.length || bytes.some((b, i) => b !== c.body[i])) {
+                    throw new Error('R2 body key already exists');
+                  }
+                }
+              }
               results.push(this.apply(p.deviceId, c, r2Key, deletes));
             }
           } catch (e) {
@@ -293,11 +320,32 @@ export class BaseDO extends DurableObject<Env> {
     }
     return { status: 200, body: { objects: short ? objects.slice(0, 1) : objects, more: [] } };
   }
+  /** A newest-first page of kept states, exclusive of `before`. */
+  versions(p: Principal, objectId: string, before: number | null, limit: number): Result<VersionsResponse> {
+    const denied = this.denied(p);
+    if (denied) return denied;
+    const rows = this.sql.exec<{ seq: number; covers: number; device_id: string; at: number; size: number }>(
+      "SELECT seq, covers, device_id, at, size FROM changes WHERE object_id = ? AND kind = 'state' AND keep = 1 AND seq < ? ORDER BY seq DESC LIMIT ?",
+      objectId, before ?? Number.MAX_SAFE_INTEGER, limit + 1).toArray();
+    return { status: 200, body: { versions: rows.slice(0, limit).map(r => ({
+      seq: r.seq, covers: r.covers, deviceId: r.device_id, at: r.at, size: r.size,
+    })), more: rows.length > limit } };
+  }
+  /** Get only a kept state belonging to this exact object. */
+  version(p: Principal, objectId: string, seq: number): Result<StoredVersion> {
+    const denied = this.denied(p);
+    if (denied) return denied;
+    const row = this.sql.exec<BodyRow & { at: number }>(
+      "SELECT seq, covers, device_id, at, body, r2_key, size FROM changes WHERE object_id = ? AND seq = ? AND kind = 'state' AND keep = 1",
+      objectId, seq).toArray()[0];
+    if (!row) return fail(404, 'not_found');
+    return { status: 200, body: { seq: row.seq, covers: row.covers!, deviceId: row.device_id, at: row.at, body: stored(row) } };
+  }
   /** Test-only view of what is stored for an object. */
   stored(p: Principal, objectId: string): Result<Stored> {
     const denied = this.denied(p);
     if (denied) return denied;
-    const rows = this.sql.exec<{ seq: number; kind: string; keep: number }>('SELECT seq, kind, keep FROM changes WHERE object_id = ? ORDER BY seq', objectId).toArray();
-    return { status: 200, body: { changes: rows.map(r => ({ seq: r.seq, kind: r.kind, keep: r.keep === 1 })) } };
+    const rows = this.sql.exec<{ seq: number; kind: string; keep: number; in_r2: number }>('SELECT seq, kind, keep, r2_key IS NOT NULL AS in_r2 FROM changes WHERE object_id = ? ORDER BY seq', objectId).toArray();
+    return { status: 200, body: { changes: rows.map(r => ({ seq: r.seq, kind: r.kind, keep: r.keep === 1, inR2: r.in_r2 === 1 })) } };
   }
 }

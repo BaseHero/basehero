@@ -18,6 +18,10 @@ use tauri::{Emitter, Manager};
 #[cfg(target_os = "macos")]
 static NEXT_WINDOW: AtomicU64 = AtomicU64::new(0);
 
+pub fn should_lock_hidden(remaining_windows: usize) -> bool {
+    remaining_windows == 0
+}
+
 pub fn should_prevent_exit(code: Option<i32>, is_macos: bool) -> bool {
     is_macos && code.is_none()
 }
@@ -136,9 +140,16 @@ pub fn request_quit(app: &AppHandle) {
             .map(|label| answers.get(label).copied())
             .collect();
         let state = app.state::<QuitState>();
-        let mut pending = state.pending.lock().unwrap();
+        let pending = state.pending.lock().unwrap();
         if pending.as_ref().is_some_and(|current| current.id == id) {
             let quit = should_quit(&results);
+            drop(pending);
+            // Drain has finished (or timed out); lock before replying to Cocoa or
+            // allowing Tauri to exit. The bound applies even if sync stalls.
+            if quit {
+                lock_hidden_bounded(&app);
+            }
+            let mut pending = state.pending.lock().unwrap();
             let native_reply = state.native.lock().unwrap().decide(quit);
             if native_reply.is_none() && quit {
                 state.approved.store(true, Ordering::SeqCst);
@@ -196,10 +207,116 @@ unsafe extern "C" {
         types: *const std::ffi::c_char,
     ) -> bool;
     fn objc_msgSend();
+    fn objc_allocateClassPair(
+        superclass: *mut c_void,
+        name: *const std::ffi::c_char,
+        extra_bytes: usize,
+    ) -> *mut c_void;
+    fn objc_registerClassPair(class: *mut c_void);
 }
 
 #[cfg(target_os = "macos")]
 static DOCK_QUIT_APP: OnceLock<AppHandle> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static SCREEN_LOCK_CALLBACK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Run the core lock off the UI thread; never hold Cocoa termination longer
+/// than three seconds even if an account's sync is unresponsive.
+#[cfg(target_os = "macos")]
+pub fn lock_hidden_bounded(app: &AppHandle) {
+    let (sender, receiver) = mpsc::channel();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Some(startup) = app.try_state::<crate::state::Startup>()
+            && let Ok(state) = startup.state()
+        {
+            tauri::async_runtime::block_on(crate::commands::hidden::lock_all_hidden(state));
+        }
+        let _ = sender.send(());
+    });
+    let _ = receiver.recv_timeout(Duration::from_secs(3));
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn screen_locked(_: *mut c_void, _: *mut c_void, _: *mut c_void) {
+    if let Some(callback) = SCREEN_LOCK_CALLBACK.get() {
+        callback();
+    }
+}
+
+/// NSDistributedNotificationCenter delivers the screen lock notification even
+/// when BaseHero has no window. Keep the observer alive for the process lifetime.
+#[cfg(target_os = "macos")]
+pub fn install_screen_lock(app: &AppHandle) {
+    let app = app.clone();
+    let _ = register_screen_lock(move || {
+        // Do not freeze AppKit while sync drains its outbox.
+        let app = app.clone();
+        std::thread::spawn(move || lock_hidden_bounded(&app));
+    });
+}
+
+/// Register one process-lifetime observer; the callback also permits a headless
+/// test of the actual distributed notification delivery.
+#[cfg(target_os = "macos")]
+pub fn register_screen_lock(callback: impl Fn() + Send + Sync + 'static) -> bool {
+    if SCREEN_LOCK_CALLBACK.set(Box::new(callback)).is_err() {
+        return false;
+    }
+    // SAFETY: Objective-C class/selector registration is process-global. The
+    // observer is deliberately retained for the app lifetime; signatures match
+    // NSObject new and addObserver:selector:name:object: on arm64.
+    unsafe {
+        let superclass = objc_getClass(c"NSObject".as_ptr());
+        let class = objc_allocateClassPair(superclass, c"BHScreenLockObserver".as_ptr(), 0);
+        if class.is_null()
+            || !class_addMethod(
+                class,
+                sel_registerName(c"screenLocked:".as_ptr()),
+                screen_locked as *const c_void,
+                c"v@:@".as_ptr(),
+            )
+        {
+            eprintln!("Could not register screen lock observer");
+            return false;
+        }
+        objc_registerClassPair(class);
+        let new: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let observer = new(class, sel_registerName(c"new".as_ptr()));
+        let center = new(
+            objc_getClass(c"NSDistributedNotificationCenter".as_ptr()),
+            sel_registerName(c"defaultCenter".as_ptr()),
+        );
+        let string: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const std::ffi::c_char,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const c_void);
+        let name = string(
+            objc_getClass(c"NSString".as_ptr()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            c"com.apple.screenIsLocked".as_ptr(),
+        );
+        let add: extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) = std::mem::transmute(objc_msgSend as *const c_void);
+        add(
+            center,
+            sel_registerName(c"addObserver:selector:name:object:".as_ptr()),
+            observer,
+            sel_registerName(c"screenLocked:".as_ptr()),
+            name,
+            std::ptr::null_mut(),
+        );
+    }
+    true
+}
 
 #[cfg(target_os = "macos")]
 extern "C" fn dock_quit(_: *mut c_void, _: *mut c_void, _: *mut c_void) -> isize {

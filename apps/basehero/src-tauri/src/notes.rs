@@ -1,6 +1,6 @@
 //! Open editor handles to core documents. The core owns the document and persists edits.
 use crate::error::CommandError;
-use bh_core::{AccountId, Base, Mode, NoteDoc, ObjectId};
+use bh_core::{AccountId, Base, BaseId, Mode, NoteDoc, ObjectId};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,7 @@ pub struct NoteOpened {
 struct Session {
     window: String,
     account: AccountId,
+    base: BaseId,
     note: NoteDoc,
     read_only: bool,
     forwarder: JoinHandle<()>,
@@ -71,6 +72,7 @@ impl NoteSessions {
             Session {
                 window: window.to_owned(),
                 account,
+                base: base.id(),
                 note,
                 read_only,
                 forwarder,
@@ -101,6 +103,13 @@ impl NoteSessions {
             .lock()
             .unwrap()
             .retain(|_, session| session.window != window);
+    }
+
+    pub fn close_base(&self, account: AccountId, base: BaseId) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, session| session.account != account || session.base != base);
     }
 
     pub fn close_account(&self, account: AccountId) {

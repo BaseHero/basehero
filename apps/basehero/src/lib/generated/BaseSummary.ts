@@ -4,8 +4,20 @@ import type { Mode } from "./Mode";
 /**
  * A base as `Account::bases` lists it.
  */
-export type BaseSummary = { id: string, name: string, mode: Mode, 
+export type BaseSummary = { 
 /**
- * Always false in this version.
+ * Identifier used to open the base.
+ */
+id: string, 
+/**
+ * Name from the base's local information object.
+ */
+name: string, 
+/**
+ * This device's access mode.
+ */
+mode: Mode, 
+/**
+ * Whether this base is hidden and currently unlocked.
  */
 hidden: boolean, };

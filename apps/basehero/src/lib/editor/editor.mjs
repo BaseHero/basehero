@@ -431,7 +431,7 @@ export async function createNoteEditor(root, host, options={}) {
       const bottom=Math.min(bounds.bottom,visualViewport.height);
       // Scroll offsets are rounded by WebView, so aim two pixels beyond the
       // required eight-pixel clearance.
-      if (caret.top<bottom && caret.bottom>bottom-10) area.scrollTop+=caret.bottom-bottom+10;
+      if (caret.bottom>bottom-10) area.scrollTop+=caret.bottom-bottom+10;
       noteView();
     },350);
   };

@@ -7,8 +7,7 @@ async function signedIn(page: Page) {
   await page.getByLabel('Email').fill('dan@example.com');
   await page.getByLabel('Password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Later' }).click();
   await expect(page.getByRole('link', { name: 'Personal' })).toBeVisible();
   return page.evaluate(() => window.__fake.accounts().then(accounts => accounts[0].id));
 }
@@ -44,7 +43,7 @@ test('removing this device confirms, erases it and shows Removed', async ({ page
   expect(await page.evaluate(() => window.__fake.accounts().then(accounts => accounts.length))).toBe(0);
 });
 
-test('removal clears an unsaved recovery kit warning', async ({ page }) => {
+test('removal clears kit state without a leave warning', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Create account' }).click();
   await page.getByLabel('Invite code').fill('WELCOME');

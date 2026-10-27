@@ -2,4 +2,8 @@
 import type { ApprovalId } from "../../../../../server/src/proto/gen/ApprovalId";
 import type { ApprovalRequest } from "./ApprovalRequest";
 
+/**
+ * Changes to an account's bases, devices or approval requests. Subscribe
+ * before waiting for a change; reload state if the receiver lags.
+ */
 export type AccountEvent = "BasesChanged" | "DevicesChanged" | "Removed" | { "ApprovalRequested": ApprovalRequest } | { "ApprovalClosed": ApprovalId };

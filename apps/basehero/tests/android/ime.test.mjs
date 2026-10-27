@@ -3,6 +3,15 @@ import assert from 'node:assert/strict';
 import { adb, launch, webview, fold, unfold, newNote, saved } from './lib.mjs';
 import { caret, afterLayout } from './geometry.mjs';
 
+async function waitForIme(shown) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (/mInputShown=(true|false)/.exec(adb('shell', 'dumpsys', 'input_method'))?.[1] === String(shown)) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.fail(`Android IME did not become ${shown ? 'visible' : 'hidden'}`);
+}
+
 test('Android keyboard does not cover a caret near the bottom', { timeout: 90_000 }, async () => {
   await unfold(); await launch();
   const page = await webview();
@@ -11,10 +20,9 @@ test('Android keyboard does not cover a caret near the bottom', { timeout: 90_00
     await edit.fill(Array.from({ length: 35 }, (_, i) => `Bottom line ${i}`).join('\n'));
     await saved(page);
     adb('shell', 'input', 'keyevent', 'KEYCODE_BACK');
-    await page.waitForTimeout(500);
-    assert.match(adb('shell', 'dumpsys', 'input_method'), /mInputShown=false/, 'the IME must start closed');
+    await waitForIme(false);
     await edit.locator('p').last().click();
-    assert.match(adb('shell', 'dumpsys', 'input_method'), /mInputShown=true/, 'the Android IME must actually be shown');
+    await waitForIme(true);
     await afterLayout(page);
     const rect = await caret(page);
     assert(rect.bottom <= rect.visibleBottom - 8, `IME covers caret: ${JSON.stringify(rect)}`);

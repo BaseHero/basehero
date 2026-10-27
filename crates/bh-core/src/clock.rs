@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+/// Monotonic clock used for device-local deadlines, independent of wall time.
 #[derive(Clone)]
 pub struct Clock(Arc<Source>);
 
@@ -14,14 +15,17 @@ enum Source {
     Manual { millis: AtomicU64, changed: Notify },
 }
 
+/// Controllable clock handle; advancing it wakes deadline sleepers.
 #[derive(Clone)]
 pub struct ManualClock(Clock);
 
 impl Clock {
+    /// Starts a clock at the current monotonic instant.
     pub fn system() -> Self {
         Self(Arc::new(Source::System(Instant::now())))
     }
 
+    /// Creates a clock and its manual advance handle, initially at zero.
     pub fn manual() -> (Self, ManualClock) {
         let clock = Self(Arc::new(Source::Manual {
             millis: AtomicU64::new(0),
@@ -30,6 +34,7 @@ impl Clock {
         (clock.clone(), ManualClock(clock))
     }
 
+    /// Milliseconds since this clock's start.
     pub fn now_ms(&self) -> u64 {
         match &*self.0 {
             Source::System(start) => start.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -37,6 +42,7 @@ impl Clock {
         }
     }
 
+    /// Waits for a monotonic deadline; does not need the network.
     pub async fn sleep_until(&self, deadline: u64) {
         match &*self.0 {
             Source::System(start) => {
@@ -59,6 +65,7 @@ impl Clock {
 }
 
 impl ManualClock {
+    /// Advances a manual clock and wakes waiting operations.
     pub fn advance(&self, duration: Duration) {
         if let Source::Manual { millis, changed } = &*self.0.0 {
             millis

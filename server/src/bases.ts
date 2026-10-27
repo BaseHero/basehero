@@ -1,4 +1,6 @@
-import type { Created, Fetched, NewChange, Stored, StoredBody } from './base';
+import type { Created, Fetched, NewChange, Stored, StoredBody, StoredVersion } from './base';
+import { handleFiles } from './files';
+import type { VersionResponse } from './proto/gen/VersionResponse';
 import type { FetchResponse } from './proto/gen/FetchResponse';
 import type { GrantMode } from './proto/gen/GrantMode';
 import type { Env, Principal, Result } from './http';
@@ -10,6 +12,7 @@ const CHANGES_BODY_MAX = 8 * MIB;
 const CHANGES_MAX = 1000;
 const FETCH_IDS_MAX = 200;
 const SINCE_LIMIT_MAX = 1000;
+const VERSIONS_LIMIT_MAX = 200;
 
 type BaseRpc = {
   create(p: Principal, epoch: number, wrapper: string): Promise<Created>;
@@ -19,6 +22,8 @@ type BaseRpc = {
   changes(p: Principal, changes: NewChange[]): Promise<Result>;
   since(p: Principal, after: number, limit: number): Promise<Result>;
   fetchObjects(p: Principal, objectIds: string[]): Promise<Result<Fetched>>;
+  versions(p: Principal, objectId: string, before: number | null, limit: number): Promise<Result>;
+  version(p: Principal, objectId: string, seq: number): Promise<Result<StoredVersion>>;
   stored(p: Principal, objectId: string): Promise<Result<Stored>>;
   dropNextLive(deviceId: string): Promise<void>;
   failNextClose(): Promise<void>;
@@ -46,6 +51,11 @@ function count(value: string | null, fallback: number): number {
   if (value === null) return fallback;
   if (!/^\d{1,15}$/.test(value)) throw new HttpError(400, 'bad_request');
   return Number(value);
+}
+function positiveSequence(value: string): number {
+  const seq = count(value, 0);
+  if (seq < 1 || !Number.isSafeInteger(seq)) throw new HttpError(400, 'bad_request');
+  return seq;
 }
 function change(value: unknown): NewChange {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new HttpError(400, 'bad_request');
@@ -124,6 +134,35 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
   if (path === '/v1/bases') {
     if (request.method !== 'POST') throw new HttpError(404, 'not_found');
     return create(request, env);
+  }
+  const file = /^\/v1\/bases\/([^/]+)\/files\/([^/]+)\/([^/]+)$/.exec(path);
+  if (file) return handleFiles(request, env, file[1], file[2], file[3]);
+  const version = /^\/v1\/bases\/([^/]+)\/objects\/([^/]+)\/versions(?:\/([^/]+))?$/.exec(path);
+  if (version) {
+    const base = baseStub(env, version[1]);
+    const objectId = id(version[2]);
+    if (request.method !== 'GET') throw new HttpError(404, 'not_found');
+    const principal = await requireDevice(request, env);
+    if (version[3] !== undefined) {
+      const seq = positiveSequence(version[3]);
+      const result = await base.version(principal, objectId, seq);
+      if (result.status !== 200) return answer(result);
+      const { body: stored, ...metadata } = result.body as StoredVersion;
+      let encoded: string;
+      if ('bytes' in stored) encoded = b64(stored.bytes);
+      else {
+        const object = await env.FILES.get(stored.r2);
+        if (!object) throw new HttpError(404, 'not_found');
+        encoded = b64(new Uint8Array(await object.arrayBuffer()));
+      }
+      const response: VersionResponse = { ...metadata, body: encoded };
+      return json(response);
+    }
+    const url = new URL(request.url);
+    const before = url.searchParams.get('before');
+    const limit = count(url.searchParams.get('limit'), VERSIONS_LIMIT_MAX);
+    if (limit < 1) throw new HttpError(400, 'bad_request');
+    return answer(await base.versions(principal, objectId, before === null ? null : positiveSequence(before), Math.min(limit, VERSIONS_LIMIT_MAX)));
   }
   const match = /^\/v1\/bases\/([^/]+)\/(key|changes|since|fetch|stored|live|drop-next-live|miss-next-fetch|short-next-fetch|hold-change-reply|release-change-reply|live-count|fail-next-device-close|grants\/([^/]+))$/.exec(path);
   if (!match) throw new HttpError(404, 'not_found');

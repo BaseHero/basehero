@@ -3,8 +3,8 @@ import { expect, test } from '@playwright/test';
 test('Hero reply shows a created note that opens in the editor', async ({ page }) => {
   await page.goto('/');
   const ref = await page.evaluate(async () => {
-    const { account } = await window.__fake.signUp({ invite: 'DEMO', email: 'hero@example.test', password: 'password', deviceName: 'Mac' });
-    await window.__fake.setKitSaved(account.id);
+    const { account, kit } = await window.__fake.signUp({ invite: 'DEMO', email: 'hero@example.test', password: 'password', deviceName: 'Mac' });
+    await window.__fake.setKitSaved(account.id, kit);
     const base = await window.__fake.createBase(account.id, 'Personal');
     const focus = await window.__fake.createObject({ account: account.id, base: base.id }, { kind: 'note', name: 'Kyoto in March', parent: null, after: null });
     const note = await window.__fake.createObject({ account: account.id, base: base.id }, { kind: 'note', name: 'Kyoto checklist', parent: null, after: null });
@@ -28,8 +28,8 @@ test('Hero reply shows a created note that opens in the editor', async ({ page }
 async function noteWithHero(page) {
   await page.goto('/');
   const ref = await page.evaluate(async () => {
-    const { account } = await window.__fake.signUp({ invite: 'DEMO', email: 'width@example.test', password: 'password', deviceName: 'Fold' });
-    await window.__fake.setKitSaved(account.id);
+    const { account, kit } = await window.__fake.signUp({ invite: 'DEMO', email: 'width@example.test', password: 'password', deviceName: 'Fold' });
+    await window.__fake.setKitSaved(account.id, kit);
     const base = await window.__fake.createBase(account.id, 'Personal');
     const note = await window.__fake.createObject({ account: account.id, base: base.id }, { kind: 'note', name: 'Ferry', parent: null, after: null });
     return { account: account.id, base: base.id, note };

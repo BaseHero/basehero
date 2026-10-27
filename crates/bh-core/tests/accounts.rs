@@ -178,9 +178,13 @@ async fn change_password_keeps_the_account() {
             .unwrap_err(),
         Error::BadKit
     );
+    a.set_kit_saved(&kit).await.unwrap();
+    let before = a.kit_status().unwrap();
     a.change_password(TEST_PASSWORD, &kit.display(), "new password")
         .await
         .unwrap();
+    assert_eq!(a.recovery_kit().unwrap(), Some(kit.clone()));
+    assert_eq!(a.kit_status().unwrap(), before);
     assert_eq!(
         device("fold").sign_in(signin_for(&a)).await.err(),
         Some(Error::BadCredentials)
@@ -193,6 +197,8 @@ async fn change_password_keeps_the_account() {
         .await
         .unwrap();
     assert_eq!(b.id(), a.id());
+    assert_eq!(b.recovery_kit().unwrap(), Some(kit));
+    assert_eq!(b.kit_status().unwrap(), before);
     // The device that changed the password stays signed in.
     assert_eq!(a.devices().await.unwrap().len(), 2);
 }

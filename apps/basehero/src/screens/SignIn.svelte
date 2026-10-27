@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getBackend } from '../lib/backend';
   import { errorMessage } from '../lib/errors';
-  let { deviceName, onpending, onback }: { deviceName: string; onpending: (id: string) => void; onback: () => void } = $props();
+  let { deviceName, onpending, onentered, onback }: { deviceName: string; onpending: (id: string) => void; onentered: (account: import('../lib/backend/types').AccountSummary) => void; onback: () => void } = $props();
   let email = $state('');
   let password = $state('');
   let device = $state('');
@@ -13,7 +13,13 @@
     event.preventDefault();
     if (busy) return;
     busy = true; error = '';
-    try { onpending(await getBackend().signInStart({ email, password, deviceName: device })); }
+    try {
+      const pending = await getBackend().signInStart({ email, password, deviceName: device });
+      // No approval request exists until the saved-kit attempt has finished.
+      const saved = await getBackend().signInSavedKit(pending);
+      if (saved) onentered(saved);
+      else onpending(pending);
+    }
     catch (cause) { error = errorMessage(cause); }
     finally { password = ''; busy = false; }
   }

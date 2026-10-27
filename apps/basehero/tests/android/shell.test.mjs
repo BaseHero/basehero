@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { adb, launch, webview, fold, unfold } from './lib.mjs';
+import { afterLayout } from './geometry.mjs';
 
 test('the app survives folding without restarting', async () => {
   await launch();
@@ -33,11 +34,27 @@ test('hardware Back calls the page hook and resume notifies the live WebView', a
     window.addEventListener('bh:resume', () => { window.__resumeCalls = (window.__resumeCalls ?? 0) + 1; });
   });
   try {
+    // Android consumes Back to dismiss an open IME before the Activity sees it.
+    if (/mInputShown=true/.test(adb('shell', 'dumpsys', 'input_method'))) {
+      adb('shell', 'input', 'keyevent', 'KEYCODE_BACK');
+      assert.match(adb('shell', 'dumpsys', 'input_method'), /mInputShown=false/, 'Back dismissed the IME');
+    }
+    await afterLayout(page);
     adb('shell', 'input', 'keyevent', 'KEYCODE_BACK');
-    await page.waitForFunction(() => window.__backCalls === 1);
+    try { await page.waitForFunction(() => window.__backCalls === 1, null, { timeout: 5000 }); }
+    catch (cause) {
+      const state = await page.evaluate(() => ({ visible: document.visibilityState, origin: performance.timeOrigin,
+        backCalls: window.__backCalls ?? 0, active: document.activeElement?.tagName }));
+      throw new Error(`Back not delivered: ${JSON.stringify(state)}, IME shown: ${/mInputShown=true/.test(adb('shell', 'dumpsys', 'input_method'))}`, { cause });
+    }
     adb('shell', 'input', 'keyevent', 'KEYCODE_HOME');
     await launch();
-    await page.waitForFunction(() => (window.__resumeCalls ?? 0) >= 1);
+    try { await page.waitForFunction(() => (window.__resumeCalls ?? 0) >= 1, null, { timeout: 5000 }); }
+    catch (cause) {
+      const state = await page.evaluate(() => ({ visible: document.visibilityState, origin: performance.timeOrigin,
+        resumeCalls: window.__resumeCalls ?? 0, backCalls: window.__backCalls ?? 0 }));
+      throw new Error(`resume event missing: ${JSON.stringify(state)}`, { cause });
+    }
   } finally {
     await page.context().browser()?.close();
   }

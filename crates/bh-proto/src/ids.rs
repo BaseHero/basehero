@@ -8,9 +8,16 @@ macro_rules! id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, TS)]
         #[ts(export, export_to = "server/src/proto/gen/", type = "string")]
-        pub struct $name(pub [u8; 16]);
+        /// A 16-byte client-generated protocol identifier. JSON serializes it
+        /// as exactly 32 lowercase hexadecimal characters; parsing text also
+        /// accepts uppercase hex.
+        pub struct $name(
+            /// The raw 16-byte identifier.
+            pub [u8; 16],
+        );
 
         impl $name {
+            /// Creates a new identifier using the operating system's random source.
             pub fn random() -> Self {
                 let mut bytes = [0; 16];
                 getrandom::fill(&mut bytes).expect("operating system random source unavailable");
@@ -69,6 +76,7 @@ macro_rules! id {
     };
 }
 
+/// An identifier was not exactly 32 hexadecimal characters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParseIdError;
 

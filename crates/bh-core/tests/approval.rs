@@ -289,6 +289,7 @@ async fn failed_second_install_preserves_the_first_device() {
 
 #[tokio::test]
 async fn concurrent_installs_of_one_account_preserve_the_winner() {
+    bh_testkit::local_only!(); // Asserts a local lock holds through a timed wait.
     use bh_core::{Core, CoreConfig, FileSecretStore, SecretStore};
     use std::sync::{
         Arc, Condvar, Mutex,
@@ -877,6 +878,7 @@ async fn a_second_encapsulation_for_the_same_commitment_is_never_sent() {
 
 #[tokio::test]
 async fn the_exchange_survives_a_server_restart() {
+    bh_testkit::local_only!();
     let mut server = bh_testkit::LocalServer::start();
     let (a, _) = bh_testkit::device_on_server("mac", &Clock::system(), &server)
         .sign_up(bh_core::SignUp {
@@ -931,6 +933,7 @@ async fn a_new_device_retries_a_lost_state_reply_without_losing_its_exchange() {
 
 #[tokio::test]
 async fn a_waiting_new_device_reconnects_when_the_server_restarts() {
+    bh_testkit::local_only!();
     let mut server = bh_testkit::LocalServer::start();
     let (a, _) = bh_testkit::device_on_server("mac", &Clock::system(), &server)
         .sign_up(bh_core::SignUp {
@@ -996,15 +999,21 @@ async fn use_kit_cancels_the_request() {
 
 #[tokio::test]
 async fn a_full_device_hears_a_new_request_without_polling() {
+    bh_testkit::local_only!(); // Remote latency can cross the fallback polling interval.
     let (a, _) = device("mac").sign_up(new_signup()).await.unwrap();
     let mut events = a.events();
+    // The counter matches by prefix, so "v1/approvals" also counts live socket
+    // connects, which are counted before their handshake. Count the two apart.
+    let connects = || request_count(&a, "v1/approvals/live");
+    let lists = || request_count(&a, "v1/approvals") - connects();
+    // Wait for the listener's first list, made once its socket is open.
     wait(async {
-        while request_count(&a, "v1/approvals") == 0 {
+        while lists() == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await;
-    let before = request_count(&a, "v1/approvals");
+    let (lists_before, connects_before) = (lists(), connects());
     let (_, id, new_id) = create_request(&a).await;
     wait(async {
         loop {
@@ -1014,14 +1023,17 @@ async fn a_full_device_hears_a_new_request_without_polling() {
         }
     })
     .await;
+    // One list for the live message; a reconnect, which a loaded machine can
+    // cause, lists again on its own, and that isn't polling.
     assert!(
-        request_count(&a, "v1/approvals") - before <= 1,
+        lists() - lists_before <= 1 + (connects() - connects_before),
         "listener polled unnecessarily"
     );
 }
 
 #[tokio::test]
 async fn a_request_made_while_offline_is_heard_on_reconnect() {
+    bh_testkit::local_only!();
     let mut server = bh_testkit::LocalServer::start();
     let core = bh_testkit::device_on_server("mac", &bh_core::Clock::system(), &server);
     let signup = bh_core::SignUp {
@@ -1112,6 +1124,7 @@ async fn a_declined_request_closes_everywhere() {
 
 #[tokio::test]
 async fn an_idle_request_expires_and_closes_on_a_full_device() {
+    bh_testkit::local_only!(); // Starts a Worker with an accelerated approval TTL.
     let server = bh_testkit::LocalServer::start_with_vars(&[("APPROVAL_TTL_MS", "700")]);
     let core = bh_testkit::device_on_server("mac", &bh_core::Clock::system(), &server);
     let (a, _) = core
@@ -1174,6 +1187,7 @@ async fn an_idle_request_expires_and_closes_on_a_full_device() {
 
 #[tokio::test]
 async fn signing_out_stops_the_listener_and_drops_its_socket() {
+    bh_testkit::local_only!(); // Checks that no retry happens within a local timing window.
     let core = device("mac");
     let (a, _) = core.sign_up(new_signup()).await.unwrap();
     let mut events = a.events();

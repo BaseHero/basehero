@@ -40,6 +40,7 @@ await build({ entryPoints: [resolve(root, 'server/src/index.ts')], outfile: bund
 const mf = new Miniflare({
   modules: true, scriptPath: bundle, modulesRoot: persist,
   compatibilityDate: '2026-08-06', host: '127.0.0.1', port,
+  cf: false, // Local tests use Miniflare's placeholder; never fetch Cloudflare's cf.json.
   durableObjects: Object.fromEntries(['ACCOUNT', 'BASE', 'DIRECTORY', 'INVITES', 'GATEWAY'].map(name =>
     [name, { className: `${name[0]}${name.slice(1).toLowerCase()}DO`, useSQLite: true }])),
   r2Buckets: ['FILES'], bindings: vars,

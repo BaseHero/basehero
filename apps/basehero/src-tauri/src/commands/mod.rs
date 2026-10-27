@@ -3,6 +3,8 @@ pub mod approval;
 pub mod base;
 #[cfg(debug_assertions)]
 pub mod dev_probe;
+pub mod files;
+pub mod hidden;
 pub mod note;
 
 use crate::views::{AppInfo, Platform};

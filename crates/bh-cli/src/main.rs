@@ -1,5 +1,13 @@
+#[path = "commands/export.rs"]
+mod export;
+#[path = "commands/files.rs"]
+mod files;
 #[path = "commands/hero.rs"]
 mod hero;
+#[path = "commands/hidden.rs"]
+mod hidden;
+#[path = "commands/usage.rs"]
+mod usage;
 
 use bh_core::{
     Account, AppCredentials, AppRequest, Base, BaseGrantRequest, Core, CoreConfig, DeviceId,
@@ -10,7 +18,9 @@ use bh_core::{
 #[path = "commands/approve.rs"]
 mod approve;
 use clap::{Parser, Subcommand};
+use files::FileCommand;
 use hero::HeroCommand;
+use hidden::HiddenCommand;
 use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -33,6 +43,8 @@ struct Cli {
     home: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
+    #[arg(long, global = true)]
+    unlock: bool,
     #[arg(long, global = true)]
     app_credentials: Option<PathBuf>,
     #[command(subcommand)]
@@ -69,6 +81,14 @@ enum Command {
         id: String,
     },
     Bases,
+    Usage {
+        #[arg(long)]
+        month: Option<String>,
+    },
+    Hidden {
+        #[command(subcommand)]
+        command: HiddenCommand,
+    },
     Base {
         #[command(subcommand)]
         command: BaseCommand,
@@ -129,6 +149,18 @@ enum Command {
         command: AdminCommand,
     },
     Sync,
+    /// Write a readable plaintext copy of a base. Hidden bases must be unlocked with --unlock; locked bases are not listed.
+    Export {
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Manage attached files.
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
 }
 #[derive(Subcommand)]
 enum BaseCommand {
@@ -215,6 +247,15 @@ fn password() -> Result<Zeroizing<String>> {
             Ok(Zeroizing::new(rpassword::prompt_password("Password: ")?))
         }
         Err(_) => Err(invalid("BH_PASSWORD must be valid UTF-8")),
+    }
+}
+fn hidden_password() -> Result<Zeroizing<String>> {
+    match env::var("BH_HIDDEN_PASSWORD") {
+        Ok(password) => Ok(Zeroizing::new(password)),
+        Err(env::VarError::NotPresent) => Ok(Zeroizing::new(rpassword::prompt_password(
+            "Extra password: ",
+        )?)),
+        Err(_) => Err(invalid("BH_HIDDEN_PASSWORD must be valid UTF-8")),
     }
 }
 fn account(core: &Core) -> Result<Account> {
@@ -318,7 +359,10 @@ async fn watch(account: &Account, json_output: bool) -> Result<Value> {
     account.refresh().await?;
     subscribe(account, &mut subscribed, &mut open_bases)?;
     let (eof_tx, mut eof_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::task::spawn_blocking(move || {
+    // A plain thread, not spawn_blocking: the runtime waits for blocking tasks
+    // when it shuts down, so a read still pending after Ctrl-C would keep the
+    // process alive until the next line of input.
+    std::thread::spawn(move || {
         let mut byte = [0u8];
         while let Ok(n) = io::stdin().read(&mut byte) {
             if n == 0 {
@@ -405,6 +449,42 @@ async fn execute(cli: &Cli) -> Result<Value> {
             return Err(invalid("app credentials do not match this home"));
         }
     }
+    let unlocked = if cli.unlock {
+        let account = account(&core)?;
+        let result = match hidden_password() {
+            Ok(password) => account.unlock_hidden(password).await.map(|_| ()),
+            Err(error) => {
+                account.lock_all_hidden().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = result {
+            account.lock_all_hidden().await;
+            return Err(Box::new(error));
+        }
+        Some(account)
+    } else {
+        None
+    };
+    // Ctrl-C in watch must return through the same lock path as errors and EOF.
+    let result = if cli.unlock && matches!(cli.command, Command::Watch) {
+        tokio::select! {
+            result = execute_command(core.clone(), cli) => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                Ok(Value::Null)
+            }
+        }
+    } else {
+        execute_command(core.clone(), cli).await
+    };
+    if let Some(account) = unlocked {
+        account.lock_all_hidden().await;
+    }
+    result
+}
+
+async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
     match &cli.command {
         Command::Signup {
             server,
@@ -473,12 +553,26 @@ async fn execute(cli: &Cli) -> Result<Value> {
             approve::approve(&account(&core)?, id.as_deref(), cli.json).await
         }
         Command::Decline { id } => approve::decline(&account(&core)?, id).await,
-        Command::Bases => Ok(serde_json::to_value(account(&core)?.bases())?),
+        Command::Bases => hidden::summaries(account(&core)?.bases()),
+        Command::Usage { month } => {
+            let account = account(&core)?;
+            let report = account.usage(month.as_deref()).await?;
+            let selected = month
+                .as_deref()
+                .or_else(|| report.days.first().map(|r| &r.period[..7]))
+                .or_else(|| report.months.last().map(|r| r.period.as_str()))
+                .unwrap_or("this month");
+            if !cli.json {
+                print!("{}", usage::format(&report, selected));
+            }
+            Ok(usage::json(&report, selected))
+        }
+        Command::Hidden { command } => hidden::execute(&account(&core)?, command).await,
         Command::Base {
             command: BaseCommand::Create { name },
         } => {
             let base = account(&core)?.create_base(name).await?;
-            Ok(json!({ "id": base.id(), "name": base.name() }))
+            Ok(json!({ "id": base.id(), "name": approve::terminal_device_name(&base.name()) }))
         }
         Command::Ls { base, parent } => {
             let base = selected_base(&account(&core)?, base.as_deref())?;
@@ -700,6 +794,8 @@ async fn execute(cli: &Cli) -> Result<Value> {
             }
             Ok(serde_json::to_value(records)?)
         }
+        Command::Export { base, out } => export::execute(&core, base, out).await,
+        Command::File { command } => files::execute(&core, command),
         Command::Watch => watch(&account(&core)?, cli.json).await,
         Command::Sync => {
             let account = account(&core)?;
@@ -753,7 +849,7 @@ async fn main() {
                 email, kit: None, ..
             } => println!("Signed in as {email}."),
             Command::Approve { .. } => {}
-            Command::Watch => {}
+            Command::Watch | Command::Usage { .. } => {}
             Command::Device {
                 command: DeviceCommand::Remove { .. },
             } if value["localCopyErased"] == true => {
@@ -771,6 +867,10 @@ async fn main() {
         Err(error) => {
             let message = match error.downcast_ref::<Error>() {
                 Some(Error::ApprovalEnded(reason)) => Some(approval_end_message(*reason)),
+                Some(Error::NothingUnlocked) if cli.json => {
+                    println!("{}", json!({ "kind": "NothingUnlocked" }));
+                    std::process::exit(1);
+                }
                 _ => None,
             };
             let formatted = message.unwrap_or("");

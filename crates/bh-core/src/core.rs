@@ -21,23 +21,38 @@ use std::time::Duration;
 use url::Url;
 use zeroize::Zeroizing;
 
+/// Local storage and secret provider for one core. Only one open core may use
+/// a data directory at a time.
 pub struct CoreConfig {
+    /// Directory for encrypted account and base stores.
     pub data_dir: PathBuf,
+    /// Storage for device keys and tokens, separate from the databases.
     pub secrets: Arc<dyn SecretStore>,
 }
 
+/// Details for creating a full-device account; the password is zeroized on drop.
 pub struct SignUp {
+    /// Cloud endpoint for this account.
     pub server: Url,
+    /// Invite code accepted by that endpoint.
     pub invite: String,
+    /// Account email address.
     pub email: String,
+    /// Account password, kept in zeroizing memory.
     pub password: Zeroizing<String>,
+    /// Display name of this device.
     pub device_name: String,
 }
 
+/// Details for signing in a full device; the password is zeroized on drop.
 pub struct SignIn {
+    /// Cloud endpoint where the account lives.
     pub server: Url,
+    /// Existing account email address.
     pub email: String,
+    /// Account password, kept in zeroizing memory.
     pub password: Zeroizing<String>,
+    /// Display name of this device.
     pub device_name: String,
 }
 
@@ -210,6 +225,8 @@ impl Shared {
     }
 }
 
+/// Owns local accounts and background sync. Clones share its runtime and stores;
+/// dropping the last handle stops the runtime.
 #[derive(Clone)]
 pub struct Core {
     shared: Arc<Shared>,
@@ -220,6 +237,11 @@ impl Core {
     /// Opens the core on `config.data_dir`, which one core at a time may use:
     /// a second open, in this process or another, fails until the first core
     /// and its accounts and bases are dropped.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] for an occupied or unreadable directory or
+    /// secret store, [`Error::Crypto`] for unreadable keys, or [`Error::Network`]
+    /// if the runtime cannot start.
     pub fn open(config: CoreConfig) -> Result<Core, Error> {
         Self::open_with_clock(config, Clock::system())
     }
@@ -232,6 +254,10 @@ impl Core {
         self.shared.runtime.stop();
     }
 
+    /// Opens a core with an explicit clock, for controlled time in tests.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::open`].
     pub fn open_with_clock(config: CoreConfig, clock: Clock) -> Result<Core, Error> {
         std::fs::create_dir_all(&config.data_dir)?;
         let lock = std::fs::File::create(config.data_dir.join(".lock"))?;
@@ -303,6 +329,7 @@ impl Core {
         Ok(Core { shared, accounts })
     }
 
+    /// Lists locally installed accounts without contacting the network.
     pub fn accounts(&self) -> Vec<AccountSummary> {
         let mut list: Vec<_> = self
             .accounts
@@ -315,6 +342,10 @@ impl Core {
         list
     }
 
+    /// Returns an installed account by ID, without contacting the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if this core has not installed the account.
     pub fn account(&self, id: AccountId) -> Result<Account, Error> {
         self.accounts
             .lock()
@@ -326,6 +357,28 @@ impl Core {
 
     /// Installs credentials returned by a full device's app connection. Needs
     /// the network to fetch only the bases this app was granted.
+    ///
+    /// Save the granted base IDs before moving the credentials; they appear in
+    /// the same order as the grants in the connection request.
+    ///
+    /// ```no_run
+    /// use bh_core::{AppCredentials, Core, CoreConfig, Error};
+    /// async fn install(core: &Core, credentials_json: &str) -> Result<(), Error> {
+    ///     let credentials: AppCredentials = serde_json::from_str(credentials_json)
+    ///         .map_err(|e| Error::Invalid(e.to_string()))?;
+    ///     let bases = credentials.bases.clone();
+    ///     let account = core.install_app(credentials).await?;
+    ///     let first_base = account.base(bases[0])?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for malformed credentials or an already
+    /// installed account, [`Error::Forbidden`] if they do not identify an app
+    /// device, [`Error::Network`] on connection failure, and errors from the
+    /// server ([`Error::Unauthorized`], [`Error::Revoked`], [`Error::NeedsUpdate`])
+    /// or the local store ([`Error::Storage`], [`Error::Crypto`]).
     pub async fn install_app(&self, creds: AppCredentials) -> Result<Account, Error> {
         let core = self.clone();
         self.shared
@@ -391,6 +444,12 @@ impl Core {
             .await
     }
 
+    /// Creates a full account and installs it locally; needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for bad input, [`Error::Conflict`] for a used
+    /// invite or email, [`Error::Network`] for a connection failure, or
+    /// [`Error::Storage`] / [`Error::Crypto`] for local key or store failures.
     pub async fn sign_up(&self, req: SignUp) -> Result<(Account, RecoveryKit), Error> {
         let core = self.clone();
         self.shared
@@ -398,6 +457,13 @@ impl Core {
             .await
     }
 
+    /// Checks a full device's password and starts sign-in; needs the network.
+    /// Finish via [`PendingSignIn::with_kit`] or an approval request.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for bad input, [`Error::BadCredentials`] for
+    /// an incorrect password, [`Error::Network`] for connection failure, or
+    /// [`Error::Storage`] for a local store error.
     pub async fn sign_in(&self, req: SignIn) -> Result<PendingSignIn, Error> {
         let core = self.clone();
         self.shared
@@ -422,6 +488,7 @@ impl Core {
             &keys::account_key_aad(&account_id),
             account_key.expose(),
         );
+        let envelope_hash = account::envelope_hash(&envelope);
         let activation_hash = bh_crypto::sha256(keys::activation(&account_key).expose());
         let response = self
             .shared
@@ -452,8 +519,12 @@ impl Core {
         )?;
         // The account exists now, so the kit must reach the user: an unnamed
         // device is the lesser loss if the name can't be written.
+        let copy = kit.clone();
         let _ = account
-            .update_data(move |data| account::set_device_name(data, device_id, &device_name))
+            .update_data(move |data| {
+                account::set_device_name(data, device_id, &device_name);
+                account::set_kit(data, &copy, false, &envelope_hash);
+            })
             .await;
         Ok((account, kit))
     }
@@ -583,6 +654,7 @@ impl Core {
     }
 
     #[cfg(feature = "test-support")]
+    /// Test-only fault that makes the next local erasure fail.
     pub fn test_fail_next_erase(&self) {
         self.shared
             .fail_next_erase
@@ -590,6 +662,7 @@ impl Core {
     }
 
     #[cfg(feature = "test-support")]
+    /// Test-only fault injected into the core's next matching HTTP requests.
     pub fn inject_fault(&self, fault: crate::client::Fault) {
         self.shared.faults.lock().unwrap().push(fault);
     }
@@ -677,6 +750,12 @@ impl std::fmt::Debug for PendingSignIn {
 }
 
 impl PendingSignIn {
+    /// The account being signed into; available after the password step without
+    /// making an approval request or contacting the network.
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
     pub(crate) fn clock(&self) -> Clock {
         self.core.shared.clock.clone()
     }
@@ -687,7 +766,12 @@ impl PendingSignIn {
 
     /// Opens the account key with the kit and activates this device. A wrong
     /// kit leaves the sign-in usable; after success this returns
-    /// `Err(Error::Invalid("signed in"))`.
+    /// `Err(Error::Invalid("signed in"))`. Needs the network to activate the device.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadKit`] for a wrong kit, [`Error::Invalid`] if already
+    /// signed in, [`Error::Network`] for connection failure, and server or store
+    /// errors including [`Error::Revoked`], [`Error::Storage`] and [`Error::Crypto`].
     pub async fn with_kit(&self, kit: &str) -> Result<Account, Error> {
         if *self.completion.lock().await {
             return Err(Error::invalid("signed in"));
@@ -703,7 +787,34 @@ impl PendingSignIn {
             other => other,
         })?;
         let account_key = Secret::<32>::from_slice(&account_key).map_err(|_| Error::BadKit)?;
-        self.snapshot().finish(account_key).await
+        let account = self.snapshot().finish(account_key).await?;
+        // Activation succeeded: failing to record the typed kit must not hide
+        // the installed account. The person still has the kit they just used.
+        let copy = kit.clone();
+        let opened_hash = account::envelope_hash(&self.envelope);
+        let _ = account
+            .update_data_with_envelope(move |data, current_hash| {
+                // A rotation between this GET and the data PUT remains a small race.
+                if current_hash != opened_hash {
+                    return false;
+                }
+                let current = data
+                    .get("kit")
+                    .filter(|v| {
+                        v.get("envelope").and_then(serde_json::Value::as_str) == Some(current_hash)
+                    })
+                    .and_then(|v| v.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| RecoveryKit::parse(text).ok());
+                if current.as_ref() != Some(&copy) {
+                    account::set_kit(data, &copy, true, current_hash);
+                    true
+                } else {
+                    false
+                }
+            })
+            .await;
+        Ok(account)
     }
 
     pub(crate) fn snapshot(&self) -> PendingSignIn {

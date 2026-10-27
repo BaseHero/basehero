@@ -599,7 +599,7 @@ fn migrating_a_version_2_store_adds_search() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
     assert_eq!(base.search("ferry", 10).unwrap()[0].id, id);
 }

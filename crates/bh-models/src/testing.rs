@@ -89,24 +89,39 @@ fn encrypted(secret: &[u8], enc: &[u8], bytes: &[u8]) -> Vec<u8> {
     framed
 }
 
+/// Gateway request captured by a test enclave for assertions.
 #[derive(Clone, Debug)]
 pub struct SeenRequest {
+    /// Original upstream URL forwarded by the gateway.
     pub original_url: String,
+    /// Captured request headers.
     pub headers: BTreeMap<String, String>,
+    /// Encrypted request body.
     pub body: Vec<u8>,
+    /// Opened JSON payload, when decryptable.
     pub plaintext: Option<Value>,
 }
+/// Reply a local test enclave gives for its next request.
 pub enum EnclaveReply {
+    /// Encrypt a completion JSON value.
     Completion(Value),
+    /// Return an HTTP status without a completion.
     Status(u16),
+    /// Redirect to another URL.
     Redirect(String),
+    /// Report an enclave key mismatch.
     KeyMismatch,
+    /// Leave the request unanswered.
     Hang,
+    /// Corrupt an encrypted completion.
     Corrupted(Value),
     /// Unencrypted fixture response for testing gateway byte/header fidelity.
     Raw {
+        /// HTTP status for the fixture response.
         status: u16,
+        /// Response headers.
         headers: Vec<(String, String)>,
+        /// Response body bytes.
         body: Vec<u8>,
     },
 }
@@ -115,6 +130,7 @@ struct Fixture {
     replies: Mutex<VecDeque<EnclaveReply>>,
     seen: Mutex<Vec<SeenRequest>>,
 }
+/// Local HTTP enclave fixture; stopping it joins its server thread.
 pub struct TestEnclave {
     url: Url,
     state: Arc<Fixture>,
@@ -122,6 +138,7 @@ pub struct TestEnclave {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl TestEnclave {
+    /// Starts an enclave fixture on an ephemeral loopback port.
     pub fn start() -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -157,15 +174,19 @@ impl TestEnclave {
             thread: Some(thread),
         }
     }
+    /// Base URL of this test server.
     pub fn url(&self) -> Url {
         self.url.clone()
     }
+    /// Hex-encoded public key used by the fixture.
     pub fn key_hex(&self) -> String {
         hex::encode(self.state.enclave.public.to_bytes())
     }
+    /// Queues the next response.
     pub fn reply(&self, reply: EnclaveReply) {
         self.state.replies.lock().unwrap().push_back(reply);
     }
+    /// Returns captured requests in arrival order.
     pub fn requests(&self) -> Vec<SeenRequest> {
         self.state.seen.lock().unwrap().clone()
     }
@@ -248,22 +269,29 @@ async fn serve(State(state): State<Arc<Fixture>>, headers: HeaderMap, body: Byte
     }
 }
 
+/// Response scripted for one synthetic model call.
 pub enum Scripted {
+    /// Produce a completion.
     Reply(Completion),
+    /// Produce a typed error.
     Fail(ModelError),
+    /// Wait indefinitely.
     Hang,
 }
+/// Local model fixture that records requests and consumes queued responses.
 pub struct ScriptedModel {
     replies: Mutex<VecDeque<Scripted>>,
     requests: Mutex<Vec<ChatRequest>>,
 }
 impl ScriptedModel {
+    /// Creates a model with responses consumed in order.
     pub fn new(replies: Vec<Scripted>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into()),
             requests: Mutex::new(vec![]),
         })
     }
+    /// Returns all captured completion requests.
     pub fn requests(&self) -> Vec<ChatRequest> {
         self.requests.lock().unwrap().clone()
     }

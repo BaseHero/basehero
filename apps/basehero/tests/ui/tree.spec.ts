@@ -5,7 +5,7 @@ async function setup(page: Page, platform?: string) {
   const r = await page.evaluate(async () => {
     const account = await window.__fake.signUp({ invite: 'WELCOME', email: 'dan@example.com', password: 'password', deviceName: 'Mac' });
     const base = await window.__fake.createBase(account.account.id, 'Personal');
-    await window.__fake.setKitSaved(account.account.id);
+    await window.__fake.setKitSaved(account.account.id, account.kit);
     return { account: account.account.id, base: base.id };
   });
   await page.evaluate(ref => { location.hash = `#/a/${ref.account}/b/${ref.base}`; }, r);

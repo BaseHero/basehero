@@ -5,19 +5,28 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::time::Instant;
 
+/// Result of the two synthetic completion checks, including their timing.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProbeResult {
+    /// Whether both synthetic checks succeeded.
     pub ok: bool,
     /// A Tinfoil model completes only after attestation verification.
     pub verified: bool,
+    /// First completion's text.
     pub text: Option<String>,
+    /// Tool called in the second completion.
     pub tool: String,
+    /// Parsed arguments of that tool call.
     pub tool_args: Value,
+    /// Milliseconds for each of the two calls.
     pub ms: Vec<u64>,
 }
+/// Probe failure with the number of the call that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeFailure {
+    /// First or second completion (1 or 2).
     pub step: u8,
+    /// Typed model failure.
     pub error: ModelError,
 }
 
@@ -35,6 +44,12 @@ fn ask(text: &str) -> ChatRequest {
     }
 }
 
+/// Checks a text reply and a tool call with short synthetic prompts. A live
+/// model needs the network; a scripted model can answer locally.
+///
+/// # Errors
+/// Returns [`ProbeFailure`] containing a [`ModelError`] for a failed call
+/// or unexpected completion.
 pub async fn probe(model: &dyn ChatModel) -> Result<ProbeResult, ProbeFailure> {
     let fail = |step, error| ProbeFailure { step, error };
     let start = Instant::now();

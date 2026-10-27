@@ -25,7 +25,9 @@ const TITLE_NODES: usize = 256;
 /// edits, 1 is Hero; editors pick other values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteUpdate {
+    /// Editor identifier, or zero for sync and core edits.
     pub origin: u64,
+    /// Yjs v1 update bytes to apply to another document.
     pub update: Vec<u8>,
 }
 
@@ -33,8 +35,9 @@ pub struct NoteUpdate {
 pub(crate) struct Live {
     pub id: ObjectId,
     pub ty: String,
-    pub doc: Doc,
-    pub events: broadcast::Sender<NoteUpdate>,
+    pub doc: Mutex<Doc>,
+    pub events: Mutex<Option<broadcast::Sender<NoteUpdate>>>,
+    closed: std::sync::atomic::AtomicBool,
     /// Local updates in `doc` that a failed save didn't store; the next save
     /// puts them in the outbox with its own.
     pub unsaved: Mutex<Vec<Vec<u8>>>,
@@ -45,18 +48,31 @@ impl Live {
         Self {
             id,
             ty,
-            doc,
-            events: broadcast::channel(256).0,
+            doc: Mutex::new(doc),
+            events: Mutex::new(Some(broadcast::channel(256).0)),
+            closed: std::sync::atomic::AtomicBool::new(false),
             unsaved: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn publish(&self, origin: u64, update: &[u8]) {
-        // No subscribers is fine.
-        let _ = self.events.send(NoteUpdate {
-            origin,
-            update: update.to_vec(),
-        });
+        if let Some(events) = self.events.lock().unwrap().as_ref() {
+            let _ = events.send(NoteUpdate {
+                origin,
+                update: update.to_vec(),
+            });
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.events.lock().unwrap().take();
+        *self.doc.lock().unwrap() = Doc::new();
+        self.unsaved.lock().unwrap().clear();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -81,6 +97,7 @@ impl NoteDoc {
         Self { base, live }
     }
 
+    /// Identifier of the object holding this document.
     pub fn id(&self) -> ObjectId {
         self.live.id
     }
@@ -89,6 +106,8 @@ impl NoteDoc {
     pub fn state(&self) -> Vec<u8> {
         self.live
             .doc
+            .lock()
+            .unwrap()
             .transact()
             .encode_state_as_update_v1(&StateVector::default())
     }
@@ -96,17 +115,35 @@ impl NoteDoc {
     /// Applies a local edit and stores it, with its update in the outbox. If
     /// storing fails, the edit stays in this document and is stored with the
     /// next one.
+    ///
+    /// # Errors
+    /// Returns [`Error::ReadOnly`] or [`Error::Revoked`] if writes are blocked,
+    /// [`Error::Invalid`] for an invalid update, [`Error::TooLarge`] if too
+    /// large, [`Error::NeedsUpdate`] for an unsupported object, or
+    /// [`Error::Storage`] if the local save fails.
     pub fn apply(&self, origin: u64, update: &[u8]) -> Result<(), Error> {
         self.base.apply_local(&self.live, origin, update)
     }
 
+    /// Subscribes to local and remote document updates; reload after lag.
     pub fn subscribe(&self) -> broadcast::Receiver<NoteUpdate> {
-        self.live.events.subscribe()
+        self.live.events.lock().unwrap().as_ref().map_or_else(
+            || {
+                let (sender, receiver) = broadcast::channel(1);
+                drop(sender);
+                receiver
+            },
+            |events| events.subscribe(),
+        )
     }
 
     /// A note's first nonempty paragraph or heading; a folder's or project's name.
     pub fn title(&self) -> String {
-        let txn = self.live.doc.transact();
+        if self.live.is_closed() {
+            return String::new();
+        }
+        let doc = self.live.doc.lock().unwrap();
+        let txn = doc.transact();
         if self.live.ty == NOTE {
             body_title(&txn)
         } else {
@@ -116,7 +153,10 @@ impl NoteDoc {
 
     /// The body's plain text, a line for each paragraph or heading.
     pub fn text(&self) -> String {
-        body_text(&self.live.doc.transact())
+        if self.live.is_closed() {
+            return String::new();
+        }
+        body_text(&self.live.doc.lock().unwrap().transact())
     }
 }
 

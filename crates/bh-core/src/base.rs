@@ -2,6 +2,9 @@
 
 use crate::client::Api;
 use crate::envelope::{self, Aad, Purpose};
+use crate::files::{
+    self, Downloader, FILE_MAX, FILE_PART, FileInfo, FileStatus, Image, NewFile, Uploader,
+};
 use crate::note::{self, Live, NoteDoc};
 use crate::objects::{self, Meta, NewObject, ObjectSummary};
 use crate::query::{self, Query};
@@ -34,8 +37,11 @@ pub(crate) const EPOCH: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+/// Permission granted to a device for one base. Read-only bases refuse local edits.
 pub enum Mode {
+    /// May read and write records.
     ReadWrite,
+    /// May read records, but writes return [`Error::ReadOnly`].
     ReadOnly,
 }
 
@@ -45,10 +51,13 @@ pub enum Mode {
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub struct BaseSummary {
     #[ts(type = "string")]
+    /// Identifier used to open the base.
     pub id: BaseId,
+    /// Name from the base's local information object.
     pub name: String,
+    /// This device's access mode.
     pub mode: Mode,
-    /// Always false in this version.
+    /// Whether this base is hidden and currently unlocked.
     pub hidden: bool,
 }
 
@@ -81,9 +90,38 @@ pub struct Base {
 #[derive(Clone)]
 pub(crate) struct BaseWeak(Weak<Inner>);
 
+pub(crate) struct OpenStore(Option<BaseDb>);
+impl std::ops::Deref for OpenStore {
+    type Target = BaseDb;
+    fn deref(&self) -> &BaseDb {
+        self.0.as_ref().expect("closed store")
+    }
+}
+impl std::ops::DerefMut for OpenStore {
+    fn deref_mut(&mut self) -> &mut BaseDb {
+        self.0.as_mut().expect("closed store")
+    }
+}
+struct KeyGuard<'a>(MutexGuard<'a, Option<BaseKey>>);
+impl std::ops::Deref for KeyGuard<'_> {
+    type Target = BaseKey;
+    fn deref(&self) -> &BaseKey {
+        self.0.as_ref().expect("closed key")
+    }
+}
+fn closed_receiver<T: Clone>() -> broadcast::Receiver<T> {
+    let (sender, receiver) = broadcast::channel(1);
+    drop(sender);
+    receiver
+}
+
 impl BaseWeak {
     pub(crate) fn upgrade(&self) -> Option<Base> {
         self.0.upgrade().map(|inner| Base { inner })
+    }
+
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -91,18 +129,29 @@ struct Inner {
     id: BaseId,
     mode: Mode,
     device: Option<DeviceId>,
-    key: BaseKey,
+    full: std::sync::atomic::AtomicBool,
+    key: Mutex<Option<BaseKey>>,
     /// The yrs client ID of this process's core edits, used only under the
     /// store lock against the stored state, so its clock never repeats.
     client: u64,
-    db: Mutex<BaseDb>,
+    db: Mutex<OpenStore>,
+    parts_root: std::path::PathBuf,
     /// Absent only for standalone test-kit bases.
     removal: OnceLock<Arc<AtomicU8>>,
     /// Open documents, one per object; always lock `db` first.
     live: Mutex<HashMap<ObjectId, Weak<Live>>>,
-    events: broadcast::Sender<BaseEvent>,
+    events: Mutex<Option<broadcast::Sender<BaseEvent>>>,
+    closed: std::sync::atomic::AtomicBool,
     /// The sync task, for a base that has a server.
     sync: OnceLock<SyncTask>,
+    uploader: OnceLock<Uploader>,
+    downloader: OnceLock<Downloader>,
+    file_api: OnceLock<Api>,
+    download_lock: tokio::sync::Mutex<()>,
+    downloads_stopped: std::sync::atomic::AtomicBool,
+    download_stop: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "test-support")]
+    held_on_demand_get: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     #[cfg(feature = "test-support")]
     fail_next_save: std::sync::atomic::AtomicBool,
 }
@@ -114,6 +163,12 @@ impl std::fmt::Debug for Base {
             .field("mode", &self.inner.mode)
             .finish_non_exhaustive()
     }
+}
+
+fn decode_file_key(encoded: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Crypto)
 }
 
 fn now_ms() -> i64 {
@@ -174,7 +229,7 @@ impl Base {
         Ok(base)
     }
 
-    fn open_store(
+    pub(crate) fn open_store(
         path: &Path,
         db_key: &[u8],
         id: BaseId,
@@ -188,19 +243,30 @@ impl Base {
                 id,
                 mode,
                 device,
-                key,
+                full: std::sync::atomic::AtomicBool::new(true),
+                key: Mutex::new(Some(key)),
                 client: u64::from(u32::from_le_bytes(bh_crypto::random::<4>())),
-                db: Mutex::new(db),
+                db: Mutex::new(OpenStore(Some(db))),
+                parts_root: files::part_root(path),
                 removal: OnceLock::new(),
                 live: Mutex::new(HashMap::new()),
-                events: broadcast::channel(256).0,
+                events: Mutex::new(Some(broadcast::channel(256).0)),
+                closed: std::sync::atomic::AtomicBool::new(false),
                 sync: OnceLock::new(),
+                uploader: OnceLock::new(),
+                downloader: OnceLock::new(),
+                file_api: OnceLock::new(),
+                download_lock: tokio::sync::Mutex::new(()),
+                downloads_stopped: std::sync::atomic::AtomicBool::new(false),
+                download_stop: tokio::sync::watch::channel(false).0,
+                #[cfg(feature = "test-support")]
+                held_on_demand_get: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 fail_next_save: Default::default(),
             }),
         };
-        if base.db().needs_search_backfill() {
-            let mut db = base.db();
+        if base.db()?.needs_search_backfill() {
+            let mut db = base.db()?;
             db.migrate_search(|db| {
                 for (id, state) in db.objects_for_backfill()? {
                     let doc = base.load(&state)?;
@@ -214,6 +280,7 @@ impl Base {
                 Ok(())
             })?;
         }
+        files::cleanup(&base, &base.inner.parts_root)?;
         Ok(base)
     }
 
@@ -230,10 +297,40 @@ impl Base {
         Self::open_store(&path, db_key.expose(), id, key, Mode::ReadWrite, None)
     }
 
+    pub(crate) fn set_full(&self, full: bool) {
+        self.inner.full.store(full, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_removal(&self, removal: Arc<AtomicU8>) {
+        self.inner.removal.set(removal).ok();
+    }
+
+    /// Ends background work, closes the encrypted store, and wipes the base key
+    /// even if callers still hold cloned handles.
+    pub(crate) async fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.stop_sync().await;
+        let _downloads = self.inner.download_lock.lock().await;
+        let mut db = crate::store::in_use(&self.inner.db);
+        for weak in lock(&self.inner.live).drain().map(|(_, weak)| weak) {
+            if let Some(live) = weak.upgrade() {
+                live.close();
+            }
+        }
+        self.inner.events.lock().unwrap().take();
+        self.inner.key.lock().unwrap().take();
+        db.0.take();
+    }
+
+    fn key(&self) -> KeyGuard<'_> {
+        KeyGuard(lock(&self.inner.key))
+    }
+
     pub(crate) fn downgrade(&self) -> BaseWeak {
         BaseWeak(Arc::downgrade(&self.inner))
     }
 
+    /// This base's stable identifier.
     pub fn id(&self) -> BaseId {
         self.inner.id
     }
@@ -247,19 +344,344 @@ impl Base {
             .unwrap_or_default()
     }
 
+    /// Access mode granted to this device.
     pub fn mode(&self) -> Mode {
         self.inner.mode
     }
 
-    pub(crate) fn db(&self) -> crate::store::InUse<'_, BaseDb> {
-        crate::store::in_use(&self.inner.db)
+    pub(crate) fn db(&self) -> Result<crate::store::InUse<'_, OpenStore>, Error> {
+        let db = crate::store::in_use(&self.inner.db);
+        if db.0.is_none() {
+            Err(Error::NotFound)
+        } else {
+            Ok(db)
+        }
     }
 
-    /// Stops background sync before the account's local stores are erased.
+    /// Adds a file locally, sealing each part with its own positional key and
+    /// persisting every sealed byte before queuing upload. No network is needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::TooLarge`] before writing for content over 100 MiB,
+    /// [`Error::ReadOnly`] or [`Error::Revoked`] when writes are blocked,
+    /// [`Error::NotFound`] for a missing parent, [`Error::Invalid`] for an
+    /// invalid parent, or [`Error::Storage`] if local persistence fails.
+    pub fn add_file(&self, new: NewFile, content: &[u8]) -> Result<ObjectId, Error> {
+        if content.len() as u64 > FILE_MAX {
+            return Err(Error::TooLarge);
+        }
+        self.writable()?;
+        let mut db = self.db()?;
+        if let Some(parent) = new.parent {
+            let s = db.summary(parent)?.ok_or(Error::NotFound)?;
+            if s.deleted || !matches!(s.ty.name.as_str(), NOTE | FOLDER | PROJECT) {
+                return Err(Error::invalid(
+                    "file parent must be a note, folder or project",
+                ));
+            }
+        }
+        let id = ObjectId::random();
+        let fk = Secret::<32>::random();
+        let count = files::parts(content.len() as u64);
+        let root = &self.inner.parts_root;
+        std::fs::create_dir_all(root)?;
+        let tmp = root.join(format!("{id}.tmp"));
+        let dir = root.join(id.to_string());
+        std::fs::create_dir(&tmp)?;
+        let result = (|| -> Result<(), Error> {
+            for n in 0..count {
+                let start = n as usize * FILE_PART;
+                let end = content.len().min(start + FILE_PART);
+                std::fs::write(
+                    tmp.join(n.to_string()),
+                    files::seal_part(&fk, self.id(), id, n, &content[start..end]),
+                )?;
+            }
+            std::fs::rename(&tmp, &dir)?;
+            let fields = Map::from_iter([
+                ("name".into(), Value::from(new.name)),
+                ("mime".into(), Value::from(new.mime)),
+                ("size".into(), Value::from(content.len() as u64)),
+                ("key".into(), Value::from(files::key_text(&fk))),
+            ]);
+            let position = self.place(&db, None, new.parent, None, true)?;
+            db.batch(|db| {
+                self.insert(
+                    db,
+                    id,
+                    &TypeRef::new(types::FILE, 1),
+                    new.parent,
+                    &position,
+                    &fields,
+                )?;
+                db.put_file(id, count)
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        drop(db);
+        result?;
+        self.emit(BaseEvent::FilesChanged(vec![id]));
+        if let Some(uploader) = self.inner.uploader.get() {
+            uploader.changed();
+        }
+        Ok(id)
+    }
+
+    /// The local metadata and availability of a file, or `None` for another
+    /// type or an unknown ID. No network is needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for a closed base, [`Error::NeedsUpdate`]
+    /// for a newer format, or [`Error::Storage`] for unreadable local data.
+    pub fn file(&self, id: ObjectId) -> Result<Option<FileInfo>, Error> {
+        let Some(summary) = self.get(id)? else {
+            return Ok(None);
+        };
+        if summary.ty.name != types::FILE {
+            return Ok(None);
+        }
+        let fields = &summary.fields;
+        let size = fields
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or(Error::NeedsUpdate)?;
+        let name = fields
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(Error::NeedsUpdate)?
+            .to_owned();
+        let mime = fields
+            .get("mime")
+            .and_then(Value::as_str)
+            .ok_or(Error::NeedsUpdate)?
+            .to_owned();
+        if size > FILE_MAX {
+            return Err(Error::Crypto);
+        }
+        let count = files::parts(size);
+        let row = self.db()?.file_row(id)?;
+        let status = match row {
+            Some(ref row) if row.sent.is_some_and(|sent| sent < count) => FileStatus::Sending {
+                done: row.sent.unwrap(),
+                parts: count,
+            },
+            Some(ref row) if row.have == count => FileStatus::Here,
+            Some(ref row) if row.broken.is_some() => FileStatus::Broken,
+            _ if fields.get("uploaded") != Some(&Value::Bool(true)) => FileStatus::Waiting,
+            _ if self.inner.full.load(Ordering::SeqCst) => FileStatus::Fetching {
+                done: row.map_or(0, |r| r.have),
+                parts: count,
+            },
+            _ => FileStatus::Remote,
+        };
+        Ok(Some(FileInfo {
+            id,
+            parent: summary.parent,
+            name,
+            mime,
+            size,
+            status,
+        }))
+    }
+
+    /// Download missing parts, authenticating each and checking the expected
+    /// plaintext length before it becomes part of the local sealed copy.
+    pub(crate) async fn download_file(&self, id: ObjectId, api: &Api) -> Result<(), Error> {
+        let mut stop = self.inner.download_stop.subscribe();
+        let _guard = self.inner.download_lock.lock().await;
+        if *stop.borrow() {
+            return Err(Error::NotFound);
+        }
+        let info = self.file(id)?.ok_or(Error::NotFound)?;
+        match info.status {
+            FileStatus::Here => return Ok(()),
+            FileStatus::Broken => return Err(Error::Crypto),
+            FileStatus::Waiting | FileStatus::Sending { .. } => return Err(Error::NotFound),
+            _ => {}
+        }
+        let object = self.get(id)?.ok_or(Error::NotFound)?;
+        let encoded = object
+            .fields
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(Error::NeedsUpdate)?;
+        let decoded = decode_file_key(encoded)?;
+        let fk = Secret::<32>::from_slice(&decoded).map_err(|_| Error::Crypto)?;
+        let count = files::parts(info.size);
+        if info.size > FILE_MAX {
+            return Err(Error::Crypto);
+        }
+        let root = self.inner.parts_root.join(id.to_string());
+        std::fs::create_dir_all(&root)?;
+        let have = self.db()?.file_row(id)?.map_or(0, |row| row.have);
+        // A crash can leave bytes ahead of the SQL progress record. Never trust
+        // either: authenticate persisted parts again on every read or resume.
+        for n in 0..count {
+            let expected =
+                (info.size - u64::from(n) * FILE_PART as u64).min(FILE_PART as u64) as usize;
+            if n < have {
+                let plain = std::fs::read(root.join(n.to_string()))
+                    .map_err(|_| Error::Crypto)
+                    .and_then(|bytes| files::open_part(&fk, self.id(), id, n, &bytes));
+                if !plain.as_ref().is_ok_and(|part| part.len() == expected) {
+                    self.db()?.file_broken(id, count)?;
+                    self.emit(BaseEvent::FilesChanged(vec![id]));
+                    return Err(Error::Crypto);
+                }
+                continue;
+            }
+            let get = async {
+                #[cfg(feature = "test-support")]
+                {
+                    let held = { lock(&self.inner.held_on_demand_get).take() };
+                    if let Some(held) = held {
+                        held.store(true, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                }
+                api.get_file_part(self.id(), id, n).await
+            };
+            let sealed = tokio::select! {
+                biased;
+                _ = stop.changed() => return Err(Error::NotFound),
+                result = get => result?,
+            };
+            let plain = match files::open_part(&fk, self.id(), id, n, &sealed) {
+                Ok(plain) if plain.len() == expected => plain,
+                _ => {
+                    self.db()?.file_broken(id, count)?;
+                    self.emit(BaseEvent::FilesChanged(vec![id]));
+                    return Err(Error::Crypto);
+                }
+            };
+            drop(plain);
+            let tmp = root.join(format!("{n}.tmp"));
+            std::fs::write(&tmp, sealed)?;
+            std::fs::rename(tmp, root.join(n.to_string()))?;
+            self.db()?.file_received(id, count, n + 1)?;
+            self.emit(BaseEvent::FilesChanged(vec![id]));
+        }
+        Ok(())
+    }
+
+    /// Return a file's plaintext only after all its sealed parts authenticate.
+    /// Missing parts are fetched and retained on both full and app devices.
+    /// The returned buffer belongs to the caller, who must wipe it when finished.
+    pub async fn file_bytes(&self, id: ObjectId) -> Result<Vec<u8>, Error> {
+        let mut bytes = self.file_bytes_owned(id).await?;
+        Ok(std::mem::take(&mut *bytes))
+    }
+
+    async fn file_bytes_owned(&self, id: ObjectId) -> Result<Zeroizing<Vec<u8>>, Error> {
+        if self.inner.downloads_stopped.load(Ordering::SeqCst) {
+            return Err(Error::NotFound);
+        }
+        let info = self.file(id)?.ok_or(Error::NotFound)?;
+        match info.status {
+            FileStatus::Broken => return Err(Error::Crypto),
+            FileStatus::Waiting => return Err(Error::NotFound),
+            FileStatus::Sending { .. }
+                if self
+                    .db()?
+                    .file_row(id)?
+                    .is_none_or(|row| row.have != row.parts) =>
+            {
+                return Err(Error::NotFound);
+            }
+            FileStatus::Here | FileStatus::Sending { .. } => {}
+            _ => {
+                self.download_file(id, self.inner.file_api.get().ok_or(Error::NotFound)?)
+                    .await?
+            }
+        }
+        let _guard = self.inner.download_lock.lock().await;
+        if self.inner.downloads_stopped.load(Ordering::SeqCst) {
+            return Err(Error::NotFound);
+        }
+        let object = self.get(id)?.ok_or(Error::NotFound)?;
+        let encoded = object
+            .fields
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(Error::NeedsUpdate)?;
+        let decoded = decode_file_key(encoded)?;
+        let fk = Secret::<32>::from_slice(&decoded).map_err(|_| Error::Crypto)?;
+        let mut bytes = Zeroizing::new(Vec::with_capacity(info.size as usize));
+        for n in 0..files::parts(info.size) {
+            let expected =
+                (info.size - u64::from(n) * FILE_PART as u64).min(FILE_PART as u64) as usize;
+            let part = std::fs::read(
+                self.inner
+                    .parts_root
+                    .join(id.to_string())
+                    .join(n.to_string()),
+            )
+            .map_err(|_| Error::Crypto)
+            .and_then(|sealed| files::open_part(&fk, self.id(), id, n, &sealed));
+            if !part.as_ref().is_ok_and(|part| part.len() == expected) {
+                self.db()?.file_broken(id, files::parts(info.size))?;
+                self.emit(BaseEvent::FilesChanged(vec![id]));
+                return Err(Error::Crypto);
+            }
+            bytes.extend_from_slice(&part.expect("checked above"));
+        }
+        Ok(bytes)
+    }
+
+    /// Read an authenticated file as an image only when its magic bytes name a supported raster type.
+    /// The returned image bytes belong to the caller, who must wipe them when finished.
+    pub async fn image(&self, id: ObjectId) -> Result<Image, Error> {
+        let mut bytes = self.file_bytes_owned(id).await?;
+        let mime = files::sniff_image(&bytes).ok_or_else(|| Error::invalid("not an image"))?;
+        Ok(Image {
+            mime: mime.into(),
+            bytes: std::mem::take(&mut *bytes),
+        })
+    }
+
+    /// Atomically write an authenticated file to the requested path.
+    /// Callers opening hidden-base copies must remove those copies on lock.
+    pub async fn save_file(&self, id: ObjectId, dest: &Path) -> Result<(), Error> {
+        let bytes = self.file_bytes_owned(id).await?;
+        let parent = dest
+            .parent()
+            .ok_or_else(|| Error::invalid("destination has no parent"))?;
+        let tmp = parent.join(format!(".{}.tmp", ObjectId::random()));
+        let result = (|| -> Result<(), Error> {
+            std::fs::write(&tmp, &bytes)?;
+            std::fs::rename(&tmp, dest)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    pub(crate) fn files_caught_up(&self) {
+        if let Some(downloader) = self.inner.downloader.get() {
+            downloader.changed();
+        }
+    }
+
+    /// Stops sync, upload and download tasks before account erasure or base close.
     pub(crate) async fn stop_sync(&self) {
+        self.inner.downloads_stopped.store(true, Ordering::SeqCst);
+        self.inner.download_stop.send_replace(true);
         if let Some(sync) = self.inner.sync.get() {
             sync.stop().await;
         }
+        if let Some(uploader) = self.inner.uploader.get() {
+            uploader.stop().await;
+        }
+        if let Some(downloader) = self.inner.downloader.get() {
+            downloader.stop().await;
+        }
+        let _downloads = self.inner.download_lock.lock().await;
     }
 
     /// Starts the base's sync task with the account's client.
@@ -269,38 +691,95 @@ impl Base {
         runtime: &tokio::runtime::Handle,
         clock: crate::Clock,
     ) {
+        self.inner.file_api.get_or_init(|| api.clone());
+        if self.inner.full.load(Ordering::SeqCst) {
+            self.inner
+                .downloader
+                .get_or_init(|| Downloader::start(self, api.clone(), runtime));
+        }
+        self.inner.uploader.get_or_init(|| {
+            Uploader::start(self, api.clone(), runtime, self.inner.parts_root.clone())
+        });
         self.inner
             .sync
             .get_or_init(|| SyncTask::start(self.clone(), api, runtime, clock));
     }
 
+    /// Current local outbox size and last successful catch-up, without a network call.
     pub fn sync_state(&self) -> SyncState {
+        if self.check_removal().is_err() {
+            return SyncState {
+                pending: 0,
+                online: false,
+                last_synced_at: None,
+            };
+        }
         let (online, last_synced_at) = self
             .inner
             .sync
             .get()
             .map_or((false, None), SyncTask::status);
         SyncState {
-            pending: self.db().pending().unwrap_or(0),
+            pending: self.db().ok().and_then(|db| db.pending().ok()).unwrap_or(0),
             online,
             last_synced_at,
         }
     }
 
+    /// Subscribes to object and sync changes. Keep the receiver alive while
+    /// refreshing a view; a lagged receiver must reload from the base.
+    /// No network call is made by subscribing.
+    ///
+    /// ```no_run
+    /// use bh_core::{Base, BaseEvent};
+    /// async fn watch(base: &Base) {
+    ///     let mut events = base.events();
+    ///     while let Ok(event) = events.recv().await {
+    ///         if let BaseEvent::ObjectsChanged(ids) = event {
+    ///             for id in ids { let _ = base.get(id); }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub fn events(&self) -> broadcast::Receiver<BaseEvent> {
-        self.inner.events.subscribe()
+        self.inner
+            .events
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(closed_receiver, |events| events.subscribe())
     }
 
     pub(crate) fn emit(&self, event: BaseEvent) {
         // No subscribers is fine.
-        let _ = self.inner.events.send(event);
+        if let Some(events) = self.inner.events.lock().unwrap().as_ref() {
+            let _ = events.send(event);
+        }
     }
 
     /// Sends the outbox now and waits until the server has it. A base
-    /// without a server has nothing to send.
+    /// without a server has nothing to send. Needs the network when online.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] if sending fails, [`Error::Revoked`] if the
+    /// device was removed, or server errors such as [`Error::TooLarge`].
     pub async fn flush(&self) -> Result<(), Error> {
+        self.check_removal()?;
         match self.inner.sync.get() {
             Some(sync) => sync.flush().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Sends pending edits and catches up with the server once before returning.
+    /// A local-only base has nothing to synchronize.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] when unreachable, or [`Error::Revoked`] when removed.
+    pub async fn sync_now(&self) -> Result<(), Error> {
+        self.check_removal()?;
+        match self.inner.sync.get() {
+            Some(sync) => sync.sync_now().await,
             None => Ok(()),
         }
     }
@@ -336,7 +815,7 @@ impl Base {
 
     /// `CK = kdf(BK, "bhcntnt1", epoch)`, which seals changes.
     fn content_key(&self) -> Secret<32> {
-        bh_crypto::kdf(self.inner.key.secret(), b"bhcntnt1", EPOCH.into())
+        bh_crypto::kdf(self.key().secret(), b"bhcntnt1", EPOCH.into())
     }
 
     pub(crate) fn seal_change(&self, id: ObjectId, state: bool, update: &[u8]) -> Vec<u8> {
@@ -365,7 +844,7 @@ impl Base {
         if types::is_core(&ty.name) {
             return Ok(types::core_def(ty));
         }
-        let id = types::type_object_id(&self.inner.key, &ty.name, ty.version);
+        let id = types::type_object_id(&self.key(), &ty.name, ty.version);
         Ok(db
             .summary(id)?
             .and_then(|s| serde_json::from_value::<TypeDef>(s.fields.get("def")?.clone()).ok())
@@ -460,6 +939,14 @@ impl Base {
         text
     }
 
+    fn check_closed(&self) -> Result<(), Error> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            Err(Error::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     fn check_removal(&self) -> Result<(), Error> {
         if self
             .inner
@@ -467,10 +954,12 @@ impl Base {
             .get()
             .is_some_and(|r| r.load(Ordering::SeqCst) != 0)
         {
-            Err(Error::Revoked)
-        } else {
-            Ok(())
+            return Err(Error::Revoked);
         }
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::NotFound);
+        }
+        Ok(())
     }
 
     /// Stores `doc` and its summary and, for local edits, their updates in
@@ -513,7 +1002,7 @@ impl Base {
             )
             .map_err(|_| Error::invalid("invalid definition"))?;
             types::check_def(&def)?;
-            if types::type_object_id(&self.inner.key, &def.name, def.version) != id {
+            if types::type_object_id(&self.key(), &def.name, def.version) != id {
                 return Err(Error::invalid("definition ID does not match"));
             }
             if let Some(old) = db.summary(id)? {
@@ -586,7 +1075,12 @@ impl Base {
     fn share(&self, id: ObjectId, update: &[u8]) {
         if let Some(live) = self.live(id) {
             if let Ok(decoded) = Update::decode_v1(update) {
-                let _ = live.doc.transact_mut().apply_update(decoded);
+                let _ = live
+                    .doc
+                    .lock()
+                    .unwrap()
+                    .transact_mut()
+                    .apply_update(decoded);
             }
             live.publish(0, update);
         }
@@ -627,7 +1121,7 @@ impl Base {
         id: ObjectId,
         edit: impl FnOnce(&BaseDb, &Meta, &TypeDef, &mut TransactionMut) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.edit_in(&mut self.db(), id, edit)
+        self.edit_in(&mut **self.db()?, id, edit)
     }
 
     /// Writes a new object.
@@ -662,7 +1156,7 @@ impl Base {
         let fields = Map::from_iter([("name".to_string(), Value::from(name))]);
         let position = objects::position_between(None, None);
         self.insert(
-            &mut self.db(),
+            &mut **self.db()?,
             ObjectId(self.inner.id.0),
             &TypeRef::new(BASE, 1),
             None,
@@ -706,9 +1200,45 @@ impl Base {
         objects::effective_parent(id, |n| db.parent_of(n))
     }
 
+    /// Writes a readable, unencrypted copy to a new or empty directory.
+    /// Files that are unavailable are reported in the summary; other failures
+    /// remove the partial copy before returning.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an unsafe or nonempty directory, or
+    /// [`Error::Storage`] when the local store cannot be read.
+    pub async fn export(&self, dir: &Path) -> Result<crate::ExportSummary, Error> {
+        crate::export::run(self, dir).await
+    }
+
+    pub(crate) fn export_objects(&self) -> Result<Vec<ObjectSummary>, Error> {
+        self.check_closed()?;
+        let ids: Vec<ObjectId> = {
+            let db = self.db()?;
+            db.summaries(
+                &format!(
+                    "SELECT {} FROM objects ORDER BY position, object_id",
+                    crate::store::SUMMARY
+                ),
+                [],
+            )?
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+        };
+        ids.into_iter()
+            .map(|id| self.get(id)?.ok_or(Error::NotFound))
+            .collect()
+    }
+
     /// An object, deleted or not, with the parent it shows under.
+    ///
+    /// # Errors
+    /// Returns [`Error::NeedsUpdate`] for an unsupported version or
+    /// [`Error::Storage`] if local data cannot be read.
     pub fn get(&self, id: ObjectId) -> Result<Option<ObjectSummary>, Error> {
-        let db = self.db();
+        self.check_closed()?;
+        let db = self.db()?;
         if db.needs_update(id)? {
             return Err(Error::NeedsUpdate);
         }
@@ -724,8 +1254,13 @@ impl Base {
 
     /// The objects shown under `parent` (`None` for the top level), in order,
     /// without deleted objects or type definitions.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for an unknown parent or [`Error::Storage`]
+    /// if the local store cannot be read.
     pub fn children(&self, parent: Option<ObjectId>) -> Result<Vec<ObjectSummary>, Error> {
-        let db = self.db();
+        self.check_closed()?;
+        let db = self.db()?;
         let Some(folder) = parent else {
             let mut out = db.top_level()?;
             for id in objects::cycle_minimums(&db.parents()?) {
@@ -764,12 +1299,19 @@ impl Base {
 
     /// Creates an object, checking its fields against its type. Without
     /// `after`, it goes last under its parent.
+    ///
+    /// # Errors
+    /// Returns [`Error::ReadOnly`] or [`Error::Revoked`] when writes are blocked,
+    /// [`Error::Invalid`] for unknown types or invalid fields, [`Error::NotFound`]
+    /// for an unknown parent/sibling, [`Error::NeedsUpdate`] for an unknown
+    /// version, [`Error::TooLarge`] for an oversized update, or [`Error::Storage`]
+    /// if writing the local store fails.
     pub fn create(&self, new: NewObject) -> Result<ObjectId, Error> {
         self.writable()?;
         if structural(&new.ty.name) {
             return Err(Error::invalid("type definitions are made with define_type"));
         }
-        let mut db = self.db();
+        let mut db = self.db()?;
         let def = self
             .def(&db, &new.ty)?
             .ok_or_else(|| Error::invalid("unknown type"))?;
@@ -791,6 +1333,12 @@ impl Base {
     }
 
     /// Sets each field, checked against the object's type; `null` removes one.
+    ///
+    /// # Errors
+    /// Returns [`Error::ReadOnly`], [`Error::Revoked`], [`Error::NotFound`],
+    /// [`Error::NeedsUpdate`], [`Error::Invalid`], [`Error::TooLarge`] or
+    /// [`Error::Storage`] for a blocked, missing, unsupported, invalid, oversized
+    /// or unwritable local edit respectively.
     pub fn set_fields(&self, id: ObjectId, fields: Map<String, Value>) -> Result<(), Error> {
         self.edit(id, |_, meta, def, txn| {
             if meta.ty.name == TYPE {
@@ -811,6 +1359,12 @@ impl Base {
     /// Moves an object under `parent` (`None` for the top level), after the
     /// sibling `after`, or first without it. A move into the object itself or
     /// one of its descendants is refused.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an invalid move, [`Error::NotFound`] for
+    /// missing objects, and [`Error::ReadOnly`], [`Error::Revoked`],
+    /// [`Error::NeedsUpdate`], [`Error::TooLarge`] or [`Error::Storage`] when
+    /// editing cannot be completed.
     pub fn move_to(
         &self,
         id: ObjectId,
@@ -850,17 +1404,30 @@ impl Base {
     }
 
     /// Moves an object to the trash: it leaves `children` and shows in `trash`.
+    ///
+    /// # Errors
+    /// Returns [`Error::ReadOnly`], [`Error::Revoked`], [`Error::NotFound`],
+    /// [`Error::Invalid`], [`Error::NeedsUpdate`], [`Error::TooLarge`] or
+    /// [`Error::Storage`] if the local edit cannot be completed.
     pub fn delete(&self, id: ObjectId) -> Result<(), Error> {
         self.set_deleted(id, true)
     }
 
+    /// Restores an object from the trash.
+    ///
+    /// # Errors
+    /// Returns the same variants as [`Self::delete`].
     pub fn undelete(&self, id: ObjectId) -> Result<(), Error> {
         self.set_deleted(id, false)
     }
 
     /// Deleted objects, the most recently changed first.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if the local store cannot be read.
     pub fn trash(&self) -> Result<Vec<ObjectSummary>, Error> {
-        let db = self.db();
+        self.check_closed()?;
+        let db = self.db()?;
         let mut out = db.trash()?;
         for s in &mut out {
             s.parent = self.shown_parent(&db, s.id)?;
@@ -869,9 +1436,15 @@ impl Base {
     }
 
     /// The document of a note, folder or project: one per object in this
-    /// process, shared by every caller. A newer object returns `NeedsUpdate`.
+    /// process, shared by every caller.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for a missing object, [`Error::Invalid`]
+    /// for a non-document, [`Error::NeedsUpdate`] for an unsupported type, or
+    /// [`Error::Storage`] for unreadable local data.
     pub fn note(&self, id: ObjectId) -> Result<NoteDoc, Error> {
-        let db = self.db();
+        self.check_closed()?;
+        let db = self.db()?;
         if db.needs_update(id)? {
             return Err(Error::NeedsUpdate);
         }
@@ -897,13 +1470,15 @@ impl Base {
             return Err(Error::TooLarge);
         }
         let decoded = Update::decode_v1(update).map_err(|_| Error::invalid("not a Yjs update"))?;
-        let mut db = self.db();
+        let mut db = self.db()?;
         if db.needs_update(live.id)? {
             return Err(Error::NeedsUpdate);
         }
         let ty = db.type_of(live.id)?.ok_or(Error::NotFound)?;
         self.editable(&db, &ty)?;
         live.doc
+            .lock()
+            .unwrap()
             .transact_mut()
             .apply_update(decoded)
             .map_err(|_| Error::invalid("the update doesn't apply"))?;
@@ -913,7 +1488,7 @@ impl Base {
         self.save(
             &mut db,
             live.id,
-            &live.doc,
+            &live.doc.lock().unwrap(),
             &outbox,
             self.inner.device,
             None,
@@ -930,10 +1505,10 @@ impl Base {
     #[cfg(feature = "test-support")]
     fn apply_remote(&self, id: ObjectId, update: &[u8], by: Option<DeviceId>) -> Result<(), Error> {
         let decoded = Update::decode_v1(update).map_err(|_| Error::invalid("not a Yjs update"))?;
-        let mut db = self.db();
+        let mut db = self.db()?;
         let live = self.live(id);
         let doc = match (&live, db.state(id)?) {
-            (Some(live), _) => live.doc.clone(),
+            (Some(live), _) => live.doc.lock().unwrap().clone(),
             (None, Some((_, state))) => self.load(&state)?,
             (None, None) => Doc::with_client_id(self.inner.client),
         };
@@ -969,7 +1544,8 @@ impl Base {
         &self,
         objects: &[(ObjectId, u64, Vec<Incoming>)],
     ) -> Result<(Vec<ObjectId>, bool), Error> {
-        let mut db = self.db();
+        self.check_removal()?;
+        let mut db = self.db()?;
         let (applied, needs_update) = db.batch(|db| {
             let mut out = Vec::new();
             let mut needs_update = false;
@@ -987,6 +1563,8 @@ impl Base {
                 for update in &applied.updates {
                     let decoded = Update::decode_v1(update).expect("already decoded");
                     live.doc
+                        .lock()
+                        .unwrap()
                         .transact_mut()
                         .apply_update(decoded)
                         .expect("already applied");
@@ -1138,14 +1716,30 @@ impl Base {
 
     /// Stores a record type's definition as a `core.type` object whose ID is
     /// keyed by the base. An existing definition may only gain optional
-    /// fields or change `doc` text.
+    /// fields or change `doc` text. Call this when opening a base, before writing.
+    ///
+    /// ```no_run
+    /// use bh_core::{Base, FieldDef, FieldKind, TypeDef, Error};
+    /// fn define(base: &Base) -> Result<(), Error> {
+    ///     base.define_type(TypeDef { name: "sample.reading".into(), version: 1,
+    ///         doc: "One reading".into(), title_field: Some("day".into()),
+    ///         fields: vec![FieldDef { name: "day".into(), kind: FieldKind::Date,
+    ///             required: true, unit: None, doc: "Calendar day".into() }] })
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an invalid definition or incompatible
+    /// change, [`Error::ReadOnly`] or [`Error::Revoked`] if writes are blocked,
+    /// [`Error::NeedsUpdate`] for an unknown version, [`Error::TooLarge`] for
+    /// an oversized edit, or [`Error::Storage`] if writing locally fails.
     pub fn define_type(&self, def: TypeDef) -> Result<(), Error> {
         self.writable()?;
         types::check_def(&def)?;
-        let id = types::type_object_id(&self.inner.key, &def.name, def.version);
+        let mut db = self.db()?;
+        let id = types::type_object_id(&self.key(), &def.name, def.version);
         let fields =
             Map::from_iter([("def".to_string(), serde_json::to_value(&def).expect("JSON"))]);
-        let mut db = self.db();
         if db.needs_update(id)? {
             return Err(Error::NeedsUpdate);
         }
@@ -1175,26 +1769,51 @@ impl Base {
     }
 
     /// Finds live objects of a type matching JSON-field filters and ordering.
+    /// Versions of a type are queried together; querying reads local data only.
+    ///
+    /// ```no_run
+    /// use bh_core::{Base, Error, Filter, Op, Order, Query};
+    /// use serde_json::json;
+    /// fn readings(base: &Base) -> Result<(), Error> {
+    ///     let found = base.query(&Query { ty: "sample.reading".into(),
+    ///         filters: vec![Filter { field: "day".into(), op: Op::Eq,
+    ///             value: json!("2026-11-01") }],
+    ///         order_by: Some(("day".into(), Order::Desc)), limit: Some(20) })?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an unrepresentable field name or
+    /// [`Error::Storage`] for a local query failure.
     pub fn query(&self, q: &Query) -> Result<Vec<ObjectSummary>, Error> {
-        query::run(&self.db(), q)
+        self.check_closed()?;
+        query::run(&**self.db()?, q)
     }
 
     /// Searches locally indexed titles, note bodies and Text fields.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if the local search fails.
     pub fn search(&self, text: &str, limit: usize) -> Result<Vec<SearchHit>, Error> {
-        search::search(&self.db(), text, limit)
+        self.check_closed()?;
+        search::search(&**self.db()?, text, limit)
     }
 
     /// The record types defined in this base, by name and version.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if the local store cannot be read.
     pub fn types(&self) -> Result<Vec<TypeDef>, Error> {
-        let db = self.db();
+        self.check_closed()?;
+        let db = self.db()?;
         let mut defs: Vec<TypeDef> = db
             .of_type(TYPE)?
             .into_iter()
             .filter(|s| !s.deleted)
             .filter_map(|s| {
                 let def: TypeDef = serde_json::from_value(s.fields.get("def")?.clone()).ok()?;
-                (types::type_object_id(&self.inner.key, &def.name, def.version) == s.id)
-                    .then_some(def)
+                (types::type_object_id(&self.key(), &def.name, def.version) == s.id).then_some(def)
             })
             .collect();
         defs.sort_by(|a, b| (&a.name, a.version).cmp(&(&b.name, b.version)));
@@ -1205,6 +1824,225 @@ impl Base {
 /// Hooks for tests.
 #[cfg(feature = "test-support")]
 impl Base {
+    /// Test-only bulk writer: the same validation, Yjs state, summaries, FTS and
+    /// outbox as `create`, but one outer store transaction and no sibling scan
+    /// per inserted object. Intended for scale fixtures, never an app API.
+    pub fn test_bulk_create(
+        &self,
+        objects: impl IntoIterator<Item = (NewObject, Option<Vec<u8>>)>,
+    ) -> Result<Vec<ObjectId>, Error> {
+        self.writable()?;
+        let mut db = self.db()?;
+        let mut positions: HashMap<Option<ObjectId>, String> = HashMap::new();
+        let mut ids = Vec::new();
+        db.batch(|db| {
+            for (new, note_update) in objects {
+                if structural(&new.ty.name) {
+                    return Err(Error::invalid("type definitions are made with define_type"));
+                }
+                let def = self
+                    .def(db, &new.ty)?
+                    .ok_or_else(|| Error::invalid("unknown type"))?;
+                let fields: Map<String, Value> = new
+                    .fields
+                    .into_iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .collect();
+                types::validate(&def, &fields)?;
+                if let Some(parent) = new.parent
+                    && db.parent_of(parent)?.is_none()
+                {
+                    return Err(Error::NotFound);
+                }
+                let last = match positions.entry(new.parent) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let last = db
+                            .siblings(new.parent)?
+                            .last()
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_default();
+                        entry.insert(last)
+                    }
+                };
+                let position = objects::position_between(
+                    if last.is_empty() {
+                        None
+                    } else {
+                        Some(last.as_str())
+                    },
+                    None,
+                );
+                *last = position.clone();
+                let id = ObjectId::random();
+                if let Some(update) = note_update {
+                    if new.ty.name != NOTE {
+                        return Err(Error::invalid("text requires a note"));
+                    }
+                    let doc = Doc::with_client_id(self.inner.client);
+                    let metadata = {
+                        let mut txn = doc.transact_mut();
+                        objects::write_type(&mut txn, &new.ty);
+                        objects::write_place(&mut txn, new.parent, &position);
+                        objects::write_deleted(&mut txn, false);
+                        objects::write_fields(&mut txn, &fields)?;
+                        txn.encode_update_v1()
+                    };
+                    doc.transact_mut()
+                        .apply_update(
+                            Update::decode_v1(&update)
+                                .map_err(|_| Error::invalid("not a Yjs update"))?,
+                        )
+                        .map_err(|_| Error::invalid("not a Yjs update"))?;
+                    self.save(db, id, &doc, &[&metadata, &update], self.inner.device, None)?;
+                    self.edited(id);
+                } else {
+                    self.insert(db, id, &new.ty, new.parent, &position, &fields)?;
+                }
+                ids.push(id);
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// Test-only year fixture: apply one chronological chunk of distinct Yjs
+    /// sessions, save each touched note once, and queue every original update
+    /// in one transaction. Sync must finish before writing the next chunk.
+    pub fn test_bulk_apply(&self, updates: &[(ObjectId, Vec<u8>)]) -> Result<(), Error> {
+        self.writable()?;
+        let mut db = self.db()?;
+        let mut docs = HashMap::new();
+        for (id, update) in updates {
+            if update.len() > MAX_UPDATE {
+                return Err(Error::TooLarge);
+            }
+            if !docs.contains_key(id) {
+                let (ty, state) = db.state(*id)?.ok_or(Error::NotFound)?;
+                if ty.name != NOTE {
+                    return Err(Error::invalid("not a note"));
+                }
+                docs.insert(*id, self.load(&state)?);
+            }
+            docs.get(id)
+                .expect("loaded note")
+                .transact_mut()
+                .apply_update(
+                    Update::decode_v1(update).map_err(|_| Error::invalid("not a Yjs update"))?,
+                )
+                .map_err(|_| Error::invalid("not a Yjs update"))?;
+        }
+        db.batch(|db| {
+            for (id, doc) in &docs {
+                self.save(db, *id, doc, &[], self.inner.device, None)?;
+            }
+            db.test_append_outbox(updates)
+        })?;
+        drop(db);
+        for id in docs.keys() {
+            self.edited(*id);
+        }
+        Ok(())
+    }
+
+    /// In tests, holds a foreground download inside the part-fetch loop.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_on_demand_file_get(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *lock(&self.inner.held_on_demand_get) = Some(held.clone());
+        held
+    }
+
+    /// In tests, reports whether close has dropped the in-memory base key.
+    #[cfg(feature = "test-support")]
+    pub fn test_has_key(&self) -> bool {
+        lock(&self.inner.key).is_some()
+    }
+
+    /// In tests, holds a full device's next file part download before its GET
+    /// until the downloader stops. The returned flag is set when it is held.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_file_gets(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let probe = &self
+            .inner
+            .downloader
+            .get()
+            .expect("the base's sync has started")
+            .probe;
+        probe.hold.store(true, Ordering::SeqCst);
+        probe.held.clone()
+    }
+
+    /// In tests, a flag that stays set while the downloader task exists.
+    #[cfg(feature = "test-support")]
+    pub fn test_downloader_alive(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.inner
+            .downloader
+            .get()
+            .expect("the base's sync has started")
+            .probe
+            .alive
+            .clone()
+    }
+
+    /// Pauses only the file uploader in tests.
+    #[cfg(feature = "test-support")]
+    pub fn pause_files(&self) {
+        if let Some(task) = self.inner.uploader.get() {
+            task.pause(true);
+        }
+    }
+
+    /// Resumes the file uploader in tests.
+    #[cfg(feature = "test-support")]
+    pub fn resume_files(&self) {
+        if let Some(task) = self.inner.uploader.get() {
+            task.pause(false);
+        }
+    }
+
+    /// In tests, holds this base's next file part upload just before its request
+    /// until the uploader stops. The returned flag is set once one is held.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_file_puts(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let probe = &self
+            .inner
+            .uploader
+            .get()
+            .expect("the base's sync has started")
+            .probe;
+        probe.hold.store(true, Ordering::SeqCst);
+        probe.held.clone()
+    }
+
+    /// In tests, a flag that stays set while this base's uploader task exists.
+    #[cfg(feature = "test-support")]
+    pub fn test_uploader_alive(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.inner
+            .uploader
+            .get()
+            .expect("the base's sync has started")
+            .probe
+            .alive
+            .clone()
+    }
+
+    /// Injects a lost reply after `n` successful part uploads in tests.
+    #[cfg(feature = "test-support")]
+    pub fn fail_file_put_after(&self, n: u32) {
+        if let Some(task) = self.inner.uploader.get() {
+            task.fail_after(n);
+        }
+    }
+
+    /// Test-only: retain one server change per queued session instead of the
+    /// normal sync engine's per-object merging. Only valid with test fixtures.
+    pub fn test_preserve_sync_updates(&self) {
+        if let Some(sync) = self.inner.sync.get() {
+            sync.preserve_updates();
+        }
+    }
+
     /// Stops the sync task sending or fetching until `test_resume_sync`.
     pub fn test_pause_sync(&self) {
         if let Some(sync) = self.inner.sync.get() {
@@ -1212,6 +2050,7 @@ impl Base {
         }
     }
 
+    /// Resumes a sync task paused by [`Self::test_pause_sync`].
     pub fn test_resume_sync(&self) {
         if let Some(sync) = self.inner.sync.get() {
             sync.pause(false);
@@ -1221,6 +2060,7 @@ impl Base {
     /// The seq up to which this device has applied every change to `id`.
     pub fn test_confirmed_seq(&self, id: ObjectId) -> u64 {
         self.db()
+            .unwrap()
             .confirmed(id)
             .expect("readable store")
             .unwrap_or(0)
@@ -1228,12 +2068,15 @@ impl Base {
 
     /// The changes set aside: their objects, seqs and errors.
     pub fn test_set_aside(&self) -> Vec<(ObjectId, u64, String)> {
-        self.db().set_aside_rows().expect("readable store")
+        self.db().unwrap().set_aside_rows().expect("readable store")
     }
 
     /// Raw future envelopes retained for a newer version of the core.
     pub fn test_future_bodies(&self, id: ObjectId) -> Vec<Vec<u8>> {
-        self.db().future_bodies(id).expect("readable store")
+        self.db()
+            .unwrap()
+            .future_bodies(id)
+            .expect("readable store")
     }
 
     /// An update to `id` sealed as this base's changes are.
@@ -1253,7 +2096,7 @@ impl Base {
 
     /// The outbox's object IDs and updates, oldest first.
     pub fn test_outbox(&self) -> Vec<(ObjectId, Vec<u8>)> {
-        self.db().outbox().expect("readable outbox")
+        self.db().unwrap().outbox().expect("readable outbox")
     }
 
     /// Makes the next store write fail, as a full disk would.
@@ -1265,7 +2108,7 @@ impl Base {
 
     /// The object ID of a type definition in this base.
     pub fn test_type_id(&self, name: &str, version: u32) -> ObjectId {
-        types::type_object_id(&self.inner.key, name, version)
+        types::type_object_id(&self.key(), name, version)
     }
 }
 
@@ -1273,6 +2116,28 @@ impl Base {
 mod tests {
     use super::*;
     use crate::FileSecretStore;
+
+    #[tokio::test]
+    async fn file_scratch_buffers_are_zeroizing_until_returned_to_the_caller() {
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [3u8; 32]);
+        let decoded: Zeroizing<Vec<u8>> = decode_file_key(&encoded).unwrap();
+        assert_eq!(decoded.as_slice(), &[3u8; 32]);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Base::open_local(tmp.path(), [7; 32]).unwrap();
+        let id = base
+            .add_file(
+                crate::NewFile {
+                    parent: None,
+                    name: "scratch".into(),
+                    mime: "image/png".into(),
+                },
+                b"private bytes",
+            )
+            .unwrap();
+        let assembled: Zeroizing<Vec<u8>> = base.file_bytes_owned(id).await.unwrap();
+        assert_eq!(assembled.as_slice(), b"private bytes");
+    }
 
     fn folder(name: &str) -> NewObject {
         NewObject {
@@ -1310,6 +2175,7 @@ mod tests {
             })
             .unwrap();
         base.db()
+            .unwrap()
             .connection()
             .execute_batch(&format!(
                 "CREATE TABLE reindexes (id INTEGER); \
@@ -1321,6 +2187,7 @@ mod tests {
         base.define_type(def.clone()).unwrap();
         let count = || {
             base.db()
+                .unwrap()
                 .connection()
                 .query_row("SELECT count(*) FROM reindexes", [], |r| r.get::<_, i64>(0))
                 .unwrap()
@@ -1465,9 +2332,10 @@ mod tests {
             (summary.title.as_str(), summary.updated_by),
             ("Trips", Some(DeviceId([3; 16])))
         );
-        assert_eq!(base.db().confirmed(id).unwrap(), Some(4));
+        assert_eq!(base.db().unwrap().confirmed(id).unwrap(), Some(4));
         let aside: Vec<u64> = base
             .db()
+            .unwrap()
             .set_aside_rows()
             .unwrap()
             .iter()
@@ -1476,8 +2344,8 @@ mod tests {
         assert_eq!(aside, [1, 2, 4]);
         // Changes up to `confirmed_seq` are never applied or set aside again.
         assert!(base.apply_fetched(&fetched).unwrap().0.is_empty());
-        assert_eq!(base.db().set_aside_rows().unwrap().len(), 3);
-        assert!(base.db().outbox().unwrap().is_empty());
+        assert_eq!(base.db().unwrap().set_aside_rows().unwrap().len(), 3);
+        assert!(base.db().unwrap().outbox().unwrap().is_empty());
     }
 
     #[test]
@@ -1508,9 +2376,9 @@ mod tests {
             Ok((vec![], true))
         );
         assert!(matches!(base.get(id), Err(Error::NeedsUpdate)));
-        assert_eq!(base.db().summary(id).unwrap().unwrap(), before);
-        assert!(base.db().set_aside_rows().unwrap().is_empty());
-        assert_eq!(base.db().confirmed(id).unwrap(), Some(0));
+        assert_eq!(base.db().unwrap().summary(id).unwrap().unwrap(), before);
+        assert!(base.db().unwrap().set_aside_rows().unwrap().is_empty());
+        assert_eq!(base.db().unwrap().confirmed(id).unwrap(), Some(0));
         let reopened = BaseDb::open(&tmp.path().join("b.sqlite"), &[1; 32]).unwrap();
         assert_eq!(reopened.future_bodies(id).unwrap(), [raw]);
         drop(reopened);
@@ -1532,8 +2400,8 @@ mod tests {
             Ok((vec![], true))
         );
         assert!(matches!(base.get(other), Err(Error::NeedsUpdate)));
-        assert!(base.db().set_aside_rows().unwrap().is_empty());
-        assert_eq!(base.db().confirmed(other).unwrap(), None);
+        assert!(base.db().unwrap().set_aside_rows().unwrap().is_empty());
+        assert_eq!(base.db().unwrap().confirmed(other).unwrap(), None);
 
         base.define_type(TypeDef {
             name: "demo.sleep".into(),
@@ -1557,7 +2425,7 @@ mod tests {
             Ok((vec![], true))
         );
         assert_eq!(
-            base.db().future_bodies(newer_app_record).unwrap(),
+            base.db().unwrap().future_bodies(newer_app_record).unwrap(),
             [envelope]
         );
         assert!(matches!(
@@ -1567,10 +2435,11 @@ mod tests {
 
         // Even a fetched change that cannot decode cannot advance a stored
         // object whose type is already newer than this build's definition.
-        let state = base.db().state(id).unwrap().unwrap().1;
-        let mut future = base.db().summary(id).unwrap().unwrap();
+        let state = base.db().unwrap().state(id).unwrap().unwrap().1;
+        let mut future = base.db().unwrap().summary(id).unwrap().unwrap();
         future.ty.version = 2;
         base.db()
+            .unwrap()
             .put(
                 &ObjectRow {
                     summary: future.clone(),
@@ -1586,9 +2455,9 @@ mod tests {
             Ok((vec![], true))
         );
         assert!(matches!(base.get(id), Err(Error::NeedsUpdate)));
-        assert_eq!(base.db().summary(id).unwrap().unwrap(), future);
-        assert!(base.db().set_aside_rows().unwrap().is_empty());
-        assert_eq!(base.db().confirmed(id).unwrap(), Some(0));
+        assert_eq!(base.db().unwrap().summary(id).unwrap().unwrap(), future);
+        assert!(base.db().unwrap().set_aside_rows().unwrap().is_empty());
+        assert_eq!(base.db().unwrap().confirmed(id).unwrap(), Some(0));
     }
 
     #[test]
@@ -1627,7 +2496,7 @@ mod tests {
         base.test_fail_next_save();
         assert!(base.apply_fetched(&[(id, 1, vec![remote])]).is_err());
         assert_eq!(doc.state(), before);
-        assert_eq!(base.db().confirmed(id).unwrap(), Some(0));
+        assert_eq!(base.db().unwrap().confirmed(id).unwrap(), Some(0));
 
         // A failure on a later object rolls the first one's write back too.
         let remote = Incoming {
@@ -1655,7 +2524,7 @@ mod tests {
             Ok((vec![id], true))
         );
         assert_ne!(doc.state(), before);
-        assert_eq!(base.db().confirmed(id).unwrap(), Some(1));
+        assert_eq!(base.db().unwrap().confirmed(id).unwrap(), Some(1));
     }
 
     #[test]
@@ -1672,7 +2541,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base.name(), "");
-        let mut db = base.db();
+        let mut db = base.db().unwrap();
         let fields = Map::from_iter([("name".into(), Value::from("Travel"))]);
         base.insert(
             &mut db,

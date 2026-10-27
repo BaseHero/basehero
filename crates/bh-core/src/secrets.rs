@@ -8,9 +8,27 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
+/// Platform-owned key and token storage. Implementations return secrets in
+/// zeroizing buffers and preserve them until explicitly deleted.
 pub trait SecretStore: Send + Sync + 'static {
+    /// Reads a named secret, or `None` when absent.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an invalid name, [`Error::Storage`] for
+    /// I/O failures, [`Error::Crypto`] for unreadable sealed data, or
+    /// [`Error::NeedsUpdate`] for a newer sealed format.
     fn get(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, Error>;
+    /// Replaces a named secret.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an invalid name or [`Error::Storage`]
+    /// for I/O failures.
     fn put(&self, name: &str, value: &[u8]) -> Result<(), Error>;
+    /// Deletes a named secret; deleting an absent name succeeds.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an invalid name or [`Error::Storage`]
+    /// for I/O failures.
     fn delete(&self, name: &str) -> Result<(), Error>;
 }
 
@@ -21,6 +39,10 @@ pub struct FileSecretStore {
 }
 
 impl FileSecretStore {
+    /// Creates the private directory if needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if the directory cannot be created.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, Error> {
         let dir = dir.into();
         fs::DirBuilder::new()
@@ -102,6 +124,11 @@ fn sealed_ad(name: &str) -> Vec<u8> {
 }
 
 impl SealedFileSecretStore {
+    /// Opens a sealed secret directory with a key supplied by the platform.
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if the directory cannot be created, or
+    /// [`Error::Crypto`] if the supplied key cannot be used.
     pub fn new(dir: PathBuf, key: Zeroizing<[u8; 32]>) -> Result<SealedFileSecretStore, Error> {
         Ok(Self {
             files: FileSecretStore::new(dir)?,

@@ -13,6 +13,7 @@ fn text(base: &Base, id: bh_core::ObjectId) -> Option<String> {
 
 #[tokio::test]
 async fn a_live_edit_arrives_without_polling() {
+    bh_testkit::local_only!(); // Asserts no fallback poll during local event delivery.
     let (a, b) = two_devices_sharing_a_base().await;
     let since = format!("v1/bases/{}/since", b.base.id());
     let initial = b.account.test_request_count(&since);
@@ -30,6 +31,7 @@ async fn a_live_edit_arrives_without_polling() {
 
 #[tokio::test]
 async fn a_gap_in_the_live_stream_refetches_the_object() {
+    bh_testkit::local_only!(); // Injects a dropped server notification.
     let (a, b) = two_devices_sharing_a_base().await;
     let id = note_with_text(&a.base, "First");
     a.base.flush().await.unwrap();
@@ -59,6 +61,7 @@ async fn a_gap_in_the_live_stream_refetches_the_object() {
 
 #[tokio::test]
 async fn devices_reconnect_after_a_server_restart() {
+    bh_testkit::local_only!();
     let mut server = LocalServer::start();
     bh_core::test_support::set_test_bypass(server.operator_token());
     let clock = Clock::system();
@@ -99,6 +102,7 @@ async fn devices_reconnect_after_a_server_restart() {
 
 #[tokio::test]
 async fn an_aged_live_socket_reconnects_and_catches_up() {
+    bh_testkit::local_only!();
     let server = LocalServer::start_with_vars(&[("LIVE_SOCKET_MAX_AGE_MS", "500")]);
     let clock = Clock::system();
     let a = device_on_server("a", &clock, &server);
@@ -146,6 +150,7 @@ async fn an_aged_live_socket_reconnects_and_catches_up() {
 
 #[tokio::test]
 async fn dropping_the_last_base_closes_its_live_socket() {
+    bh_testkit::local_only!(); // Reads a local Worker test-only socket count.
     let (a, b) = two_devices_sharing_a_base().await;
     let raw = bh_testkit::raw_device(&b.account);
     let path = format!("/v1/bases/{}/live-count", a.base.id());
@@ -167,6 +172,7 @@ async fn dropping_the_last_base_closes_its_live_socket() {
 
 #[tokio::test]
 async fn a_missing_fetch_body_retries_catch_up_without_another_live_change() {
+    bh_testkit::local_only!(); // Injects a missing server fetch body.
     let (a, b) = two_devices_sharing_a_base().await;
     pause_sync(&b.base);
     let id = note_with_text(&a.base, "Fetched after retry");
@@ -187,6 +193,7 @@ async fn a_missing_fetch_body_retries_catch_up_without_another_live_change() {
 
 #[tokio::test]
 async fn a_short_fetch_retries_the_unaccounted_object() {
+    bh_testkit::local_only!(); // Injects a shortened server fetch response.
     let (a, b) = two_devices_sharing_a_base().await;
     pause_sync(&b.base);
     let first = note_with_text(&a.base, "First after retry");
@@ -213,6 +220,7 @@ async fn a_short_fetch_retries_the_unaccounted_object() {
 
 #[tokio::test]
 async fn a_device_ignores_the_echo_of_its_own_change() {
+    bh_testkit::local_only!(); // Holds a server reply through a test-only endpoint.
     let (a, b) = two_devices_sharing_a_base().await;
     wait_for(|| a.base.sync_state().online && b.base.sync_state().online).await;
     let raw = raw_device(&a.account);

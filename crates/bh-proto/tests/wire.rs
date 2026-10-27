@@ -200,6 +200,34 @@ fn protocol_constants_and_empty_bodies() {
 }
 
 #[test]
+fn versions_response_matches_the_protocol() {
+    let response = VersionsResponse {
+        versions: vec![VersionInfo {
+            seq: 9,
+            covers: 7,
+            device_id: DeviceId([0xab; 16]),
+            at: 1,
+            size: 3,
+        }],
+        more: false,
+    };
+    let json = serde_json::json!({"versions":[{"seq":9,"covers":7,"deviceId":"abababababababababababababababab","at":1,"size":3}],"more":false});
+    assert_eq!(serde_json::to_value(&response).unwrap(), json);
+    assert_eq!(
+        serde_json::from_value::<VersionsResponse>(json).unwrap(),
+        response
+    );
+    let version = VersionResponse {
+        seq: 9,
+        covers: 7,
+        device_id: DeviceId([0xab; 16]),
+        at: 1,
+        body: Bytes(vec![0xff]),
+    };
+    assert_eq!(serde_json::to_value(version).unwrap()["body"], "_w");
+}
+
+#[test]
 fn approval_messages_match_the_relay() {
     let ended = ApprovalStateResponse {
         state: ApprovalState::Ended,

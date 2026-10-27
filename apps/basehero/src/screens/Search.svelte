@@ -1,12 +1,27 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { getBackend } from '../lib/backend';
   import type { SearchResult } from '../lib/backend/types';
   let { account, base, query, open }: { account: string; base: string | null; query: string; open: (result: SearchResult) => void } = $props();
   let groups = $state<{ base: string; name: string; results: SearchResult[] }[]>([]);
   const label = (name: string) => ({ 'core.note': 'Note', 'core.folder': 'Folder', 'core.project': 'Project' })[name as 'core.note' | 'core.folder' | 'core.project'] ?? name;
   let error = $state('');
+  let revision = $state(0);
+  onMount(() => {
+    let active = true;
+    let stop: (() => void) | undefined;
+    void getBackend().onEvent(event => {
+      if (active && event.kind.toLowerCase() === 'account' && event.account === account &&
+          (event.event === 'BasesChanged' || (typeof event.event === 'object' && event.event !== null && 'BasesChanged' in event.event))) {
+        revision++;
+        groups = []; // Clear visible plaintext before any replacement request completes.
+      }
+    }).then(unsubscribe => { if (active) stop = unsubscribe; else unsubscribe(); });
+    return () => { active = false; stop?.(); };
+  });
   $effect(() => {
     const text = query.trim();
+    const requestedRevision = revision;
     let active = true;
     groups = [];
     error = '';
@@ -19,8 +34,8 @@
             if (!grouped.has(result.base)) grouped.set(result.base, { base: result.base, name: result.baseName, results: [] });
             grouped.get(result.base)!.results.push(result);
           }
-          if (active) groups = [...grouped.values()];
-        } catch { if (active) error = 'Search is unavailable. Try again.'; }
+          if (active && requestedRevision === revision) groups = [...grouped.values()];
+        } catch { if (active && requestedRevision === revision) error = 'Search is unavailable. Try again.'; }
       })();
     }
     return () => { active = false; };

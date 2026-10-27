@@ -7,8 +7,7 @@ async function signedIn(page: Page) {
   await page.getByLabel('Email').fill('dan@example.com');
   await page.getByLabel('Password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Later' }).click();
   const r = await page.evaluate(async () => {
     const account = (await window.__fake.accounts())[0].id;
     const base = await window.__fake.createBase(account, 'Personal');

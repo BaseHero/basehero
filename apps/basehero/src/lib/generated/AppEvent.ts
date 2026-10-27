@@ -6,4 +6,4 @@ import type { HeroEvent } from "./HeroEvent";
 /**
  * Sent to every window as `bh:event`. Bases and Hero add their variants.
  */
-export type AppEvent = { "kind": "account", account: string, event: AccountEvent, } | { "kind": "base", account: string, base: string, event: BaseEvent, } | { "kind": "hero", account: string, base: string, chat: string, event: HeroEvent, };
+export type AppEvent = { "kind": "kitChanged", account: string, } | { "kind": "account", account: string, event: AccountEvent, } | { "kind": "base", account: string, base: string, event: BaseEvent, } | { "kind": "hero", account: string, base: string, chat: string, event: HeroEvent, };

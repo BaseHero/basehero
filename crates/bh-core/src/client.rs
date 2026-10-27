@@ -2,6 +2,7 @@
 //! codes map to [`Error`].
 
 use crate::{EndReason, Error};
+use crate::{envelope, files::FILE_PART};
 use bh_proto::*;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -37,6 +38,11 @@ pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// How long opening a live socket may take: TCP, TLS and the upgrade. Without a
+/// bound, a stalled handshake, as on a network that changes mid-connect, would
+/// hold a sync or approval task until the system gave up, or forever.
+const LIVE_HANDSHAKE: Duration = Duration::from_secs(20);
+
 fn http_client(tls: &rustls::ClientConfig) -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls.clone())
@@ -64,9 +70,13 @@ pub fn set_test_bypass(operator_token: &str) {
 #[cfg(feature = "test-support")]
 #[derive(Clone, Debug)]
 pub struct Fault {
+    /// HTTP method matched by this injected failure.
     pub method: &'static str,
+    /// Request path matched by this injected failure.
     pub path: &'static str,
+    /// Whether to discard the response after the server handles the request.
     pub lost_reply: bool,
+    /// Number of matching calls to fail.
     pub times: u32,
 }
 
@@ -281,6 +291,147 @@ impl Api {
         }
     }
 
+    /// Fetches one opaque file part, preserving the binary response unchanged.
+    pub(crate) async fn get_file_part(
+        &self,
+        base: BaseId,
+        id: ObjectId,
+        n: u32,
+    ) -> Result<Vec<u8>, Error> {
+        let path = format!("v1/bases/{base}/files/{id}/{n}");
+        let url = self
+            .server
+            .join(&path)
+            .map_err(|_| Error::invalid("server address"))?;
+        let mut request = self
+            .http
+            .get(url)
+            .header("BH-Protocol", PROTOCOL.to_string());
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.as_str());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(bypass) = TEST_BYPASS.read().unwrap().as_deref() {
+            request = request.header("BH-Test-Bypass", bypass);
+        }
+        #[cfg(feature = "test-support")]
+        {
+            *self.counts.lock().unwrap().entry(path.clone()).or_default() += 1;
+            self.fault(&Method::GET, &path, false)?;
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+        let status = response.status();
+        match response
+            .headers()
+            .get("BH-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            Some(PROTOCOL) => {}
+            Some(v) if v > PROTOCOL => return Err(Error::NeedsUpdate),
+            _ if status == StatusCode::UPGRADE_REQUIRED => return Err(Error::NeedsUpdate),
+            _ => return Err(Error::Network(format!("unexpected response ({status})"))),
+        }
+        let limit = FILE_PART + envelope::OVERHEAD;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Network(e.without_url().to_string()))?
+        {
+            if chunk.len() > limit - bytes.len() {
+                return Err(Error::Network("file part response too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        #[cfg(feature = "test-support")]
+        self.fault(&Method::GET, &path, true)?;
+        if status.is_success() {
+            return Ok(bytes);
+        }
+        let error = match serde_json::from_slice::<ErrorBody>(&bytes) {
+            Ok(body) => map_error(status, &body.error, body.message),
+            Err(_) => map_error(status, "", status.to_string()),
+        };
+        if error == Error::Revoked {
+            self.revoked();
+        }
+        Err(error)
+    }
+
+    /// Uploads the *persisted* sealed bytes, not a fresh sealing on retry.
+    pub(crate) async fn put_file_part(
+        &self,
+        base: BaseId,
+        id: ObjectId,
+        n: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        let path = format!("v1/bases/{base}/files/{id}/{n}");
+        let url = self
+            .server
+            .join(&path)
+            .map_err(|_| Error::invalid("server address"))?;
+        let mut request = self
+            .http
+            .put(url)
+            .header("BH-Protocol", PROTOCOL.to_string())
+            .header("Content-Type", "application/octet-stream");
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.as_str());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(bypass) = TEST_BYPASS.read().unwrap().as_deref() {
+            request = request.header("BH-Test-Bypass", bypass);
+        }
+        #[cfg(feature = "test-support")]
+        {
+            *self.counts.lock().unwrap().entry(path.clone()).or_default() += 1;
+            self.fault(&Method::PUT, &path, false)?;
+        }
+        let response = request
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+        let status = response.status();
+        let protocol = response
+            .headers()
+            .get("BH-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+        if protocol != Some(PROTOCOL) {
+            return Err(
+                if protocol.is_some_and(|v| v > PROTOCOL) || status == StatusCode::UPGRADE_REQUIRED
+                {
+                    Error::NeedsUpdate
+                } else {
+                    Error::Network(format!("unexpected response ({status})"))
+                },
+            );
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+        #[cfg(feature = "test-support")]
+        self.fault(&Method::PUT, &path, true)?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let error = match serde_json::from_slice::<ErrorBody>(&body) {
+            Ok(body) => map_error(status, &body.error, body.message),
+            Err(_) => map_error(status, "", status.to_string()),
+        };
+        if error == Error::Revoked {
+            self.revoked();
+        }
+        Err(error)
+    }
+
     #[allow(dead_code, reason = "used by the approval exchange")]
     pub(crate) async fn approval_create(
         &self,
@@ -427,16 +578,16 @@ impl Api {
         {
             *self.counts.lock().unwrap().entry(path.into()).or_default() += 1;
         }
-        match connect_async_tls_with_config(
+        let connect = connect_async_tls_with_config(
             request,
             None,
             false,
             Some(Connector::Rustls(tls_config())),
-        )
-        .await
-        {
-            Ok((socket, _)) => Ok(socket),
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+        );
+        match tokio::time::timeout(LIVE_HANDSHAKE, connect).await {
+            Err(_) => Err(Error::Network("live connection timed out".into())),
+            Ok(Ok((socket, _))) => Ok(socket),
+            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
                 let status = response.status();
                 let code = response
                     .body()
@@ -452,7 +603,7 @@ impl Api {
                     )))
                 }
             }
-            Err(e) => Err(Error::Network(e.to_string())),
+            Ok(Err(e)) => Err(Error::Network(e.to_string())),
         }
     }
 
@@ -483,6 +634,14 @@ impl Api {
 
     pub(crate) async fn account(&self) -> Result<AccountResponse, Error> {
         self.call(Method::GET, "v1/account", None::<&()>).await
+    }
+
+    pub(crate) async fn usage(&self, month: Option<&str>) -> Result<UsageResponse, Error> {
+        let path = month.map_or_else(
+            || "v1/usage".to_owned(),
+            |month| format!("v1/usage?month={month}"),
+        );
+        self.call(Method::GET, &path, None::<&()>).await
     }
 
     pub(crate) async fn put_account_data(
@@ -823,6 +982,56 @@ mod tests {
             .changes(BaseId::random(), &ChangesRequest { changes: vec![] })
             .await;
         assert!(result.is_ok(), "{result:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_handshake_that_never_answers_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        // Accept, then hold the connection without ever answering the upgrade.
+        let (held, release) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = release.recv();
+            drop(stream);
+        });
+        let api = Api::new(url, None);
+        let result = tokio::time::timeout(Duration::from_secs(120), api.approvals_live())
+            .await
+            .expect("a stalled handshake must end on its own");
+        assert!(
+            matches!(&result, Err(Error::Network(message)) if message == "live connection timed out"),
+            "{:?}",
+            result.map(|_| ())
+        );
+        drop(held);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_part_rejects_an_oversized_stream_without_content_length() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 8192];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("/files/"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nBH-Protocol: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let size = crate::files::FILE_PART + crate::envelope::OVERHEAD + 1;
+            write!(stream, "{size:X}\r\n").unwrap();
+            stream.write_all(&vec![0x5a; size]).unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+        });
+        let result = Api::new(url, None)
+            .get_file_part(BaseId::random(), ObjectId::random(), 0)
+            .await;
+        assert!(matches!(result, Err(Error::Network(_))), "{result:?}");
         server.join().unwrap();
     }
 

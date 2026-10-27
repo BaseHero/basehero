@@ -7,9 +7,10 @@ use crate::client::Api;
 use crate::client::ApprovalLive;
 use crate::core::{Shared, derive, login_salt};
 use crate::envelope;
+use crate::hidden::{self, HiddenKey};
 use crate::keys::{self, DEFAULT_KDF, RecoveryKit};
 use crate::store::{AccountDb, BaseRow};
-use crate::{Base, BaseSummary, EndReason, Error, Mode};
+use crate::{Base, BaseSummary, EndReason, Error, Mode, UsageRow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_crypto::Secret;
 use bh_proto::{
@@ -19,7 +20,7 @@ use bh_proto::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,8 +32,12 @@ use zeroize::Zeroizing;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+/// Device capability: full devices manage the account; app devices use only
+/// explicitly granted bases.
 pub enum DeviceKind {
+    /// A signed-in account device.
     Full,
+    /// An app installed with its own credentials and base grants.
     App,
 }
 
@@ -65,36 +70,75 @@ impl From<bh_proto::DeviceKind> for DeviceKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+/// A locally installed account; listing these does not contact the server.
 pub struct AccountSummary {
+    /// Account identifier.
     #[ts(type = "string")]
     pub id: AccountId,
+    /// Account email address.
     pub email: String,
+    /// Capability of this installation.
     pub kind: DeviceKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+/// One account device, with its name from encrypted account data.
 pub struct DeviceSummary {
+    /// Device identifier.
     #[ts(type = "string")]
     pub id: DeviceId,
+    /// Full or app device.
     pub kind: DeviceKind,
+    /// Display name, if available.
     pub name: String,
+    /// Server-reported status.
     pub status: String,
+    /// Creation time in Unix milliseconds.
     #[ts(type = "number")]
     pub created_at: i64,
+    /// Last activity in Unix milliseconds.
     #[ts(type = "number")]
     pub last_seen_at: i64,
+    /// Whether this is the current device.
     pub this_device: bool,
+}
+
+/// Usage attributed by random ID, named only from this device's decrypted lists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+pub struct AccountUsage {
+    /// Each month's rows, including months before breakdowns existed.
+    pub months: Vec<UsageRow>,
+    /// The selected month's UTC days.
+    pub days: Vec<UsageRow>,
+    /// Names available locally for base IDs; absent IDs need a fallback label.
+    #[ts(type = "Record<string, string>")]
+    pub base_names: BTreeMap<BaseId, String>,
+    /// Names available from decrypted account data; absent IDs are removed devices.
+    #[ts(type = "Record<string, string>")]
+    pub device_names: BTreeMap<DeviceId, String>,
 }
 
 /// A base selected for an app; a new base is created before registering the app device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseGrantRequest {
     /// Grant an existing base.
-    Existing { base: BaseId, mode: Mode },
+    Existing {
+        /// Existing base identifier.
+        base: BaseId,
+        /// Requested access mode.
+        mode: Mode,
+    },
     /// Create and grant a new base.
-    New { name: String, mode: Mode },
+    New {
+        /// Name of the new base.
+        name: String,
+        /// Requested access mode.
+        mode: Mode,
+    },
 }
 
 /// Connection request from a full device. Empty grants reuse `replaces`' grants.
@@ -194,18 +238,28 @@ impl std::fmt::Debug for AppCredentials {
     }
 }
 
+/// Changes to an account's bases, devices or approval requests. Subscribe
+/// before waiting for a change; reload state if the receiver lags.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum AccountEvent {
+    /// Granted bases changed.
     BasesChanged,
+    /// Known devices changed.
     DevicesChanged,
+    /// This account was removed locally.
     Removed,
+    /// A device requested approval.
     ApprovalRequested(ApprovalRequest),
+    /// An approval exchange ended.
     ApprovalClosed(ApprovalId),
 }
 
-/// Account data, `{ "v": 1, "devices": { "<deviceId>": { "name": "…" } }, "apps": {} }`,
+/// Account data, `{ "v": 1, "devices": {}, "apps": {},
+/// "kit": { "code": "…", "saved": false, "at": <Unix ms>, "envelope": "<sha256 hex>" } }`,
 /// sealed under `kdf(AK, "bhacdat1", 1)`. Edits keep fields this version doesn't know.
+/// Erasure is best effort: JSON map strings and WebView display copies of the
+/// kit can remain in process memory even when serialized buffers are zeroized.
 type Data = Map<String, Value>;
 
 fn new_data() -> Data {
@@ -244,6 +298,36 @@ pub(crate) fn set_device_name(data: &mut Data, device: DeviceId, name: &str) {
     device["name"] = Value::String(name.to_string());
 }
 
+pub(crate) fn envelope_hash(envelope: &[u8]) -> String {
+    bh_crypto::sha256(envelope)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn set_kit(data: &mut Data, kit: &RecoveryKit, saved: bool, envelope: &str) {
+    let code = Zeroizing::new(kit.display());
+    data.insert(
+        "kit".into(),
+        json!({ "code": code.as_str(), "saved": saved, "at": now_ms(), "envelope": envelope }),
+    );
+}
+
+/// Whether a full device knows the kit and whether its owner has saved it.
+/// No kit code is included in this status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+pub struct KitStatus {
+    /// Whether encrypted account data holds a kit.
+    pub known: bool,
+    /// Whether the person has saved that kit.
+    pub saved: bool,
+    /// Time the kit was made, in Unix milliseconds, when known.
+    #[ts(type = "number | null")]
+    pub made_at: Option<i64>,
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -259,6 +343,8 @@ fn device_name(data: &Data, device: DeviceId) -> String {
         .to_string()
 }
 
+/// One installed account on this device. Clones share local stores and
+/// network sync; an app installation can open only its granted bases.
 #[derive(Clone)]
 pub struct Account {
     inner: Arc<Inner>,
@@ -278,6 +364,17 @@ struct Inner {
     declined_approvals: tokio::sync::Mutex<HashSet<ApprovalId>>,
     /// The open bases, each with its sync task: one per base in this process.
     bases: Mutex<HashMap<BaseId, BaseWeak>>,
+    /// Async gate serializes password work, creation and locking for this account.
+    hidden_gate: tokio::sync::Mutex<()>,
+    /// Synchronous listing cannot block on an async mutex inside an async caller.
+    hidden: Mutex<HashMap<BaseId, Base>>,
+    #[cfg(feature = "test-support")]
+    held_hidden_open: Mutex<
+        Option<(
+            Arc<tokio::sync::Semaphore>,
+            Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    >,
     #[cfg(feature = "test-support")]
     synthetic_readers: Mutex<HashMap<BaseId, std::collections::BTreeSet<DeviceId>>>,
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -365,6 +462,10 @@ impl Account {
                     events: broadcast::channel(64).0,
                     declined_approvals: tokio::sync::Mutex::new(HashSet::new()),
                     bases: Mutex::new(HashMap::new()),
+                    hidden_gate: tokio::sync::Mutex::new(()),
+                    hidden: Mutex::new(HashMap::new()),
+                    #[cfg(feature = "test-support")]
+                    held_hidden_open: Mutex::new(None),
                     #[cfg(feature = "test-support")]
                     synthetic_readers: Mutex::new(HashMap::new()),
                     listener: Mutex::new(None),
@@ -388,18 +489,22 @@ impl Account {
         Ok(account)
     }
 
+    /// Stable account identifier.
     pub fn id(&self) -> AccountId {
         self.inner.id
     }
 
+    /// Identifier of this installed device.
     pub fn device_id(&self) -> DeviceId {
         self.inner.device_id
     }
 
+    /// Account email address from local data.
     pub fn email(&self) -> String {
         self.inner.email.clone()
     }
 
+    /// Whether this installation is a full or app device.
     pub fn kind(&self) -> DeviceKind {
         self.inner.kind
     }
@@ -413,6 +518,7 @@ impl Account {
     }
 
     #[cfg(feature = "test-support")]
+    /// Test-only count of requests to the given endpoint path.
     pub fn test_request_count(&self, path: &str) -> usize {
         self.inner.api.count(path)
     }
@@ -423,6 +529,31 @@ impl Account {
         self.inner.api.hold_next_account_get()
     }
 
+    /// Test only: pause the next hidden unlock inside the gate before it opens a base.
+    /// The returned flag signals when the gate is held; add a permit to release it.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_next_hidden_open(
+        &self,
+    ) -> (
+        Arc<tokio::sync::Semaphore>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.inner.held_hidden_open.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn wait_for_test_hidden_open(&self) {
+        let hold = self.inner.held_hidden_open.lock().unwrap().take();
+        if let Some((release, entered)) = hold {
+            entered.store(true, Ordering::SeqCst);
+            release.acquire().await.expect("test release").forget();
+        }
+    }
+
+    /// Subscribes to local account changes; no network call is made.
     pub fn events(&self) -> broadcast::Receiver<AccountEvent> {
         self.inner.events.subscribe()
     }
@@ -431,8 +562,9 @@ impl Account {
         crate::store::in_use(&self.inner.db)
     }
 
-    /// The bases this device may open, by name. Listing a base opens it, so
-    /// it syncs.
+    /// Lists ordinary bases, then currently unlocked hidden bases, by name.
+    /// Locked hidden bases have no entry. Listing opens ordinary bases locally
+    /// and starts their background sync; it does not wait for the network.
     pub fn bases(&self) -> Vec<BaseSummary> {
         let rows = self.db().bases().unwrap_or_default();
         let mut list: Vec<_> = rows
@@ -448,6 +580,25 @@ impl Account {
             })
             .collect();
         list.sort_by_cached_key(|s| (s.name.to_lowercase(), s.id));
+        let handles: Vec<_> = self
+            .inner
+            .hidden
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let mut hidden: Vec<_> = handles
+            .iter()
+            .map(|base| BaseSummary {
+                id: base.id(),
+                name: base.name(),
+                mode: base.mode(),
+                hidden: true,
+            })
+            .collect();
+        hidden.sort_by_cached_key(|s| (s.name.to_lowercase(), s.id));
+        list.extend(hidden);
         list
     }
 
@@ -517,9 +668,125 @@ impl Account {
             .collect()
     }
 
+    /// Reads the kit from cached encrypted account data without the network.
+    /// Accounts created by older versions, or whose initial data write failed,
+    /// return `None` until a new kit is made or a kit sign-in records one.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on app devices, [`Error::Storage`] for
+    /// unreadable cached data, or [`Error::BadKit`] for a malformed stored kit.
+    pub fn recovery_kit(&self) -> Result<Option<RecoveryKit>, Error> {
+        let data = self.kit_data()?;
+        self.current_kit(&data)?
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str)
+            .map(RecoveryKit::parse)
+            .transpose()
+    }
+
+    /// Reads whether the kit is known and saved, from cached account data;
+    /// never contacts the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on app devices or [`Error::Storage`] for
+    /// unreadable cached data.
+    pub fn kit_status(&self) -> Result<KitStatus, Error> {
+        let data = self.kit_data()?;
+        let kit = self.current_kit(&data)?;
+        Ok(KitStatus {
+            known: kit
+                .and_then(|v| v.get("code"))
+                .and_then(Value::as_str)
+                .is_some(),
+            saved: kit
+                .and_then(|v| v.get("saved"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            made_at: kit.and_then(|v| v.get("at")).and_then(Value::as_i64),
+        })
+    }
+
+    fn current_kit<'a>(&self, data: &'a Data) -> Result<Option<&'a Value>, Error> {
+        let hash = self.db().envelope_hash()?;
+        Ok(data.get("kit").filter(|kit| {
+            hash.as_deref()
+                .is_some_and(|current| kit.get("envelope").and_then(Value::as_str) == Some(current))
+        }))
+    }
+
+    fn kit_data(&self) -> Result<Data, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        self.db()
+            .account_data()?
+            .map(|(_, json)| parse_data(json.as_bytes()))
+            .transpose()
+            .map(|data| data.unwrap_or_else(new_data))
+    }
+
+    /// Marks the kit actually shown or saved as saved in encrypted account data.
+    /// Needs the network; retries a concurrent edit rather than losing it.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on app devices, [`Error::NotFound`] if
+    /// this account has no stored kit, [`Error::Conflict`] if it is not the
+    /// current kit, or network, crypto and storage errors from the update.
+    pub async fn set_kit_saved(&self, kit: &RecoveryKit) -> Result<(), Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let expected = kit.clone();
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stale = changed.clone();
+                let missing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let absent = missing.clone();
+                this.update_data_with_envelope(move |data, current_hash| {
+                    let stored = data.get("kit");
+                    let current = stored
+                        .filter(|v| v.get("envelope").and_then(Value::as_str) == Some(current_hash))
+                        .and_then(|v| v.get("code"))
+                        .and_then(Value::as_str)
+                        .and_then(|text| RecoveryKit::parse(text).ok());
+                    if current.as_ref() == Some(&expected) {
+                        data["kit"]["saved"] = Value::Bool(true);
+                        true
+                    } else {
+                        if stored.is_none() {
+                            absent.store(true, Ordering::Relaxed);
+                        } else {
+                            stale.store(true, Ordering::Relaxed);
+                        }
+                        false
+                    }
+                })
+                .await?;
+                if changed.load(Ordering::Relaxed) {
+                    Err(Error::Conflict("kit_changed".into()))
+                } else if missing.load(Ordering::Relaxed) {
+                    Err(Error::NotFound)
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+    }
+
     /// Connects an app as its own device. Needs the network and a full account.
     /// A failed grant removes the new device before returning; an old device is
-    /// removed only after all new grants succeed.
+    /// removed only after all new grants succeed. The returned credentials
+    /// contain the granted base IDs in request order, even when reusing grants.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] for an app account, [`Error::Invalid`]
+    /// for an empty or overlong name, missing grants or duplicate bases,
+    /// [`Error::NotFound`] for an unknown replacement/base, [`Error::Network`]
+    /// on connection failure, or server/storage errors including
+    /// [`Error::Revoked`], [`Error::Conflict`] and [`Error::Storage`].
     pub async fn connect_app(&self, req: AppRequest) -> Result<AppCredentials, Error> {
         if self.kind() != DeviceKind::Full {
             return Err(Error::Forbidden);
@@ -560,6 +827,14 @@ impl Account {
             if let BaseGrantRequest::Existing { base, .. } = grant {
                 if !seen.insert(*base) {
                     return Err(Error::invalid("duplicate base"));
+                }
+                if self
+                    .db()
+                    .hidden_wrappers()?
+                    .iter()
+                    .any(|(id, _, _)| id == base)
+                {
+                    return Err(Error::Forbidden);
                 }
                 self.base(*base)?;
             }
@@ -711,7 +986,13 @@ impl Account {
         Ok(())
     }
 
-    /// Revokes a device and removes its app listing. Removing this device also erases it locally.
+    /// Revokes a device and removes its app listing. Removing this device also
+    /// erases it locally. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] when an app removes another device,
+    /// [`Error::Network`] if revocation fails, [`Error::NotFound`] for an
+    /// unknown device, or [`Error::Storage`] if local erasure fails.
     pub async fn remove_device(&self, id: DeviceId) -> Result<(), Error> {
         if self.kind() != DeviceKind::Full && self.device_id() != id {
             return Err(Error::Forbidden);
@@ -776,6 +1057,13 @@ impl Account {
     }
 
     /// The open base `id`, the same one on every call in this process.
+    /// A locked hidden base is not openable by ID; use [`Self::unlock_hidden`].
+    /// Opening uses local data; its background sync may then use the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for a base not granted to this device,
+    /// [`Error::Revoked`] after local removal, [`Error::NeedsUpdate`] for
+    /// unsupported data, or [`Error::Storage`] for a local store failure.
     pub fn base(&self, id: BaseId) -> Result<Base, Error> {
         let mut open = self
             .inner
@@ -784,6 +1072,9 @@ impl Account {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.inner.removal.load(Ordering::SeqCst) != 0 {
             return Err(Error::Revoked);
+        }
+        if let Some(base) = self.inner.hidden.lock().unwrap().get(&id) {
+            return Ok(base.clone());
         }
         let row = self
             .db()
@@ -813,12 +1104,47 @@ impl Account {
             Some(self.inner.device_id),
             Some(self.inner.removal.clone()),
         )?;
+        base.set_full(self.kind() == DeviceKind::Full);
         base.start_sync(
             self.inner.api.clone(),
             &self.inner.shared.handle,
             self.inner.shared.clock.clone(),
         );
         open.insert(id, base.downgrade());
+        Ok(base)
+    }
+
+    /// Opens a hidden base without ever creating an account-key-only store secret.
+    pub(crate) fn open_base_with_key(
+        &self,
+        id: BaseId,
+        key: BaseKey,
+        store_key: &Secret<32>,
+        mode: Mode,
+    ) -> Result<Base, Error> {
+        self.check_active()?;
+        let path = self
+            .inner
+            .shared
+            .account_dir(self.id())
+            .join("bases")
+            .join(format!("{id}.sqlite"));
+        let base = Base::open_store(
+            &path,
+            store_key.expose(),
+            id,
+            key,
+            mode,
+            Some(self.device_id()),
+        )?;
+        base.set_removal(self.inner.removal.clone());
+        base.set_full(self.kind() == DeviceKind::Full);
+        base.start_sync(
+            self.inner.api.clone(),
+            &self.inner.shared.handle,
+            self.inner.shared.clock.clone(),
+        );
+        self.inner.hidden.lock().unwrap().insert(id, base.clone());
         Ok(base)
     }
 
@@ -833,7 +1159,13 @@ impl Account {
     }
 
     /// Creates a base named `name`, with a new key that only this account's
-    /// key opens. Full devices only.
+    /// key opens. Full devices only. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an empty name, [`Error::Forbidden`] on
+    /// an app device, [`Error::Revoked`] for a removed device, [`Error::Network`]
+    /// for connection failure, [`Error::Conflict`] if a key conflicts, or
+    /// [`Error::Storage`] for a local store failure.
     pub async fn create_base(&self, name: &str) -> Result<Base, Error> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -899,8 +1231,232 @@ impl Account {
             .await
     }
 
+    /// Creates a hidden base sealed under the account key and extra password.
+    /// Needs the network to create the base on the server; after creation it
+    /// opens the base locally, starts sync and announces `BasesChanged`. Only
+    /// full devices may create one. The password is never sent to the server.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on app devices, [`Error::Invalid`] for an
+    /// empty name or password, [`Error::Revoked`] after device removal,
+    /// [`Error::Network`] when the server is unreachable, [`Error::Conflict`]
+    /// on a conflicting server key, [`Error::Storage`] for a local store or
+    /// password-derivation failure, [`Error::Crypto`] for invalid local key
+    /// material, or [`Error::NeedsUpdate`] for an unsupported store format.
+    pub async fn create_hidden_base(
+        &self,
+        name: &str,
+        password: Zeroizing<String>,
+    ) -> Result<Base, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(Error::invalid("base name"));
+        }
+        if password.is_empty() {
+            return Err(Error::invalid("password"));
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                // Known limit: creation holds this gate during server calls. A
+                // lock requested meanwhile cannot hide already-open hidden
+                // bases until the call returns or times out.
+                let _gate = this.inner.hidden_gate.lock().await;
+                this.check_active()?;
+                let account_key = this.account_key()?;
+                let hidden_key =
+                    tokio::task::spawn_blocking(move || HiddenKey::derive(&account_key, &password))
+                        .await
+                        .map_err(|_| Error::Storage("hidden key derivation failed".into()))??;
+                let id = BaseId::random();
+                let raw_key = Zeroizing::new(bh_crypto::random::<32>());
+                let key = BaseKey::new(&*raw_key)?;
+                let wrapper = hidden_key.wrap(this.id(), id, EPOCH, &key);
+                let request = BasesRequest {
+                    base_id: id,
+                    epoch: EPOCH,
+                    wrapper: Bytes(wrapper.clone()),
+                };
+                let api = &this.inner.api;
+                match api.create_base(&request).await {
+                    Ok(_) => {}
+                    Err(Error::Network(_)) => match api.create_base(&request).await {
+                        Ok(_) => {}
+                        Err(Error::Conflict(code)) if code == "exists" => {
+                            if api.base_key(id).await?.wrapper.0 != wrapper {
+                                return Err(Error::Conflict(code));
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    Err(e) => return Err(e),
+                }
+                this.check_active()?;
+                this.db().remember_hidden(id, EPOCH, &wrapper)?;
+                let store_key = hidden::store_key(&key);
+                let base = this.open_base_with_key(id, key, &store_key, Mode::ReadWrite)?;
+                base.write_info(&name)?;
+                let _ = this.inner.events.send(AccountEvent::BasesChanged);
+                Ok(base)
+            })
+            .await
+    }
+
+    /// Tests one extra password against every local hidden wrapper, opening
+    /// every matching base and returning summaries including already-open ones.
+    /// Works offline and makes no network request; opened bases start background
+    /// sync when connectivity is available. Runs one Argon2id even if the index
+    /// is empty. Announces `BasesChanged` if any base opens, even if a later
+    /// matching store cannot open.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on app devices, [`Error::Invalid`] for an
+    /// empty password, [`Error::NothingUnlocked`] if no wrapper matches,
+    /// [`Error::Revoked`] after device removal, [`Error::Storage`] for a local
+    /// store or password-derivation failure, [`Error::Crypto`] for invalid local
+    /// key material, or [`Error::NeedsUpdate`] for an unsupported store format.
+    pub async fn unlock_hidden(
+        &self,
+        password: Zeroizing<String>,
+    ) -> Result<Vec<BaseSummary>, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                let _gate = this.inner.hidden_gate.lock().await;
+                this.check_active()?;
+                #[cfg(feature = "test-support")]
+                this.wait_for_test_hidden_open().await;
+                let account_key = this.account_key()?;
+                let key =
+                    tokio::task::spawn_blocking(move || HiddenKey::derive(&account_key, &password))
+                        .await
+                        .map_err(|_| Error::Storage("hidden key derivation failed".into()))??;
+                let wrappers = this.db().hidden_wrappers()?;
+                let mut found = Vec::new();
+                let mut added = false;
+                for (id, epoch, wrapper) in wrappers {
+                    if let Some(base_key) = key.open(this.id(), id, epoch, &wrapper) {
+                        let base = if let Some(base) = this.inner.hidden.lock().unwrap().get(&id) {
+                            base.clone()
+                        } else {
+                            let store_key = hidden::store_key(&base_key);
+                            match this.open_base_with_key(id, base_key, &store_key, Mode::ReadWrite)
+                            {
+                                Ok(base) => {
+                                    added = true;
+                                    base
+                                }
+                                Err(err) => {
+                                    if added {
+                                        let _ = this.inner.events.send(AccountEvent::BasesChanged);
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        };
+                        found.push(BaseSummary {
+                            id,
+                            name: base.name(),
+                            mode: base.mode(),
+                            hidden: true,
+                        });
+                    }
+                }
+                if found.is_empty() {
+                    return Err(Error::NothingUnlocked);
+                }
+                if added {
+                    let _ = this.inner.events.send(AccountEvent::BasesChanged);
+                }
+                Ok(found)
+            })
+            .await
+    }
+
+    /// Once it acquires the hidden-base gate, removes an unlocked hidden base
+    /// from account navigation, then tries to flush its edits for up to two
+    /// seconds before stopping sync and closing
+    /// its store and handles. Flushing uses the network if online, but locking
+    /// does not require connectivity. Once started, locking continues if the
+    /// caller drops its future. A create stalled on the network can delay the
+    /// gate (and thus hiding an already-open base). Previously queued subscriber
+    /// updates may still be read after locking.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if `id` is not an unlocked hidden base, or
+    /// [`Error::Network`] if the core's runtime is shutting down before the
+    /// operation starts. Flush failures are ignored; unsent edits stay local.
+    pub async fn lock_hidden(&self, id: BaseId) -> Result<(), Error> {
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move { this.lock_hidden_here(Some(id)).await })
+            .await
+    }
+
+    /// Locks every unlocked hidden base, including ones opened by an in-progress
+    /// unlock or create. All bases share one two-second deadline for flushing
+    /// pending edits. Flushes use the network if online, but locking does not
+    /// need connectivity. Once started, the lock continues if the caller drops
+    /// its future. A create stalled on the network can delay the gate, leaving
+    /// already-open bases visible until it returns. Already-queued subscriber
+    /// updates may still be read after locking.
+    pub async fn lock_all_hidden(&self) {
+        let this = self.clone();
+        let _ = self
+            .inner
+            .shared
+            .run(async move { this.lock_hidden_here(None).await })
+            .await;
+    }
+
+    async fn lock_hidden_here(&self, id: Option<BaseId>) -> Result<(), Error> {
+        // Take the gate before selecting bases: an unlock or create already in
+        // progress must not leave a newly opened base behind after lock-all.
+        let _gate = self.inner.hidden_gate.lock().await;
+        let bases: Vec<Base> = {
+            let mut hidden = self.inner.hidden.lock().unwrap();
+            match id {
+                Some(id) => vec![hidden.remove(&id).ok_or(Error::NotFound)?],
+                None => hidden.drain().map(|(_, base)| base).collect(),
+            }
+        };
+        for _ in &bases {
+            let _ = self.inner.events.send(AccountEvent::BasesChanged);
+        }
+        // The account event is a fallback; locking must itself await every turn
+        // before flushing or closing the base's store.
+        for base in &bases {
+            crate::hero::cancel_account_base(self, base.id()).await;
+        }
+        // Already queued subscriber updates can still be read after locking.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let _ = tokio::time::timeout_at(
+            deadline,
+            futures_util::future::join_all(bases.iter().map(Base::flush)),
+        )
+        .await;
+        for base in bases {
+            base.close().await;
+        }
+        Ok(())
+    }
+
     /// Blocks writes, stops background work, then erases secrets and stores.
     /// Repeated calls, including simultaneous revocation notifications, are no-ops.
+    /// Does not need the network (stops local background work).
+    ///
+    /// # Errors
+    /// Returns [`Error::Storage`] if local erasure fails, or [`Error::Revoked`]
+    /// after an earlier erasure failed.
     pub async fn sign_out(&self) -> Result<(), Error> {
         // Serialize the transition with base(): a base must not start sync
         // after we've collected the tasks to stop.
@@ -967,12 +1523,31 @@ impl Account {
             // A writer already in the store lock finishes before deletion.
             drop(base.db());
         }
+        // Sign-out shares the gate with unlock/create, so it cannot drain
+        // before an in-progress unlock registers its base.
+        let _gate = self.inner.hidden_gate.lock().await;
+        let hidden: Vec<_> = self
+            .inner
+            .hidden
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, base)| base)
+            .collect();
+        for base in hidden {
+            base.close().await;
+        }
         erase_disk(&self.inner.shared, self.inner.id, &base_ids)?;
         let _ = self.inner.events.send(AccountEvent::Removed);
         Ok(())
     }
 
     /// Lists requests without answering them or sending any message to the new device.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device, [`Error::Network`]
+    /// on connection failure, or server errors such as [`Error::Revoked`].
     pub async fn approval_requests(&self) -> Result<Vec<ApprovalRequest>, Error> {
         if self.kind() != DeviceKind::Full {
             return Err(Error::Forbidden);
@@ -998,6 +1573,13 @@ impl Account {
     }
 
     /// Opens a listed request on explicit user action and waits for its reveal.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device,
+    /// [`Error::ApprovalEnded`] if expired, declined or already answered,
+    /// [`Error::Network`] for connection failure, or [`Error::Storage`] for
+    /// a local claim failure.
     pub async fn open_request(&self, id: ApprovalId) -> Result<OpenRequest, Error> {
         if self.kind() != DeviceKind::Full {
             return Err(Error::Forbidden);
@@ -1107,6 +1689,13 @@ impl Account {
     }
 
     /// Checks typed digits and sends the account key only if they match.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] for the wrong account/device,
+    /// [`Error::ApprovalEnded`] for incorrect digits or an ended exchange,
+    /// [`Error::Network`] for connection failure, or [`Error::Storage`] for
+    /// a local key failure.
     pub async fn approve(
         &self,
         mut request: OpenRequest,
@@ -1212,14 +1801,34 @@ impl Account {
     }
 
     /// Learns of bases added on other devices, and asks every open base to
-    /// catch up.
+    /// catch up. Needs the network to fetch grants; sync then continues in
+    /// the background.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] on connection failure,
+    /// [`Error::NeedsUpdate`] for unsupported granted data, [`Error::Revoked`]
+    /// if removed, or [`Error::Storage`] for local data failures.
     pub async fn refresh(&self) -> Result<(), Error> {
         let this = self.clone();
         self.inner
             .shared
             .run(async move {
                 let listed = this.inner.api.me().await?.bases;
-                let known: Vec<BaseId> = this.db().bases()?.iter().map(|r| r.id).collect();
+                let data_error = if this.kind() == DeviceKind::Full {
+                    match this.refresh_account_data().await {
+                        Err(Error::Revoked) => return Err(Error::Revoked),
+                        other => other.err(),
+                    }
+                } else {
+                    None
+                };
+                let mut known: HashSet<BaseId> = this.db().bases()?.iter().map(|r| r.id).collect();
+                known.extend(
+                    this.db()
+                        .hidden_wrappers()?
+                        .into_iter()
+                        .map(|(id, _, _)| id),
+                );
                 let mut added = false;
                 let mut needs_update = false;
                 for id in listed.into_iter().filter(|id| !known.contains(id)) {
@@ -1233,11 +1842,13 @@ impl Account {
                             GrantMode::ReadOnly => Mode::ReadOnly,
                         },
                     };
-                    // A wrapper this device can't open, such as a hidden
-                    // base's, is left out and never stored.
+                    // An unopened wrapper is indexed without a name, mode or key.
                     match this.base_key(&row) {
                         Ok(_) => {}
-                        Err(Error::Crypto) => continue,
+                        Err(Error::Crypto) => {
+                            this.db().remember_hidden(id, row.epoch, &row.wrapper)?;
+                            continue;
+                        }
                         Err(Error::NeedsUpdate) => {
                             needs_update = true;
                             continue;
@@ -1259,11 +1870,24 @@ impl Account {
                         Err(e) => return Err(e),
                     }
                 }
+                let hidden: Vec<_> = this
+                    .inner
+                    .hidden
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect();
+                for base in hidden {
+                    base.catch_up();
+                }
                 if added {
                     let _ = this.inner.events.send(AccountEvent::BasesChanged);
                 }
                 if needs_update {
                     Err(Error::NeedsUpdate)
+                } else if let Some(error) = data_error {
+                    Err(error)
                 } else {
                     Ok(())
                 }
@@ -1271,7 +1895,12 @@ impl Account {
             .await
     }
 
-    /// Declines a request before or after opening it.
+    /// Declines a request before or after opening it. Needs the network to
+    /// notify the other device; the local rejection remains even if that fails.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device or [`Error::Network`]
+    /// if the server cannot be reached.
     pub async fn decline(&self, id: ApprovalId) -> Result<(), Error> {
         if self.kind() != DeviceKind::Full {
             return Err(Error::Forbidden);
@@ -1299,7 +1928,9 @@ impl Account {
                 if this.kind() != DeviceKind::Full {
                     return Ok(());
                 }
-                match this.inner.api.account().await?.data {
+                let record = this.inner.api.account().await?;
+                this.cache_envelope(&record.account_key_envelope.0)?;
+                match record.data {
                     Some(sealed) => {
                         let data = this.open_data(&sealed.ciphertext.0)?;
                         this.cache(sealed.version, &data)
@@ -1310,7 +1941,12 @@ impl Account {
             .await
     }
 
-    /// The account's devices, named from account data.
+    /// The account's devices, named from account data. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] on connection failure,
+    /// [`Error::NeedsUpdate`] for newer account data, [`Error::Crypto`] for
+    /// unreadable account data, or [`Error::Storage`] on a local cache error.
     pub async fn devices(&self) -> Result<Vec<DeviceSummary>, Error> {
         let this = self.clone();
         self.inner
@@ -1342,7 +1978,61 @@ impl Account {
             .await
     }
 
-    /// Replaces the recovery kit. The old kit stops working.
+    /// Reads account usage, naming IDs only from this device's decrypted lists.
+    /// Needs the network; days and months are UTC, costs are whole micro-dollars.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device, [`Error::Invalid`] for a
+    /// malformed month, or network/account-data errors from the server.
+    pub async fn usage(&self, month: Option<&str>) -> Result<AccountUsage, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        if month.is_some_and(|value| {
+            let bytes = value.as_bytes();
+            bytes.len() != 7
+                || bytes[4] != b'-'
+                || !bytes[..4].iter().chain(&bytes[5..]).all(u8::is_ascii_digit)
+                || !(bytes[5] == b'0' && (b'1'..=b'9').contains(&bytes[6])
+                    || bytes[5] == b'1' && (b'0'..=b'2').contains(&bytes[6]))
+        }) {
+            return Err(Error::invalid("month must be YYYY-MM"));
+        }
+        let this = self.clone();
+        let month = month.map(str::to_owned);
+        self.inner
+            .shared
+            .run(async move {
+                let response = this.inner.api.usage(month.as_deref()).await?;
+                let base_names = this
+                    .bases()
+                    .into_iter()
+                    .map(|base| (base.id, base.name))
+                    .collect();
+                let device_names = this
+                    .devices()
+                    .await?
+                    .into_iter()
+                    .filter(|device| !device.name.is_empty())
+                    .map(|device| (device.id, device.name))
+                    .collect();
+                Ok(AccountUsage {
+                    months: response.months.into_iter().map(Into::into).collect(),
+                    days: response.days.into_iter().map(Into::into).collect(),
+                    base_names,
+                    device_names,
+                })
+            })
+            .await
+    }
+
+    /// Replaces the recovery kit. The old kit stops working. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadCredentials`] if the password is wrong,
+    /// [`Error::Network`] on connection failure, [`Error::NeedsUpdate`] for
+    /// unsupported credentials, or [`Error::Storage`] / [`Error::Crypto`]
+    /// for local key failures.
     pub async fn new_kit(&self, password: &str) -> Result<RecoveryKit, Error> {
         let this = self.clone();
         let password = Zeroizing::new(password.to_string());
@@ -1382,6 +2072,14 @@ impl Account {
                     }
                     Err(e) => return Err(e),
                 }
+                // Credentials rotate first. A failed account-data write still
+                // returns the kit, so the person can keep the only working copy.
+                let hash = envelope_hash(&request.account_key_envelope.0);
+                this.inner.db.lock().unwrap().set_envelope_hash(&hash)?;
+                let copy = kit.clone();
+                let _ = this
+                    .update_data(move |data| set_kit(data, &copy, false, &hash))
+                    .await;
                 Ok(kit)
             })
             .await
@@ -1391,6 +2089,13 @@ impl Account {
     /// current envelope must open with `current` and `kit` to the account key
     /// this device holds, so a mistyped kit can't replace the real one; a wrong
     /// password or kit gives `BadKit`, as the two can't be told apart.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for an empty new password,
+    /// [`Error::BadKit`] for the wrong password or kit, [`Error::Network`]
+    /// for connection failure, or [`Error::Storage`] / [`Error::Crypto`]
+    /// for local key failures.
     pub async fn change_password(
         &self,
         current: &str,
@@ -1424,6 +2129,7 @@ impl Account {
                 if !bh_crypto::constant_time_eq(&opened, account_key.expose()) {
                     return Err(Error::BadKit);
                 }
+                let old_hash = envelope_hash(&sealed.0);
                 let salt = bh_crypto::random::<16>();
                 let next = derive(new_password, salt, DEFAULT_KDF).await?;
                 let envelope = envelope::seal(
@@ -1431,12 +2137,35 @@ impl Account {
                     &keys::account_key_aad(&this.inner.id),
                     account_key.expose(),
                 );
+                let hash = envelope_hash(&envelope);
                 api.put_credentials(&CredentialsRequest {
                     current_login_key: Bytes(current.login_key().to_vec()),
                     login_key: Bytes(next.login_key().to_vec()),
                     salt: Bytes(salt.to_vec()),
                     kdf: DEFAULT_KDF,
                     account_key_envelope: Bytes(envelope),
+                })
+                .await?;
+                this.inner.db.lock().unwrap().set_envelope_hash(&hash)?;
+                // The same verified kit still opens the new envelope. Keep its
+                // acknowledgement and creation time when rebinding account data.
+                this.update_data_with_envelope(move |data, current_hash| {
+                    let Some(stored) = data.get_mut("kit") else {
+                        return false;
+                    };
+                    if current_hash != hash
+                        || stored.get("envelope").and_then(Value::as_str) != Some(&old_hash)
+                        || stored
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .and_then(|text| RecoveryKit::parse(text).ok())
+                            .as_ref()
+                            != Some(&kit)
+                    {
+                        return false;
+                    }
+                    stored["envelope"] = Value::String(hash.clone());
+                    true
                 })
                 .await?;
                 Ok(())
@@ -1450,13 +2179,30 @@ impl Account {
         &self,
         edit: impl Fn(&mut Data) + Send + 'static,
     ) -> Result<(), Error> {
+        self.update_data_with_envelope(move |data, _| {
+            edit(data);
+            true
+        })
+        .await
+    }
+
+    /// The envelope hash belongs to the same server snapshot as the data being edited.
+    pub(crate) async fn update_data_with_envelope(
+        &self,
+        edit: impl Fn(&mut Data, &str) -> bool + Send + 'static,
+    ) -> Result<(), Error> {
         let api = &self.inner.api;
         for _ in 0..5 {
-            let (version, mut data) = match api.account().await?.data {
+            let record = api.account().await?;
+            let hash = envelope_hash(&record.account_key_envelope.0);
+            self.db().set_envelope_hash(&hash)?;
+            let (version, mut data) = match record.data {
                 Some(sealed) => (sealed.version, self.open_data(&sealed.ciphertext.0)?),
                 None => (0, new_data()),
             };
-            edit(&mut data);
+            if !edit(&mut data, &hash) {
+                return Ok(());
+            }
             let json = Zeroizing::new(serde_json::to_vec(&data).expect("JSON map"));
             let ciphertext = envelope::seal(
                 &keys::account_data_key(&self.account_key()?),
@@ -1476,6 +2222,10 @@ impl Account {
             }
         }
         Err(Error::Conflict("version_conflict".into()))
+    }
+
+    fn cache_envelope(&self, envelope: &[u8]) -> Result<(), Error> {
+        self.db().set_envelope_hash(&envelope_hash(envelope))
     }
 
     fn open_data(&self, ciphertext: &[u8]) -> Result<Data, Error> {
@@ -1663,12 +2413,85 @@ mod tests {
 
     #[test]
     fn account_data_edits_keep_unknown_fields() {
-        let mut data = parse_data(br#"{"v":1,"devices":{},"apps":{},"later":{"x":1}}"#).unwrap();
+        let mut data = parse_data(br#"{"v":1,"devices":{},"apps":{},"later":{"x":1},"kit":{"code":"0000-0000-0000-0000-0000-0000-00","saved":false,"at":123}}"#).unwrap();
         let device = DeviceId([1; 16]);
         set_device_name(&mut data, device, "mac");
         assert_eq!(device_name(&data, device), "mac");
         assert_eq!(data["later"], json!({ "x": 1 }));
+        assert_eq!(
+            data["kit"],
+            json!({ "code": "0000-0000-0000-0000-0000-0000-00", "saved": false, "at": 123 })
+        );
         assert_eq!(parse_data(br#"{"v":2}"#), Err(Error::NeedsUpdate));
+    }
+
+    #[tokio::test]
+    async fn kit_record_without_an_envelope_is_unknown() {
+        let server = LocalServer::from_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let (account, _) = core(tmp.path())
+            .sign_up(SignUp {
+                server: server.url(),
+                invite: invite(server),
+                email: format!("{}@example.test", AccountId::random()),
+                password: Zeroizing::new(PASSWORD.into()),
+                device_name: "first".into(),
+            })
+            .await
+            .unwrap();
+        account
+            .update_data(|data| {
+                data["kit"].as_object_mut().unwrap().remove("envelope");
+            })
+            .await
+            .unwrap();
+        assert_eq!(account.recovery_kit().unwrap(), None);
+        assert_eq!(
+            account.kit_status().unwrap(),
+            KitStatus {
+                known: false,
+                saved: false,
+                made_at: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_account_data_still_discovers_readable_bases() {
+        let server = LocalServer::from_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let email = format!("{}@example.test", AccountId::random());
+        let (a, kit) = core(&tmp.path().join("a"))
+            .sign_up(SignUp {
+                server: server.url(),
+                invite: invite(server),
+                email: email.clone(),
+                password: Zeroizing::new(PASSWORD.into()),
+                device_name: "first".into(),
+            })
+            .await
+            .unwrap();
+        let b = core(&tmp.path().join("b"))
+            .sign_in(SignIn {
+                server: server.url(),
+                email,
+                password: Zeroizing::new(PASSWORD.into()),
+                device_name: "second".into(),
+            })
+            .await
+            .unwrap()
+            .with_kit(&kit.display())
+            .await
+            .unwrap();
+        let base = a.create_base("Readable").await.unwrap();
+        a.update_data(|data| {
+            data.insert("v".into(), json!(2));
+        })
+        .await
+        .unwrap();
+        assert_eq!(b.refresh().await, Err(Error::NeedsUpdate));
+        assert!(b.bases().iter().any(|known| known.id == base.id()));
+        assert_eq!(b.base(base.id()).unwrap().mode(), Mode::ReadWrite);
     }
 
     #[tokio::test]

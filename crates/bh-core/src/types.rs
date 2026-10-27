@@ -9,6 +9,7 @@ use ts_rs::TS;
 
 pub(crate) const BASE: &str = "core.base";
 pub(crate) const NOTE: &str = "core.note";
+pub(crate) const FILE: &str = "core.file";
 pub(crate) const FOLDER: &str = "core.folder";
 pub(crate) const PROJECT: &str = "core.project";
 pub(crate) const TYPE: &str = "core.type";
@@ -19,11 +20,14 @@ pub(crate) const MESSAGE: &str = "core.message";
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub struct TypeRef {
+    /// Fully qualified type name, including its namespace.
     pub name: String,
+    /// Version of that type; versions are stored alongside one another.
     pub version: u32,
 }
 
 impl TypeRef {
+    /// Constructs a reference without checking whether the type is defined.
     pub fn new(name: impl Into<String>, version: u32) -> Self {
         Self {
             name: name.into(),
@@ -38,25 +42,37 @@ impl TypeRef {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub struct TypeDef {
+    /// Fully qualified name for records of this type.
     pub name: String,
+    /// Definition version used when writing new records.
     pub version: u32,
+    /// Description of the type, also available to Hero.
     #[serde(default)]
     pub doc: String,
+    /// Field used as the object's display title, if any.
     #[serde(default)]
     pub title_field: Option<String>,
+    /// Fields checked on local edits; unknown fields are retained.
     pub fields: Vec<FieldDef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+/// Declares how one field is checked on local edits. Fields not declared by a
+/// definition remain in stored records unchanged.
 pub struct FieldDef {
+    /// JSON key in the object's fields.
     pub name: String,
+    /// Expected JSON value kind.
     pub kind: FieldKind,
+    /// Whether a non-null value must be supplied.
     #[serde(default)]
     pub required: bool,
+    /// Measurement unit, when applicable; part of the field's meaning.
     #[serde(default)]
     pub unit: Option<String>,
+    /// Description of the field, also available to Hero.
     #[serde(default)]
     pub doc: String,
 }
@@ -67,13 +83,21 @@ pub struct FieldDef {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum FieldKind {
+    /// A JSON string.
     Text,
+    /// A JSON number.
     Number,
+    /// A JSON integer.
     Integer,
+    /// A JSON boolean.
     Bool,
+    /// A real calendar day as `YYYY-MM-DD`.
     Date,
+    /// An RFC 3339 timestamp with offset.
     DateTime,
+    /// A lowercase hexadecimal object ID.
     Ref,
+    /// Any JSON value.
     Json,
     /// Encrypted field that is never indexed by search or exposed by Hero's tools.
     Secret,
@@ -101,6 +125,17 @@ pub(crate) fn core_def(ty: &TypeRef) -> Option<TypeDef> {
     let (doc, title_field, fields) = match ty.name.as_str() {
         BASE => named("A base's own information"),
         NOTE => ("A note", None, vec![]),
+        FILE => (
+            "An encrypted file",
+            Some("name"),
+            vec![
+                field("name", FieldKind::Text, true),
+                field("mime", FieldKind::Text, true),
+                field("size", FieldKind::Integer, true),
+                field("key", FieldKind::Secret, true),
+                field("uploaded", FieldKind::Bool, false),
+            ],
+        ),
         FOLDER => named("A folder"),
         PROJECT => named("A project"),
         CHAT => (

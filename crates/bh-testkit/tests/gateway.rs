@@ -2,7 +2,10 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_core::{Core, CoreConfig, FileSecretStore, SignUp};
 use bh_models::{testing::*, *};
-use bh_testkit::{LocalServer, LocalServerOptions, RawDevice, TEST_PASSWORD, invite, raw_device};
+use bh_testkit::{
+    LocalServer, LocalServerOptions, RawDevice, TEST_PASSWORD, b64, invite, random, random_id,
+    raw_device,
+};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
@@ -80,7 +83,10 @@ fn fixture() -> &'static Mutex<Fixture> {
             let enclave = TestEnclave::start();
             let server = LocalServer::start_with(LocalServerOptions {
                 tinfoil_upstream: Some(enclave.url()),
-                vars: vec![("TINFOIL_MODELS".into(), "deepseek-v4-1-flash".into())],
+                vars: vec![
+                    ("TINFOIL_MODELS".into(), "deepseek-v4-1-flash".into()),
+                    ("GATEWAY_NOW_MS".into(), "1793102400000".into()),
+                ],
             });
             let (device, email) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -272,12 +278,14 @@ async fn a_key_config_problem_passes_through() {
 #[tokio::test]
 async fn bh_models_talks_to_the_enclave_through_the_local_gateway() {
     let f = fixture().lock().await;
+    let base = create_base(&f.device).await;
     f.enclave.reply(EnclaveReply::Completion(json!({"choices":[{"message":{"role":"assistant","content":"ferry"},"finish_reason":"stop"}]})));
     let model = Tinfoil::unverified_for_tests(
         Gateway::new(f.server.url().join("/v1/models/tinfoil/").unwrap().as_str()).unwrap(),
         Zeroizing::new(f.device.token.clone()),
         f.enclave.key_hex(),
-    );
+    )
+    .with_base(base.clone());
     let c = model
         .complete(ChatRequest {
             messages: vec![Message {
@@ -295,7 +303,34 @@ async fn bh_models_talks_to_the_enclave_through_the_local_gateway() {
     assert_eq!(c.text.as_deref(), Some("ferry"));
     let seen = f.enclave.requests().pop().unwrap();
     assert_eq!(seen.headers["authorization"], "Bearer local-tinfoil-key");
+    assert!(!seen.headers.contains_key("bh-base"));
     assert!(!String::from_utf8_lossy(&seen.body).contains("One word"));
+}
+#[tokio::test]
+async fn the_model_client_sends_the_base_header() {
+    let f = fixture().lock().await;
+    let before = f.enclave.requests().len();
+    let model = Tinfoil::unverified_for_tests(
+        Gateway::new(f.server.url().join("/v1/models/tinfoil/").unwrap().as_str()).unwrap(),
+        Zeroizing::new(f.device.token.clone()),
+        f.enclave.key_hex(),
+    )
+    .with_base(random_id());
+    let result = model
+        .complete(ChatRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: Some("secret".into()),
+                tool_calls: vec![],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            tool_choice: None,
+            max_tokens: 64,
+        })
+        .await;
+    assert!(matches!(result, Err(ModelError::Forbidden)), "{result:?}");
+    assert_eq!(f.enclave.requests().len(), before);
 }
 #[tokio::test]
 async fn the_operator_token_no_longer_calls_models() {
@@ -589,6 +624,272 @@ async fn the_daily_cost_cap_stops_further_calls() {
         .unwrap();
     assert_eq!(response.status(), 429);
     assert_eq!(enclave.requests().len(), 2);
+}
+async fn create_base(device: &RawDevice) -> String {
+    let base = random_id();
+    let (status, body) = device
+        .post(
+            "/v1/bases",
+            json!({"baseId": base, "epoch": 1, "wrapper": b64(&random(77))}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    base
+}
+async fn account_usage(server: &LocalServer, token: &str, month: &str) -> reqwest::Response {
+    Client::new()
+        .get(
+            server
+                .url()
+                .join(&format!("/v1/usage?month={month}"))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "1")
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn calls_are_recorded_by_base_and_device() {
+    let f = fixture().lock().await;
+    let a = new_device(&f.server).await;
+    let base = create_base(&a).await;
+    let app_id = random_id();
+    let (status, added) = a
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, grant) = a
+        .put(
+            &format!("/v1/bases/{base}/grants/{app_id}"),
+            json!({"mode":"ro","epoch":1,"wrapper":b64(&random(77))}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    let metric = "prompt=10,completion=5,cost_usd=0.000101";
+    for (token, base_id, metrics) in [
+        (a.token.as_str(), Some(base.as_str()), Some(metric)),
+        (a.token.as_str(), Some(base.as_str()), Some(metric)),
+        (
+            added["token"].as_str().unwrap(),
+            Some(base.as_str()),
+            Some(metric),
+        ),
+        (a.token.as_str(), None, None),
+    ] {
+        f.enclave.reply(reply(
+            metrics.map_or(vec![], |m| vec![("x-tinfoil-usage-metrics", m)]),
+        ));
+        let mut req = call(&f.server, token, &"e1".repeat(32));
+        if let Some(base_id) = base_id {
+            req = req.header("BH-Base", base_id);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 200);
+    }
+    let result: Value = account_usage(&f.server, &a.token, "2026-10")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let rows = result["days"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{result}");
+    let row = rows
+        .iter()
+        .find(|r| r["base"] == base && r["device"] == a.device_id)
+        .unwrap();
+    assert_eq!(row["period"], "2026-10-27");
+    assert_eq!(row["service"], "model");
+    assert_eq!(row["requests"], 2);
+    assert_eq!(row["promptTokens"], 20);
+    assert_eq!(row["costMicroUsd"], 202);
+    assert_eq!(row["priceMicroUsd"], 303);
+    assert_eq!(
+        rows.iter().find(|r| r["device"] == app_id).unwrap()["requests"],
+        1
+    );
+    let none = rows.iter().find(|r| r["base"].is_null()).unwrap();
+    assert_eq!(none["unreported"], 1);
+    assert_eq!(
+        result["months"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["requests"].as_u64().unwrap())
+            .sum::<u64>(),
+        4
+    );
+}
+#[tokio::test]
+async fn a_call_naming_a_base_the_device_cannot_read_is_refused() {
+    let f = fixture().lock().await;
+    let a = new_device(&f.server).await;
+    let base = create_base(&a).await;
+    let app_id = random_id();
+    let (_, added) = a
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    let other = new_device(&f.server).await;
+    let before = f.enclave.requests().len();
+    for (token, named) in [
+        (added["token"].as_str().unwrap(), base.as_str()),
+        (other.token.as_str(), base.as_str()),
+    ] {
+        let response = call(&f.server, token, &"e2".repeat(32))
+            .header("BH-Base", named)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "forbidden"
+        );
+    }
+    assert_eq!(f.enclave.requests().len(), before);
+    assert!(
+        account_usage(&f.server, &a.token, "2026-10")
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["days"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+#[tokio::test]
+async fn only_the_accounts_full_devices_read_usage() {
+    let f = fixture().lock().await;
+    let (a, email) = new_account(&f.server).await;
+    f.enclave.reply(reply(vec![]));
+    assert_eq!(
+        call(&f.server, &a.token, &"ed".repeat(32))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let app_id = random_id();
+    let (_, added) = a
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    let pending = pending_device(&f.server, &a.account_id, &email).await;
+    let other = new_device(&f.server).await;
+    assert!(
+        account_usage(&f.server, &other.token, "2026-10")
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["days"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        account_usage(&f.server, &a.token, "2026-10")
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["days"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for (token, status, code) in [
+        (added["token"].as_str().unwrap(), 403, "forbidden"),
+        (&pending.token, 403, "pending"),
+        ("", 401, "unauthorized"),
+    ] {
+        let response = account_usage(&f.server, token, "2026-10").await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.json::<Value>().await.unwrap()["error"], code);
+    }
+}
+#[tokio::test]
+async fn days_before_the_breakdown_show_as_not_broken_down() {
+    let f = fixture().lock().await;
+    let a = new_device(&f.server).await;
+    let seeded = Client::new()
+        .post(
+            f.server
+                .url()
+                .join(&format!(
+                    "/v1/admin/test/legacy-usage?account={}",
+                    a.account_id
+                ))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "1")
+        .bearer_auth(f.server.operator_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), 200);
+    let result: Value = account_usage(&f.server, &a.token, "2026-10")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let day = &result["days"][0];
+    assert_eq!(result["days"].as_array().unwrap().len(), 1);
+    assert_eq!(day["requests"], 2);
+    assert_eq!(day["base"], Value::Null);
+    assert_eq!(day["device"], Value::Null);
+    assert_eq!(day["unreported"], 1);
+    assert_eq!(day["costMicroUsd"], 101);
+    assert_eq!(day["priceMicroUsd"], 152);
+    assert_eq!(result["months"][0]["requests"], 2);
+    f.enclave.reply(reply(vec![(
+        "x-tinfoil-usage-metrics",
+        "prompt=4,completion=2,cost_usd=0.00001",
+    )]));
+    assert_eq!(
+        call(&f.server, &a.token, &"f1".repeat(32))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let updated: Value = account_usage(&f.server, &a.token, "2026-10")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["days"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        updated["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["requests"].as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        updated["months"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["costMicroUsd"].as_u64().unwrap())
+            .sum::<u64>(),
+        111
+    );
+}
+#[tokio::test]
+async fn a_malformed_month_is_a_bad_request() {
+    let f = fixture().lock().await;
+    for month in ["2026-13", "abc"] {
+        let response = account_usage(&f.server, &f.device.token, month).await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "bad_request"
+        );
+    }
 }
 #[tokio::test]
 async fn usage_is_operator_only() {

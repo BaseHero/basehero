@@ -7,6 +7,7 @@ mod synthetic_tests;
 pub(crate) mod tools;
 mod turn;
 
+use crate::base::BaseWeak;
 use crate::{Account, AccountEvent, Base, BaseId, Error, NewObject, ObjectId, TypeRef};
 use bh_models::ChatModel;
 use serde::{Deserialize, Serialize};
@@ -143,9 +144,10 @@ struct Active {
 }
 struct Inner {
     account: Account,
-    model: Arc<dyn ChatModel>,
+    model: Option<Arc<dyn ChatModel>>,
     turns: Mutex<HashMap<ObjectId, Active>>,
-    watched: Mutex<HashSet<BaseId>>,
+    tasks: Mutex<HashMap<BaseId, Vec<tokio::task::JoinHandle<()>>>>,
+    watched: Mutex<HashMap<BaseId, BaseWeak>>,
     idle: Notify,
     running: Arc<Running>,
     events: broadcast::Sender<HeroEvent>,
@@ -165,6 +167,21 @@ pub struct Hero {
 type Controllers = Mutex<HashMap<(crate::AccountId, crate::DeviceId), Weak<Inner>>>;
 static HEROES: OnceLock<Controllers> = OnceLock::new();
 static ALL_HEROES: OnceLock<Mutex<Vec<Weak<Inner>>>> = OnceLock::new();
+
+pub(crate) async fn cancel_account_base(account: &Account, base: BaseId) {
+    let heroes: Vec<_> = ALL_HEROES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|h| h.account.id() == account.id() && h.account.device_id() == account.device_id())
+        .map(|inner| Hero { inner })
+        .collect();
+    for hero in heroes {
+        hero.cancel_base(base).await;
+    }
+}
 
 pub(crate) async fn stop_account_turns(account: &Account) {
     let heroes: Vec<_> = ALL_HEROES
@@ -216,29 +233,67 @@ impl Account {
         {
             return Hero { inner };
         }
-        let hero = Hero::new(self.clone(), self.model().expect("model configuration"));
+        let hero = Hero::new(self.clone(), None);
         map.insert((self.id(), self.device_id()), Arc::downgrade(&hero.inner));
         hero
     }
-    /// The account's configured, attested cloud model (also used by connected apps).
+    /// The account's configured cloud model (also used by connected apps).
+    /// Constructing the handle is local; completing a request needs the network.
+    ///
+    /// ```no_run
+    /// use bh_core::{Account, Error, models::{ChatModel, ChatRequest, Message, Role}};
+    /// async fn ask(account: &Account) -> Result<(), Error> {
+    ///     let model = account.model()?;
+    ///     let answer = model.complete(ChatRequest {
+    ///         messages: vec![Message { role: Role::User,
+    ///             content: Some("Reply briefly.".into()), tool_calls: vec![],
+    ///             tool_call_id: None }],
+    ///         tools: vec![], tool_choice: None, max_tokens: 64,
+    ///     }).await;
+    ///     let _text = answer.map_err(|e| Error::Network(e.to_string()))?.text;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for a malformed gateway URL,
+    /// [`Error::Storage`] for missing local credentials, or [`Error::Crypto`]
+    /// for a local key failure. Completion errors are [`crate::models::ModelError`].
     pub fn model(&self) -> Result<Arc<dyn ChatModel>, Error> {
-        crate::models::for_account(self)
+        crate::models::for_account(self, None)
+    }
+    /// The cloud model attributed to a base this device can open. Handle creation
+    /// is local; completion needs the network and the server rechecks the grant.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] if the base cannot be opened, or local
+    /// configuration, storage or key errors from [`Self::model`].
+    pub fn model_for(&self, base: BaseId) -> Result<Arc<dyn ChatModel>, Error> {
+        self.base(base).map_err(|error| {
+            if error == Error::NotFound {
+                Error::Forbidden
+            } else {
+                error
+            }
+        })?;
+        crate::models::for_account(self, Some(base))
     }
     /// A controller using a synthetic model; no live model calls in tests.
     #[cfg(feature = "test-support")]
     pub fn hero_with_model(&self, model: Arc<dyn ChatModel>) -> Hero {
-        Hero::new(self.clone(), model)
+        Hero::new(self.clone(), Some(model))
     }
 }
 impl Hero {
-    fn new(account: Account, model: Arc<dyn ChatModel>) -> Self {
+    fn new(account: Account, model: Option<Arc<dyn ChatModel>>) -> Self {
         let (events, _) = broadcast::channel(128);
         let hero = Self {
             inner: Arc::new(Inner {
                 account: account.clone(),
                 model,
                 turns: Mutex::new(HashMap::new()),
-                watched: Mutex::new(HashSet::new()),
+                tasks: Mutex::new(HashMap::new()),
+                watched: Mutex::new(HashMap::new()),
                 idle: Notify::new(),
                 running: Arc::new(Running::default()),
                 events,
@@ -284,7 +339,17 @@ impl Hero {
     }
     fn base(&self, id: BaseId) -> Result<Base, Error> {
         let base = self.inner.account.base(id)?;
-        if self.inner.watched.lock().unwrap().insert(id) {
+        let watch = base.downgrade();
+        let needs_watch = {
+            let mut watched = self.inner.watched.lock().unwrap();
+            if watched.get(&id).is_some_and(|old| old.is_same(&watch)) {
+                false
+            } else {
+                watched.insert(id, watch.clone());
+                true
+            }
+        };
+        if needs_watch {
             let weak = Arc::downgrade(&self.inner);
             let mut updates = base.events();
             self.inner.account.runtime().spawn(async move {
@@ -309,11 +374,22 @@ impl Hero {
                         }
                     }
                 }
+                if let Some(inner) = weak.upgrade() {
+                    let mut watched = inner.watched.lock().unwrap();
+                    if watched.get(&id).is_some_and(|old| old.is_same(&watch)) {
+                        watched.remove(&id);
+                    }
+                }
             });
         }
         Ok(base)
     }
     /// Lists chats in this base, newest first.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for an ungranted base,
+    /// [`Error::NeedsUpdate`] for unknown data, or [`Error::Storage`] for a
+    /// local read failure.
     pub fn chats(&self, id: BaseId) -> Result<Vec<ChatSummary>, Error> {
         let base = self.base(id)?;
         let mut chats: Vec<_> = base
@@ -356,6 +432,11 @@ impl Hero {
         Ok(chats.into_iter().map(|(chat, _)| chat).collect())
     }
     /// Gets or creates the chat for a project, or the newest top-level chat.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for an unknown project/base, or local edit
+    /// errors from [`Base::create`] including [`Error::ReadOnly`],
+    /// [`Error::NeedsUpdate`], [`Error::Invalid`] and [`Error::Storage`].
     pub fn chat_for(&self, base: BaseId, project: Option<ObjectId>) -> Result<ObjectId, Error> {
         if let Some(chat) = self.chats(base)?.into_iter().find(|s| s.project == project) {
             return Ok(chat.id);
@@ -363,6 +444,11 @@ impl Hero {
         self.make_chat(base, project)
     }
     /// Starts a fresh top-level chat.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for an ungranted base, or edit errors
+    /// from [`Base::create`] including [`Error::ReadOnly`], [`Error::Invalid`]
+    /// and [`Error::Storage`].
     pub fn new_chat(&self, base: BaseId) -> Result<ObjectId, Error> {
         self.make_chat(base, None)
     }
@@ -399,6 +485,11 @@ impl Hero {
             .ok_or(Error::NotFound)
     }
     /// Lists a chat's messages, marking interrupted local work after a restart.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for an unknown chat/base, or local read or
+    /// edit errors such as [`Error::NeedsUpdate`], [`Error::ReadOnly`] or
+    /// [`Error::Storage`].
     pub fn messages(&self, id: BaseId, chat: ObjectId) -> Result<Vec<ChatMessage>, Error> {
         let base = self.base(id)?;
         self.ensure_chat(&base, chat)?;
@@ -427,6 +518,14 @@ impl Hero {
         Ok(result)
     }
     /// Appends a user message and starts a turn. A concurrent send returns `busy`.
+    /// The turn runs asynchronously and needs the network for a live model;
+    /// sending the local message itself does not.
+    ///
+    /// # Errors
+    /// Returns [`Error::Conflict`] for a turn already running,
+    /// [`Error::ReadOnly`] for a read-only base, [`Error::NotFound`] for an
+    /// unknown chat/base, or local errors such as [`Error::Revoked`],
+    /// [`Error::Invalid`], [`Error::NeedsUpdate`] and [`Error::Storage`].
     pub fn send(
         &self,
         id: BaseId,
@@ -501,12 +600,12 @@ impl Hero {
         focus: Option<ObjectId>,
         project: Option<ObjectId>,
         history: Vec<ChatMessage>,
-        cancel: watch::Receiver<bool>,
+        mut cancel: watch::Receiver<bool>,
     ) {
         let weak = Arc::downgrade(&self.inner);
         self.inner.running.count.fetch_add(1, Ordering::SeqCst);
         let running = RunningTurn(self.inner.running.clone());
-        self.inner.account.runtime().spawn(async move {
+        let task = self.inner.account.runtime().spawn(async move {
             let _running = running;
             let Some(inner) = weak.upgrade() else { return };
             let hero = Hero { inner };
@@ -554,12 +653,32 @@ impl Hero {
             };
             let clock = hero.inner.account.clock();
             let readers_fresh = tokio::select! {
+                biased;
+                _ = cancel.changed() => return,
                 result = hero.inner.account.refresh_account_data() => result.is_ok(),
                 _ = clock.sleep_until(clock.now_ms().saturating_add(10_000)) => false,
             };
-            let mut tools = hero.tools(id, project, &chat_info, readers_fresh);
-            let model = hero.inner.model.clone();
-            drop(base);
+            if *cancel.borrow() {
+                return;
+            }
+            let mut tools = hero.tools(base.clone(), project, &chat_info, readers_fresh);
+            let model = match &hero.inner.model {
+                Some(model) => model.clone(),
+                None => match hero.inner.account.model_for(id) {
+                    Ok(model) => model,
+                    Err(_) => {
+                        hero.finish(
+                            id,
+                            chat,
+                            message,
+                            ResultKind::Failed("failed"),
+                            vec![],
+                            vec![],
+                        );
+                        return;
+                    }
+                },
+            };
             drop(hero);
             let outcome = turn::run(
                 model.as_ref(),
@@ -574,7 +693,6 @@ impl Hero {
                     if turns
                         .get(&chat)
                         .is_some_and(|a| a.message == message && !*a.cancel.borrow())
-                        && let Ok(base) = hero.base(id)
                         && let Ok(Some(entry)) = base.get(message)
                     {
                         let mut fields = entry.fields;
@@ -614,14 +732,19 @@ impl Hero {
                 );
             }
         });
+        let mut tasks = self.inner.tasks.lock().unwrap();
+        let group = tasks.entry(id).or_default();
+        group.retain(|task| !task.is_finished());
+        group.push(task);
     }
     fn tools(
         &self,
-        id: BaseId,
+        chat_base: Base,
         project: Option<ObjectId>,
         chat: &crate::ObjectSummary,
         readers_fresh: bool,
     ) -> tools::Tools {
+        let id = chat_base.id();
         let summaries = self.inner.account.bases();
         let current = summaries.iter().find(|b| b.id == id);
         let allowed: Vec<BaseId> =
@@ -650,11 +773,7 @@ impl Hero {
                 self.inner.account.base(s.id).ok().map(|b| (b, permission))
             })
             .collect();
-        tools::Tools::new(
-            self.inner.account.base(id).expect("open chat base"),
-            others,
-            project,
-        )
+        tools::Tools::new(chat_base, others, project)
     }
     fn finish(
         &self,
@@ -726,7 +845,13 @@ impl Hero {
         self.inner.idle.notify_waiters();
         self.changed(id, chat);
     }
-    /// Cancels the in-flight call and atomically persists Stopped.
+    /// Cancels the in-flight call and persists Stopped locally; no separate
+    /// network request is made.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] for a chat in another base, or local
+    /// errors such as [`Error::Storage`] and [`Error::NeedsUpdate`] if no
+    /// active turn exists and the chat cannot be opened.
     pub fn stop(&self, id: BaseId, chat: ObjectId) -> Result<(), Error> {
         let mut turns = self.inner.turns.lock().unwrap();
         if let Some(active) = turns.get(&chat) {
@@ -752,7 +877,14 @@ impl Hero {
         self.ensure_chat(&base, chat)?;
         Ok(())
     }
-    /// Answers a permission request and reruns the last user message.
+    /// Answers a permission request and reruns the last user message. The
+    /// resulting live turn needs the network; this method edits locally.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if there is no pending request,
+    /// [`Error::Conflict`] if another turn is active, or local edit errors
+    /// including [`Error::ReadOnly`], [`Error::Revoked`], [`Error::NeedsUpdate`]
+    /// and [`Error::Storage`].
     pub fn answer(&self, id: BaseId, chat: ObjectId, allow: bool) -> Result<(), Error> {
         let messages = self.messages(id, chat)?;
         let ask = messages
@@ -775,7 +907,14 @@ impl Hero {
         base.set_fields(chat, fields)?;
         self.retry(id, chat)
     }
-    /// Reruns the last user message without changing chat permissions.
+    /// Reruns the last user message without changing chat permissions. The
+    /// resulting live turn needs the network; this method edits locally.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if the chat or its messages are absent,
+    /// [`Error::Conflict`] for a running turn, or local edit errors including
+    /// [`Error::ReadOnly`], [`Error::Revoked`], [`Error::NeedsUpdate`] and
+    /// [`Error::Storage`].
     pub fn retry(&self, id: BaseId, chat: ObjectId) -> Result<(), Error> {
         let base = self.base(id)?;
         let summary = self.ensure_chat(&base, chat)?;
@@ -834,11 +973,42 @@ impl Hero {
         drop(turns);
         Ok(())
     }
+    /// Cancels every turn in `base` and awaits the turn tasks, even if the
+    /// account has already hidden the base. Clears Hero's cached base watcher.
+    /// Infallible: a cancelled task cannot make another model request or write
+    /// a late reply; an inaccessible working message becomes `interrupted` on
+    /// the next unlock.
+    pub(crate) async fn cancel_base(&self, base: BaseId) {
+        let chats: Vec<_> = self
+            .inner
+            .turns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, active)| active.base == base)
+            .map(|(chat, _)| *chat)
+            .collect();
+        for chat in chats {
+            let _ = self.stop(base, chat);
+        }
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap()
+            .remove(&base)
+            .unwrap_or_default();
+        for task in tasks {
+            let _ = task.await;
+        }
+        self.inner.watched.lock().unwrap().remove(&base);
+    }
     /// Subscribes to changed chats, including changes received by sync.
     pub fn events(&self) -> broadcast::Receiver<HeroEvent> {
         self.inner.events.subscribe()
     }
-    /// Waits until this process has no active turn for the chat.
+    /// Waits until this process has no active turn for the chat. A live turn may need
+    /// the network, but this method does not make a separate request.
     pub async fn wait_idle(&self, chat: ObjectId) {
         loop {
             let notified = self.inner.idle.notified();

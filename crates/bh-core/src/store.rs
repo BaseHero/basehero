@@ -212,6 +212,7 @@ const ACCOUNT_MIGRATIONS: &[&str] = &[
         epoch INTEGER NOT NULL,
         wrapper BLOB NOT NULL
     );",
+    "CREATE TABLE credential_envelope (id INTEGER PRIMARY KEY CHECK (id = 1), hash TEXT NOT NULL);",
 ];
 
 /// A base this device may open: its key as the server's wrapper, which only
@@ -296,6 +297,27 @@ impl AccountDb {
                 |r| Ok((r.get::<_, i64>(0)? as u64, Zeroizing::new(r.get(1)?))),
             )
             .optional()?)
+    }
+
+    /// The last fetched credential envelope's SHA-256, independent of account-data version.
+    pub(crate) fn envelope_hash(&self) -> Result<Option<String>, Error> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT hash FROM credential_envelope WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn set_envelope_hash(&self, hash: &str) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO credential_envelope (id, hash) VALUES (1, ?)
+             ON CONFLICT (id) DO UPDATE SET hash = excluded.hash",
+            [hash],
+        )?;
+        Ok(())
     }
 
     /// Records a commitment before any response is sent; duplicates remain forever.
@@ -476,8 +498,20 @@ const BASE_MIGRATIONS: &[&str] = &[
      DELETE FROM set_aside WHERE seq IS NOT NULL AND id NOT IN
          (SELECT min(id) FROM set_aside WHERE seq IS NOT NULL GROUP BY object_id, seq);
      CREATE UNIQUE INDEX IF NOT EXISTS set_aside_unique ON set_aside (object_id, seq) WHERE seq IS NOT NULL;
-     CREATE VIRTUAL TABLE IF NOT EXISTS object_search USING fts5(object_id UNINDEXED, title, body);"
+     CREATE VIRTUAL TABLE IF NOT EXISTS object_search USING fts5(object_id UNINDEXED, title, body);",
+    "CREATE TABLE IF NOT EXISTS files (object_id TEXT PRIMARY KEY, parts INTEGER NOT NULL, have INTEGER NOT NULL, sent INTEGER, broken TEXT);
+     CREATE TABLE IF NOT EXISTS edits (object_id TEXT PRIMARY KEY, last_edit_at INTEGER NOT NULL, last_version_at INTEGER);"
 ];
+
+/// Local progress for one sealed file.
+#[derive(Clone, Debug)]
+pub(crate) struct FileRow {
+    pub id: ObjectId,
+    pub parts: u32,
+    pub have: u32,
+    pub sent: Option<u32>,
+    pub broken: Option<String>,
+}
 
 /// Types that never show in the folder tree or the trash.
 const HIDDEN: &str = "type NOT IN ('core.type', 'core.base')";
@@ -900,6 +934,47 @@ impl BaseDb {
         Ok(())
     }
 
+    /// Test-only: one Yjs update per simulated edit session, in the caller's
+    /// transaction. Unlike `put`, does not rewrite the final object state.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_append_outbox(&self, updates: &[(ObjectId, Vec<u8>)]) -> Result<(), Error> {
+        let mut statement = self.0.prepare_cached(
+            "INSERT INTO outbox (object_id, \"update\", created_at) VALUES (?, ?, ?)",
+        )?;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        for (id, update) in updates {
+            statement.execute(params![id.to_string(), update, at])?;
+        }
+        Ok(())
+    }
+
+    /// Test-only: unmerged outbox rows, oldest first, bounded like a real
+    /// request. The normal sync path deliberately merges an object's edits.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_outbox_batch(
+        &self,
+        end: i64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(i64, ObjectId, Vec<u8>)>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT id, object_id, \"update\" FROM outbox WHERE id <= ? ORDER BY id LIMIT ?",
+        )?;
+        let mut rows = statement.query(params![end, limit as i64])?;
+        let (mut out, mut bytes) = (Vec::new(), 0);
+        while let Some(row) = rows.next()? {
+            let update: Vec<u8> = row.get(2)?;
+            if !out.is_empty() && bytes + update.len() + 64 > max_bytes {
+                break;
+            }
+            bytes += update.len() + 64;
+            out.push((row.get(0)?, parse_id(&row.get::<_, String>(1)?)?, update));
+        }
+        Ok(out)
+    }
+
     /// The newest outbox row's ID, or 0.
     pub(crate) fn outbox_end(&self) -> Result<i64, Error> {
         Ok(self
@@ -1086,6 +1161,99 @@ impl BaseDb {
         Ok(())
     }
 
+    pub(crate) fn file_row(&self, id: ObjectId) -> Result<Option<FileRow>, Error> {
+        let row = self
+            .0
+            .query_row(
+                "SELECT parts, have, sent, broken FROM files WHERE object_id = ?",
+                [id.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, Option<u32>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(parts, have, sent, broken)| FileRow {
+            id,
+            parts,
+            have,
+            sent,
+            broken,
+        }))
+    }
+
+    pub(crate) fn put_file(&self, id: ObjectId, parts: u32) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO files (object_id, parts, have, sent) VALUES (?, ?, ?, 0)",
+            params![id.to_string(), parts, parts],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn file_rows(&self) -> Result<Vec<FileRow>, Error> {
+        let mut statement = self
+            .0
+            .prepare("SELECT object_id, parts, have, sent, broken FROM files")?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, u32>(2)?,
+                r.get::<_, Option<u32>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (id, parts, have, sent, broken) = r?;
+            Ok(FileRow {
+                id: parse_id(&id)?,
+                parts,
+                have,
+                sent,
+                broken,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn file_candidates(&self) -> Result<Vec<ObjectId>, Error> {
+        let mut statement = self
+            .0
+            .prepare("SELECT object_id FROM objects WHERE type = 'core.file'")?;
+        let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| parse_id(&r?)).collect()
+    }
+
+    pub(crate) fn file_received(&self, id: ObjectId, parts: u32, have: u32) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO files (object_id, parts, have, sent) VALUES (?, ?, ?, NULL)
+             ON CONFLICT(object_id) DO UPDATE SET have = excluded.have WHERE sent IS NULL AND have < excluded.have",
+            params![id.to_string(), parts, have],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn file_broken(&self, id: ObjectId, parts: u32) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO files (object_id, parts, have, sent, broken) VALUES (?, ?, 0, NULL, 'authentication failed')
+             ON CONFLICT(object_id) DO UPDATE SET broken = 'authentication failed', have = 0",
+            params![id.to_string(), parts],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn file_sent(&self, id: ObjectId, sent: u32) -> Result<(), Error> {
+        self.0.execute(
+            "UPDATE files SET sent = ? WHERE object_id = ?",
+            params![sent, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// The outbox, oldest first.
     #[cfg(feature = "test-support")]
     pub(crate) fn outbox(&self) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
@@ -1105,6 +1273,30 @@ impl BaseDb {
 mod tests {
     use super::*;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn migrating_a_version_5_store_adds_files_and_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("base.sqlite");
+        let mut conn = open_encrypted(&path, &[3; 32]).unwrap();
+        migrate(&mut conn, &BASE_MIGRATIONS[..5]).unwrap();
+        drop(conn);
+        let db = BaseDb::open(&path, &[3; 32]).unwrap();
+        let version: u32 =
+            db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 6);
+        for table in ["files", "edits"] {
+            let count: i64 =
+                db.0.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
+    }
 
     #[test]
     fn a_base_store_is_encrypted_at_version_4_and_writes_state_with_its_outbox() {
@@ -1210,7 +1402,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1250,7 +1442,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1268,7 +1460,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1346,7 +1538,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let count: u32 =
             db.0.query_row("SELECT count(*) FROM approvals_answered", [], |r| r.get(0))
                 .unwrap();

@@ -74,7 +74,7 @@ export const fold = () => adb('emu', 'fold');
 export const unfold = () => adb('emu', 'unfold');
 
 const cli = resolve(import.meta.dirname, '../../../../target/debug/bh');
-export function bh(args, { home, password, operatorToken } = {}) {
+export function bh(args, { home, password, hiddenPassword, operatorToken } = {}) {
   // A CLI test has no ambient GitHub/operator credentials and never sees the real
   // home. Only invite gets the dev operator token, and neither its value nor
   // subprocess stderr is logged.
@@ -82,6 +82,7 @@ export function bh(args, { home, password, operatorToken } = {}) {
   const dir = home ?? scratch;
   const env = { PATH: process.env.PATH, HOME: dir, XDG_CONFIG_HOME: dir, GH_CONFIG_DIR: dir };
   if (password !== undefined) env.BH_PASSWORD = password;
+  if (hiddenPassword !== undefined) env.BH_HIDDEN_PASSWORD = hiddenPassword;
   if (operatorToken !== undefined) env.BH_OPERATOR_TOKEN = operatorToken;
   try {
     const result = execFileSync(cli, ['--json', ...args], { encoding: 'utf8', timeout: 60_000,
@@ -109,10 +110,9 @@ export async function signUpOnDev(page) {
   await page.getByLabel('Password').fill(password);
   await page.getByLabel('Device name').fill('Emulator');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByRole('heading', { name: 'Save your recovery kit' }).waitFor({ timeout: 30_000 });
+  await page.getByRole('heading', { name: 'Your recovery kit' }).waitFor({ timeout: 30_000 });
   const kit = (await page.getByTestId('kit').textContent()).trim();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: "I've saved it" }).click();
   await page.getByRole('heading', { name: 'BaseHero' }).first().waitFor();
   return { email, password, kit };
 }

@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 case "${1:-}" in
   build)
     export BH_SERVER="${BH_SERVER:-https://dev-api.basehero.com}"
-    (cd apps/basehero && cargo tauri android build --debug --apk --target x86_64 --ci)
+    (cd apps/basehero && VITE_BH_DEBUG=1 cargo tauri android build --debug --apk --target x86_64 --ci)
     ;;
   install)
     "$0" build
@@ -15,7 +15,17 @@ case "${1:-}" in
     [ "$(adb -s emulator-5580 emu avd name | tr -d '\r' | head -n 1)" = bh-fold-36 ] || {
       echo 'port 5580 is not the BaseHero emulator' >&2; exit 1;
     }
-    adb -s emulator-5580 install -r "$apk"
+    if ! out=$(adb -s emulator-5580 install -r "$apk" 2>&1); then
+      case $out in
+        *INSTALL_FAILED_UPDATE_INCOMPATIBLE*)
+          # Another worktree's build used a different debug key. The disposable
+          # emulator's app holds nothing to keep: each suite clears it anyway.
+          adb -s emulator-5580 uninstall app.basehero
+          adb -s emulator-5580 install "$apk"
+          ;;
+        *) printf '%s\n' "$out" >&2; exit 1 ;;
+      esac
+    fi
     ;;
   release-check)
     # R8 must keep the verifier's Kotlin half and KeysPlugin, which Rust reaches

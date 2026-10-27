@@ -1,5 +1,6 @@
 //! Device approval: a signed-in device gives a new device the account key.
 
+/// Binary exchange messages, bounded state machines and displayed digits.
 pub mod protocol;
 
 use crate::client::{Api, ApprovalLive, ApprovalState};
@@ -86,6 +87,13 @@ impl Approval {
     }
 
     /// Waits for the response, posts the reveal and returns digits for the approving device.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] if already signed in,
+    /// [`Error::ApprovalEnded`] if the exchange expired or ended,
+    /// [`Error::NeedsUpdate`] for a newer message format, or [`Error::Network`]
+    /// if the exchange cannot be reached.
     pub async fn digits(&mut self) -> Result<Digits, Error> {
         if self.pending.is_complete().await {
             return Err(Error::invalid("signed in"));
@@ -147,6 +155,12 @@ impl Approval {
     }
 
     /// Waits for the sealed account key, opens it and activates the pending device.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for a completed sign-in,
+    /// [`Error::ApprovalEnded`] for an ended exchange, [`Error::Network`]
+    /// for a connection failure, or [`Error::Storage`] for a local install failure.
     pub async fn wait(&mut self) -> Result<Account, Error> {
         if self.side.is_none() {
             return Err(Error::invalid("signed in"));
@@ -188,6 +202,11 @@ impl Approval {
     }
 
     /// Starts a fresh exchange after the previous exchange has ended.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] if already signed in, [`Error::Network`]
+    /// on connection failure, or an error from [`Self::cancel`].
     pub async fn retry(&mut self) -> Result<(), Error> {
         if self.pending.is_complete().await {
             return Err(Error::invalid("signed in"));
@@ -214,7 +233,12 @@ impl Approval {
     }
 
     /// Erases this device's exchange state even if ending it on the relay fails.
-    /// Returns that relay error so the app can report it.
+    /// Returns that relay error so the app can report it. Needs the network
+    /// to notify the relay.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] if the relay cannot be reached or a
+    /// server error such as [`Error::Revoked`].
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.side = None;
         self.digits = None;
@@ -230,6 +254,12 @@ impl Approval {
     }
 
     /// Switches to the recovery kit. A bad kit can be retried on this handle.
+    /// Needs the network to activate the device.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] if already signed in, [`Error::BadKit`]
+    /// for an incorrect kit, [`Error::Network`] on connection failure, or
+    /// errors from [`Self::cancel`].
     pub async fn use_kit(&mut self, kit: &str) -> Result<Account, Error> {
         if self.side.is_none() && self.pending.is_complete().await {
             return Err(Error::invalid("signed in"));
@@ -256,6 +286,11 @@ impl Approval {
 
 impl PendingSignIn {
     /// Creates an approval request after password sign-in; no kit is needed.
+    /// Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Network`] on connection failure or server errors
+    /// including [`Error::Revoked`] and [`Error::Conflict`].
     pub async fn request_approval(&self) -> Result<Approval, Error> {
         let id = ApprovalId::random();
         let clock = self.clock();

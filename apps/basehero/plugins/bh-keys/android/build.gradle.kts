@@ -15,6 +15,7 @@ android {
 }
 
 dependencies {
+    implementation("com.google.android.gms:play-services-auth-blockstore:16.4.0")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

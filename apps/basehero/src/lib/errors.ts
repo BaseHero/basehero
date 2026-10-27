@@ -4,6 +4,7 @@ export function messageFor(kind: string, message = ''): string {
   switch (kind) {
     case 'BadCredentials': return 'Email or password is wrong.';
     case 'BadKit': return "That kit doesn't match this account.";
+    case 'NothingUnlocked': return 'No hidden bases open with that password.';
     case 'Network': return "Can't reach BaseHero. Check your connection.";
     case 'RateLimited': return 'Too many tries. Wait a few minutes, then try again.';
     case 'NeedsUpdate': return 'This version of BaseHero is too old. Update it to continue.';

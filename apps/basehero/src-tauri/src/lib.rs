@@ -3,7 +3,9 @@ mod android_tls;
 pub mod commands;
 pub mod error;
 pub mod hero;
+pub mod kit_store;
 pub mod notes;
+mod recents;
 pub mod secrets;
 pub mod state;
 pub mod update;
@@ -52,6 +54,14 @@ async fn sign_in_start(
 }
 
 #[tauri::command]
+async fn sign_in_saved_kit(
+    startup: tauri::State<'_, state::Startup>,
+    pending: String,
+) -> Result<Option<bh_core::AccountSummary>, error::CommandError> {
+    commands::account::sign_in_saved_kit(startup.state()?, &pending).await
+}
+
+#[tauri::command]
 async fn sign_in_with_kit(
     startup: tauri::State<'_, state::Startup>,
     pending: String,
@@ -88,19 +98,37 @@ async fn new_kit(
 }
 
 #[tauri::command]
-fn kit_saved(
+fn kit_status(
     startup: tauri::State<'_, state::Startup>,
     account: bh_core::AccountId,
-) -> Result<bool, error::CommandError> {
-    commands::account::kit_saved(startup.state()?, account)
+) -> Result<bh_core::KitStatus, error::CommandError> {
+    commands::account::kit_status(startup.state()?, account)
 }
 
 #[tauri::command]
-fn set_kit_saved(
+async fn kit_kept_here(
     startup: tauri::State<'_, state::Startup>,
     account: bh_core::AccountId,
+) -> Result<bool, error::CommandError> {
+    commands::account::kit_kept_here(startup.state()?, account).await
+}
+
+#[tauri::command]
+fn show_kit(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<views::SecretString, error::CommandError> {
+    commands::account::show_kit(startup.state()?, account)
+}
+
+#[tauri::command]
+async fn set_kit_saved(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    kit: String,
 ) -> Result<(), error::CommandError> {
-    commands::account::set_kit_saved(startup.state()?, account)
+    let kit = views::SecretString::from(kit);
+    commands::account::set_kit_saved(startup.state()?, account, &kit).await
 }
 
 #[tauri::command]
@@ -109,6 +137,15 @@ async fn devices(
     account: bh_core::AccountId,
 ) -> Result<Vec<bh_core::DeviceSummary>, error::CommandError> {
     commands::account::devices(startup.state()?, account).await
+}
+
+#[tauri::command]
+async fn usage(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    month: Option<String>,
+) -> Result<bh_core::AccountUsage, error::CommandError> {
+    commands::account::usage(startup.state()?, account, month.as_deref()).await
 }
 
 #[tauri::command]
@@ -196,6 +233,9 @@ pub fn run() {
                 {
                     state.notes.close_window(window.label());
                 }
+                if windows::should_lock_hidden(window.app_handle().webview_windows().len()) {
+                    windows::lock_hidden_bounded(window.app_handle());
+                }
             }
             _ => {}
         });
@@ -205,6 +245,7 @@ pub fn run() {
             {
                 app.manage(windows::QuitState::default());
                 windows::install_dock_quit(app.handle());
+                windows::install_screen_lock(app.handle());
             }
             app.manage(state::Startup::open(app.handle()));
             Ok(())
@@ -215,6 +256,7 @@ pub fn run() {
             reset_device,
             sign_up,
             sign_in_start,
+            sign_in_saved_kit,
             sign_in_with_kit,
             sign_in_cancel,
             commands::approval::ipc::approval_start,
@@ -228,15 +270,29 @@ pub fn run() {
             commands::approval::ipc::approval_decline,
             sign_out,
             new_kit,
-            kit_saved,
+            kit_status,
+            kit_kept_here,
+            show_kit,
             set_kit_saved,
             devices,
+            usage,
             remove_device,
             commands::note::note_open,
             commands::note::note_apply,
             commands::note::note_close,
             commands::base::ipc::bases,
             commands::base::ipc::create_base,
+            commands::hidden::ipc::create_hidden_base,
+            commands::hidden::ipc::unlock_hidden,
+            commands::hidden::ipc::lock_hidden,
+            commands::hidden::ipc::lock_all_hidden,
+            commands::hidden::ipc::password_strength,
+            commands::hidden::ipc::refresh_account,
+            commands::files::ipc::file_add,
+            commands::files::ipc::files,
+            commands::files::ipc::file_info,
+            commands::files::ipc::file_image,
+            commands::files::ipc::file_open,
             commands::base::ipc::children,
             commands::base::ipc::get_object,
             commands::base::ipc::create_object,
@@ -296,6 +352,8 @@ pub fn run() {
                 }
                 // Stop the core's threads before the process exits; see `Core::shutdown`.
                 tauri::RunEvent::Exit => {
+                    #[cfg(target_os = "macos")]
+                    windows::lock_hidden_bounded(app);
                     if let Some(startup) = app.try_state::<state::Startup>()
                         && let Ok(state) = startup.state()
                     {

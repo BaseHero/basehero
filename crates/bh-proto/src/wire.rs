@@ -411,6 +411,46 @@ pub struct FetchResponse {
     pub more: Vec<ObjectId>,
 }
 
+/// Metadata for one retained state of an object; `at` is server Unix milliseconds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct VersionInfo {
+    #[ts(type = "number")]
+    pub seq: u64,
+    #[ts(type = "number")]
+    pub covers: u64,
+    pub device_id: DeviceId,
+    #[ts(type = "number")]
+    pub at: i64,
+    #[ts(type = "number")]
+    pub size: u64,
+}
+
+/// A newest-first page of retained object states.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct VersionsResponse {
+    pub versions: Vec<VersionInfo>,
+    pub more: bool,
+}
+
+/// One retained object's opaque state body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct VersionResponse {
+    #[ts(type = "number")]
+    pub seq: u64,
+    #[ts(type = "number")]
+    pub covers: u64,
+    pub device_id: DeviceId,
+    #[ts(type = "number")]
+    pub at: i64,
+    pub body: Bytes,
+}
+
 /// WebSocket server messages; clients only send pings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "t", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -555,6 +595,40 @@ pub enum ApprovalLiveMessage {
         #[ts(optional)]
         end_reason: Option<ApprovalEndReason>,
     },
+}
+
+/// One day or month of attributed usage; absent IDs are unassigned or legacy calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct UsageRow {
+    pub period: String,
+    pub service: String,
+    pub base: Option<BaseId>,
+    pub device: Option<DeviceId>,
+    #[ts(type = "number")]
+    pub requests: u64,
+    #[ts(type = "number")]
+    pub unreported: u64,
+    #[ts(type = "number")]
+    pub prompt_tokens: u64,
+    #[ts(type = "number")]
+    pub completion_tokens: u64,
+    #[ts(type = "number")]
+    pub stored_bytes: u64,
+    #[ts(type = "number")]
+    pub cost_micro_usd: u64,
+    #[ts(type = "number")]
+    pub price_micro_usd: u64,
+}
+
+/// Account usage by month and the selected month's UTC days.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct UsageResponse {
+    pub months: Vec<UsageRow>,
+    pub days: Vec<UsageRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]

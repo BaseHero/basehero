@@ -52,18 +52,25 @@ const HEAD: &str = "head";
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub struct SyncState {
     #[ts(type = "number")]
+    /// Number of objects with unsent changes.
     pub pending: u64,
+    /// Whether the sync task currently has a connection.
     pub online: bool,
+    /// Millisecond timestamp of the last completed catch-up, if any.
     #[ts(type = "number | null")]
     pub last_synced_at: Option<i64>,
 }
 
+/// Notifications for local edits, fetched changes and sync status. On receiver
+/// lag, read fresh summaries from the base rather than relying on every event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum BaseEvent {
     /// Object summaries or documents changed.
     ObjectsChanged(#[ts(type = "Array<string>")] Vec<ObjectId>),
+    /// Local file upload progress or availability changed.
+    FilesChanged(#[ts(type = "Array<string>")] Vec<ObjectId>),
     /// The base's sync status changed.
     Sync(SyncState),
     /// A fetched object requires a newer version; other objects continue syncing.
@@ -114,6 +121,7 @@ enum Command {
     Changed,
     CatchUp,
     Flush(oneshot::Sender<Result<(), Error>>),
+    SyncNow(oneshot::Sender<Result<(), Error>>),
     #[cfg(feature = "test-support")]
     Resume,
 }
@@ -131,6 +139,8 @@ pub(crate) struct SyncTask {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "test-support")]
     paused: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    unmerged: Arc<AtomicBool>,
 }
 
 impl SyncTask {
@@ -143,6 +153,8 @@ impl SyncTask {
         let (commands, receiver) = mpsc::unbounded_channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let paused = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let unmerged = Arc::new(AtomicBool::new(false));
         let engine = Engine {
             owner: base.downgrade(),
             base: None,
@@ -151,6 +163,8 @@ impl SyncTask {
             commands: receiver,
             status: status.clone(),
             paused: paused.clone(),
+            #[cfg(feature = "test-support")]
+            unmerged: unmerged.clone(),
             flushes: Vec::new(),
             dirty: true,
             caught_up: false,
@@ -172,6 +186,8 @@ impl SyncTask {
             task: Mutex::new(Some(task)),
             #[cfg(feature = "test-support")]
             paused,
+            #[cfg(feature = "test-support")]
+            unmerged,
         }
     }
 
@@ -208,6 +224,20 @@ impl SyncTask {
         done.await.map_err(|_| stopped())?
     }
 
+    pub(crate) async fn sync_now(&self) -> Result<(), Error> {
+        let (reply, done) = oneshot::channel();
+        self.commands
+            .send(Command::SyncNow(reply))
+            .map_err(|_| Error::Network("sync has stopped".into()))?;
+        done.await
+            .map_err(|_| Error::Network("sync has stopped".into()))?
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn preserve_updates(&self) {
+        self.unmerged.store(true, Ordering::SeqCst);
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn pause(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
@@ -226,6 +256,8 @@ struct Engine {
     commands: mpsc::UnboundedReceiver<Command>,
     status: Arc<Mutex<Status>>,
     paused: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    unmerged: Arc<AtomicBool>,
     /// Callers waiting for the outbox to be sent.
     flushes: Vec<oneshot::Sender<Result<(), Error>>>,
     /// The outbox may hold changes.
@@ -374,7 +406,7 @@ impl Engine {
         }
         let sending: HashSet<_> = self
             .base()
-            .db()
+            .db()?
             .sending()?
             .into_iter()
             .map(|row| row.change_id)
@@ -394,7 +426,7 @@ impl Engine {
             let confirmed = if let Some(index) = index {
                 batch[index].1
             } else {
-                self.base().db().confirmed(change.object_id)?.unwrap_or(0)
+                self.base().db()?.confirmed(change.object_id)?.unwrap_or(0)
             };
             if change.seq <= confirmed {
                 continue;
@@ -444,12 +476,13 @@ impl Engine {
         if !changed.is_empty() {
             *worked = true;
             self.base().emit(BaseEvent::ObjectsChanged(changed));
+            self.base().files_caught_up();
         }
         Ok(())
     }
 
     async fn apply_live(&mut self, change: LiveChange, worked: &mut bool) -> Result<(), Error> {
-        let confirmed = self.base().db().confirmed(change.object_id)?.unwrap_or(0);
+        let confirmed = self.base().db()?.confirmed(change.object_id)?.unwrap_or(0);
         if change.seq <= confirmed {
             return Ok(());
         }
@@ -489,6 +522,10 @@ impl Engine {
             }
             Command::CatchUp => self.caught_up = false,
             Command::Flush(reply) => self.flushes.push(reply),
+            Command::SyncNow(reply) => {
+                self.caught_up = false;
+                self.flushes.push(reply);
+            }
         }
     }
 
@@ -520,7 +557,13 @@ impl Engine {
         if self.retry_at.is_some_and(|at| now < at) && !flushing {
             return;
         }
-        if !self.needs_update_reported && self.base().db().has_future().unwrap_or(false) {
+        if !self.needs_update_reported
+            && self
+                .base()
+                .db()
+                .ok()
+                .is_some_and(|db| db.has_future().unwrap_or(false))
+        {
             self.needs_update_reported = true;
             self.base().emit(BaseEvent::NeedsUpdate);
         }
@@ -574,6 +617,7 @@ impl Engine {
         if catch_up {
             self.catch_up(worked).await?;
             self.caught_up = true;
+            self.base().files_caught_up();
         }
         if send {
             self.send(worked).await?;
@@ -595,14 +639,14 @@ impl Engine {
     /// from the base head caught up to.
     async fn catch_up(&mut self, worked: &mut bool) -> Result<(), Error> {
         let id = self.base().id();
-        let mut after = self.base().db().sync_value(HEAD)?.unwrap_or(0);
+        let mut after = self.base().db()?.sync_value(HEAD)?.unwrap_or(0);
         loop {
             if self.paused() {
                 return Ok(());
             }
             let page = self.api.since(id, after).await?;
             let wanted = {
-                let db = self.base().db();
+                let db = self.base().db()?;
                 let mut wanted = Vec::new();
                 for object in &page.objects {
                     if object.head > db.confirmed(object.object_id)?.unwrap_or(0) {
@@ -618,7 +662,7 @@ impl Engine {
                 (true, Some(last)) => last.head,
                 _ => page.head,
             };
-            self.base().db().set_sync_value(HEAD, after)?;
+            self.base().db()?.set_sync_value(HEAD, after)?;
             if !page.more {
                 return Ok(());
             }
@@ -668,6 +712,7 @@ impl Engine {
                 if !changed.is_empty() {
                     *worked = true;
                     self.base().emit(BaseEvent::ObjectsChanged(changed));
+                    self.base().files_caught_up();
                 }
                 ask = reply.more;
             }
@@ -680,11 +725,11 @@ impl Engine {
     /// unchanged, before any other. Edits made meanwhile wait for the next
     /// send, so an object goes out at most once a send.
     async fn send(&mut self, worked: &mut bool) -> Result<(), Error> {
-        let end = self.base().db().outbox_end()?;
+        let end = self.base().db()?.outbox_end()?;
         loop {
             let batch = {
                 let base = self.base().clone();
-                let mut db = base.db();
+                let mut db = base.db()?;
                 // Checked under the store lock, so an edit made after pausing
                 // is never in a batch.
                 if self.paused() {
@@ -772,14 +817,18 @@ impl Engine {
         batch: &[SendingRow],
         results: &[ChangeResult],
     ) -> Result<Vec<ObjectId>, Error> {
-        let mut db = self.base().db();
+        let mut db = self.base().db()?;
         let (mut done, mut fetch) = (Vec::new(), Vec::new());
+        #[cfg(feature = "test-support")]
+        let mut sequence = HashMap::new();
         for row in batch {
             let result = results
                 .iter()
                 .find(|r| r.change_id == row.change_id)
                 .ok_or_else(|| Error::Network("malformed response".into()))?;
             let confirmed = db.confirmed(row.object_id)?.unwrap_or(0);
+            #[cfg(feature = "test-support")]
+            let confirmed = *sequence.get(&row.object_id).unwrap_or(&confirmed);
             let confirm = match result.seq {
                 Some(seq) if result.prev_head == confirmed => Some(seq),
                 Some(seq) => {
@@ -790,6 +839,10 @@ impl Engine {
                 }
                 None => None,
             };
+            #[cfg(feature = "test-support")]
+            if let Some(seq) = confirm {
+                sequence.insert(row.object_id, seq);
+            }
             done.push((row, confirm));
         }
         db.sent(&done)?;
@@ -843,9 +896,13 @@ impl Engine {
             }
         }
         let base = self.base().clone();
-        let mut db = base.db();
+        let mut db = base.db()?;
         let mut states = Vec::new();
+        let mut unique = HashSet::new();
         for id in candidates {
+            if !unique.insert(id) {
+                continue;
+            }
             if db.needs_update(id)? {
                 continue;
             }
@@ -882,6 +939,23 @@ impl Engine {
     /// The next batch from the outbox up to row `end`: one change per object,
     /// merging its waiting updates, within a request's limits.
     fn next_batch(&self, db: &BaseDb, end: i64, flushing: bool) -> Result<Vec<SendingRow>, Error> {
+        #[cfg(feature = "test-support")]
+        if self.unmerged.load(Ordering::SeqCst) {
+            return db
+                .test_outbox_batch(end, BATCH_CHANGES, BATCH_BYTES)?
+                .into_iter()
+                .map(|(row_id, id, update)| {
+                    Ok(SendingRow {
+                        change_id: ChangeId::random(),
+                        object_id: id,
+                        state: false,
+                        body: self.base().seal_change(id, false, &update),
+                        covers: None,
+                        outbox_max_id: row_id,
+                    })
+                })
+                .collect();
+        }
         let mut batch = Vec::new();
         let mut total = 0;
         for id in db.outbox_objects(end)? {

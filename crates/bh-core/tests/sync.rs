@@ -384,6 +384,7 @@ async fn a_newer_object_does_not_block_catch_up_or_sending() {
 
 #[tokio::test]
 async fn dropping_the_last_base_handle_stops_polling() {
+    local_only!(); // Times two fallback polling intervals after dropping the handle.
     let (account, _) = bh_testkit::device("drop")
         .sign_up(bh_testkit::new_signup())
         .await

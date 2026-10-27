@@ -115,6 +115,37 @@ impl RawDevice {
     pub async fn delete(&self, path: &str, payload: Value) -> (StatusCode, Value) {
         self.request(Method::DELETE, path, payload).await
     }
+    /// Send opaque bytes to a protocol endpoint, returning its JSON response.
+    pub async fn put_bytes(&self, path: &str, body: &[u8]) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .put(self.server.join(path).expect("protocol path"))
+            .header("BH-Protocol", "1")
+            .header("BH-Test-Bypass", &self.bypass)
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await
+            .expect("raw byte PUT");
+        assert_eq!(response.headers()["BH-Protocol"], "1");
+        (response.status(), response.json().await.expect("raw JSON"))
+    }
+    /// Read opaque bytes, including a JSON error body on failure.
+    pub async fn get_bytes(&self, path: &str) -> (StatusCode, Vec<u8>) {
+        let response = reqwest::Client::new()
+            .get(self.server.join(path).expect("protocol path"))
+            .header("BH-Protocol", "1")
+            .header("BH-Test-Bypass", &self.bypass)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("raw byte GET");
+        assert_eq!(response.headers()["BH-Protocol"], "1");
+        (
+            response.status(),
+            response.bytes().await.expect("raw bytes").to_vec(),
+        )
+    }
     pub async fn live(&self, path: &str) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         self.try_live(path).await.expect("live connection")
     }
@@ -123,6 +154,9 @@ impl RawDevice {
         &self,
         path: &str,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::Error> {
+        // Raw TLS sockets use tungstenite's default rustls connector. Both ring
+        // and aws-lc-rs are in the test binary; select one before a wss call.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut url = self.server.join(path).expect("live path");
         url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
             .unwrap();

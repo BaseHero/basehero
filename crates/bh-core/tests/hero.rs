@@ -570,6 +570,44 @@ async fn dropping_all_handles_releases_the_directory_during_a_hung_turn() {
 }
 
 #[tokio::test]
+async fn a_hero_watcher_does_not_keep_an_ordinary_base_open() {
+    let (account, base) = setup().await;
+    let id = base.id();
+    let hero = account.hero_with_model(ScriptedModel::new(vec![]));
+    hero.chats(id).unwrap(); // subscribe without starting a turn
+    let raw = bh_testkit::raw_device(&account);
+    let path = format!("/v1/bases/{id}/live-count");
+    // Establish that this base has a live socket before dropping its owners.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (_, count) = raw.get(&path, json!({})).await;
+            if count["count"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ordinary base must start live sync");
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the watcher drain startup events
+    drop(hero);
+    drop(base);
+    // The server observes the socket close asynchronously. One generous
+    // deadline, as for every wait: a loaded machine slows this, not fails it.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (_, count) = raw.get(&path, json!({})).await;
+            if count["count"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Hero's watcher must not pin an ordinary base open");
+}
+
+#[tokio::test]
 async fn losing_the_chat_base_cancels_a_hung_turn() {
     let core = device("a");
     let (account, _) = core

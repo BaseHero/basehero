@@ -17,9 +17,8 @@ async function signed(page: Page, beforeContinue?: () => Promise<void>): Promise
   await page.getByLabel('Password').fill('correct horse battery staple');
   await page.getByLabel('Device name').fill('Mac');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByLabel("I've saved my kit").check();
   await beforeContinue?.();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Later' }).click();
   return (await page.evaluate(() => window.__fake.accounts()))[0].id;
 }
 

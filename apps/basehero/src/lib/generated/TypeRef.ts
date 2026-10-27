@@ -3,4 +3,12 @@
 /**
  * A type's name and version, such as `core.note` version 1.
  */
-export type TypeRef = { name: string, version: number, };
+export type TypeRef = { 
+/**
+ * Fully qualified type name, including its namespace.
+ */
+name: string, 
+/**
+ * Version of that type; versions are stored alongside one another.
+ */
+version: number, };

@@ -9,23 +9,41 @@ use ts_rs::TS;
 #[serde(tag = "kind", content = "message")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum Error {
+    /// A request or connection failed.
     Network(String),
+    /// No valid sign-in is available.
     Unauthorized,
+    /// The account credentials were rejected.
     BadCredentials,
+    /// The kit did not open this account.
     BadKit,
+    /// This device has been removed.
     Revoked,
+    /// This device has not finished activation.
     Pending,
+    /// This device lacks permission for the operation.
     Forbidden,
+    /// A write was attempted on a read-only base.
     ReadOnly,
+    /// The requested resource was not found.
     NotFound,
+    /// No hidden bases were unlocked for this operation.
     NothingUnlocked,
+    /// A server-side conflict, with its stable code.
     Conflict(String),
+    /// The request or local change exceeds its size limit.
     TooLarge,
+    /// A request limit has been reached.
     RateLimited,
+    /// A newer core is needed to read this data.
     NeedsUpdate,
+    /// Input was invalid, with a human-readable reason.
     Invalid(String),
+    /// Local storage failed, with a human-readable reason.
     Storage(String),
+    /// An encrypted value could not be opened.
     Crypto,
+    /// An approval exchange ended for the given reason.
     ApprovalEnded(EndReason),
 }
 
@@ -34,11 +52,17 @@ pub enum Error {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum EndReason {
+    /// The displayed digits did not match.
     WrongDigits,
+    /// The approving device declined.
     Declined,
+    /// The exchange was cancelled.
     Cancelled,
+    /// The exchange expired.
     Expired,
+    /// The exchange was already answered elsewhere.
     AlreadyAnswered,
+    /// The exchanged message could not be accepted.
     BadMessage,
 }
 

@@ -20,17 +20,6 @@ async function pendingSignIn(page: Page) {
   await page.getByRole('button', { name: 'Continue' }).click();
 }
 
-test('sign-up shows the kit once and continues only once it is saved', async ({ page }) => {
-  await signUp(page);
-  await expect(page.getByTestId('kit')).toHaveText(/^([0-9A-Z]{4}-){6}[0-9A-Z]{2}$/);
-  await expect(page.getByRole('button', { name: 'Continue' })).toBeDisabled();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await expect(page.getByRole('link', { name: 'Personal' })).toBeVisible();
-  await page.goBack();
-  await expect(page.getByTestId('kit')).toHaveCount(0);
-});
-
 test('sign-in with the kit reaches the account', async ({ page }) => {
   await pendingSignIn(page);
   await expect(page.getByText('Approval in the app')).toBeVisible();
@@ -52,10 +41,10 @@ test('a wrong kit says so and keeps what was typed', async ({ page }) => {
   expect(calls.filter(call => call.startsWith('signInStart'))).toHaveLength(1);
 });
 
-test('the UI never stores the password or the kit', async ({ page }) => {
-  await signUp(page);
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+test('sign-in never stores the password or the kit', async ({ page }) => {
+  await pendingSignIn(page);
+  await page.getByLabel('Recovery kit').fill(kit);
+  await page.getByRole('button', { name: 'Use kit' }).click();
   const stored = await page.evaluate(async () => {
     const data: unknown[] = [Object.entries(localStorage), Object.entries(sessionStorage)];
     for (const database of await indexedDB.databases()) {
@@ -86,60 +75,13 @@ test('the UI never stores the password or the kit', async ({ page }) => {
   expect(page.url()).not.toContain(kit);
 });
 
-test('browser and Android Back ask before losing an unacknowledged kit', async ({ page }) => {
+test('browser and Android Back leave the kit without prompting', async ({ page }) => {
   await signUp(page);
-  page.once('dialog', dialog => { expect(dialog.type()).toBe('confirm'); expect(dialog.message()).toContain("You haven't saved your recovery kit"); void dialog.dismiss(); });
-  await page.goBack();
-  await expect(page.getByTestId('kit')).toBeVisible();
-  page.once('dialog', dialog => { expect(dialog.type()).toBe('confirm'); void dialog.accept(); });
+  let dialogs = 0;
+  page.on('dialog', dialog => { dialogs++; void dialog.dismiss(); });
   await page.evaluate(() => window.__bhBack?.());
-  await expect(page.getByRole('button', { name: 'Make a new recovery kit' })).toBeVisible();
-  await expect(page.getByTestId('kit')).toHaveCount(0);
-  expect(await page.evaluate(() => {
-    const event = new Event('beforeunload', { cancelable: true });
-    window.dispatchEvent(event);
-    return event.defaultPrevented;
-  })).toBe(true);
-});
-
-test('unacknowledged kit warns on reload and window close', async ({ page, context }) => {
-  await signUp(page);
-  const reloadWarning = page.waitForEvent('dialog');
-  void page.evaluate(() => { location.reload(); }).catch(() => {});
-  const dialog = await reloadWarning;
-  expect(dialog.type()).toBe('beforeunload');
-  await dialog.dismiss();
-  await expect(page.getByTestId('kit')).toBeVisible();
-  const closeWarning = page.waitForEvent('dialog');
-  await page.close({ runBeforeUnload: true });
-  const closeDialog = await closeWarning;
-  expect(closeDialog.type()).toBe('beforeunload');
-  await closeDialog.dismiss();
-  expect(context.pages()).toContain(page);
-});
-
-test('an unsaved account can make a fresh kit after Back, then clear the reminder', async ({ page }) => {
-  await signUp(page);
-  page.once('dialog', dialog => void dialog.accept());
-  await page.getByRole('button', { name: 'Back' }).click();
-  await page.evaluate(() => window.__bhRestart?.());
-  await expect(page.getByRole('button', { name: 'Make a new recovery kit' })).toBeVisible();
-  await page.getByRole('button', { name: 'Make a new recovery kit' }).click();
-  await page.getByLabel('Password').fill('wrong');
-  await page.getByRole('button', { name: 'Make kit' }).click();
-  await expect(page.getByText('Email or password is wrong.')).toBeVisible();
-  await page.getByLabel('Password').fill('correct horse battery staple');
-  await page.getByRole('button', { name: 'Make kit' }).click();
-  const fresh = await page.getByTestId('kit').textContent();
-  expect(fresh).toMatch(/^([0-9A-Z]{4}-){6}[0-9A-Z]{2}$/);
-  expect(fresh).not.toBe(kit);
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
-  await expect(page.getByRole('button', { name: 'Make a new recovery kit' })).toHaveCount(0);
-  const logAndHistory = await page.evaluate(() => JSON.stringify({ calls: window.__fake.calls, state: history.state }));
-  expect(logAndHistory).not.toContain('correct horse battery staple');
-  expect(logAndHistory).not.toContain(fresh!);
-  expect(await page.evaluate(() => window.__fake.calls.filter(call => call.startsWith('newKit ')))).toHaveLength(2);
+  await expect(page.getByRole('link', { name: 'Personal' })).toBeVisible();
+  expect(dialogs).toBe(0);
 });
 
 test('kit print stays black on white in dark mode', async ({ page }) => {
@@ -150,7 +92,7 @@ test('kit print stays black on white in dark mode', async ({ page }) => {
     return { ink: style.color, paper: style.backgroundColor };
   });
   expect(colors).toEqual({ ink: 'rgb(0, 0, 0)', paper: 'rgb(255, 255, 255)' });
-  await expect(page.getByRole('heading', { name: 'Save your recovery kit' })).toHaveCSS('color', 'rgb(0, 0, 0)');
+  await expect(page.getByRole('heading', { name: 'Your recovery kit' })).toHaveCSS('color', 'rgb(0, 0, 0)');
 });
 
 test('screen changes focus the heading, then Tab reaches the first field', async ({ page }) => {
@@ -164,9 +106,8 @@ test('screen changes focus the heading, then Tab reaches the first field', async
   await page.getByLabel('Email').fill('dan@example.com');
   await page.getByLabel('Password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await expect(page.getByRole('heading', { name: 'Save your recovery kit' })).toBeFocused();
-  await page.getByLabel("I've saved my kit").check();
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: 'Your recovery kit' })).toBeFocused();
+  await page.getByRole('button', { name: 'Later' }).click();
   await expect(page.getByRole('heading', { name: 'BaseHero' })).toBeFocused();
 });
 

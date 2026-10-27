@@ -21,9 +21,13 @@ pub(crate) const BODY: &str = "default";
 /// goes last among `parent`'s children.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewObject {
+    /// Defined record type and version.
     pub ty: TypeRef,
+    /// Parent object, or `None` for the top level.
     pub parent: Option<ObjectId>,
+    /// Sibling after which to place the object; `None` appends on creation.
     pub after: Option<ObjectId>,
+    /// Initial JSON fields, checked against the type's definition.
     pub fields: Map<String, Value>,
 }
 
@@ -35,17 +39,26 @@ pub struct NewObject {
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub struct ObjectSummary {
     #[ts(type = "string")]
+    /// Stable object ID.
     pub id: ObjectId,
+    /// Stored type name and version.
     pub ty: TypeRef,
+    /// Effective parent for display, or the top level.
     #[ts(type = "string | null")]
     pub parent: Option<ObjectId>,
+    /// Sort key among siblings.
     pub position: String,
+    /// Whether the object is in the trash.
     pub deleted: bool,
+    /// Display title computed from the record type or document.
     pub title: String,
+    /// JSON fields, including any not defined by this version.
     #[ts(as = "HashMap<String, TsJsonValue>")]
     pub fields: Map<String, Value>,
+    /// Last local update time in milliseconds.
     #[ts(type = "number")]
     pub updated_at: i64,
+    /// Device responsible for the last applied change, when known.
     #[ts(type = "string | null")]
     pub updated_by: Option<DeviceId>,
 }

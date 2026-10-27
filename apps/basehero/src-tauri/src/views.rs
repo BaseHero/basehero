@@ -117,6 +117,10 @@ mod secret_tests {
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
 pub enum AppEvent {
+    KitChanged {
+        #[ts(type = "string")]
+        account: AccountId,
+    },
     Account {
         #[ts(type = "string")]
         account: AccountId,

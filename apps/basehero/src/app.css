@@ -1,4 +1,15 @@
 * { box-sizing: border-box; }
+.hidden-dialog-backdrop { position: fixed; inset: 0; z-index: 900; display: flex; align-items: center; justify-content: center; padding: 1rem; background: rgba(0,0,0,.65); }
+.hidden-dialog { width: min(100%, 30rem); max-height: calc(100dvh - 2rem); overflow-y: auto; background: var(--panel); color: var(--text); border: 1px solid var(--line-strong); padding: clamp(1rem, 4vw, 2rem); }
+.hidden-dialog h2 { margin: .5rem 0 1rem; font-size: 1.5rem; }
+.hidden-dialog form { display: grid; gap: .65rem; }
+.hidden-dialog label:not(.acknowledge) { display: grid; gap: .3rem; }
+.hidden-dialog input:not([type=checkbox]) { width: 100%; min-width: 0; padding: .65rem; }
+.hidden-dialog .acknowledge { display: flex; align-items: flex-start; gap: .6rem; }
+.hidden-dialog p { margin: .2rem 0; line-height: 1.4; }
+.hidden-dialog .actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: .5rem 0 0; padding: .5rem 0; position: sticky; bottom: 0; background: var(--panel); }
+.hidden-dialog button { min-height: 2.5rem; }
+.bases-screen .hidden-bases li button { width: auto; }
 body { margin: 0; font-family: var(--sans); color: var(--text); background: var(--panel-2); }
 .entry-grid { min-height: 100vh; display: grid; place-items: center; padding: 2rem; background-color: var(--panel-2); background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px); background-size: 4rem 4rem; }
 .entry-panel { width: min(100%, 32rem); padding: clamp(1.5rem, 5vw, 3rem); background: var(--panel); border: 1px solid var(--line-strong); box-shadow: 8px 8px 0 var(--grid); }

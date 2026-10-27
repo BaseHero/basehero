@@ -9,9 +9,14 @@ const HOST: &str = "inference.tinfoil.sh";
 const REPO: &str = "tinfoilsh/confidential-model-router";
 const ENCLAVE: &str = "https://inference.tinfoil.sh";
 
+/// Validated gateway endpoint for encrypted model requests.
 #[derive(Clone)]
 pub struct Gateway(Url);
 impl Gateway {
+    /// Accepts HTTPS, or HTTP on loopback, without URL credentials or query.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::InvalidGateway`] for a malformed or disallowed URL.
     pub fn new(url: &str) -> Result<Self, ModelError> {
         let parsed = Url::parse(url).map_err(|_| ModelError::InvalidGateway)?;
         let loopback = match parsed.host() {
@@ -34,8 +39,11 @@ impl Gateway {
     }
 }
 
+/// Model implementation that verifies the enclave and encrypts each
+/// completion request and response; credentials stay on the calling device.
 pub struct Tinfoil {
     gateway: Gateway,
+    base: Option<String>,
     credential: Zeroizing<String>,
     cache_secret: Zeroizing<String>,
     tls: Arc<rustls::ClientConfig>,
@@ -44,6 +52,8 @@ pub struct Tinfoil {
     test_key: Option<String>,
 }
 impl Tinfoil {
+    /// Configures a gateway with device credentials and a TLS client.
+    /// Verification and network requests occur on [`ChatModel::complete`].
     pub fn new(
         gateway: Gateway,
         credential: Zeroizing<String>,
@@ -52,6 +62,7 @@ impl Tinfoil {
     ) -> Self {
         Self {
             gateway,
+            base: None,
             credential,
             cache_secret,
             tls,
@@ -61,6 +72,7 @@ impl Tinfoil {
         }
     }
 
+    /// Creates a fixture model with a supplied enclave key for local tests.
     #[cfg(all(feature = "testing", debug_assertions))]
     pub fn unverified_for_tests(
         gateway: Gateway,
@@ -82,6 +94,12 @@ impl Tinfoil {
         );
         model.test_key = Some(key_hex);
         model
+    }
+
+    /// Attributes calls to a base ID; the gateway checks this device's read grant.
+    pub fn with_base(mut self, base: String) -> Self {
+        self.base = Some(base);
+        self
     }
 
     async fn connect(&self) -> Result<Verified, ModelError> {
@@ -108,9 +126,11 @@ impl Tinfoil {
                 }
                 cache.as_ref().unwrap().clone()
             };
-            let request = route
-                .http
-                .post(route.url.clone())
+            let mut builder = route.http.post(route.url.clone());
+            if let Some(base) = &self.base {
+                builder = builder.header("BH-Base", base);
+            }
+            let request = builder
                 .header(header::AUTHORIZATION, bearer.clone())
                 .header("x-tinfoil-enclave-url", ENCLAVE)
                 .header("x-tinfoil-model", TINFOIL_MODEL)

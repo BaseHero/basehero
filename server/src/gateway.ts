@@ -1,15 +1,17 @@
-import { error, requireDevice } from './http';
-import type { Env } from './http';
-import type { Limits, Usage, UsageDay } from './gateway_do';
+import { answer, error, id, requireDevice } from './http';
+import type { Env, Principal, Result } from './http';
+import type { Limits, Usage, UsageDay, DayTotals, Breakdown } from './gateway_do';
 
 const UPSTREAM = 'https://inference.tinfoil.sh/v1/chat/completions';
 const ENCLAVE = 'https://inference.tinfoil.sh';
 const MAX_BODY = 1024 * 1024;
 
 type GatewayRpc = {
-  reserve(limits: Limits): Promise<{ ok: true } | { ok: false; retryAfter: number }>;
-  record(usage: Usage | null): Promise<void>;
+  reserve(limits: Limits, base: string, device: string): Promise<{ ok: true } | { ok: false; retryAfter: number }>;
+  record(usage: Usage | null, base: string, device: string): Promise<void>;
   usage(): Promise<UsageDay[]>;
+  report(): Promise<{ days: DayTotals[]; breakdown: Breakdown[] }>;
+  seedLegacyDay(): Promise<void>;
 };
 export function gatewayStub(env: Env, accountId: string): GatewayRpc {
   return env.GATEWAY.get(env.GATEWAY.idFromName(`gw:${accountId}`)) as unknown as GatewayRpc;
@@ -34,6 +36,13 @@ function parseUsage(value: string | null): Usage | null {
 
 export async function handleModels(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const principal = await requireDevice(request, env);
+  const named = request.headers.get('BH-Base');
+  const baseId = named === null ? '' : id(named);
+  if (baseId) {
+    const base = env.BASE.get(env.BASE.idFromName(baseId)) as unknown as { fileAccess(p: Principal, write: boolean): Promise<Result> };
+    const access = await base.fileAccess(principal, false);
+    if (access.status !== 200) return answer(access);
+  }
   const key = request.headers.get('ehbp-encapsulated-key');
   const model = request.headers.get('x-tinfoil-model');
   if (!key || !/^[0-9a-fA-F]{64}$/.test(key) ||
@@ -73,7 +82,7 @@ export async function handleModels(request: Request, env: Env, ctx: ExecutionCon
     return error('bad_gateway', 502, 'Model unavailable');
   }
   const stub = gatewayStub(env, principal.accountId);
-  const reserved = await stub.reserve({ perMinute, perDay, dailyCostMicroUsd });
+  const reserved = await stub.reserve({ perMinute, perDay, dailyCostMicroUsd }, baseId, principal.deviceId);
   if (!reserved.ok) {
     const response = error('rate_limited', 429, 'Model rate limit reached');
     response.headers.set('Retry-After', String(reserved.retryAfter));
@@ -102,7 +111,7 @@ export async function handleModels(request: Request, env: Env, ctx: ExecutionCon
       await upstream.body?.cancel();
       return error('bad_gateway', 502, 'Model unavailable');
     }
-    ctx.waitUntil(stub.record(parseUsage(upstream.headers.get('x-tinfoil-usage-metrics'))));
+    ctx.waitUntil(stub.record(parseUsage(upstream.headers.get('x-tinfoil-usage-metrics')), baseId, principal.deviceId));
     const responseHeaders = new Headers({ 'BH-Protocol': '1' });
     for (const name of ['content-type', 'ehbp-response-nonce']) {
       const value = upstream.headers.get(name);

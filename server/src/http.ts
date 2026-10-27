@@ -104,6 +104,7 @@ export type AccountRpc = {
   activate(principal: Principal, activation: string): Promise<Result>;
   me(principal: Principal): Promise<Result>;
   account(principal: Principal): Promise<Result>;
+  usageBases(principal: Principal): Promise<string[]>;
   data(principal: Principal, ciphertext: string, expectedVersion: number): Promise<Result>;
   credentials(principal: Principal, input: import('./proto/gen/CredentialsRequest').CredentialsRequest): Promise<Result>;
   addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string): Promise<Result>;

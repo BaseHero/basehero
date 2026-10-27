@@ -16,6 +16,7 @@
   let { r, id, onleave, retryleave }: { r: BaseRef; id: ObjectId | null; onleave: (hook: () => Promise<boolean>) => () => void; retryleave: () => void } = $props();
   const model = untrack(() => new TreeModel(r));
   let baseName = $state('Base');
+  let hidden = $state(false);
   let drawer = $state(false);
   let heroOpen = $state(false);
   let menu = $state<ObjectSummary | null>(null);
@@ -51,7 +52,7 @@
   });
   onMount(() => {
     let active = true;
-    void getBackend().bases(r.account).then(bases => { if (active) baseName = bases.find(base => base.id === r.base)?.name ?? 'Base'; }).catch(e => error = errorMessage(e));
+    void getBackend().bases(r.account).then(bases => { if (active) { const base = bases.find(base => base.id === r.base); baseName = base?.name ?? 'Base'; hidden = base?.hidden ?? false; } }).catch(e => error = errorMessage(e));
     void getBackend().appInfo().then(info => { if (active) mac = info.platform === 'macos'; });
     void model.expand(null).catch(e => error = errorMessage(e));
     let unsubscribe = () => {};
@@ -135,7 +136,7 @@
       <button onclick={() => trashOpen = !trashOpen}>Trash</button>
     </aside>
     <section class="content-panel">
-      <LocationBar {r} {baseName} {id} {revision} onopen={open} />
+      <LocationBar {r} {baseName} {hidden} {id} {revision} onopen={open} />
       {#if menu}<div class="item-menu"><span>{menu.title}</span><button onclick={startRename}>Rename</button><button onclick={() => { move = menu; menu = null; }}>Move to…</button><button onclick={remove}>Delete</button><button onclick={() => menu = null}>Close menu</button></div>{/if}
       {#if renaming}<form onsubmit={rename}><label>New name <input bind:value={newName} required /></label><button type="submit">Save name</button><button type="button" onclick={() => renaming = null}>Cancel</button></form>{/if}
       {#if move}<MoveDialog {r} item={move} onmove={doMove} onclose={() => move = null} />{/if}

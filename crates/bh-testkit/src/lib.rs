@@ -1,5 +1,7 @@
 mod bases;
 mod device;
+pub mod generate;
+pub mod inspect;
 mod mitm;
 mod proxy;
 mod raw;

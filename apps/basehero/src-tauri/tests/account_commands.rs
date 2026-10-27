@@ -1,7 +1,7 @@
 mod common;
 
 use basehero_app_lib::commands::account::{
-    accounts, devices, kit_saved, new_kit, remove_device, set_kit_saved, sign_in_cancel,
+    accounts, devices, kit_status, new_kit, remove_device, set_kit_saved, show_kit, sign_in_cancel,
     sign_in_start, sign_in_with_kit, sign_out, sign_up,
 };
 use basehero_app_lib::views::{AppEvent, SignInForm, SignUpForm};
@@ -176,20 +176,31 @@ async fn an_unknown_or_cancelled_pending_id_is_not_found() {
 }
 
 #[tokio::test]
-async fn a_kit_saved_flag_survives_restart_but_a_new_kit_clears_it() {
+async fn a_saved_kit_survives_restart_but_a_new_kit_clears_it() {
     let (state, events) = state_at(server().url());
     let signed = sign_up(&state, form()).await.unwrap();
-    assert!(!kit_saved(&state, signed.account.id).unwrap());
-    set_kit_saved(&state, signed.account.id).unwrap();
-    assert!(kit_saved(&state, signed.account.id).unwrap());
+    let status = kit_status(&state, signed.account.id).unwrap();
+    assert!(status.known && !status.saved && status.made_at.is_some());
+    assert_eq!(&*show_kit(&state, signed.account.id).unwrap(), &*signed.kit);
+    set_kit_saved(&state, signed.account.id, &signed.kit)
+        .await
+        .unwrap();
+    assert!(kit_status(&state, signed.account.id).unwrap().saved);
     drop(state);
     let again = open_at(events.data_dir(), server().url(), &events);
-    assert!(kit_saved(&again, signed.account.id).unwrap());
+    assert!(kit_status(&again, signed.account.id).unwrap().saved);
     let replacement = new_kit(&again, signed.account.id, TEST_PASSWORD)
         .await
         .unwrap();
     assert_eq!(replacement.replace('-', "").len(), 26);
-    assert!(!kit_saved(&again, signed.account.id).unwrap());
+    assert!(!kit_status(&again, signed.account.id).unwrap().saved);
+    assert_eq!(
+        set_kit_saved(&again, signed.account.id, &signed.kit)
+            .await
+            .unwrap_err()
+            .kind,
+        "Conflict"
+    );
 }
 
 #[tokio::test]
@@ -199,7 +210,7 @@ async fn sign_out_forgets_the_account() {
     sign_out(&state, signed.account.id).await.unwrap();
     assert!(accounts(&state).unwrap().is_empty());
     assert_eq!(
-        kit_saved(&state, signed.account.id).unwrap_err().kind,
+        kit_status(&state, signed.account.id).unwrap_err().kind,
         "NotFound"
     );
     assert!(matches!(
@@ -261,7 +272,7 @@ async fn removing_this_device_signs_out_the_app_shell() {
     remove_device(&state, signed.account.id, own).await.unwrap();
     assert!(accounts(&state).unwrap().is_empty());
     assert_eq!(
-        kit_saved(&state, signed.account.id).unwrap_err().kind,
+        kit_status(&state, signed.account.id).unwrap_err().kind,
         "NotFound"
     );
     assert!(
