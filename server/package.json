@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261027.1",
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0",
+    "typescript": "5.9.3",
+    "workerd": "1.20261023.1",
+    "wrangler": "4.153.0"
+  }
+}

@@ -1,0 +1,121 @@
+name = "basehero-api"
+main = "src/index.ts"
+compatibility_date = "2026-08-06"
+workers_dev = false
+
+[vars]
+TINFOIL_MODELS = "deepseek-v4-1-flash"
+GATEWAY_PER_MINUTE = "20"
+GATEWAY_PER_DAY = "500"
+GATEWAY_DAILY_COST_USD = "2"
+APPROVAL_TTL_MS = "120000"
+
+[[durable_objects.bindings]]
+name = "ACCOUNT"
+class_name = "AccountDO"
+[[durable_objects.bindings]]
+name = "BASE"
+class_name = "BaseDO"
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+[[durable_objects.bindings]]
+name = "INVITES"
+class_name = "InvitesDO"
+[[durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "GatewayDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountDO", "BaseDO", "DirectoryDO", "InvitesDO"]
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["GatewayDO"]
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "basehero-files"
+[[ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1003"
+simple = { limit = 30, period = 60 }
+
+[env.dev]
+name = "basehero-api-dev"
+workers_dev = false
+routes = [{ pattern = "dev-api.basehero.com", custom_domain = true }]
+[env.dev.vars]
+ALLOW_TEST_BYPASS = "1"
+TINFOIL_MODELS = "deepseek-v4-1-flash"
+GATEWAY_PER_MINUTE = "20"
+GATEWAY_PER_DAY = "500"
+GATEWAY_DAILY_COST_USD = "1"
+APPROVAL_TTL_MS = "120000"
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT"
+class_name = "AccountDO"
+[[env.dev.durable_objects.bindings]]
+name = "BASE"
+class_name = "BaseDO"
+[[env.dev.durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+[[env.dev.durable_objects.bindings]]
+name = "INVITES"
+class_name = "InvitesDO"
+[[env.dev.durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "GatewayDO"
+[[env.dev.migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountDO", "BaseDO", "DirectoryDO", "InvitesDO"]
+[[env.dev.migrations]]
+tag = "v2"
+new_sqlite_classes = ["GatewayDO"]
+[[env.dev.r2_buckets]]
+binding = "FILES"
+bucket_name = "basehero-dev-files"
+[[env.dev.ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
+
+[env.production]
+name = "basehero-api"
+workers_dev = false
+routes = [{ pattern = "api.basehero.com", custom_domain = true }]
+[env.production.vars]
+TINFOIL_MODELS = "deepseek-v4-1-flash"
+GATEWAY_PER_MINUTE = "20"
+GATEWAY_PER_DAY = "500"
+GATEWAY_DAILY_COST_USD = "2"
+APPROVAL_TTL_MS = "120000"
+[[env.production.durable_objects.bindings]]
+name = "ACCOUNT"
+class_name = "AccountDO"
+[[env.production.durable_objects.bindings]]
+name = "BASE"
+class_name = "BaseDO"
+[[env.production.durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+[[env.production.durable_objects.bindings]]
+name = "INVITES"
+class_name = "InvitesDO"
+[[env.production.durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "GatewayDO"
+[[env.production.migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccountDO", "BaseDO", "DirectoryDO", "InvitesDO"]
+[[env.production.migrations]]
+tag = "v2"
+new_sqlite_classes = ["GatewayDO"]
+[[env.production.r2_buckets]]
+binding = "FILES"
+bucket_name = "basehero-files"
+[[env.production.ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 30, period = 60 }

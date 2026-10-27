@@ -1,0 +1,29 @@
+[package]
+name = "bh-models"
+version.workspace = true
+edition.workspace = true
+
+[features]
+testing = ["dep:hpke", "dep:aes-gcm", "dep:rand", "dep:hex", "dep:axum"]
+
+[dependencies]
+futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+tinfoil.workspace = true
+tinfoil-ehbp.workspace = true
+tokio.workspace = true
+url.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hpke = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+webpki-roots.workspace = true
+getrandom.workspace = true

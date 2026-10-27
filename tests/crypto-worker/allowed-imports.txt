@@ -1,4 +1,0 @@
-__assert_fail
-abort
-emscripten_asm_const_int
-explicit_bzero

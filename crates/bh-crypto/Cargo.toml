@@ -1,0 +1,22 @@
+[package]
+name = "bh-crypto"
+version.workspace = true
+edition.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+zeroize = "1"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+hex = "0.4"
+
+# The libsodium FFI needs unsafe; unlike the rest of the foundation it cannot forbid it.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -1,0 +1,232 @@
+use crate::{ChatModel, ChatRequest, Completion, ModelError, TINFOIL_MODEL, response};
+use futures_util::{StreamExt, future::BoxFuture};
+use reqwest::{Url, header};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Mutex;
+use zeroize::Zeroizing;
+
+const HOST: &str = "inference.tinfoil.sh";
+const REPO: &str = "tinfoilsh/confidential-model-router";
+const ENCLAVE: &str = "https://inference.tinfoil.sh";
+
+#[derive(Clone)]
+pub struct Gateway(Url);
+impl Gateway {
+    pub fn new(url: &str) -> Result<Self, ModelError> {
+        let parsed = Url::parse(url).map_err(|_| ModelError::InvalidGateway)?;
+        let loopback = match parsed.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        if !(parsed.scheme() == "https" || parsed.scheme() == "http" && loopback)
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.query().is_some()
+            || parsed.port() == Some(0)
+        {
+            return Err(ModelError::InvalidGateway);
+        }
+        Ok(Self(parsed))
+    }
+}
+
+pub struct Tinfoil {
+    gateway: Gateway,
+    credential: Zeroizing<String>,
+    cache_secret: Zeroizing<String>,
+    tls: Arc<rustls::ClientConfig>,
+    verified: Mutex<Option<Arc<Verified>>>,
+    #[cfg(all(feature = "testing", debug_assertions))]
+    test_key: Option<String>,
+}
+impl Tinfoil {
+    pub fn new(
+        gateway: Gateway,
+        credential: Zeroizing<String>,
+        cache_secret: Zeroizing<String>,
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Self {
+        Self {
+            gateway,
+            credential,
+            cache_secret,
+            tls,
+            verified: Mutex::new(None),
+            #[cfg(all(feature = "testing", debug_assertions))]
+            test_key: None,
+        }
+    }
+
+    #[cfg(all(feature = "testing", debug_assertions))]
+    pub fn unverified_for_tests(
+        gateway: Gateway,
+        credential: Zeroizing<String>,
+        key_hex: String,
+    ) -> Self {
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let mut model = Self::new(
+            gateway,
+            credential,
+            Zeroizing::new("cache-secret-for-tests".into()),
+            Arc::new(tls),
+        );
+        model.test_key = Some(key_hex);
+        model
+    }
+
+    async fn connect(&self) -> Result<Verified, ModelError> {
+        #[cfg(all(feature = "testing", debug_assertions))]
+        if let Some(key) = &self.test_key {
+            return Verified::from_verified_key(&self.gateway, key, &self.tls);
+        }
+        Verified::connect(&self.gateway, &self.credential, &self.tls).await
+    }
+
+    async fn run(&self, req: ChatRequest) -> Result<Completion, ModelError> {
+        let body = req.encode(&self.cache_secret)?;
+        if self.credential.is_empty() {
+            return Err(ModelError::InvalidRequest);
+        }
+        let mut bearer = header::HeaderValue::from_str(&format!("Bearer {}", *self.credential))
+            .map_err(|_| ModelError::InvalidRequest)?;
+        bearer.set_sensitive(true);
+        for attempt in 0..2 {
+            let route = {
+                let mut cache = self.verified.lock().await;
+                if cache.is_none() {
+                    *cache = Some(Arc::new(self.connect().await?));
+                }
+                cache.as_ref().unwrap().clone()
+            };
+            let request = route
+                .http
+                .post(route.url.clone())
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("x-tinfoil-enclave-url", ENCLAVE)
+                .header("x-tinfoil-model", TINFOIL_MODEL)
+                .header("BH-Protocol", "1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json")
+                .body(body.clone())
+                .build()
+                .map_err(|_| ModelError::InvalidRequest)?;
+            let response = match route.ehbp.execute(request).await {
+                Ok(response) => response,
+                Err(tinfoil_ehbp::Error::KeyConfigMismatch(_)) => {
+                    let mut cache = self.verified.lock().await;
+                    // Don't invalidate another call's freshly verified route.
+                    if cache.as_ref().is_some_and(|r| Arc::ptr_eq(r, &route)) {
+                        *cache = None;
+                    }
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(ModelError::Encryption);
+                }
+                Err(tinfoil_ehbp::Error::Http(_)) => return Err(ModelError::Transport),
+                Err(_) => return Err(ModelError::Encryption),
+            };
+            if !response.status().is_success() {
+                return Err(match response.status().as_u16() {
+                    401 => ModelError::Unauthorized,
+                    403 => ModelError::Forbidden,
+                    413 => ModelError::TooLarge,
+                    426 => ModelError::NeedsUpdate,
+                    429 => ModelError::RateLimited,
+                    status => ModelError::HttpStatus(status),
+                });
+            }
+            let mut bytes = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| ModelError::Encryption)?;
+                if chunk.len() > 8 * 1024 * 1024 - bytes.len() {
+                    return Err(ModelError::Response);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return response::decode(&bytes);
+        }
+        unreachable!()
+    }
+}
+impl ChatModel for Tinfoil {
+    fn complete(&self, req: ChatRequest) -> BoxFuture<'_, Result<Completion, ModelError>> {
+        Box::pin(async move {
+            tokio::time::timeout(Duration::from_secs(120), self.run(req))
+                .await
+                .map_err(|_| ModelError::Transport)?
+        })
+    }
+}
+
+struct Verified {
+    ehbp: tinfoil_ehbp::Client,
+    url: Url,
+    http: reqwest::Client,
+}
+impl Verified {
+    async fn connect(
+        gateway: &Gateway,
+        credential: &str,
+        tls: &rustls::ClientConfig,
+    ) -> Result<Self, ModelError> {
+        let mut verified =
+            tinfoil::SecureClient::new_with_proxy(HOST, REPO, credential, gateway.0.as_str());
+        verified
+            .verify()
+            .await
+            .map_err(|_| ModelError::Verification)?;
+        if !verified.is_verified() {
+            return Err(ModelError::Verification);
+        }
+        let doc = verified
+            .verification_document()
+            .ok_or(ModelError::Verification)?;
+        if !doc.security_verified
+            || doc.enclave_host != HOST
+            || doc.config_repo != REPO
+            || doc.hpke_public_key.is_empty()
+        {
+            return Err(ModelError::Verification);
+        }
+        Self::from_verified_key(gateway, &doc.hpke_public_key, tls)
+    }
+    fn from_verified_key(
+        gateway: &Gateway,
+        key: &str,
+        tls: &rustls::ClientConfig,
+    ) -> Result<Self, ModelError> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(120))
+            .use_preconfigured_tls(tls.clone())
+            .build()
+            .map_err(|_| ModelError::Transport)?;
+        let ehbp = tinfoil_ehbp::Client::with_public_key_hex_and_http_client(
+            gateway.0.as_str(),
+            key,
+            http.clone(),
+        )
+        .map_err(|_| ModelError::Encryption)?;
+        let mut base = gateway.0.clone();
+        if !base.path().ends_with('/') {
+            base.set_path(&format!("{}/", base.path()));
+        }
+        let url = base
+            .join("v1/chat/completions")
+            .map_err(|_| ModelError::InvalidGateway)?;
+        Ok(Self { ehbp, url, http })
+    }
+}

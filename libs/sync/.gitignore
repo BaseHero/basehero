@@ -1,3 +1,0 @@
-/target/
-# The enclosing product workspace owns the release lockfile.
-/Cargo.lock

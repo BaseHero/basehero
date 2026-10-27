@@ -1,0 +1,4 @@
+# Target-specific linkers and libraries are configured by the development shells.
+[env]
+# Every exported type names its file relative to this workspace root.
+TS_RS_EXPORT_DIR = { value = ".", relative = true }

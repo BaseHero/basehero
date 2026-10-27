@@ -1,8 +1,0 @@
-{
-  "description": "remote ref",
-  "schema": {
-    "$ref": "https://example.com/schema"
-  },
-  "accept": false,
-  "keyword": "$ref"
-}
