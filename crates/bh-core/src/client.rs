@@ -291,6 +291,35 @@ impl Api {
         }
     }
 
+    pub(crate) async fn versions(
+        &self,
+        base: BaseId,
+        id: ObjectId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<VersionsResponse, Error> {
+        let mut path = format!("v1/bases/{base}/objects/{id}/versions?limit={limit}");
+        if let Some(before) = before {
+            path.push_str(&format!("&before={before}"));
+        }
+        self.call(Method::GET, &path, None::<&VersionsResponse>)
+            .await
+    }
+
+    pub(crate) async fn version(
+        &self,
+        base: BaseId,
+        id: ObjectId,
+        seq: u64,
+    ) -> Result<VersionResponse, Error> {
+        self.call(
+            Method::GET,
+            &format!("v1/bases/{base}/objects/{id}/versions/{seq}"),
+            None::<&VersionResponse>,
+        )
+        .await
+    }
+
     /// Fetches one opaque file part, preserving the binary response unchanged.
     pub(crate) async fn get_file_part(
         &self,

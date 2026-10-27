@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "fragment": "default",
+  "editingPositions": 1000000,
+  "nodes": {
+    "paragraph": {},
+    "heading": { "level": { "enum": [1, 2, 3] } },
+    "bulletList": {},
+    "orderedList": { "start": { "integer": [1, 100000] }, "type": { "enum": [null] } },
+    "listItem": {},
+    "taskList": {},
+    "taskItem": { "checked": { "enum": [false, true] } },
+    "blockquote": {},
+    "hardBreak": {},
+    "image": { "file": { "objectId": true } }
+  },
+  "children": {
+    "default": ["paragraph", "heading", "bulletList", "orderedList", "taskList", "blockquote", "image"],
+    "blockquote": ["paragraph", "heading", "bulletList", "orderedList", "taskList", "blockquote", "image"],
+    "bulletList": ["listItem"],
+    "orderedList": ["listItem"],
+    "taskList": ["taskItem"],
+    "listItem": ["paragraph", "bulletList", "orderedList", "taskList", "blockquote", "image"],
+    "taskItem": ["paragraph", "bulletList", "orderedList", "taskList", "blockquote", "image"],
+    "paragraph": ["text", "hardBreak"],
+    "heading": ["text", "hardBreak"]
+  },
+  "requiredFirst": {
+    "blockquote": ["paragraph", "heading", "bulletList", "orderedList", "taskList", "blockquote", "image"],
+    "bulletList": ["listItem"],
+    "orderedList": ["listItem"],
+    "taskList": ["taskItem"],
+    "listItem": ["paragraph"],
+    "taskItem": ["paragraph"]
+  },
+  "marks": {
+    "bold": {},
+    "italic": {},
+    "underline": {},
+    "strike": {},
+    "code": {},
+    "link": {
+      "href": { "url": ["http:", "https:"] },
+      "target": { "enum": ["_blank"] },
+      "rel": { "enum": ["noopener noreferrer nofollow"] },
+      "class": { "enum": [null] },
+      "title": { "enum": [null] }
+    }
+  }
+}

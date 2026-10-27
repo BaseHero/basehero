@@ -29,3 +29,7 @@ yrs = "0.28"
 assert_cmd = "2"
 bh-testkit = { path = "../bh-testkit" }
 tempfile = "3"
+
+[[example]]
+name = "keep_emulator_version"
+required-features = ["test-support"]

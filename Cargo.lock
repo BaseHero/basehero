@@ -504,6 +504,7 @@ dependencies = [
  "bh-core",
  "bh-mac-keychain-helper",
  "bh-models",
+ "bh-open",
  "bh-testkit",
  "futures-util",
  "getrandom 0.3.4",
@@ -526,6 +527,33 @@ dependencies = [
  "webpki-roots 1.0.9",
  "yrs",
  "zeroize",
+]
+
+[[package]]
+name = "basehero-sample"
+version = "0.1.0"
+dependencies = [
+ "basehero-sample-core",
+ "bh-core",
+ "chrono",
+ "jni 0.22.4",
+ "rustls-platform-verifier",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tokio",
+]
+
+[[package]]
+name = "basehero-sample-core"
+version = "0.1.0"
+dependencies = [
+ "bh-core",
+ "bh-models",
+ "bh-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -629,6 +657,15 @@ dependencies = [
  "url",
  "webpki-roots 1.0.9",
  "zeroize",
+]
+
+[[package]]
+name = "bh-open"
+version = "0.1.0"
+dependencies = [
+ "jni 0.22.4",
+ "ndk-context",
+ "tauri",
 ]
 
 [[package]]

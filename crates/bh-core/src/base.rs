@@ -12,6 +12,7 @@ use crate::search::{self, SearchHit};
 use crate::store::{BaseDb, ObjectRow};
 use crate::sync::{BaseEvent, Incoming, SyncState, SyncTask};
 use crate::types::{self, BASE, FOLDER, NOTE, PROJECT, TYPE, TypeDef, TypeRef};
+use crate::versions::VersionTicker;
 use crate::{Error, SecretStore};
 use bh_crypto::Secret;
 use bh_proto::{BaseId, DeviceId, ObjectId};
@@ -145,13 +146,20 @@ struct Inner {
     /// The sync task, for a base that has a server.
     sync: OnceLock<SyncTask>,
     uploader: OnceLock<Uploader>,
+    versions: OnceLock<VersionTicker>,
+    version_clock: OnceLock<crate::Clock>,
+    version_tick_lock: tokio::sync::Mutex<()>,
     downloader: OnceLock<Downloader>,
     file_api: OnceLock<Api>,
+    version_device_name: OnceLock<Arc<dyn Fn(DeviceId) -> Option<String> + Send + Sync>>,
     download_lock: tokio::sync::Mutex<()>,
     downloads_stopped: std::sync::atomic::AtomicBool,
     download_stop: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "test-support")]
     held_on_demand_get: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    #[cfg(feature = "test-support")]
+    held_version_fetch:
+        Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>)>>,
     #[cfg(feature = "test-support")]
     fail_next_save: std::sync::atomic::AtomicBool,
 }
@@ -254,13 +262,19 @@ impl Base {
                 closed: std::sync::atomic::AtomicBool::new(false),
                 sync: OnceLock::new(),
                 uploader: OnceLock::new(),
+                versions: OnceLock::new(),
+                version_clock: OnceLock::new(),
+                version_tick_lock: tokio::sync::Mutex::new(()),
                 downloader: OnceLock::new(),
                 file_api: OnceLock::new(),
+                version_device_name: OnceLock::new(),
                 download_lock: tokio::sync::Mutex::new(()),
                 downloads_stopped: std::sync::atomic::AtomicBool::new(false),
                 download_stop: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "test-support")]
                 held_on_demand_get: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                held_version_fetch: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 fail_next_save: Default::default(),
             }),
@@ -488,6 +502,120 @@ impl Base {
         }))
     }
 
+    pub(crate) fn version_now(&self) -> i64 {
+        // Before start_sync installs the injected clock, edits use wall time.
+        // Tests using ManualClock should start sync before making local edits.
+        self.inner
+            .version_clock
+            .get()
+            .map_or_else(now_ms, crate::Clock::edit_time_ms)
+    }
+
+    pub(crate) fn version_tick_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.version_tick_lock
+    }
+
+    pub(crate) fn version_sync(&self) -> Option<&SyncTask> {
+        self.inner.sync.get()
+    }
+
+    pub(crate) fn version_api(&self) -> Result<&Api, Error> {
+        self.check_removal()?;
+        self.inner
+            .file_api
+            .get()
+            .ok_or_else(|| Error::Network("base is offline".into()))
+    }
+
+    pub(crate) fn set_version_device_name(
+        &self,
+        lookup: impl Fn(DeviceId) -> Option<String> + Send + Sync + 'static,
+    ) {
+        self.inner.version_device_name.set(Arc::new(lookup)).ok();
+    }
+
+    pub(crate) fn version_device_name(&self, device: DeviceId) -> Option<String> {
+        self.inner.version_device_name.get()?.as_ref()(device)
+    }
+
+    pub(crate) fn version_writable(&self, id: ObjectId) -> Result<(), Error> {
+        self.writable()?;
+        let db = self.db()?;
+        if db.needs_update(id)? {
+            return Err(Error::NeedsUpdate);
+        }
+        let (ty, _) = db.state(id)?.ok_or(Error::NotFound)?;
+        self.editable(&db, &ty)?;
+        if !matches!(ty.name.as_str(), NOTE | FOLDER | PROJECT) {
+            return Err(Error::invalid("not a note, folder or project"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_content(&self, id: ObjectId, version: &Doc) -> Result<(), Error> {
+        self.edit_with_origin(id, u64::MAX, |_, _, _, txn| {
+            crate::versions::copy_content(txn, version)
+        })
+    }
+
+    pub(crate) fn current_version_content_matches(
+        &self,
+        id: ObjectId,
+        version: &Doc,
+    ) -> Result<bool, Error> {
+        let db = self.db()?;
+        let (_, state) = db.state(id)?.ok_or(Error::NotFound)?;
+        let current = self.load(&state)?;
+        Ok(crate::versions::same_content(&current, version))
+    }
+
+    pub(crate) fn open_version_body(&self, id: ObjectId, body: &[u8]) -> Result<Doc, Error> {
+        let _db = self.db()?;
+        let opened = self.open_change(id, true, body)?;
+        self.load(&opened).map_err(|_| Error::Crypto)
+    }
+
+    /// In tests, holds a fetched version before it is opened or the current content is kept.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_version_fetch(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *lock(&self.inner.held_version_fetch) =
+            Some((entered.clone(), Arc::new(tokio::sync::Notify::new())));
+        entered
+    }
+
+    /// Releases a version held by `test_hold_version_fetch`.
+    #[cfg(feature = "test-support")]
+    pub fn test_resume_version_fetch(&self) {
+        if let Some((_, notify)) = lock(&self.inner.held_version_fetch).take() {
+            notify.notify_one();
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn test_wait_version_fetch(&self) {
+        let held = lock(&self.inner.held_version_fetch).clone();
+        if let Some((entered, notify)) = held {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            entered.store(true, Ordering::SeqCst);
+            notified.await;
+        }
+    }
+
+    /// Opens a kept state's sealed body for tests of content and object binding.
+    #[cfg(feature = "test-support")]
+    pub fn test_open_kept_state(&self, id: ObjectId, body: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(self.open_change(id, true, body)?.to_vec())
+    }
+
+    /// Holds the next background version check until the base stops it.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_version_tick(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.inner.versions.get().expect("version task").hold_next()
+    }
+
     /// Download missing parts, authenticating each and checking the expected
     /// plaintext length before it becomes part of the local sealed copy.
     pub(crate) async fn download_file(&self, id: ObjectId, api: &Api) -> Result<(), Error> {
@@ -672,6 +800,9 @@ impl Base {
     pub(crate) async fn stop_sync(&self) {
         self.inner.downloads_stopped.store(true, Ordering::SeqCst);
         self.inner.download_stop.send_replace(true);
+        if let Some(versions) = self.inner.versions.get() {
+            versions.stop().await;
+        }
         if let Some(sync) = self.inner.sync.get() {
             sync.stop().await;
         }
@@ -700,9 +831,13 @@ impl Base {
         self.inner.uploader.get_or_init(|| {
             Uploader::start(self, api.clone(), runtime, self.inner.parts_root.clone())
         });
+        self.inner.version_clock.get_or_init(|| clock.clone());
         self.inner
             .sync
-            .get_or_init(|| SyncTask::start(self.clone(), api, runtime, clock));
+            .get_or_init(|| SyncTask::start(self.clone(), api, runtime, clock.clone()));
+        self.inner
+            .versions
+            .get_or_init(|| VersionTicker::start(self.downgrade(), clock, runtime));
     }
 
     /// Current local outbox size and last successful catch-up, without a network call.
@@ -1042,6 +1177,9 @@ impl Base {
         let row = ObjectRow { summary, state };
         db.batch(|db| {
             db.put(&row, outbox, confirmed)?;
+            if !outbox.is_empty() {
+                db.record_local_edit(id, self.version_now())?;
+            }
             db.put_search(id, &row.summary.title, &search_text)?;
             if reindex {
                 let def: TypeDef = serde_json::from_value(row.summary.fields["def"].clone())
@@ -1072,7 +1210,7 @@ impl Base {
     }
 
     /// Gives a stored update to the object's open document, if any.
-    fn share(&self, id: ObjectId, update: &[u8]) {
+    fn share_with_origin(&self, id: ObjectId, origin: u64, update: &[u8]) {
         if let Some(live) = self.live(id) {
             if let Ok(decoded) = Update::decode_v1(update) {
                 let _ = live
@@ -1082,7 +1220,7 @@ impl Base {
                     .transact_mut()
                     .apply_update(decoded);
             }
-            live.publish(0, update);
+            live.publish(origin, update);
         }
     }
 
@@ -1092,6 +1230,7 @@ impl Base {
         &self,
         db: &mut BaseDb,
         id: ObjectId,
+        origin: u64,
         edit: impl FnOnce(&BaseDb, &Meta, &TypeDef, &mut TransactionMut) -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.writable()?;
@@ -1111,7 +1250,7 @@ impl Base {
             return Err(Error::TooLarge);
         }
         self.save(db, id, &doc, &[&update], self.inner.device, None)?;
-        self.share(id, &update);
+        self.share_with_origin(id, origin, &update);
         self.edited(id);
         Ok(())
     }
@@ -1121,7 +1260,16 @@ impl Base {
         id: ObjectId,
         edit: impl FnOnce(&BaseDb, &Meta, &TypeDef, &mut TransactionMut) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.edit_in(&mut **self.db()?, id, edit)
+        self.edit_with_origin(id, 0, edit)
+    }
+
+    fn edit_with_origin(
+        &self,
+        id: ObjectId,
+        origin: u64,
+        edit: impl FnOnce(&BaseDb, &Meta, &TypeDef, &mut TransactionMut) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.edit_in(&mut **self.db()?, id, origin, edit)
     }
 
     /// Writes a new object.
@@ -1763,7 +1911,7 @@ impl Base {
             return Ok(());
         }
         types::check_redefinition(&old, &def)?;
-        self.edit_in(&mut db, id, |_, _, _, txn| {
+        self.edit_in(&mut db, id, 0, |_, _, _, txn| {
             objects::write_fields(txn, &fields)
         })
     }
@@ -2033,6 +2181,16 @@ impl Base {
         if let Some(task) = self.inner.uploader.get() {
             task.fail_after(n);
         }
+    }
+
+    /// Holds the next kept-state response after the server replies, for clock tests.
+    pub fn test_hold_kept_reply(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.inner.sync.get().unwrap().hold_next_kept_reply()
+    }
+
+    /// Releases a kept-state response held by `test_hold_kept_reply`.
+    pub fn test_resume_kept_reply(&self) {
+        self.inner.sync.get().unwrap().resume_kept_reply();
     }
 
     /// Test-only: retain one server change per queued session instead of the

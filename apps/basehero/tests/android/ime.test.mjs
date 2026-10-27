@@ -26,6 +26,17 @@ test('Android keyboard does not cover a caret near the bottom', { timeout: 90_00
     await afterLayout(page);
     const rect = await caret(page);
     assert(rect.bottom <= rect.visibleBottom - 8, `IME covers caret: ${JSON.stringify(rect)}`);
+    // Model the last visual-viewport shrink arriving after the tap timer,
+    // without a window resize. The actual IME is still open in this WebView.
+    await page.evaluate(() => {
+      const height = visualViewport.height;
+      Object.defineProperty(visualViewport, 'height', { configurable: true, get: () => height - 6 });
+      visualViewport.dispatchEvent(new Event('resize'));
+    });
+    await afterLayout(page);
+    const late = await caret(page);
+    assert(late.bottom <= late.visibleBottom - 8, `late IME viewport covers caret: ${JSON.stringify(late)}`);
+    await page.evaluate(() => { delete visualViewport.height; });
   } finally { await page.context().browser()?.close(); }
 });
 

@@ -7,7 +7,6 @@ import { createRequire } from 'node:module';
 
 // Only the disposable BaseHero emulator is ever a target of these tests.
 const serial = 'emulator-5580';
-const app = 'app.basehero';
 const { chromium } = createRequire(new URL('../../package.json', import.meta.url))('@playwright/test');
 export function createAdb(run = execFileSync) {
   return (...args) => {
@@ -25,18 +24,18 @@ export function createAdb(run = execFileSync) {
 export const adb = createAdb();
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-export async function launch() {
-  adb('shell', 'am', 'start', '-W', '-n', `${app}/.MainActivity`);
+export async function launch(pkg = 'app.basehero') {
+  adb('shell', 'am', 'start', '-W', '-n', `${pkg}/.MainActivity`);
   const deadline = Date.now() + 30_000;
-  while (!adb('shell', 'pidof', app)) {
-    assert(Date.now() < deadline, `${app} did not start`);
+  while (!adb('shell', 'pidof', pkg)) {
+    assert(Date.now() < deadline, `${pkg} did not start`);
     await pause(200);
   }
 }
 
-export async function webview() {
-  const pid = adb('shell', 'pidof', app).split(/\s+/)[0];
-  assert.match(pid, /^\d+$/, `${app} is not running`);
+export async function webview(pkg = 'app.basehero') {
+  const pid = adb('shell', 'pidof', pkg).split(/\s+/)[0];
+  assert.match(pid, /^\d+$/, `${pkg} is not running`);
   const port = adb('forward', 'tcp:0', `localabstract:webview_devtools_remote_${pid}`);
   const endpoint = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 30_000;

@@ -71,33 +71,53 @@ Call `Core::shutdown()` as the app quits. The core also stops when its last hand
 
 ## Connect
 
-**Android:** How apps connect on Android is being finalised. Do not build against an Android connection contract yet.
-
-For development on a desktop, use a full device signed into the `dev` environment to create a base and issue app credentials. The current `bh app connect` takes one base, either an existing base by ID or name (`--base`) or a new base (`--new-base`). It does not accept an app ID or reconnect an existing app; a fresh connection is a new app device.
+For development, use a full device signed into the `dev` environment to create a base and issue app credentials. The sample app connects to one new base, **Sample readings**. The current `bh app connect` accepts either `--base` (an existing base ID or name) or `--new-base`, not both. A fresh connection is a new app device.
 
 ```sh
-bh app connect --name "Developer - Example" --new-base "Example data" --out app-credentials.json
+bh app connect --name "Tester - BaseHero Sample" --new-base "Sample readings" --out app-credentials.json
 ```
 
-Choose `--read-only` for an app that must not write. Use a **different** data directory for the app than the full device's CLI home. The credentials file contains a bearer token and an app key; read it in native code, install it once, and delete the file. Never put it in a WebView, a log, a repository or a backup. Its `bases` array holds the granted base IDs in request order.
+Choose `--read-only` if an app must not write. Use a **different** data directory from the full device's CLI home. The JSON contains a bearer token and app key; read it in native Rust, install it once, and delete it only after installation and the first catch-up succeed. Never put it in a WebView, a log, a repository or a backup. Its `bases` array holds granted base IDs in request order. The following is the native install helper called by [`Sample::install_file`](../apps/sample/core/src/lib.rs) in the [sample app](../apps/sample/README.md). The sample passes its `reading_type()` definition for `sample.reading` as `ty`; define your own type in your app.
 
+<!-- snippet: apps/sample/core/src/lib.rs#install -->
 ```rust,no_run
-use bh_core::{AppCredentials, Core, Error};
-use std::{fs, path::Path};
+mod install_example {
+    use bh_core::{Account, AppCredentials, BaseId, Core, Error, Mode, TypeDef};
+    use std::{path::Path, time::Duration};
 
-async fn install(core: &Core, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let credentials: AppCredentials = serde_json::from_slice(&fs::read(path)?)?;
-    let base_ids = credentials.bases.clone();
-    let account = core.install_app(credentials).await?;
-    fs::remove_file(path)?;
-    for id in base_ids {
-        let _base = account.base(id)?;
+    pub async fn install_file(
+        core: &Core,
+        path: &Path,
+        ty: TypeDef,
+    ) -> Result<(Account, BaseId), Error> {
+        // This file is private app storage, never passed to the WebView.
+        let bytes = std::fs::read(path)?;
+        let credentials: AppCredentials =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Invalid(e.to_string()))?;
+        let base_id = *credentials
+            .bases
+            .first()
+            .ok_or_else(|| Error::Invalid("no base grant".into()))?;
+        let account = core.install_app(credentials).await?;
+        let base = account.base(base_id)?;
+        // A second installation must fetch existing records before query-and-create.
+        tokio::time::timeout(Duration::from_secs(30), base.sync_now())
+            .await
+            .map_err(|_| Error::Network("first catch-up timed out".into()))??;
+        if base.mode() == Mode::ReadWrite {
+            base.define_type(ty)?;
+        }
+        std::fs::remove_file(path)?;
+        Ok((account, base_id))
     }
-    Ok(())
 }
 ```
 
-`Core::install_app` needs the network. On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` rather than installing again. If `AccountEvent::Removed` arrives, the core has erased its local account copy. Stop using its base handles and ask the person to connect again.
+On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` instead of installing again. Before any query-and-create after restart, wait for `base.sync_state().last_synced_at` or call `base.sync_now()`. If `AccountEvent::Removed` arrives, the core has erased its account copy; stop using old base handles and ask the person to reconnect.
+
+### On Android
+
+For development, copy the JSON into the sample's private `app_data_dir()/app-credentials.json` with `adb exec-in run-as app.basehero.sample sh -c 'cat > app-credentials.json'`, piping the JSON as stdin. Install the debug app first so `run-as` can open its private directory. Never put the file on shared storage or pass it through the WebView. Tap **Connect**; the native Rust command calls `Sample::install_file` and deletes the file after catch-up. The sample disables Android backup. For a real app, seal local secrets with a platform-protected key as in [Open the core](#open-the-core).
 
 ## What your app can see
 

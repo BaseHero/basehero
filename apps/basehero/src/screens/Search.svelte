@@ -4,7 +4,7 @@
   import type { SearchResult } from '../lib/backend/types';
   let { account, base, query, open }: { account: string; base: string | null; query: string; open: (result: SearchResult) => void } = $props();
   let groups = $state<{ base: string; name: string; results: SearchResult[] }[]>([]);
-  const label = (name: string) => ({ 'core.note': 'Note', 'core.folder': 'Folder', 'core.project': 'Project' })[name as 'core.note' | 'core.folder' | 'core.project'] ?? name;
+  const label = (name: string) => ({ 'core.note': 'Note', 'core.folder': 'Folder', 'core.project': 'Project', 'core.file': 'File' })[name as 'core.note' | 'core.folder' | 'core.project' | 'core.file'] ?? name;
   let error = $state('');
   let revision = $state(0);
   onMount(() => {

@@ -3,10 +3,12 @@ import * as Y from 'yjs';
 import { Editor, Extension } from '@tiptap/core';
 import { Plugin, PluginKey, TextSelection } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
+import { DOMParser as ProseMirrorDOMParser } from '@tiptap/pm/model';
 import { ySyncPlugin, yUndoPlugin, ySyncPluginKey, yUndoPluginKey, undo, redo,
   absolutePositionToRelativePosition, relativePositionToAbsolutePosition } from '@tiptap/y-tiptap';
 import { extensions, createPreflightMirror, supportsProseMirror, safeViewNode, inventory, withinEditingLimit, editingPositions, isLeafNode } from './schema.mjs';
 import { SaveQueue } from './save-queue.mjs';
+import { imageNode } from './image.mjs';
 
 const TOO_LARGE='This note has reached its size limit, about one million characters. That change wasn’t added.';
 const PAUSED='Editing is paused until your writing is saved. It picks up again by itself in a moment.';
@@ -163,6 +165,52 @@ export async function createNoteEditor(root, host, options={}) {
   const retryButton=document.createElement('button');retryButton.type='button';retryButton.textContent='Retry';
   retryButton.setAttribute('aria-label','Retry save');retryButton.className='note-retry';retryButton.hidden=true;
   const content=document.createElement('div');content.className='note-content';
+  const imageButton=document.createElement('button');imageButton.type='button';imageButton.textContent='Insert image';
+  imageButton.className='note-insert-image';
+  const imageInput=document.createElement('input');imageInput.type='file';imageInput.hidden=true;
+  imageInput.accept='image/png,image/jpeg,image/gif,image/webp';
+  imageButton.addEventListener('click',()=>{if(canAuthor())imageInput.click();});
+  imageInput.addEventListener('change',()=>{if(imageInput.files?.length)void addFiles(imageInput.files);imageInput.value='';});
+  async function addFiles(files) {
+    if(!canAuthor() || !options.backend || !options.r)return;
+    for(const file of files) {
+      if (file.size>104_857_600) {say('Files can be at most 100 MB.');continue;}
+      try {
+        const added=await options.backend.fileAdd(options.r,options.noteId,file.name,file.type,new Uint8Array(await file.arrayBuffer()));
+        if(closed || !canAuthor())return;
+        // Never decide from the supplied name or type: the core sniffs bytes.
+        try {
+          await options.backend.fileImage(options.r,added.id);
+          if(!closed && canAuthor()) editor.chain().focus().insertContent([
+            {type:'image',attrs:{file:added.id}},{type:'paragraph'},
+          ]).run();
+        } catch(error) {if(error?.kind!=='Invalid')say("Can't show this image");}
+      } catch(error) {say(error?.kind==='TooLarge'?'Files can be at most 100 MB.':`Could not add file: ${String(error)}`);}
+    }
+  }
+  // Parse HTML with media in an inert document. Strip anything that could
+  // fetch, then use ProseMirror's schema parser to keep headings, lists and
+  // links; a pasted image never becomes a note image, even with a file ID.
+  content.addEventListener('paste',event=>{
+    const transfer=event.clipboardData;
+    if(!transfer || !canAuthor())return;
+    if(transfer.files.length) {event.preventDefault();void addFiles([...transfer.files]);return;}
+    const html=transfer.getData('text/html');
+    if(/<(?:img|picture|source|video|audio|iframe|object|embed)\b/i.test(html)) {
+      event.preventDefault();
+      const doc=new DOMParser().parseFromString(html,'text/html');
+      for(const node of doc.querySelectorAll('img,picture,source,video,audio,iframe,object,embed'))node.remove();
+      for(const node of doc.querySelectorAll('[srcset],[style]')) {
+        node.removeAttribute('srcset');node.removeAttribute('style');
+      }
+      const slice=ProseMirrorDOMParser.fromSchema(editor.schema).parseSlice(doc.body);
+      editor.view.dispatch(editor.state.tr.replaceSelection(slice).scrollIntoView());
+    }
+  },true);
+  content.addEventListener('drop',event=>{
+    if(!event.dataTransfer?.files.length || !canAuthor())return;
+    event.preventDefault();void addFiles([...event.dataTransfer.files]);
+  },true);
   // An IME composition is live input: a drain lets it finish first.
   let composingNow=false;
   content.addEventListener('compositionstart',()=>{composingNow=true;});
@@ -197,7 +245,7 @@ export async function createNoteEditor(root, host, options={}) {
   bubble.setAttribute('role','toolbar');bubble.setAttribute('aria-label','Format');
   const linkPop=document.createElement('div');linkPop.className='note-linkpop';linkPop.hidden=true;
   linkPop.setAttribute('role','dialog');linkPop.setAttribute('aria-label','Link');
-  root.append(notice,large,content,bubble,linkPop);
+  root.append(notice,large,imageButton,imageInput,content,bubble,linkPop);
   if(options.statusBar)options.statusBar.replaceChildren(status,retryButton);else root.append(status,retryButton);
   const retrySave=()=>{if(!closed && !working){failed=false;setStatus();void flush();}};
   retryButton.addEventListener('click',retrySave);
@@ -377,7 +425,7 @@ export async function createNoteEditor(root, host, options={}) {
     if (!android || !editor || closed) return;
     const bounds=scroller().getBoundingClientRect();
     const caret=editor.view.coordsAtPos(editor.state.selection.head);
-    caretSeen=caret.bottom>bounds.top && caret.top<bounds.bottom;
+    caretSeen=caret.bottom>Math.max(bounds.top,0) && caret.top<Math.min(bounds.bottom,visualViewport.height);
     // The first block in view, and how far down it the pane's top falls.
     const blocks=editor.view.dom.children;
     let low=0,high=blocks.length-1;
@@ -421,19 +469,28 @@ export async function createNoteEditor(root, host, options={}) {
   // A tap can reopen the keyboard without moving the caret: no selection
   // update then fires. Check its final viewport after the IME animation.
   let tapMarginTimer=null;
+  const clearCaret=()=>{
+    const area=scroller(),bounds=area.getBoundingClientRect();
+    const caret=editor.view.coordsAtPos(editor.state.selection.head);
+    const bottom=Math.min(bounds.bottom,visualViewport.height);
+    // Scroll offsets are rounded by WebView, so aim two pixels beyond the
+    // required eight-pixel clearance.
+    if (caret.bottom>bottom-10) area.scrollTop+=caret.bottom-bottom+10;
+  };
   const onEditorTap=()=>{
     if (!android) return;
     clearTimeout(tapMarginTimer);
     tapMarginTimer=setTimeout(()=>{
       if (!editor || closed) return;
-      const area=scroller(),bounds=area.getBoundingClientRect();
-      const caret=editor.view.coordsAtPos(editor.state.selection.head);
-      const bottom=Math.min(bounds.bottom,visualViewport.height);
-      // Scroll offsets are rounded by WebView, so aim two pixels beyond the
-      // required eight-pixel clearance.
-      if (caret.bottom>bottom-10) area.scrollTop+=caret.bottom-bottom+10;
-      noteView();
+      clearCaret();noteView();
     },350);
+  };
+  // The last IME change can resize only the visual viewport, after the tap
+  // timer and window resize. Only follow a focused caret that was in view;
+  // scrolling away to read must not bring it back.
+  const onViewportResize=()=>{
+    if (!android || !editor || closed || !editor.view.hasFocus() || !caretSeen) return;
+    clearCaret();
   };
   const onSelectionIntent=()=>{if(android)pendingRestoration=null;queueMicrotask(noteView);};
   const pointerDown=event=>{if(content.contains(event.target)){pointerSelecting=true;bubble.hidden=true;}};
@@ -443,6 +500,7 @@ export async function createNoteEditor(root, host, options={}) {
   window.addEventListener('mouseup',pointerUp,true);
   window.addEventListener('scroll',onScroll,true);
   window.addEventListener('resize',relayout);
+  if(android)visualViewport?.addEventListener('resize',onViewportResize);
   content.addEventListener('pointerup',onEditorTap);
   if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
     window.addEventListener(type,onUserIntent,{capture:true,passive:true});
@@ -681,7 +739,9 @@ export async function createNoteEditor(root, host, options={}) {
       addKeyboardShortcuts(){return {'Mod-z':()=>history(undo,this.editor),'Mod-Shift-z':()=>history(redo,this.editor),'Mod-y':()=>history(redo,this.editor),'Mod-k':()=>openLink()};},
     });
     editable=!options.readOnly && !tooLarge && !held;
-    editor=new Editor({element:content,extensions:[...extensions,binding],content:'',injectCSS:false,editable});
+    editor=new Editor({element:content,extensions:[...extensions.filter(ext=>ext.name!=='image'),imageNode.configure({
+      backend:options.backend,r:options.r,objectUrl:options.objectUrl,releaseObjectUrl:options.releaseObjectUrl,
+    }),binding],content:'',injectCSS:false,editable});
     for(const event of ['selectionUpdate','focus','blur','transaction'])editor.on(event,()=>queueMicrotask(placeBubble));
     editor.on('selectionUpdate',onSelectionIntent);
     editor.on('focus',()=>sendSelection());
@@ -720,8 +780,16 @@ export async function createNoteEditor(root, host, options={}) {
   // hold: a read-only ProseMirror drops unread DOM input. Accepted writing,
   // in flight or queued, is saved; a failed save is retried once unchanged.
   // False at the deadline or on failure, still held: the caller decides.
+  // A resume can arrive before the hold does: Android suspends a page's
+  // timers while it's away. The drain then still saves but doesn't hold.
+  let draining=null,resumedEarly=false;
   async function drain(deadline,reason='close') {
     if(closed)return false;
+    draining=reason;resumedEarly=false;
+    try {return await drainHeld(deadline,reason);}
+    finally {draining=null;}
+  }
+  async function drainHeld(deadline,reason) {
     for(;;) {
       while(composing()) if(!await wait(deadline))return false;
       if(!await wait(deadline,25))return false;
@@ -729,7 +797,7 @@ export async function createNoteEditor(root, host, options={}) {
     }
     if(closed)return false;
     if(editor) {editor.view.domObserver.forceFlush();editor.view.domObserver.flush();}
-    held=reason;syncEditable();setStatus();
+    if(!resumedEarly) {held=reason;syncEditable();setStatus();}
     let retried=false;
     for(;;) {
       if(closed)return false;
@@ -745,7 +813,10 @@ export async function createNoteEditor(root, host, options={}) {
   // Hold without draining: an editor created after its page told native it
   // had nothing to save must not take input until native resumes it.
   function hold(reason='close') {if(!closed){held=reason;syncEditable();setStatus();}}
-  function resume() {if(held){held=null;if(!closed){syncEditable();setStatus();}}}
+  function resume(reason) {
+    if(draining!==null && held!==draining && (reason===undefined || draining===reason))resumedEarly=true;
+    if(held && (reason===undefined || held===reason)){held=null;if(!closed){syncEditable();setStatus();}}
+  }
   // The nearest scrolling ancestor actually holding this note's content.
   function scroller() {
     for(let el=content.parentElement;el && el!==document.body && el!==document.documentElement;el=el.parentElement) {
@@ -849,6 +920,7 @@ export async function createNoteEditor(root, host, options={}) {
       pending.close();mirror?.destroy();doc.destroy();doc=null;fragment=null;
       document.removeEventListener('mousedown',outside,true);document.removeEventListener('mousedown',pointerDown,true);
       window.removeEventListener('mouseup',pointerUp,true);window.removeEventListener('scroll',onScroll,true);window.removeEventListener('resize',relayout);
+      if(android)visualViewport?.removeEventListener('resize',onViewportResize);
       content.removeEventListener('pointerup',onEditorTap);clearTimeout(tapMarginTimer);
       if(android)for(const type of ['wheel','touchstart','pointerdown','keydown'])
         window.removeEventListener(type,onUserIntent,true);

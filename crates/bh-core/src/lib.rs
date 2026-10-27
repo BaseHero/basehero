@@ -64,6 +64,8 @@ mod strength;
 mod sync;
 mod types;
 mod usage;
+/// Device-local version policy and its background checks.
+pub mod versions;
 
 pub use crate::core::{Core, CoreConfig, PendingSignIn, SignIn, SignUp};
 pub use account::{
@@ -88,6 +90,7 @@ pub use sync::{BaseEvent, SyncState};
 pub use types::{FieldDef, FieldKind, TypeDef, TypeRef};
 pub use url::Url;
 pub use usage::UsageRow;
+pub use versions::ObjectVersion;
 
 /// Hooks for bh-testkit; never enabled in apps.
 #[cfg(feature = "test-support")]

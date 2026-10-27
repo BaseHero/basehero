@@ -1,5 +1,5 @@
 /* Only a bound note host loads this stylesheet and the bundled editor module. */
-.note-bubble[hidden], .note-linkpop[hidden], .note-refusal[hidden], .note-large[hidden], .note-retry[hidden] { display: none; }
+.note-bubble[hidden], .note-linkpop[hidden], .note-refusal[hidden], .note-large[hidden], .note-retry[hidden], .note-pane input[hidden] { display: none; }
 /* The page: the writing gets the window. */
 .note-pane > section { max-width: 680px; margin: 0 auto; padding: 40px 48px 90px; }
 .note-content { position: relative; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -45,6 +45,10 @@
 .note-content .bh-remote-label { position: absolute; left: -2px; bottom: 100%; margin-bottom: 1px; padding: 3px 5px; background: var(--peer); color: #fff; font: 600 11px/1 var(--mono); letter-spacing: .02em; white-space: nowrap; pointer-events: auto; }
 .note-content .bh-remote-cursor[data-collapsed] .bh-remote-label { width: 6px; height: 6px; padding: 0; font-size: 0; overflow: hidden; }
 .note-content .bh-remote-cursor[data-collapsed] .bh-remote-label:hover { width: auto; height: auto; padding: 3px 5px; font-size: 11px; }
+.note-image { margin: 14px 0; color: var(--text-2); }
+.note-image-content { display: block; max-width: 100%; height: auto; }
+.note-image button, .note-insert-image { cursor: pointer; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-strong); padding: 5px 10px; }
+.note-insert-image { margin-bottom: 16px; }
 .note-content .note-placeholder { display: inline-block; padding: 4px 8px; border: 1px solid var(--line); background: var(--panel-2); font: 500 12px var(--mono); }
 
 /* Notices inside the page: paused, refused, read-only. */

@@ -8,6 +8,8 @@ mod hero;
 mod hidden;
 #[path = "commands/usage.rs"]
 mod usage;
+#[path = "commands/versions.rs"]
+mod versions;
 
 use bh_core::{
     Account, AppCredentials, AppRequest, Base, BaseGrantRequest, Core, CoreConfig, DeviceId,
@@ -103,6 +105,19 @@ enum Command {
     },
     Search {
         text: String,
+    },
+    Versions {
+        #[arg(long)]
+        base: String,
+        id: String,
+        #[arg(long)]
+        before: Option<u64>,
+    },
+    Restore {
+        #[arg(long)]
+        base: String,
+        id: String,
+        seq: u64,
     },
     Hero {
         #[command(subcommand)]
@@ -466,6 +481,8 @@ async fn execute(cli: &Cli) -> Result<Value> {
     } else {
         None
     };
+    // Taken before the command runs: a removal takes the account off the list.
+    let current = account(&core).ok();
     // Ctrl-C in watch must return through the same lock path as errors and EOF.
     let result = if cli.unlock && matches!(cli.command, Command::Watch) {
         tokio::select! {
@@ -478,6 +495,13 @@ async fn execute(cli: &Cli) -> Result<Value> {
     } else {
         execute_command(core.clone(), cli).await
     };
+    // A refused request starts erasing a removed device's copy in the background.
+    // Finish it before the core stops, or the copy outlives every run.
+    if let (Some(account), Err(error)) = (&current, &result)
+        && matches!(error.downcast_ref::<Error>(), Some(Error::Revoked))
+    {
+        let _ = account.sign_out().await;
+    }
     if let Some(account) = unlocked {
         account.lock_all_hidden().await;
     }
@@ -592,6 +616,12 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
                 result["text"] = Value::String(base.note(id)?.text());
             }
             Ok(result)
+        }
+        Command::Versions { base, id, before } => {
+            versions::list(&account(&core)?, base, id, *before).await
+        }
+        Command::Restore { base, id, seq } => {
+            versions::restore(&account(&core)?, base, id, *seq).await
         }
         Command::Search { text } => {
             let account = account(&core)?;

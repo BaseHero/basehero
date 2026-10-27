@@ -1,7 +1,7 @@
 //! Deterministic, direct core-API workloads for the scale checks.
-use crate::note;
-use bh_core::{Base, FieldDef, FieldKind, NewObject, ObjectId, TypeDef, TypeRef};
-use serde_json::{Map, Value};
+use crate::{RawDevice, b64, note, random_id};
+use bh_core::{Base, BaseId, FieldDef, FieldKind, NewFile, NewObject, ObjectId, TypeDef, TypeRef};
+use serde_json::{Map, Value, json};
 use std::time::Instant;
 use yrs::updates::decoder::Decode;
 use yrs::{
@@ -21,6 +21,84 @@ pub fn notes(base: &Base, count: usize) -> Vec<ObjectId> {
         )
     }))
     .expect("bulk notes")
+}
+
+/// Adds `count` different files with random content through the real file API.
+/// Callers can keep the returned IDs without retaining the plaintext bodies.
+pub fn files(base: &Base, parent: Option<ObjectId>, count: usize, size: usize) -> Vec<ObjectId> {
+    (0..count)
+        .map(|i| {
+            let mut content = vec![0; size];
+            getrandom::fill(&mut content).expect("random file content");
+            base.add_file(
+                NewFile {
+                    parent,
+                    name: format!("file-{i:05}.bin"),
+                    mime: "application/octet-stream".into(),
+                },
+                &content,
+            )
+            .expect("add scale file")
+        })
+        .collect()
+}
+
+/// Posts synthetic kept states directly to the local Worker, from 2 KiB to
+/// twice `mean_size`. These opaque bodies exercise server storage and listing;
+/// callers needing a restorable version must also post a real sealed state.
+pub async fn kept_versions(
+    raw: &RawDevice,
+    base: BaseId,
+    object: ObjectId,
+    n: usize,
+    mean_size: usize,
+) {
+    assert!(mean_size >= 1024 && n > 0);
+    let (status, reply) = raw
+        .post(
+            &format!("/v1/bases/{base}/fetch"),
+            json!({ "objectIds": [object] }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+    let covers = reply["objects"][0]["head"].as_u64().expect("object head");
+    assert!(covers > 0, "a kept state needs an existing object");
+    let started = Instant::now();
+    for first in (0..n).step_by(100) {
+        let changes: Vec<Value> = (first..(first + 100).min(n))
+            .map(|i| {
+                let size = 2_048 + i * (2 * mean_size - 2_048) / n;
+                json!({"changeId": random_id(), "objectId": object,
+                    "kind": "state", "covers": covers, "keep": true,
+                    "body": b64(&vec![i as u8; size])})
+            })
+            .collect();
+        let (status, reply) = raw
+            .post(
+                &format!("/v1/bases/{base}/changes"),
+                json!({"changes": changes}),
+            )
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{reply}");
+        assert_eq!(
+            reply["results"].as_array().unwrap().len(),
+            (first + 100).min(n) - first
+        );
+        assert!(
+            reply["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["stale"] == false)
+        );
+    }
+    println!(
+        "kept-version generator: {n} states, mean {mean_size} bytes in {:?}, load={}",
+        started.elapsed(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim()
+    );
 }
 
 /// Creates a wide folder, as a normal sequence of new notes.

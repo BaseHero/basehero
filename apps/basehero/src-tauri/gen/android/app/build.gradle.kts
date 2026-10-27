@@ -70,6 +70,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
     implementation("org.rustls:rustls-platform-verifier:$rustlsPlatformVerifierVersion")
     implementation(project(":bh-keys"))
+    implementation(project(":bh-open"))
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

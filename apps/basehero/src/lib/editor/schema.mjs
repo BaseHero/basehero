@@ -6,7 +6,8 @@ import TaskList from '@tiptap/extension-task-list';
 import TaskItem from '@tiptap/extension-task-item';
 import { initProseMirrorDoc } from '@tiptap/y-tiptap';
 import { Mark } from '@tiptap/pm/model';
-import inventory from '../../../../../note-schema/v1.json' with { type: 'json' };
+import inventory from '../../../../../note-schema/v2.json' with { type: 'json' };
+import { imageNode, validObjectId } from './image.mjs';
 
 // The inventory is shared with bh-core. Do not silently add a StarterKit node:
 // every supported name, attribute and value must be checked before binding.
@@ -21,7 +22,7 @@ export const extensions = [
   }).configure({ undoRedo:false, trailingNode:false, codeBlock:false,
     horizontalRule:false, heading:{levels:inventory.nodes.heading.level.enum},
     link:{openOnClick:false,autolink:false,linkOnPaste:false} }),
-  TaskList, TaskItem.configure({ nested:true }),
+  TaskList, TaskItem.configure({ nested:true }), imageNode,
 ];
 export { inventory };
 
@@ -58,6 +59,7 @@ export const isLeafNode=name=>!!editorSchema.nodes[name]?.isLeaf;
 
 function valueMatches(rule, value) {
   if ('enum' in rule) return rule.enum.some(item => item === value);
+  if ('objectId' in rule) return validObjectId(value);
   if ('integer' in rule) return Number.isSafeInteger(value) && value >= rule.integer[0] && value <= rule.integer[1];
   if ('url' in rule) {
     if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/u.test(value)) return false;

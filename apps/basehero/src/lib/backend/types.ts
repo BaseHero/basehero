@@ -12,6 +12,7 @@ import type { AccountUsage } from '../generated/AccountUsage';
 import type { UsageRow } from '../generated/UsageRow';
 import type { FileInfo } from '../generated/FileInfo';
 import type { FileStatus } from '../generated/FileStatus';
+import type { ObjectVersion } from '../generated/ObjectVersion';
 export type { AppInfo, CommandError, UpdateInfo, SearchHit, SearchResult, ChatSummary, ChatMessage, KitStatus, AccountUsage, UsageRow };
 export type AccountId = string;
 export type BaseId = string;
@@ -27,7 +28,8 @@ export class BackendError extends Error {
 export type AccountSummary = { id: AccountId; email: string; kind: 'full' | 'app' };
 export type DeviceSummary = { id: DeviceId; name: string; kind: string; status: string; thisDevice: boolean; createdAt: number; lastSeenAt: number | null };
 export type BaseSummary = { id: BaseId; name: string; mode: 'readWrite' | 'readOnly'; hidden: boolean };
-export type { PasswordStrength, FileInfo, FileStatus };
+export type { PasswordStrength, FileInfo, FileStatus, ObjectVersion };
+export type VersionsPage = { versions: ObjectVersion[]; more: boolean };
 export type FileImage = { mime: string; bytes: Uint8Array };
 export type ObjectSummary = { id: ObjectId; title: string; parent: ObjectId | null; deleted: boolean; [key: string]: unknown };
 export type ItemKind = 'note' | 'folder' | 'project';
@@ -79,6 +81,9 @@ export interface Backend {
   fileInfo(r: BaseRef, id: ObjectId): Promise<FileInfo | null>;
   fileImage(r: BaseRef, id: ObjectId): Promise<FileImage>;
   fileOpen(r: BaseRef, id: ObjectId): Promise<void>;
+  versions(r: BaseRef, id: ObjectId, before: number | null): Promise<VersionsPage>;
+  versionState(r: BaseRef, id: ObjectId, seq: number): Promise<Uint8Array>;
+  versionRestore(r: BaseRef, id: ObjectId, seq: number): Promise<void>;
   children(r: BaseRef, parent: ObjectId | null): Promise<ObjectSummary[]>;
   getObject(r: BaseRef, id: ObjectId): Promise<ObjectSummary | null>;
   createObject(r: BaseRef, item: NewItem): Promise<ObjectId>;

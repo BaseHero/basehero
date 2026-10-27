@@ -258,17 +258,17 @@ async fn a_part_that_does_not_open_is_set_aside() {
         a.base.file(good).unwrap().unwrap().status == FileStatus::Here
     })
     .await;
-    a.base.pause_files();
+    // Pause is checked between uploads; hold this particular PUT before it starts.
+    let held = a.base.test_hold_file_puts();
     let bad = a
         .base
         .add_file(new_file("bad"), b"not the garbage")
         .unwrap();
+    bh_testkit::wait_for(|| held.load(std::sync::atomic::Ordering::SeqCst)).await;
     a.base.flush().await.unwrap();
     let path = format!("/v1/bases/{}/files/{bad}/0", a.base.id());
-    assert_eq!(
-        raw_device(&a.account).put_bytes(&path, b"garbage").await.0,
-        StatusCode::OK
-    );
+    let (status, reply) = raw_device(&a.account).put_bytes(&path, b"garbage").await;
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
     // Test a server returning an inauthentic part after the authenticated
     // metadata claims upload completed. A 409 for different bytes is NOT sent.
     a.base

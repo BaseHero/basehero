@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { getBackend } from '../../lib/backend';
   import type { AccountId, BaseSummary } from '../../lib/backend/types';
-  import { drainAll } from '../../lib/editor/host';
+  import { drainAll, resumeAll } from '../../lib/editor/host';
   import { errorMessage } from '../../lib/errors';
   import UnlockDialog from '../hidden/UnlockDialog.svelte';
   import CreateHiddenDialog from '../hidden/CreateHiddenDialog.svelte';
@@ -28,12 +28,12 @@
     if (busy) return;
     busy = true; error = '';
     try {
-      await drainAll();
+      await drainAll('lock');
       if (base) await getBackend().lockHidden(account, base);
       else await getBackend().lockAllHidden();
       await refresh();
     } catch (cause) { error = errorMessage(cause); }
-    finally { busy = false; }
+    finally { busy = false; resumeAll('lock'); }
   }
 </script>
 <section aria-label="Hidden bases" class="hidden-bases">

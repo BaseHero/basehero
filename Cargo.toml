@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "apps/basehero/src-tauri"]
+members = ["crates/*", "apps/basehero/src-tauri", "apps/basehero/plugins/bh-open", "apps/sample/core", "apps/sample/src-tauri"]
 resolver = "2"
 
 # Fixed for the byte-stable Mac Keychain helper, independent of app release changes.

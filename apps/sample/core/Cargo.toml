@@ -1,0 +1,14 @@
+[package]
+name = "basehero-sample-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bh-core = { path = "../../../crates/bh-core" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+bh-testkit = { path = "../../../crates/bh-testkit" }
+bh-models = { path = "../../../crates/bh-models" }
+tempfile = "3"

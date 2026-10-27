@@ -13,7 +13,7 @@
   import KeyError from './screens/KeyError.svelte';
   import { errorMessage } from './lib/errors';
   import { session } from './lib/session.svelte';
-  import { drainAll } from './lib/editor/host';
+  import { drainAll, resumeAll } from './lib/editor/host';
   import Base from './screens/Base.svelte';
   import Bases from './screens/Bases.svelte';
   import Welcome from './screens/Welcome.svelte';
@@ -97,7 +97,7 @@
         let timeout: ReturnType<typeof setTimeout> | undefined;
         try {
           await Promise.race([
-            drainAll().catch(() => {}),
+            drainAll('away').catch(() => {}),
             new Promise<void>(resolve => { timeout = setTimeout(resolve, 3_000); }),
           ]);
         } finally { clearTimeout(timeout); }
@@ -129,16 +129,21 @@
     const base = bases.find(base => base.name === 'Personal')?.id ?? bases[0]?.id;
     void requestRoute(base ? `#/a/${session.account.id}/b/${base}` : `#/a/${session.account.id}`);
   }
-  function openHit(result: SearchResult) {
+  async function openHit(result: SearchResult) {
     if (!session.account) return;
-    void requestRoute(`#/a/${session.account.id}/b/${result.base}/n/${result.hit.id}`);
+    if (result.hit.ty.name === 'core.file') {
+      const file = await getBackend().getObject({ account: session.account.id, base: result.base }, result.hit.id);
+      if (file?.parent) await requestRoute(`#/a/${session.account.id}/b/${result.base}/n/${file.parent}?files=1`);
+      return;
+    }
+    await requestRoute(`#/a/${session.account.id}/b/${result.base}/n/${result.hit.id}`);
   }
 
   let hash = $state(location.hash);
   let leave: (() => Promise<boolean>) | undefined;
   let requestedHash = '';
   let transitioning = false;
-  let route = $derived(/^#\/a\/([^/]+)(?:\/b\/([^/]+)(?:\/n\/([^/]+))?)?$/.exec(hash));
+  let route = $derived(/^#\/a\/([^/]+)(?:\/b\/([^/]+)(?:\/n\/([^/?]+)(?:\?files=1)?)?)?$/.exec(hash));
   let specialRoute = $derived(/^#\/a\/([^/]+)\/(search(?:\?q=[^#]*)?|devices|usage)$/.exec(hash));
   let routeAccount = $derived(route?.[1] ?? specialRoute?.[1]);
   let knownRoute = $derived(accountsLoaded && !!routeAccount && knownAccounts.includes(routeAccount) && !removedAccounts.has(routeAccount));
@@ -386,7 +391,7 @@
       // failed lock's retry on the next stop; only pending work is a duplicate.
       if (lockTimer !== undefined || lockingAway) return;
       away = true; // Hide first; Android can suspend timers and network work immediately.
-      void drainAll().catch(() => { quitSaveError = 'Could not save your notes. Copy your text and try again.'; });
+      void drainAll('away').catch(() => { quitSaveError = 'Could not save your notes. Copy your text and try again.'; });
       clearTimeout(lockTimer);
       if (timerFired) {
         void lockAway().catch(() => { quitSaveError = 'Could not lock hidden bases. Try again.'; });
@@ -403,9 +408,10 @@
       lockTimer = undefined;
       if (timerFired || (awayMs ?? 0) >= lockAfterMs()) {
         // Keep content blank until both the lock and route eviction have finished.
-        void lockAway().then(() => { away = false; }, () => { quitSaveError = 'Could not lock hidden bases. Try again.'; });
+        void lockAway().then(() => { away = false; resumeAll('away'); }, () => { quitSaveError = 'Could not lock hidden bases. Try again.'; });
       } else {
         away = false;
+        resumeAll('away');
       }
       if (session.account) refreshAccount(session.account.id);
     };
@@ -420,10 +426,11 @@
     async function drainForQuit(requestId: number) {
       let ok = false;
       try {
-        await drainAll();
+        await drainAll('quit');
         ok = true;
       } catch {
         quitSaveError = 'Could not save your notes. Copy your text and try again.';
+        resumeAll('quit');
       }
       if (import.meta.env.MODE === 'fake') {
         const testWindow = window as typeof window & { __bhDrainAcks?: { requestId: number; ok: boolean }[] };
@@ -541,7 +548,7 @@
 {#if keyError}
   <KeyError kind={keyError.kind} message={keyError.message} onreset={resetDevice} />
 {:else if route?.[2] && knownRoute && (screen === 'account' || screen === 'welcome')}
-  {#key `${route[1]}:${route[2]}`}<Base r={{ account: route[1], base: route[2] }} id={route[3] ?? null}
+  {#key `${route[1]}:${route[2]}`}<Base r={{ account: route[1], base: route[2] }} id={route[3] ?? null} filesOpen={hash.endsWith('?files=1')}
     {onleave} retryleave={() => { if (requestedHash) void requestRoute(requestedHash); }} />{/key}
 {:else if route && knownRoute && (screen === 'account' || screen === 'welcome')}
   <Bases account={route[1]} email={session.account?.email ?? ''} onopen={base => void requestRoute(`#/a/${route[1]}/b/${base}`)} />

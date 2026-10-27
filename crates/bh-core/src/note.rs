@@ -1,5 +1,5 @@
 //! `NoteDoc`, and a note body's title and text, read through the editor's
-//! schema (`note-schema/v1.json`).
+//! schema (`note-schema/v2.json`).
 
 use crate::base::Base;
 use crate::objects::{self, BODY};
@@ -179,7 +179,7 @@ struct Schema {
 fn schema() -> &'static Schema {
     static SCHEMA: OnceLock<Schema> = OnceLock::new();
     SCHEMA.get_or_init(|| {
-        let spec: Value = serde_json::from_str(include_str!("../../../note-schema/v1.json"))
+        let spec: Value = serde_json::from_str(include_str!("../../../note-schema/v2.json"))
             .expect("the note schema is JSON");
         let mut schema = Schema {
             blocks: HashSet::new(),
@@ -353,7 +353,10 @@ mod tests {
         ] {
             assert!(s.containers.contains(c), "{c}");
         }
-        assert_eq!(s.leaves, HashSet::from(["hardBreak".to_string()]));
+        assert_eq!(
+            s.leaves,
+            HashSet::from(["hardBreak".to_string(), "image".to_string()])
+        );
     }
 
     #[test]
@@ -404,6 +407,28 @@ mod tests {
         });
         assert_eq!(body_title(&blank.transact()), "");
         assert_eq!(body_title(&Doc::new().transact()), "");
+    }
+
+    #[test]
+    fn a_title_skips_a_leading_image() {
+        let doc = doc_with(|txn, body| {
+            body.push_back(txn, XmlElementPrelim::empty("image"));
+            body.push_back(
+                txn,
+                XmlElementPrelim::new("heading", [XmlTextPrelim::new("Kyoto in March").into()]),
+            );
+        });
+        assert_eq!(body_title(&doc.transact()), "Kyoto in March");
+        assert_eq!(body_text(&doc.transact()), "Kyoto in March");
+        assert!(schema().leaves.contains("image"));
+    }
+
+    #[test]
+    fn old_note_schema_v1_is_still_available_for_tests() {
+        let old: Value =
+            serde_json::from_str(include_str!("../../../note-schema/v1.json")).unwrap();
+        assert_eq!(old["version"], 1);
+        assert!(old["nodes"].get("image").is_none());
     }
 
     #[test]

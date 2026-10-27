@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getBackend } from '../lib/backend';
-  import { drainAll } from '../lib/editor/host';
+  import { drainAll, resumeAll } from '../lib/editor/host';
   import { errorMessage } from '../lib/errors';
   import type { BaseRef, ObjectId, ObjectSummary } from '../lib/backend/types';
   let { r, baseName, hidden = false, id, revision, onopen }: { r: BaseRef; baseName: string; hidden?: boolean; id: ObjectId | null; revision: number; onopen: (id: ObjectId | null) => void } = $props();
@@ -9,9 +9,9 @@
   async function lock() {
     if (locking) return;
     locking = true;
-    try { await drainAll(); await getBackend().lockHidden(r.account, r.base); }
+    try { await drainAll('lock'); await getBackend().lockHidden(r.account, r.base); }
     catch (cause) { error = errorMessage(cause); }
-    finally { locking = false; }
+    finally { locking = false; resumeAll('lock'); }
   }
   let path = $state<ObjectSummary[]>([]);
   let address = $state('');

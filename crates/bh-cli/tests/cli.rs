@@ -99,6 +99,67 @@ fn run(home: &Path, args: &[&str], password: Option<&str>, token: Option<&str>) 
 }
 
 #[test]
+fn bh_versions_and_restore_work_headless() {
+    use bh_core::{Clock, Core, CoreConfig, FileSecretStore};
+    use bh_testkit::{append_text, note_with_text};
+    use std::{sync::Arc, time::Duration};
+
+    let server = LocalServer::start();
+    let home = TempDir::new().unwrap();
+    let _ = enrolled(&server, home.path(), "history-cli@example.com");
+    let (clock, manual) = Clock::manual();
+    let core = Core::open_with_clock(
+        CoreConfig {
+            data_dir: home.path().to_path_buf(),
+            secrets: Arc::new(FileSecretStore::new(home.path().join("secrets")).unwrap()),
+        },
+        clock,
+    )
+    .unwrap();
+    let account = core.account(core.accounts()[0].id).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (base_id, id, seq) = {
+        let base = runtime.block_on(account.create_base("History")).unwrap();
+        let id = note_with_text(&base, "Ferry at 9");
+        runtime.block_on(async {
+            base.flush().await.unwrap();
+            manual.advance(Duration::from_secs(6 * 60));
+            base.tick_versions().await.unwrap();
+        });
+        let seq = runtime.block_on(base.versions(id, None, 1)).unwrap().0[0].seq;
+        let note = base.note(id).unwrap();
+        note.apply(10, &append_text(&note.state(), "Ferry at 10"))
+            .unwrap();
+        runtime.block_on(base.flush()).unwrap();
+        (base.id().to_string(), id.to_string(), seq)
+    };
+    core.shutdown();
+    drop(account);
+    drop(core);
+    let listed = output(home.path(), &["versions", "--base", &base_id, &id]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listing: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listing["versions"][0]["seq"], seq);
+    let restored = output(
+        home.path(),
+        &["restore", "--base", &base_id, &id, &seq.to_string()],
+    );
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(
+        run(home.path(), &["show", &id], None, None)["text"],
+        "Ferry at 9"
+    );
+}
+
+#[test]
 fn json_errors_are_machine_readable_without_credentials() {
     let home = TempDir::new().unwrap();
     let output = Command::new("timeout")

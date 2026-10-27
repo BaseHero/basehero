@@ -13,7 +13,7 @@
   import NoteEditor from '../components/NoteEditor.svelte';
   import HeroPanel from '../lib/hero/HeroPanel.svelte';
 
-  let { r, id, onleave, retryleave }: { r: BaseRef; id: ObjectId | null; onleave: (hook: () => Promise<boolean>) => () => void; retryleave: () => void } = $props();
+  let { r, id, filesOpen, onleave, retryleave }: { r: BaseRef; id: ObjectId | null; filesOpen: boolean; onleave: (hook: () => Promise<boolean>) => () => void; retryleave: () => void } = $props();
   const model = untrack(() => new TreeModel(r));
   let baseName = $state('Base');
   let hidden = $state(false);
@@ -21,6 +21,7 @@
   let heroOpen = $state(false);
   let menu = $state<ObjectSummary | null>(null);
   let noteMenu = $state(false);
+  $effect(() => { if (filesOpen) noteMenu = true; });
   let move = $state<ObjectSummary | null>(null);
   let renaming = $state<ObjectSummary | null>(null);
   let newName = $state('');

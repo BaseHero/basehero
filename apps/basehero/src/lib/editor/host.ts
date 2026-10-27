@@ -42,13 +42,29 @@ export function noteHost(backend: Backend, r: BaseRef, id: ObjectId): NoteHost {
   };
 }
 
-export interface DrainingEditor { drain(deadline: number, reason?: string): Promise<boolean> }
+export function staticHost(state: Uint8Array): NoteHost {
+  return {
+    readOnly: true,
+    async open() {
+      return { state: [state], clientId: Math.max(2, crypto.getRandomValues(new Uint32Array(1))[0]), unsubscribe: () => {} };
+    },
+    async commit() { throw new Error('Historical versions are read-only'); },
+    async openExternal() { throw new Error('Historical versions are read-only'); },
+    async search() { return []; },
+  };
+}
+
+export interface DrainingEditor { drain(deadline: number, reason?: string): Promise<boolean>; resume(reason?: string): void }
 const editors = new Set<DrainingEditor>();
 export function trackEditor(editor: DrainingEditor): () => void {
   editors.add(editor);
   return () => { editors.delete(editor); };
 }
-export async function drainAll(): Promise<void> {
-  const drained = await Promise.all([...editors].map(editor => editor.drain(Date.now() + 30_000, 'update')));
+// A drain holds each editor until it closes or resumeAll is called with the same reason.
+export async function drainAll(reason = 'update'): Promise<void> {
+  const drained = await Promise.all([...editors].map(editor => editor.drain(Date.now() + 30_000, reason)));
   if (drained.some(ok => !ok)) throw new Error('Could not save every open note');
+}
+export function resumeAll(reason: string): void {
+  for (const editor of editors) editor.resume(reason);
 }

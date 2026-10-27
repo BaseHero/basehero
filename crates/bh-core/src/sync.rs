@@ -121,6 +121,7 @@ enum Command {
     Changed,
     CatchUp,
     Flush(oneshot::Sender<Result<(), Error>>),
+    PostState(ObjectId, bool, oneshot::Sender<Result<PostedState, Error>>),
     SyncNow(oneshot::Sender<Result<(), Error>>),
     #[cfg(feature = "test-support")]
     Resume,
@@ -132,6 +133,13 @@ struct Status {
     last_synced_at: Option<i64>,
 }
 
+/// Result of attempting to post one kept state.
+pub(crate) enum PostedState {
+    Stored,
+    Stale,
+    Skipped,
+}
+
 /// A base's handle on its sync task.
 pub(crate) struct SyncTask {
     commands: mpsc::UnboundedSender<Command>,
@@ -141,6 +149,12 @@ pub(crate) struct SyncTask {
     paused: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     unmerged: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    hold_kept_reply: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    kept_reply_entered: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    release_kept_reply: Arc<tokio::sync::Notify>,
 }
 
 impl SyncTask {
@@ -155,6 +169,12 @@ impl SyncTask {
         let paused = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "test-support")]
         let unmerged = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let hold_kept_reply = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let kept_reply_entered = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        let release_kept_reply = Arc::new(tokio::sync::Notify::new());
         let engine = Engine {
             owner: base.downgrade(),
             base: None,
@@ -165,6 +185,12 @@ impl SyncTask {
             paused: paused.clone(),
             #[cfg(feature = "test-support")]
             unmerged: unmerged.clone(),
+            #[cfg(feature = "test-support")]
+            hold_kept_reply: hold_kept_reply.clone(),
+            #[cfg(feature = "test-support")]
+            kept_reply_entered: kept_reply_entered.clone(),
+            #[cfg(feature = "test-support")]
+            release_kept_reply: release_kept_reply.clone(),
             flushes: Vec::new(),
             dirty: true,
             caught_up: false,
@@ -178,6 +204,8 @@ impl SyncTask {
             applied_bytes: HashMap::new(),
             pending_tail_bytes: HashMap::new(),
             too_large_warned: HashSet::new(),
+            posted: HashMap::new(),
+            pending_posts: Vec::new(),
         };
         let task = runtime.spawn(engine.run());
         SyncTask {
@@ -188,6 +216,12 @@ impl SyncTask {
             paused,
             #[cfg(feature = "test-support")]
             unmerged,
+            #[cfg(feature = "test-support")]
+            hold_kept_reply,
+            #[cfg(feature = "test-support")]
+            kept_reply_entered,
+            #[cfg(feature = "test-support")]
+            release_kept_reply,
         }
     }
 
@@ -224,6 +258,29 @@ impl SyncTask {
         done.await.map_err(|_| stopped())?
     }
 
+    pub(crate) async fn post_state(&self, id: ObjectId) -> Result<PostedState, Error> {
+        self.enqueue_state(id, true).await
+    }
+
+    /// An explicit restore keeps the current state regardless of the hourly
+    /// version policy, while retaining all send/catch-up safety checks.
+    pub(crate) async fn post_state_for_restore(&self, id: ObjectId) -> Result<PostedState, Error> {
+        self.enqueue_state(id, false).await
+    }
+
+    async fn enqueue_state(
+        &self,
+        id: ObjectId,
+        check_candidate: bool,
+    ) -> Result<PostedState, Error> {
+        let (reply, done) = oneshot::channel();
+        self.commands
+            .send(Command::PostState(id, check_candidate, reply))
+            .map_err(|_| Error::Network("sync has stopped".into()))?;
+        done.await
+            .map_err(|_| Error::Network("sync has stopped".into()))?
+    }
+
     pub(crate) async fn sync_now(&self) -> Result<(), Error> {
         let (reply, done) = oneshot::channel();
         self.commands
@@ -231,6 +288,18 @@ impl SyncTask {
             .map_err(|_| Error::Network("sync has stopped".into()))?;
         done.await
             .map_err(|_| Error::Network("sync has stopped".into()))?
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_kept_reply(&self) -> Arc<AtomicBool> {
+        self.kept_reply_entered.store(false, Ordering::SeqCst);
+        self.hold_kept_reply.store(true, Ordering::SeqCst);
+        self.kept_reply_entered.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn resume_kept_reply(&self) {
+        self.release_kept_reply.notify_one();
     }
 
     #[cfg(feature = "test-support")]
@@ -247,6 +316,12 @@ impl SyncTask {
     }
 }
 
+struct PendingPost {
+    id: ObjectId,
+    check_candidate: bool,
+    reply: oneshot::Sender<Result<PostedState, Error>>,
+}
+
 struct Engine {
     /// The task never owns the base between rounds: the last caller can drop it.
     owner: BaseWeak,
@@ -258,6 +333,12 @@ struct Engine {
     paused: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     unmerged: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    hold_kept_reply: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    kept_reply_entered: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    release_kept_reply: Arc<tokio::sync::Notify>,
     /// Callers waiting for the outbox to be sent.
     flushes: Vec<oneshot::Sender<Result<(), Error>>>,
     /// The outbox may hold changes.
@@ -279,6 +360,8 @@ struct Engine {
     /// This device's posted updates after the latest observed state.
     pending_tail_bytes: HashMap<ObjectId, usize>,
     too_large_warned: HashSet<ObjectId>,
+    posted: HashMap<ChangeId, bool>,
+    pending_posts: Vec<PendingPost>,
 }
 
 impl Engine {
@@ -308,6 +391,16 @@ impl Engine {
             while let Ok(command) = self.commands.try_recv() {
                 self.take(command);
             }
+            if let Some(PendingPost {
+                id,
+                check_candidate,
+                reply,
+            }) = self.pending_posts.pop()
+            {
+                let result = self.post_kept_state(id, check_candidate).await;
+                let _ = reply.send(result);
+                continue;
+            }
             if self.paused() {
                 for flush in self.flushes.drain(..) {
                     let _ = flush.send(Err(Error::Network("sync is paused".into())));
@@ -321,6 +414,91 @@ impl Engine {
             self.step().await;
             self.base = None;
         }
+    }
+
+    /// Use the ordinary durable sending queue, including its retry and fetch path.
+    async fn post_kept_state(
+        &mut self,
+        id: ObjectId,
+        check_candidate: bool,
+    ) -> Result<PostedState, Error> {
+        if self.paused() {
+            return Err(Error::Network("sync is paused".into()));
+        }
+        // Only step() owns reconnecting and catch-up; a post must not mark
+        // caught_up without a live socket during reconnect backoff.
+        if self.socket.is_none() || !self.caught_up {
+            return Err(Error::Network("sync is not connected".into()));
+        }
+        let base = self.owner.upgrade().ok_or(Error::NotFound)?;
+        self.base = Some(base);
+        let result = async {
+            let mut worked = false;
+            // A kept state must cover the edits this device has already sent.
+            let (force, _reply) = oneshot::channel();
+            self.flushes.push(force);
+            let sent = self.send(&mut worked).await;
+            self.flushes.pop();
+            sent?;
+            let row = {
+                let base = self.base();
+                let db = base.db()?;
+                // The flush may have retried a kept row and recorded its version.
+                if check_candidate
+                    && !db
+                        .version_candidates(base.version_now(), 0, 0)?
+                        .contains(&id)
+                {
+                    return Ok(PostedState::Skipped);
+                }
+                let Some((ty, state)) = db.state(id)? else {
+                    return Ok(PostedState::Skipped);
+                };
+                // A local edit could land during the network send above. Never
+                // seal a state that includes edits beyond its covers sequence.
+                if db.outbox_objects(db.outbox_end()?)?.contains(&id)
+                    || db.needs_update(id)?
+                    || base.newer_type_for_compaction(&db, &ty)?
+                    || state.len() + OVERHEAD > MAX_STATE_BYTES
+                {
+                    return Ok(PostedState::Skipped);
+                }
+                let Some(covers) = db.confirmed(id)?.filter(|n| *n > 0) else {
+                    return Ok(PostedState::Skipped);
+                };
+                SendingRow {
+                    change_id: ChangeId::random(),
+                    object_id: id,
+                    state: true,
+                    keep: true,
+                    body: base.seal_change(id, true, &state),
+                    covers: Some(covers),
+                    outbox_max_id: 0,
+                }
+            };
+            self.base()
+                .db()?
+                .start_sending(std::slice::from_ref(&row))?;
+            // A caller deliberately asked for this kept state now. Do not
+            // throttle it behind the just-flushed edits for this object.
+            let (force, _reply) = oneshot::channel();
+            self.flushes.push(force);
+            let sent = self.send(&mut worked).await;
+            self.flushes.pop();
+            sent?;
+            match self.posted.remove(&row.change_id) {
+                Some(true) => Ok(PostedState::Stored),
+                Some(false) => {
+                    self.fetch(vec![id], &mut worked).await?;
+                    Ok(PostedState::Stale)
+                }
+                None => Err(Error::Network("kept state awaits retry".into())),
+            }
+        }
+        .await;
+        self.posted.clear();
+        self.base = None;
+        result
     }
 
     fn disconnect(&mut self) {
@@ -522,6 +700,13 @@ impl Engine {
             }
             Command::CatchUp => self.caught_up = false,
             Command::Flush(reply) => self.flushes.push(reply),
+            Command::PostState(id, check_candidate, reply) => {
+                self.pending_posts.push(PendingPost {
+                    id,
+                    check_candidate,
+                    reply,
+                })
+            }
             Command::SyncNow(reply) => {
                 self.caught_up = false;
                 self.flushes.push(reply);
@@ -800,6 +985,33 @@ impl Engine {
                 self.last_sent.insert(row.object_id, sent_at);
             }
             let reply = reply?;
+            #[cfg(feature = "test-support")]
+            if batch.iter().any(|row| row.keep)
+                && self.hold_kept_reply.swap(false, Ordering::SeqCst)
+            {
+                let released = self.release_kept_reply.notified();
+                self.kept_reply_entered.store(true, Ordering::SeqCst);
+                released.await;
+            }
+            for row in &batch {
+                if row.keep {
+                    let result = reply
+                        .results
+                        .iter()
+                        .find(|r| r.change_id == row.change_id)
+                        .ok_or_else(|| Error::Network("malformed response".into()))?;
+                    let stored = result.seq.is_some() && !result.stale;
+                    // A retried kept send whose first reply was lost records this
+                    // reply's time, so the edit since waits for the next version.
+                    // Known limit: nothing is lost, it's in the current state.
+                    if stored {
+                        self.base()
+                            .db()?
+                            .version_stored(row.object_id, self.base().version_now())?;
+                    }
+                    self.posted.insert(row.change_id, stored);
+                }
+            }
             *worked = true;
             let fetch = self.apply_results(&batch, &reply.results)?;
             if !fetch.is_empty() {
@@ -925,6 +1137,7 @@ impl Engine {
                 change_id: ChangeId::random(),
                 object_id: id,
                 state: true,
+                keep: false,
                 body: base.seal_change(id, true, &state),
                 covers: Some(covers),
                 outbox_max_id: 0,
@@ -949,6 +1162,7 @@ impl Engine {
                         change_id: ChangeId::random(),
                         object_id: id,
                         state: false,
+                        keep: false,
                         body: self.base().seal_change(id, false, &update),
                         covers: None,
                         outbox_max_id: row_id,
@@ -995,6 +1209,7 @@ impl Engine {
                 change_id: ChangeId::random(),
                 object_id: id,
                 state: false,
+                keep: false,
                 body,
                 covers: None,
                 outbox_max_id: rows.last().expect("an outbox row").0,
@@ -1015,7 +1230,7 @@ fn change(row: &SendingRow) -> Change {
         },
         body: Bytes(row.body.clone()),
         covers: row.covers,
-        keep: None,
+        keep: row.keep.then_some(true),
     }
 }
 

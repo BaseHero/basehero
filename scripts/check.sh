@@ -26,9 +26,9 @@ for stage in "$@"; do
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
       cargo fmt --all -- --check
-      cargo clippy --workspace --exclude basehero-app --exclude bh-mac-keychain-helper --all-targets --features bh-cli/test-support -- -D warnings
+      cargo clippy --workspace --exclude basehero-app --exclude basehero-sample --exclude bh-mac-keychain-helper --all-targets --features bh-cli/test-support -- -D warnings
       # Exercise the real bh binary with its debug-only scripted model hook.
-      cargo test --workspace --exclude basehero-app --exclude bh-mac-keychain-helper --features bh-cli/test-support
+      cargo test --workspace --exclude basehero-app --exclude basehero-sample --exclude bh-mac-keychain-helper --features bh-cli/test-support
       node scripts/check-docs.mjs
       node --test scripts/check-docs.test.mjs
       RUSTDOCFLAGS="-D warnings" cargo doc -p bh-core -p bh-docs --no-deps
@@ -56,6 +56,7 @@ for stage in "$@"; do
       fi
       cargo fmt -p basehero-app -- --check
       cargo clippy -p basehero-app -- -D warnings
+      cargo clippy -p basehero-sample -- -D warnings
       cargo test -p basehero-app
       (
         cd apps/basehero
@@ -68,18 +69,27 @@ for stage in "$@"; do
       git diff --exit-code -- apps/basehero/src/lib/generated
       ! grep -rn '{@html' apps/basehero/src
       ;;
+    android-sample)
+      scripts/android-emulator.sh
+      nix develop --command cargo build -p bh-cli
+      (cd apps/basehero && npm ci --no-audit --no-fund)
+      scripts/sample-android.sh install
+      adb -s emulator-5580 shell pm clear app.basehero.sample
+      node --test apps/sample/tests/android/sample.test.mjs
+      ;;
     android)
       scripts/android-emulator.sh
       # The Android cross shell has only Android libsodium; the host CLI
       # needs the native library from the default development shell.
       nix develop --command cargo build -p bh-cli
+      nix develop --command cargo build -p bh-cli --features test-support --example keep_emulator_version
       (cd apps/basehero && npm ci --no-audit --no-fund)
       scripts/android-dev.sh install
       # The disposable emulator starts each suite with a new local account.
       adb -s emulator-5580 shell pm clear app.basehero
       # One emulator and one app: test files take turns. The approval runner
       # creates a disposable dev approver and isolates its CLI credentials.
-      for file in lib keys shell model notes fold ime hero update approval kit hidden; do
+      for file in lib keys shell model notes fold ime hero update approval kit hidden files; do
         if [ "$file" = approval ]; then
           node apps/basehero/tests/android/run-approval.mjs
         else
@@ -113,7 +123,7 @@ for stage in "$@"; do
       memory_tmp
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
-      cargo test --release -p bh-core --test scale -- --nocapture --test-threads=1
+      cargo test --release -p bh-core --test scale --test scale_files -- --nocapture --test-threads=1
       du -sh "$TMPDIR" # Fixture footprint before the check's in-memory directory is removed.
       ;;
     *)

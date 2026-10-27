@@ -355,6 +355,12 @@ impl Uploader {
                 match result {
                     Ok(true) => backoff = Duration::from_millis(500),
                     Ok(false) => task_wake.notified().await,
+                    Err(Error::RateLimited) => {
+                        // File PUTs share the server's 50-write/s device window
+                        // with change POSTs. Retry at that pace rather than
+                        // exponentially backing off for a full minute.
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
                     Err(_) => {
                         tokio::select! { _ = tokio::time::sleep(backoff) => {}, _ = task_wake.notified() => {} }
                         backoff = (backoff * 2).min(Duration::from_secs(30));

@@ -15,7 +15,7 @@ function el(name, attributes = {}) {
 }
 
 test('inventory matches actual bundled editor nodes and marks', () => {
-  assert.deepEqual(Object.keys(schema.nodes).sort(), ['blockquote','bulletList','doc','hardBreak','heading','listItem','orderedList','paragraph','taskItem','taskList','text'].sort());
+  assert.deepEqual(Object.keys(schema.nodes).sort(), ['blockquote','bulletList','doc','hardBreak','heading','image','listItem','orderedList','paragraph','taskItem','taskList','text'].sort());
   assert.deepEqual(Object.keys(schema.marks).sort(), ['bold','code','italic','link','strike','underline'].sort());
   for(const [name,mark] of Object.entries(schema.marks))
     for(const [otherName,other] of Object.entries(schema.marks))

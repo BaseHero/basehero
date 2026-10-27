@@ -21,6 +21,7 @@ const commands: Record<string, [string, string[]]> = {
   lockAllHidden: ['lock_all_hidden', []], passwordStrength: ['password_strength', ['password', 'context']],
   refreshAccount: ['refresh_account', ['account']],
   files: ['files', ['r', 'parent']], fileInfo: ['file_info', ['r', 'id']], fileOpen: ['file_open', ['r', 'id']],
+  versions: ['versions', ['r', 'id', 'before']], versionRestore: ['version_restore', ['r', 'id', 'seq']],
   children: ['children', ['r', 'parent']], getObject: ['get_object', ['r', 'id']],
   createObject: ['create_object', ['r', 'item']], renameObject: ['rename_object', ['r', 'id', 'name']],
   moveObject: ['move_object', ['r', 'id', 'parent', 'after']],
@@ -50,6 +51,9 @@ export const tauriBackend: Backend = new Proxy({
       'bh-account': r.account, 'bh-base': r.base, 'bh-parent': parent ?? '',
       'bh-name': encodeURIComponent(name), 'bh-mime': mime,
     } }).catch(rethrow);
+  },
+  async versionState(r: BaseRef, id: string, seq: number): Promise<Uint8Array> {
+    return new Uint8Array(await call<Uint8Array>('version_state', { r, id, seq }));
   },
   async fileImage(r: BaseRef, id: string): Promise<FileImage> {
     const raw = await call<Uint8Array>('file_image', { r, id });

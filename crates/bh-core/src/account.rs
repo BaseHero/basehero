@@ -1037,6 +1037,33 @@ impl Account {
             .insert(base, readers);
     }
 
+    fn version_device_name(&self, id: DeviceId) -> Option<String> {
+        if self.kind() == DeviceKind::App {
+            return None;
+        }
+        self.db()
+            .account_data()
+            .ok()
+            .flatten()
+            .and_then(|(_, json)| parse_data(json.as_bytes()).ok())
+            .and_then(|data| {
+                data.get("devices")?
+                    .get(id.to_string())?
+                    .get("name")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .filter(|name| !name.is_empty())
+    }
+
+    fn attach_version_names(&self, base: &Base) {
+        let weak = Arc::downgrade(&self.inner);
+        base.set_version_device_name(move |id| {
+            let inner = weak.upgrade()?;
+            Account { inner }.version_device_name(id)
+        });
+    }
+
     pub(crate) fn app_reader_name(&self, id: DeviceId) -> String {
         self.db()
             .account_data()
@@ -1105,6 +1132,7 @@ impl Account {
             Some(self.inner.removal.clone()),
         )?;
         base.set_full(self.kind() == DeviceKind::Full);
+        self.attach_version_names(&base);
         base.start_sync(
             self.inner.api.clone(),
             &self.inner.shared.handle,
@@ -1139,6 +1167,7 @@ impl Account {
         )?;
         base.set_removal(self.inner.removal.clone());
         base.set_full(self.kind() == DeviceKind::Full);
+        self.attach_version_names(&base);
         base.start_sync(
             self.inner.api.clone(),
             &self.inner.shared.handle,

@@ -5,6 +5,19 @@ const r = { account: 'account', base: 'base' };
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1]);
 
 describe('fake file boundary', () => {
+  it('sniffs all four supported raster formats regardless of supplied type', async () => {
+    const backend = new FakeBackend();
+    const note = await backend.createObject(r, { kind: 'note', parent: null, after: null, name: null });
+    for (const [mime, signature] of [
+      ['image/jpeg', [255,216,255,0]],
+      ['image/gif', [...new TextEncoder().encode('GIF89a'),0]],
+      ['image/webp', [...new TextEncoder().encode('RIFF'),0,0,0,0,...new TextEncoder().encode('WEBP')]],
+    ] as const) {
+      const bytes = new Uint8Array(signature);
+      const file = await backend.fileAdd(r,note,'wrong.svg','image/svg+xml',bytes);
+      expect(await backend.fileImage(r,file.id)).toEqual({mime,bytes});
+    }
+  });
   it('keeps the uploaded bytes and never trusts declared MIME for image display', async () => {
     const backend = new FakeBackend();
     const note = await backend.createObject(r, { kind: 'note', parent: null, after: null, name: null });

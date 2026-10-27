@@ -526,6 +526,7 @@ pub(crate) struct SendingRow {
     pub object_id: ObjectId,
     /// A `state` change rather than an `update`.
     pub state: bool,
+    pub keep: bool,
     pub body: Vec<u8>,
     pub covers: Option<u64>,
     pub outbox_max_id: i64,
@@ -702,6 +703,45 @@ impl BaseDb {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a local edit, inside the caller's object/outbox transaction.
+    pub(crate) fn record_local_edit(&self, id: ObjectId, at: i64) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO edits (object_id, last_edit_at) VALUES (?, ?)
+             ON CONFLICT(object_id) DO UPDATE SET last_edit_at = excluded.last_edit_at",
+            params![id.to_string(), at],
+        )?;
+        Ok(())
+    }
+
+    /// Locally edited objects eligible for a kept state at this time.
+    pub(crate) fn version_candidates(
+        &self,
+        now: i64,
+        pause: i64,
+        gap: i64,
+    ) -> Result<Vec<ObjectId>, Error> {
+        let mut stmt = self.0.prepare(
+            "SELECT e.object_id FROM edits e JOIN objects o USING (object_id)
+             WHERE o.type IN ('core.note', 'core.folder', 'core.project') AND o.type_version = 1
+               AND e.last_edit_at <= ?1 AND (e.last_version_at IS NULL OR
+                 (e.last_edit_at > e.last_version_at AND e.last_version_at <= ?2))",
+        )?;
+        let rows = stmt.query_map(
+            params![now.saturating_sub(pause), now.saturating_sub(gap)],
+            |r| r.get::<_, String>(0),
+        )?;
+        rows.map(|row| parse_id(&row?)).collect()
+    }
+
+    /// Records a successfully kept version; the next edit must be later.
+    pub(crate) fn version_stored(&self, id: ObjectId, at: i64) -> Result<(), Error> {
+        self.0.execute(
+            "UPDATE edits SET last_version_at = ? WHERE object_id = ?",
+            params![at, id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -1037,9 +1077,10 @@ impl BaseDb {
                 object_id: parse_id(&object_id)?,
                 state: match kind.as_str() {
                     "update" => false,
-                    "state" => true,
+                    "state" | "kept_state" => true,
                     _ => return Err(corrupt("change kind")),
                 },
+                keep: kind == "kept_state",
                 body,
                 covers: covers.map(|c| c as u64),
                 outbox_max_id,
@@ -1058,7 +1099,13 @@ impl BaseDb {
                 params![
                     c.change_id.to_string(),
                     c.object_id.to_string(),
-                    if c.state { "state" } else { "update" },
+                    if c.keep {
+                        "kept_state"
+                    } else if c.state {
+                        "state"
+                    } else {
+                        "update"
+                    },
                     c.body,
                     c.covers.map(|c| c as i64),
                     c.outbox_max_id
@@ -1299,6 +1346,57 @@ mod tests {
     }
 
     #[test]
+    fn version_candidates_require_a_local_edit_and_supported_type_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = BaseDb::open(&tmp.path().join("base.sqlite"), &[3; 32]).unwrap();
+        db.migrate_search(|_| Ok(())).unwrap();
+        let id = ObjectId([5; 16]);
+        let mut row = ObjectRow {
+            summary: ObjectSummary {
+                id,
+                ty: TypeRef::new("core.note", 1),
+                parent: None,
+                position: "V".into(),
+                deleted: false,
+                title: String::new(),
+                fields: Map::new(),
+                updated_at: 0,
+                updated_by: None,
+            },
+            state: vec![1],
+        };
+        db.put(&row, &[], None).unwrap();
+        assert!(
+            db.version_candidates(600_000, 300_000, 3_600_000)
+                .unwrap()
+                .is_empty()
+        );
+        db.batch(|db| {
+            db.put(&row, &[&[1]], None)?;
+            db.record_local_edit(id, 0)
+        })
+        .unwrap();
+        assert_eq!(
+            db.version_candidates(300_000, 300_000, 3_600_000).unwrap(),
+            vec![id]
+        );
+        db.version_stored(id, 300_000).unwrap();
+        db.record_local_edit(id, 600_000).unwrap();
+        assert!(
+            db.version_candidates(900_000, 300_000, 3_600_000)
+                .unwrap()
+                .is_empty()
+        );
+        row.summary.ty.version = 2;
+        db.put(&row, &[], None).unwrap();
+        assert!(
+            db.version_candidates(4_000_000, 300_000, 3_600_000)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_base_store_is_encrypted_at_version_4_and_writes_state_with_its_outbox() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("base.sqlite");
@@ -1507,6 +1605,7 @@ mod tests {
             change_id: ChangeId([7; 16]),
             object_id: id,
             state: false,
+            keep: false,
             body: vec![9],
             covers: None,
             outbox_max_id: covered[0].0,

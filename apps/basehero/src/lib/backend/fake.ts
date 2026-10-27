@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage } from './types';
+import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
 
 export class FakeBackend implements Backend {
   calls: string[] = [];
@@ -47,6 +47,21 @@ export class FakeBackend implements Backend {
   private approvalsDone = new Map<string, AccountSummary>();
   private items = new Map<string, ObjectSummary[]>();
   private fileData = new Map<string, { r: BaseRef; info: FileInfo; bytes: Uint8Array }>();
+  private versionData = new Map<string, { row: ObjectVersion; state: Uint8Array }[]>();
+  private online = true;
+  setOnline(online: boolean) { this.online = online; }
+  addVersion(r: BaseRef, id: string, text: string) {
+    const doc = new Y.Doc();
+    const paragraph = new Y.XmlElement('paragraph');
+    paragraph.insert(0, [new Y.XmlText(text)]);
+    doc.getXmlFragment('default').insert(0, [paragraph]);
+    const versions = this.versionData.get(`${this.key(r)}:${id}`) ?? [];
+    const seq = versions.length ? versions[0].row.seq + 1 : 1;
+    versions.unshift({ row: { seq, at: Date.now(), deviceId: 'mac', deviceName: 'Mac' }, state: Y.encodeStateAsUpdate(doc) });
+    this.versionData.set(`${this.key(r)}:${id}`, versions);
+    doc.destroy();
+    return seq;
+  }
   private sync = new Map<string, SyncState>();
   private sessions = new Map<number, { id: string; onUpdate: (update: Uint8Array) => void }>();
   private notes = new Map<string, Y.Doc>();
@@ -317,14 +332,55 @@ export class FakeBackend implements Backend {
     const file = this.fileData.get(id);
     if (!file || !await this.fileInfo(r, id)) throw new BackendError('NotFound', 'File not found');
     if (file.info.status.kind !== 'here') throw new BackendError('NotFound', 'File not on this device');
-    const signature = [137, 80, 78, 71, 13, 10, 26, 10];
-    if (!signature.every((byte, index) => file.bytes[index] === byte)) throw new BackendError('Invalid', 'Not an image');
-    return { mime: 'image/png', bytes: file.bytes.slice() };
+    const bytes=file.bytes;
+    const has=(signature: number[],offset=0)=>signature.every((byte,index)=>bytes[offset+index]===byte);
+    const mime=has([137,80,78,71,13,10,26,10])?'image/png'
+      :has([255,216,255])?'image/jpeg'
+      :has([71,73,70,56,55,97]) || has([71,73,70,56,57,97])?'image/gif'
+      :bytes.length>=12 && has([82,73,70,70]) && has([87,69,66,80],8)?'image/webp':null;
+    if (!mime) throw new BackendError('Invalid', 'Not an image');
+    return { mime, bytes: bytes.slice() };
   }
   async fileOpen(r: BaseRef, id: string): Promise<void> {
     this.log('fileOpen', r.account);
     const file = this.fileData.get(id);
     if (!file || !await this.fileInfo(r, id) || file.info.status.kind !== 'here') throw new BackendError('NotFound', 'File not on this device');
+  }
+  async versions(r: BaseRef, id: string, before: number | null): Promise<VersionsPage> {
+    this.log('versions', r.account);
+    if (!this.online) throw new BackendError('Network', 'Offline');
+    const rows = (this.versionData.get(`${this.key(r)}:${id}`) ?? []).filter(v => before === null || v.row.seq < before);
+    return { versions: rows.slice(0, 50).map(v => ({ ...v.row })), more: rows.length > 50 };
+  }
+  async versionState(r: BaseRef, id: string, seq: number): Promise<Uint8Array> {
+    this.log('versionState', r.account);
+    if (!this.online) throw new BackendError('Network', 'Offline');
+    const version = this.versionData.get(`${this.key(r)}:${id}`)?.find(v => v.row.seq === seq);
+    if (!version) throw new BackendError('NotFound', 'Version not found');
+    return version.state.slice();
+  }
+  async versionRestore(r: BaseRef, id: string, seq: number): Promise<void> {
+    this.log('versionRestore', r.account);
+    const state = await this.versionState(r, id, seq);
+    const historical = new Y.Doc(); Y.applyUpdate(historical, state);
+    const current = this.doc(id);
+    const versions = this.versionData.get(`${this.key(r)}:${id}`) ?? [];
+    const nextSeq = versions.length ? versions[0].row.seq + 1 : 1;
+    versions.unshift({ row: { seq: nextSeq, at: Date.now(), deviceId: 'mac', deviceName: 'Mac' }, state: Y.encodeStateAsUpdate(current) });
+    this.versionData.set(`${this.key(r)}:${id}`, versions);
+    current.transact(() => {
+      const target = current.getXmlFragment('default');
+      if (target.length) target.delete(0, target.length);
+      for (const element of historical.getXmlFragment('default').toArray()) {
+        if (!(element instanceof Y.XmlElement || element instanceof Y.XmlText)) throw new BackendError('NeedsUpdate', 'Unsupported note content');
+        target.insert(target.length, [element.clone()]);
+      }
+    });
+    historical.destroy();
+    if (typeof localStorage !== 'undefined') localStorage.setItem(`basehero:fake-note:${id}`, JSON.stringify(Array.from(Y.encodeStateAsUpdate(current))));
+    // Publish an update from the restored document so open editors update without reopening.
+    const update = Y.encodeStateAsUpdate(current);
+    for (const session of this.sessions.values()) if (session.id === id) session.onUpdate(update);
   }
   async children(r: BaseRef, parent: string | null) { this.log('children', r); return (this.items.get(this.key(r)) ?? []).filter(x => x.parent === parent && !x.deleted); }
   async getObject(r: BaseRef, id: string) { this.log('getObject', r); return this.items.get(this.key(r))?.find(x => x.id === id) ?? null; }
@@ -344,7 +400,7 @@ export class FakeBackend implements Backend {
       for (const item of this.items.get(this.key({ account, base: entry.id })) ?? []) {
         if (item.deleted || !item.title.toLowerCase().includes(text.toLowerCase())) continue;
         results.push({ base: entry.id, baseName: entry.name, hit: {
-          id: item.id, ty: { name: `core.${item.kind}`, version: 1 }, title: item.title, snippet: '',
+          id: item.id, ty: (item.ty as { name: string; version: number } | undefined) ?? { name: `core.${item.kind}`, version: 1 }, title: item.title, snippet: '',
         } });
         if (results.length >= limit) return results;
       }

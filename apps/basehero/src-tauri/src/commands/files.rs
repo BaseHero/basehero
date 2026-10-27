@@ -2,7 +2,7 @@
 use crate::error::CommandError;
 use crate::state::AppState;
 use crate::views::BaseRef;
-use bh_core::{BaseId, FileInfo, Image, NewFile, ObjectId};
+use bh_core::{BaseId, FileInfo, Image, NewFile, ObjectId, ObjectVersion};
 use std::path::{Path, PathBuf};
 
 pub fn file_add(
@@ -56,6 +56,33 @@ pub async fn file_image(
     id: ObjectId,
 ) -> Result<Image, CommandError> {
     Ok(state.base(r)?.image(id).await?)
+}
+
+pub async fn versions(
+    state: &AppState,
+    r: &BaseRef,
+    id: ObjectId,
+    before: Option<u64>,
+) -> Result<(Vec<ObjectVersion>, bool), CommandError> {
+    Ok(state.base(r)?.versions(id, before, 50).await?)
+}
+
+pub async fn version_state(
+    state: &AppState,
+    r: &BaseRef,
+    id: ObjectId,
+    seq: u64,
+) -> Result<Vec<u8>, CommandError> {
+    Ok(state.base(r)?.version(id, seq).await?)
+}
+
+pub async fn version_restore(
+    state: &AppState,
+    r: &BaseRef,
+    id: ObjectId,
+    seq: u64,
+) -> Result<(), CommandError> {
+    Ok(state.base(r)?.restore_version(id, seq).await?)
 }
 
 fn storage(error: std::io::Error) -> CommandError {
@@ -179,8 +206,16 @@ pub mod ipc {
             .map_err(|_| invalid("Invalid file name"))?
             .into_owned();
         let mime = header(&request, "bh-mime")?;
-        let InvokeBody::Raw(bytes) = request.body() else {
-            return Err(invalid("Expected raw file bytes"));
+        let bytes: std::borrow::Cow<'_, [u8]> = match request.body() {
+            InvokeBody::Raw(bytes) => std::borrow::Cow::Borrowed(bytes),
+            // The Android WebView IPC serializes Uint8Array to a JSON array.
+            #[cfg(target_os = "android")]
+            InvokeBody::Json(value) => std::borrow::Cow::Owned(
+                serde_json::from_value(value.clone())
+                    .map_err(|_| invalid("Expected file bytes"))?,
+            ),
+            #[cfg(not(target_os = "android"))]
+            _ => return Err(invalid("Expected raw file bytes")),
         };
         super::file_add(
             startup.state()?,
@@ -188,7 +223,7 @@ pub mod ipc {
             parent,
             &name,
             &mime,
-            bytes,
+            &bytes,
         )
     }
 
@@ -221,6 +256,45 @@ pub mod ipc {
         raw.extend(image.bytes);
         Ok(Response::new(raw))
     }
+    #[derive(serde::Serialize)]
+    pub struct VersionsPage {
+        versions: Vec<ObjectVersion>,
+        more: bool,
+    }
+
+    #[tauri::command]
+    pub async fn versions(
+        startup: tauri::State<'_, Startup>,
+        r: BaseRef,
+        id: ObjectId,
+        before: Option<u64>,
+    ) -> Result<VersionsPage, CommandError> {
+        let (versions, more) = super::versions(startup.state()?, &r, id, before).await?;
+        Ok(VersionsPage { versions, more })
+    }
+
+    #[tauri::command]
+    pub async fn version_state(
+        startup: tauri::State<'_, Startup>,
+        r: BaseRef,
+        id: ObjectId,
+        seq: u64,
+    ) -> Result<Response, CommandError> {
+        Ok(Response::new(
+            super::version_state(startup.state()?, &r, id, seq).await?,
+        ))
+    }
+
+    #[tauri::command]
+    pub async fn version_restore(
+        startup: tauri::State<'_, Startup>,
+        r: BaseRef,
+        id: ObjectId,
+        seq: u64,
+    ) -> Result<(), CommandError> {
+        super::version_restore(startup.state()?, &r, id, seq).await
+    }
+
     #[tauri::command]
     pub async fn file_open(
         app: tauri::AppHandle,
@@ -230,9 +304,13 @@ pub mod ipc {
     ) -> Result<(), CommandError> {
         #[cfg(target_os = "android")]
         {
-            let _ = (app, startup, r, id);
-            // Android needs a FileProvider; opener paths cannot grant an external viewer access.
-            Err(invalid("not on Android yet"))
+            let state = startup.state()?;
+            let info = super::file_info(state, &r, id)?.ok_or(bh_core::Error::NotFound)?;
+            let path = super::open_copy(state, &r, id).await?;
+            bh_open::open(&app, &path, &info.mime).map_err(|message| CommandError {
+                kind: "Storage".into(),
+                message,
+            })
         }
         #[cfg(not(target_os = "android"))]
         {

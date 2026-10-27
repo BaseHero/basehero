@@ -2,5 +2,7 @@ include ':app'
 // The Android Keystore master key, which Rust reaches through JNI.
 include ':bh-keys'
 project(':bh-keys').projectDir = new File(settingsDir, '../../../plugins/bh-keys/android')
+include ':bh-open'
+project(':bh-open').projectDir = new File(settingsDir, '../../../plugins/bh-open/android')
 
 apply from: 'tauri.settings.gradle'

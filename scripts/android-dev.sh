@@ -28,7 +28,7 @@ case "${1:-}" in
     fi
     ;;
   release-check)
-    # R8 must keep the verifier's Kotlin half and KeysPlugin, which Rust reaches
+    # R8 must keep the verifier's Kotlin half, KeysPlugin and OpenPlugin, which Rust reaches
     # only through JNI, and release builds must not contain the debug-only model probe.
     export BH_SERVER="${BH_SERVER:-https://dev-api.basehero.com}"
     (cd apps/basehero && cargo tauri android build --apk --target x86_64 --ci)
@@ -49,10 +49,13 @@ case "${1:-}" in
     grep -q "Class descriptor  : 'Lapp/basehero/keys/KeysPlugin;'" "$out/classes.txt" || {
       echo 'R8 removed app.basehero.keys.KeysPlugin' >&2; exit 1;
     }
+    grep -q "Class descriptor  : 'Lapp/basehero/open/OpenPlugin;'" "$out/classes.txt" || {
+      echo 'R8 removed app.basehero.open.OpenPlugin' >&2; exit 1;
+    }
     ! grep -q dev_model_probe "$out/lib/$abi/libbasehero_app_lib.so" || {
       echo 'the release library contains dev_model_probe' >&2; exit 1;
     }
-    echo 'release APK keeps CertificateVerifier and KeysPlugin and omits dev_model_probe'
+    echo 'release APK keeps CertificateVerifier, KeysPlugin and OpenPlugin and omits dev_model_probe'
     ;;
   *) echo 'Usage: android-dev.sh build|install|release-check|release-check-apk APK ABI' >&2; exit 2 ;;
 esac

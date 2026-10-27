@@ -11,8 +11,11 @@ test('Hero on dev replies, creates a note, and its button opens the editor', { t
   await launch(); const page = await webview();
   try {
     await newNote(page, 'Hero check');
-    if (await page.locator('.hero-toggle').isVisible()) await page.locator('.hero-toggle').click();
     const panel = page.getByRole('region', { name: 'Hero' });
+    // The app remembers an open panel; the toggle would close it.
+    if (!await panel.getByLabel('Ask Hero').isVisible() && await page.locator('.hero-toggle').isVisible()) {
+      await page.locator('.hero-toggle').click();
+    }
     await panel.getByLabel('Ask Hero').waitFor();
     // On a rerun, use the already completed turn rather than spending on another call.
     if (!await panel.getByText(prompt, { exact: true }).count()) {

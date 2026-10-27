@@ -42,6 +42,17 @@ impl Clock {
         }
     }
 
+    /// A persistent edit timestamp: wall time on a real device, the controllable
+    /// monotonic value for tests (including reopened cores sharing this clock).
+    pub(crate) fn edit_time_ms(&self) -> i64 {
+        match &*self.0 {
+            Source::Manual { .. } => self.now_ms().min(i64::MAX as u64) as i64,
+            Source::System(_) => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis().min(i64::MAX as u128) as i64),
+        }
+    }
+
     /// Waits for a monotonic deadline; does not need the network.
     pub async fn sleep_until(&self, deadline: u64) {
         match &*self.0 {

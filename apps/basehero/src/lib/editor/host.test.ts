@@ -1,11 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { drainAll, noteHost, trackEditor } from './host';
+import { drainAll, noteHost, resumeAll, staticHost, trackEditor } from './host';
 import { FakeBackend } from '../backend/fake';
 import * as Y from 'yjs';
 
 const r = { account: 'account', base: 'base' };
 
 describe('note host', () => {
+  it('opens a static version and refuses commits', async () => {
+    const bytes = new Uint8Array([0, 0]);
+    const host = staticHost(bytes);
+    expect(host.readOnly).toBe(true);
+    const opened = await host.open(() => {});
+    expect(opened.state[0]).toEqual(bytes);
+    await expect(host.commit(bytes, 'request')).rejects.toThrow();
+    opened.unsubscribe();
+  });
   it('acknowledges only after the backend has committed the exact update', async () => {
     const backend = new FakeBackend();
     const id = await backend.createObject(r, { kind: 'note', name: 'Note', parent: null, after: null });
@@ -23,9 +32,18 @@ describe('note host', () => {
     doc.destroy();
   });
 
+  it('resumes editors with the reason they were drained for', () => {
+    const reasons: (string | undefined)[] = [];
+    const stop = trackEditor({ drain: async () => true, resume: reason => { reasons.push(reason); } });
+    try {
+      resumeAll('away');
+      expect(reasons).toEqual(['away']);
+    } finally { stop(); }
+  });
+
   it('waits for every open editor and refuses an unsuccessful drain', async () => {
     let finish!: (ok: boolean) => void;
-    const stopping = trackEditor({ drain: () => new Promise<boolean>(resolve => { finish = resolve; }) });
+    const stopping = trackEditor({ drain: () => new Promise<boolean>(resolve => { finish = resolve; }), resume: () => {} });
     try {
       const pending = drainAll();
       let finished = false;
@@ -35,7 +53,7 @@ describe('note host', () => {
       finish(true);
       await pending;
       stopping();
-      const rejecting = trackEditor({ drain: async () => false });
+      const rejecting = trackEditor({ drain: async () => false, resume: () => {} });
       try { await expect(drainAll()).rejects.toThrow('Could not save'); }
       finally { rejecting(); }
     } finally { stopping(); }

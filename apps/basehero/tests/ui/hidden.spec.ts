@@ -137,6 +137,37 @@ test('coming back within the minute keeps hidden bases open; later, locks first'
   await expect(page.locator('body')).not.toContainText('Gelato with Marguerite');
   expect(await page.evaluate(() => window.__fake.calls.filter(c => c === 'lockAllHidden').length)).toBe(1);
 });
+test('a note open when leaving the app takes typing again on return', async ({ page }) => {
+  const account = await setup(page);
+  const base = await page.evaluate(async id => (await window.__fake.bases(id)).find(b => !b.hidden)!.id, account);
+  const note = await page.evaluate(ref => window.__fake.createObject(ref, { kind: 'note', parent: null, after: null, name: 'Ferry at 9' }), { account, base });
+  await page.evaluate(({ account, base, note }) => { location.hash = `#/a/${account}/b/${base}/n/${note}`; }, { account, base, note });
+  const editor = page.locator('[aria-label="Note editor"] .ProseMirror');
+  await expect(editor).toHaveAttribute('contenteditable', 'true');
+  // Android suspends the page's timers while it's away, so the return can
+  // arrive before the drain has taken its hold.
+  await page.clock.install();
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('bh:stop'));
+    window.dispatchEvent(new CustomEvent('bh:resume', { detail: { awayMs: 1000 } }));
+  });
+  await page.clock.runFor(1000);
+  await page.clock.resume();
+  await editor.click();
+  await page.keyboard.type('Pier ');
+  await expect(editor).toContainText('Pier');
+  for (const awayMs of [5000, 61000]) {
+    // Within the minute, and after it, when hidden bases lock on return.
+    await page.evaluate(() => window.dispatchEvent(new Event('bh:stop')));
+    await page.evaluate(ms => window.dispatchEvent(new CustomEvent('bh:resume', { detail: { awayMs: ms } })), awayMs);
+    await expect(editor).toHaveAttribute('contenteditable', 'true');
+    await expect(page.getByText('Saving before update…')).toHaveCount(0);
+  }
+
+  await editor.click();
+  await page.keyboard.type('Gate 4');
+  await expect(editor).toContainText('Gate 4');
+});
 test('debug lock timeout override locks after the configured time', async ({ page }) => {
   const account = await setup(page); await create(page);
   await page.evaluate(() => localStorage.setItem('bh.lockAfterMs', '100'));

@@ -239,6 +239,25 @@ async fn hero_creates_a_note_in_the_chat_base_only() {
 }
 
 #[tokio::test]
+async fn a_retry_that_succeeds_clears_the_failed_turns_error() {
+    let (account, base) = setup().await;
+    let model = ScriptedModel::new(vec![Scripted::Fail(ModelError::Transport), reply("Ferry")]);
+    let hero = account.hero_with_model(model);
+    let chat = hero.new_chat(base.id()).unwrap();
+    hero.send(base.id(), chat, "Hello", None).unwrap();
+    hero.wait_idle(chat).await;
+    let failed = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(failed.state, MessageState::Failed);
+    assert_eq!(failed.error.as_deref(), Some("unavailable"));
+    hero.retry(base.id(), chat).unwrap();
+    hero.wait_idle(chat).await;
+    let done = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(done.state, MessageState::Done);
+    assert_eq!(done.text, "Ferry");
+    assert_eq!(done.error, None);
+}
+
+#[tokio::test]
 async fn the_focus_note_is_in_the_first_request() {
     let (account, base) = setup().await;
     let focus = note_with_text(&base, "Kyoto in March");

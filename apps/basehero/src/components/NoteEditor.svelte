@@ -3,11 +3,12 @@
   import { getBackend } from '../lib/backend';
   import { BackendError, type BaseRef, type ObjectId } from '../lib/backend/types';
   import { createNoteEditor } from '../lib/editor/editor.mjs';
-  import { noteHost, trackEditor } from '../lib/editor/host';
+  import { noteHost, trackEditor, type NoteHost } from '../lib/editor/host';
+  import { objectUrl, releaseObjectUrl } from '../lib/files.svelte';
   import '../lib/editor/editor.css';
 
-  let { r, id, readOnly, onnavigate, onleave, retryleave }: {
-    r: BaseRef; id: ObjectId; readOnly: boolean;
+  let { r, id, readOnly, host: suppliedHost, onnavigate, onleave, retryleave }: {
+    r: BaseRef; id: ObjectId; readOnly: boolean; host?: NoteHost;
     onnavigate: (r: BaseRef, id: ObjectId) => void;
     onleave: (leave: () => Promise<boolean>) => () => void;
     retryleave: () => void;
@@ -18,7 +19,7 @@
     let cancelled = false;
     let stop = () => {};
     let editor: Awaited<ReturnType<typeof createNoteEditor>> | undefined;
-    const host = noteHost(getBackend(), r, id);
+    const host = suppliedHost ?? noteHost(getBackend(), r, id);
     async function dispose(opened: Awaited<ReturnType<typeof createNoteEditor>>) {
       try { await opened.drain(Date.now() + 30_000); }
       catch { /* A removed route cannot keep its editor alive to retry. */ }
@@ -26,6 +27,7 @@
     }
     const opening = createNoteEditor(root, host, {
       baseId: r.base,
+      backend: getBackend(), r, noteId: id, objectUrl, releaseObjectUrl,
       get readOnly() { return readOnly || host.readOnly; },
       navigate: (base: string, note: string) => onnavigate({ account: r.account, base }, note),
     }).then(opened => {

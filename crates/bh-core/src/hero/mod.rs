@@ -832,12 +832,12 @@ impl Hero {
             if let Some(e) = error {
                 fields.insert("error".into(), json!(e));
             } else {
-                fields.remove("error");
+                fields.insert("error".into(), json!(null));
             }
             if let Some(a) = ask {
                 fields.insert("ask".into(), json!(a));
             } else {
-                fields.remove("ask");
+                fields.insert("ask".into(), json!(null));
             }
             let _ = base.set_fields(message, fields);
         }
@@ -944,8 +944,9 @@ impl Hero {
         let mut fields = base.get(existing)?.ok_or(Error::NotFound)?.fields;
         fields.insert("state".into(), json!("working"));
         fields.insert("text".into(), json!(""));
-        fields.remove("error");
-        fields.remove("ask");
+        // set_fields keeps a field it isn't given; only null removes one.
+        fields.insert("error".into(), json!(null));
+        fields.insert("ask".into(), json!(null));
         fields.insert("steps".into(), json!([]));
         base.set_fields(existing, fields)?;
         let (cancel, receiver) = watch::channel(false);

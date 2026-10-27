@@ -225,6 +225,9 @@ async fn a_large_pending_tail_compacts_without_bypassing_background_throttle() {
 
 #[tokio::test]
 async fn multiple_large_states_stay_within_the_request_limit() {
+    // It moves about 20 MB; on dev, other tests sharing the uplink push it past
+    // the deadline. The request limit is the same code on the local Worker.
+    bh_testkit::local_only!();
     let (a, _) = two_devices_sharing_a_base().await;
     let ids = [
         note_with_text(&a.base, "one"),

@@ -19,6 +19,7 @@ serde_json = "1"
 percent-encoding.workspace = true
 ts-rs.workspace = true
 bh-core = { path = "../../../crates/bh-core" }
+bh-open = { path = "../plugins/bh-open" }
 tokio.workspace = true
 futures-util.workspace = true
 bh-models = { path = "../../../crates/bh-models" }
