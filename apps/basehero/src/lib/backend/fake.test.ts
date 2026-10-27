@@ -31,19 +31,32 @@ describe('fake backend', () => {
     const fake = new FakeBackend();
     const first = vi.fn();
     const second = vi.fn();
-    const a = await fake.noteOpen(r, 'note', first);
-    const b = await fake.noteOpen(r, 'note', second);
+    const id = await fake.createObject(r, { kind: 'note', name: 'Note', parent: null, after: null });
+    const a = await fake.noteOpen(r, id, first);
+    const b = await fake.noteOpen(r, id, second);
     expect(fake.openSessions()).toBe(2);
     const doc = new Y.Doc();
     const paragraph = new Y.XmlElement('paragraph');
     paragraph.insert(0, [new Y.XmlText('Hello')]);
     doc.getXmlFragment('default').insert(0, [paragraph]);
     await fake.noteApply(a.session, Y.encodeStateAsUpdate(doc));
-    expect(fake.noteText('note')).toBe('Hello');
+    expect(fake.noteText(id)).toBe('Hello');
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledOnce();
     await fake.noteClose(a.session);
     await fake.noteClose(b.session);
+    expect(fake.openSessions()).toBe(0);
+  });
+
+  it('opens folders and projects but rejects missing and non-note objects', async () => {
+    const fake = new FakeBackend();
+    for (const kind of ['folder', 'project'] as const) {
+      const id = await fake.createObject(r, { kind, name: kind, parent: null, after: null });
+      await fake.noteClose((await fake.noteOpen(r, id, () => {})).session);
+    }
+    await expect(fake.noteOpen(r, 'unknown', () => {})).rejects.toMatchObject({ kind: 'NotFound' });
+    const chat = fake.remoteCreate(r, { kind: 'chat' as 'note', name: 'Chat', parent: null, after: null });
+    await expect(fake.noteOpen(r, chat, () => {})).rejects.toMatchObject({ kind: 'Invalid' });
     expect(fake.openSessions()).toBe(0);
   });
 });

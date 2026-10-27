@@ -114,7 +114,16 @@ export class FakeBackend implements Backend {
   async trash(r: BaseRef) { this.log('trash', r); return (this.items.get(this.key(r)) ?? []).filter(x => x.deleted); }
   async search(account: string, base: string, text: string, limit: number): Promise<SearchResult[]> { this.log('search', account); return (this.items.get(this.key({ account, base })) ?? []).filter(x => !x.deleted && x.title.toLowerCase().includes(text.toLowerCase())).slice(0, limit).map(x => ({ base, baseName: this.baseList.get(account)?.find(b => b.id === base)?.name ?? '', hit: { id: x.id, ty: x.kind as 'note' | 'folder' | 'project', title: x.title, snippet: '' } })); }
   async syncState(r: BaseRef) { this.log('syncState', r); return this.sync.get(this.key(r)) ?? { pending: 0, online: true, lastSyncedAt: null }; }
-  async noteOpen(r: BaseRef, note: string, onUpdate: (update: Uint8Array) => void): Promise<NoteOpened> { this.log('noteOpen', r); const session = this.nextSession++; this.sessions.set(session, { id: note, onUpdate }); return { session, state: Y.encodeStateAsUpdate(this.doc(note)), readOnly: this.newerNotes.has(note) }; }
+  async noteOpen(r: BaseRef, note: string, onUpdate: (update: Uint8Array) => void): Promise<NoteOpened> {
+    this.log('noteOpen', r);
+    const object = await this.getObject(r, note);
+    if (!object) throw new BackendError('NotFound', 'Object not found');
+    const kind = (object.ty as { name?: string } | undefined)?.name ?? `core.${object.kind}`;
+    if (!['core.note', 'core.folder', 'core.project'].includes(kind)) throw new BackendError('Invalid', 'Not a note, folder or project');
+    const session = this.nextSession++;
+    this.sessions.set(session, { id: note, onUpdate });
+    return { session, state: Y.encodeStateAsUpdate(this.doc(note)), readOnly: this.newerNotes.has(note) };
+  }
   async noteApply(session: number, update: Uint8Array) { this.log('noteApply', session); const entry = this.sessions.get(session); if (!entry) throw new BackendError('NotFound', 'Session not found'); const doc = this.doc(entry.id); Y.applyUpdate(doc, update);
     if (typeof localStorage !== 'undefined') localStorage.setItem(`basehero:fake-note:${entry.id}`, JSON.stringify(Array.from(Y.encodeStateAsUpdate(doc))));
     this.channel?.postMessage({ id: entry.id, update: Array.from(update) });

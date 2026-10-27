@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { getBackend } from './lib/backend';
-  import type { AccountSummary, BaseRef, ObjectId, SearchResult, SignedUp } from './lib/backend/types';
+  import type { AccountSummary, BaseRef, SearchResult, SignedUp } from './lib/backend/types';
   import { SyncStatus } from './lib/sync.svelte';
   import Search from './screens/Search.svelte';
   import Devices from './screens/Devices.svelte';
@@ -10,7 +10,8 @@
   import KeyError from './screens/KeyError.svelte';
   import { errorMessage } from './lib/errors';
   import { session } from './lib/session.svelte';
-  import NoteEditor from './components/NoteEditor.svelte';
+  import Base from './screens/Base.svelte';
+  import Bases from './screens/Bases.svelte';
   import Welcome from './screens/Welcome.svelte';
   import UpdateBanner from './components/UpdateBanner.svelte';
   import SignUp from './screens/SignUp.svelte';
@@ -36,32 +37,25 @@
   let searchField = $state<HTMLInputElement>();
   const sync = new SyncStatus();
   const removedAccounts = new Set<string>();
+  let knownAccounts = $state<string[]>([]);
+  let accountsLoaded = $state(false);
   function ref(): BaseRef | null {
     return session.account && currentBase ? { account: session.account.id, base: currentBase } : null;
   }
   function submitSearch(event: SubmitEvent) {
     event.preventDefault();
     if (!session.account || !searchText.trim()) return;
-    query = searchText.trim();
-    location.hash = `/a/${session.account.id}/search?q=${encodeURIComponent(query)}`;
-    screen = 'search';
+    void requestRoute(`#/a/${session.account.id}/search?q=${encodeURIComponent(searchText.trim())}`);
   }
   async function showBase(event: MouseEvent) {
     event.preventDefault();
     if (!session.account) return;
     const bases = await getBackend().bases(session.account.id);
-    currentBase = bases.find(base => base.name === 'Personal')?.id ?? bases[0]?.id ?? null;
-    if (currentBase) {
-      location.hash = `/a/${session.account.id}/b/${currentBase}`;
-      void sync.refresh(getBackend(), { account: session.account.id, base: currentBase });
-    }
-    screen = 'account';
+    const base = bases.find(base => base.name === 'Personal')?.id ?? bases[0]?.id;
+    void requestRoute(base ? `#/a/${session.account.id}/b/${base}` : `#/a/${session.account.id}`);
   }
   function openHit(result: SearchResult) {
     if (!session.account) return;
-    currentBase = result.base;
-    void sync.refresh(getBackend(), { account: session.account.id, base: result.base });
-    screen = 'account';
     void requestRoute(`#/a/${session.account.id}/b/${result.base}/n/${result.hit.id}`);
   }
 
@@ -69,7 +63,17 @@
   let leave: (() => Promise<boolean>) | undefined;
   let requestedHash = '';
   let transitioning = false;
-  let route = $derived(/^#\/a\/([^/]+)\/b\/([^/]+)\/n\/([^/]+)$/.exec(hash));
+  let route = $derived(/^#\/a\/([^/]+)(?:\/b\/([^/]+)(?:\/n\/([^/]+))?)?$/.exec(hash));
+  let specialRoute = $derived(/^#\/a\/([^/]+)\/(search(?:\?q=[^#]*)?|devices)$/.exec(hash));
+  let routeAccount = $derived(route?.[1] ?? specialRoute?.[1]);
+  let knownRoute = $derived(accountsLoaded && !!routeAccount && knownAccounts.includes(routeAccount) && !removedAccounts.has(routeAccount));
+  $effect(() => {
+    const base = route?.[2];
+    if (base && knownRoute && base !== currentBase) {
+      currentBase = base;
+      void sync.refresh(getBackend(), { account: route![1], base });
+    }
+  });
 
   $effect(() => {
     screen;
@@ -79,7 +83,8 @@
       if (heading) { heading.tabIndex = -1; heading.focus(); }
     });
   });
-  function navigate(next: Screen) {
+  async function navigate(next: Screen) {
+    if (!await guardLeave()) return;
     history.pushState(null, '', '/'); // Never put credentials, pending ids, or kits in URLs or history.
     hash = '';
     screen = next;
@@ -88,55 +93,61 @@
     leave = hook;
     return () => { if (leave === hook) leave = undefined; };
   }
-  function leaveKit() {
-    if (!window.confirm("You haven't saved your recovery kit. You won't be able to see it again. Leave anyway?")) return false;
-    signedUp = null;
-    screen = 'account';
+  async function guardLeave(): Promise<boolean> {
+    if (screen === 'kit' && signedUp && !window.confirm("You haven't saved your recovery kit. You won't be able to see it again. Leave anyway?")) return false;
+    if (route?.[3] && leave && !await leave()) return false;
+    if (screen === 'kit') signedUp = null;
     return true;
   }
   function allowed(next: string): boolean {
     const account = /^#\/a\/([^/]+)/.exec(next)?.[1];
-    return !account || (screen !== 'removed' && !removedAccounts.has(account));
+    return !account || (screen !== 'removed' && !removedAccounts.has(account) && (!accountsLoaded || knownAccounts.includes(account)));
   }
   async function requestRoute(next: string) {
-    if (!allowed(next)) {
-      history.replaceState(null, '', location.pathname + location.search + hash);
-      return;
+    if (screen === 'removed') { history.replaceState(null, '', '/'); return; }
+    const targetAccount = /^#\/a\/([^/]+)/.exec(next)?.[1];
+    let found: AccountSummary | undefined;
+    if (targetAccount && !knownAccounts.includes(targetAccount) && !removedAccounts.has(targetAccount)) {
+      try { found = (await getBackend().accounts()).find(account => account.id === targetAccount); }
+      catch { /* An unavailable account list cannot authorize a route. */ }
     }
-    if (next === hash) return;
-    requestedHash = next;
+    if (found && !knownAccounts.includes(found.id)) knownAccounts = [...knownAccounts, found.id];
+    const fallback = session.account && knownAccounts.includes(session.account.id) ? `#/a/${session.account.id}` : '';
+    const destination = allowed(next) ? next : fallback;
+    if (destination === hash && screen !== 'kit') return;
+    requestedHash = destination;
     if (transitioning) return;
     transitioning = true;
     try {
-      if (screen === 'kit' && signedUp && !leaveKit()) return;
-      if (route && leave && !await leave()) return;
+      if (!await guardLeave()) return;
       // A newer route requested during the editor drain wins; removal cancels both.
-      const destination = requestedHash;
-      if (!allowed(destination)) {
-        history.replaceState(null, '', location.pathname + location.search + hash);
-        return;
-      }
-      hash = destination;
-      if (location.hash !== destination) location.hash = destination;
-      if (/^#\/a\/[^/]+\/search(?:\?|$)/.test(destination)) {
-        query = new URLSearchParams(destination.split('?')[1] ?? '').get('q') ?? '';
+      const target = requestedHash;
+      if (!allowed(target)) return;
+      hash = target;
+      if (location.hash !== target) history.pushState(null, '', location.pathname + location.search + target);
+      if (/^#\/a\/[^/]+\/search(?:\?|$)/.test(target)) {
+        query = new URLSearchParams(target.split('?')[1] ?? '').get('q') ?? '';
         searchText = query;
         screen = 'search';
-      } else if (destination.includes('/devices')) screen = 'devices';
-      else if (destination.startsWith('#/a/')) screen = 'account';
+      } else if (/^#\/a\/[^/]+\/devices$/.test(target)) screen = 'devices';
+      else screen = target ? 'account' : (session.account ? 'account' : 'welcome');
+      if (found && target === next) await openAccount(found);
       requestedHash = '';
     } finally { transitioning = false; }
   }
-  function navigateNote(r: BaseRef, id: ObjectId) {
-    void requestRoute(`#/a/${r.account}/b/${r.base}/n/${id}`);
-  }
   async function openAccount(account: AccountSummary) {
     session.account = account;
+    if (!knownAccounts.includes(account.id)) knownAccounts = [...knownAccounts, account.id];
     kitNotSaved = !(await getBackend().kitSaved(account.id));
     if (session.account?.id === account.id) {
       currentBase = null;
       sync.clear();
-      if (route) screen = 'account'; // Keep a directly opened note route mounted.
+      if (specialRoute?.[2].startsWith('search')) {
+        query = new URLSearchParams(hash.split('?')[1] ?? '').get('q') ?? '';
+        searchText = query;
+        screen = 'search';
+      } else if (specialRoute?.[2] === 'devices') screen = 'devices';
+      else if (route) screen = 'account'; // Keep a directly opened note route mounted.
       else navigate('account');
     }
   }
@@ -168,7 +179,7 @@
   async function cancelPending() {
     const id = pending;
     pending = null;
-    screen = 'welcome';
+    void navigate('welcome');
     if (id !== null) {
       try { await getBackend().signInCancel(id); } catch { /* A cancelled request cannot be retried here. */ }
     }
@@ -188,9 +199,21 @@
       if (active) { platform = info.platform; deviceName = info.platform === 'android' ? 'Android' : 'Mac'; }
     }).catch(() => {});
     getBackend().accounts().then(accounts => {
-      if (active && accounts.length && screen === 'welcome') void openAccount(accounts[0]);
+      if (!active) return;
+      knownAccounts = accounts.map(account => account.id);
+      accountsLoaded = true;
+      if (screen !== 'welcome') return;
+      const requested = /^#\/a\/([^/]+)/.exec(hash)?.[1];
+      if (requested && !knownAccounts.includes(requested)) {
+        const fallback = accounts[0];
+        void requestRoute(fallback ? `#/a/${fallback.id}` : '').then(() => {
+          if (active && fallback) void openAccount(fallback);
+        });
+      } else if (accounts.length) void openAccount(accounts.find(account => account.id === requested) ?? accounts[0]);
     }).catch(cause => {
-      if (active) keyError = startupError(cause);
+      if (!active) return;
+      accountsLoaded = true;
+      keyError = startupError(cause);
     });
     let unsubscribe: (() => void) | undefined;
     void getBackend().onEvent(event => {
@@ -230,14 +253,13 @@
       // Route both through the same guards, rather than treating it as kit Back.
       if (screen === 'removed') { history.replaceState(null, '', '/'); return; }
       if (popped && location.hash !== hash) { restoreRoute(location.hash); return; }
-      if (route && (screen === 'account' || screen === 'welcome')) {
+      if ((route || specialRoute) && (screen === 'account' || screen === 'welcome' || screen === 'search' || screen === 'devices')) {
         if (!popped) void requestRoute('');
       } else if (screen === 'kit' && signedUp) {
-        const left = leaveKit();
         // A refused browser Back must restore the history entry so a later Back is still guarded.
-        if (popped || left) history.pushState(null, '', '/');
+        void navigate('account').then(() => { if (popped) history.pushState(null, '', '/'); });
       } else if (pending !== null) void cancelPending();
-      else screen = session.account ? 'account' : 'welcome';
+      else void navigate(session.account ? 'account' : 'welcome');
     };
     const pop = () => back(true);
     const update = () => {
@@ -264,31 +286,35 @@
     };
   });
 </script>
-{#if keyError}
-  <KeyError kind={keyError.kind} message={keyError.message} />
-{:else if route && (screen === 'account' || screen === 'welcome') && !removedAccounts.has(route[1])}
-  {#key hash}<NoteEditor r={{ account: route[1], base: route[2] }} id={route[3]} readOnly={false}
-    onnavigate={navigateNote} {onleave} retryleave={() => { if (requestedHash) void requestRoute(requestedHash); }} />{/key}
-{:else if screen === 'welcome'}
-  <Welcome onsignup={() => navigate('signup')} onsignin={() => navigate('signin')} />
-{:else if screen === 'signup'}
-  <SignUp {deviceName} oncreated={(result) => { session.account = result.account; kitNotSaved = true; signedUp = result; navigate('kit'); }} onback={() => screen = 'welcome'} />
-{:else if screen === 'kit' && signedUp}
-  <Kit kit={signedUp.kit} oncontinue={acknowledgeKit} onback={() => { if (leaveKit()) history.pushState(null, '', '/'); }} />
-{:else if screen === 'signin'}
-  <SignIn {deviceName} onpending={(id) => { pending = id; navigate('pending'); }} onback={() => screen = 'welcome'} />
-{:else if screen === 'pending' && pending !== null}
-  <PendingSignIn {pending} onapproved={entered} oncancel={cancelPending} />
-{:else if screen === 'removed'}
-  <Removed oncontinue={() => { history.replaceState(null, '', '/'); screen = 'welcome'; }} />
-{:else if session.account && (screen === 'account' || screen === 'search' || screen === 'devices')}
+{#if !keyError && session.account && ((screen === 'account' && (!routeAccount || knownRoute)) || (knownRoute && (screen === 'search' || screen === 'devices')))}
   <header class="location-bar">
-    <a href="/" onclick={(event) => { event.preventDefault(); void requestRoute(''); screen = 'account'; }}>BaseHero</a>
+    <a href="/" onclick={(event) => { event.preventDefault(); void requestRoute(''); }}>BaseHero</a>
     <form role="search" onsubmit={submitSearch}><input type="search" aria-label="Search" placeholder="Search" bind:value={searchText} bind:this={searchField} /></form>
     <StatusBar {sync} mac={platform === 'macos'} />
   </header>
   <nav class="workspace-nav"><a href={`#/a/${session.account.id}/b/${currentBase ?? ''}`} onclick={showBase}>Personal</a>
     <a href={`#/a/${session.account.id}/devices`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/devices`); }}>Devices</a></nav>
+{/if}
+{#if keyError}
+  <KeyError kind={keyError.kind} message={keyError.message} />
+{:else if route?.[2] && knownRoute && (screen === 'account' || screen === 'welcome')}
+  {#key `${route[1]}:${route[2]}`}<Base r={{ account: route[1], base: route[2] }} id={route[3] ?? null}
+    {onleave} retryleave={() => { if (requestedHash) void requestRoute(requestedHash); }} />{/key}
+{:else if route && knownRoute && (screen === 'account' || screen === 'welcome')}
+  <Bases account={route[1]} onopen={base => void requestRoute(`#/a/${route[1]}/b/${base}`)} />
+{:else if screen === 'welcome'}
+  <Welcome onsignup={() => navigate('signup')} onsignin={() => navigate('signin')} />
+{:else if screen === 'signup'}
+  <SignUp {deviceName} oncreated={(result) => { session.account = result.account; knownAccounts = [...knownAccounts, result.account.id]; kitNotSaved = true; signedUp = result; void navigate('kit'); }} onback={() => void navigate('welcome')} />
+{:else if screen === 'kit' && signedUp}
+  <Kit kit={signedUp.kit} oncontinue={acknowledgeKit} onback={() => void navigate('account')} />
+{:else if screen === 'signin'}
+  <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onback={() => void navigate('welcome')} />
+{:else if screen === 'pending' && pending !== null}
+  <PendingSignIn {pending} onapproved={entered} oncancel={cancelPending} />
+{:else if screen === 'removed'}
+  <Removed oncontinue={() => void navigate('welcome')} />
+{:else if session.account && (screen === 'account' || (knownRoute && (screen === 'search' || screen === 'devices')))}
   {#if screen === 'search'}
     <Search account={session.account.id} base={currentBase} {query} open={openHit} />
   {:else if screen === 'devices'}
@@ -308,6 +334,7 @@
         </form>
       {/if}
     {/if}
+    <Bases account={session.account.id} onopen={base => void requestRoute(`#/a/${session.account!.id}/b/${base}`)} />
   </section></main>
   {/if}
 {/if}

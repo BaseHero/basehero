@@ -2,6 +2,24 @@ import { test, expect, type Page } from '@playwright/test';
 
 const r = { account: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', base: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' };
 const note = 'cccccccccccccccccccccccccccccccc';
+// Seed the fake before App loads, including on reload and in a second window.
+test.beforeEach(async ({ context }) => {
+  await context.addInitScript(() => {
+    Object.defineProperty(window, '__fake', { configurable: true, set(fake: typeof window.__fake) {
+      Object.defineProperty(window, '__fake', { configurable: true, value: fake });
+      const state = fake as unknown as {
+        accountList: { id: string; email: string; kind: 'full' }[];
+        baseList: Map<string, { id: string; name: string; mode: 'readWrite' }[]>;
+        items: Map<string, { id: string; title: string; parent: null; deleted: false; kind: 'note' }[]>;
+      };
+      const account = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const base = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      state.accountList.push({ id: account, email: 'fixture@example.com', kind: 'full' });
+      state.baseList.set(account, [{ id: base, name: 'Personal', mode: 'readWrite' }]);
+      state.items.set(`${account}:${base}`, ['cccccccccccccccccccccccccccccccc', 'dddddddddddddddddddddddddddddddd'].map(id => ({ id, title: 'Note', parent: null, deleted: false, kind: 'note' })));
+    } });
+  });
+});
 async function open(page: Page, id = note) {
   await page.goto(`/#/a/${r.account}/b/${r.base}/n/${id}`);
   await expect(page.locator('.ProseMirror')).toBeVisible();
@@ -109,8 +127,8 @@ test('Link to a note searches and inserts an internal note link', async ({ page 
   await page.keyboard.press('ControlOrMeta+k');
   await page.getByRole('button', { name: 'Link to a note' }).click();
   await page.getByRole('searchbox', { name: 'Search notes' }).fill('Ferry');
-  await expect(page.getByRole('button', { name: 'Ferry folder' })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Ferry schedule' }).click();
+  await expect(page.locator('.note-link-results').getByRole('button', { name: 'Ferry folder' })).toHaveCount(0);
+  await page.locator('.note-link-results').getByRole('button', { name: 'Ferry schedule' }).click();
   await expect(page.locator('.ProseMirror a')).toHaveAttribute('href', `https://basehero.com/open/${r.base}/${target}`);
 });
 

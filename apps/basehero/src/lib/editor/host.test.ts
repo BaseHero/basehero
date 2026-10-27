@@ -8,7 +8,8 @@ const r = { account: 'account', base: 'base' };
 describe('note host', () => {
   it('acknowledges only after the backend has committed the exact update', async () => {
     const backend = new FakeBackend();
-    const host = noteHost(backend, r, 'note');
+    const id = await backend.createObject(r, { kind: 'note', name: 'Note', parent: null, after: null });
+    const host = noteHost(backend, r, id);
     const opened = await host.open(() => {});
     expect(opened.clientId).toBeGreaterThanOrEqual(2);
     const doc = new Y.Doc();
@@ -16,7 +17,7 @@ describe('note host', () => {
     paragraph.insert(0, [new Y.XmlText('Safe')]);
     doc.getXmlFragment('default').insert(0, [paragraph]);
     expect(await host.commit(Y.encodeStateAsUpdate(doc), 'request-1')).toEqual({ requestId: 'request-1' });
-    expect(backend.noteText('note')).toBe('Safe');
+    expect(backend.noteText(id)).toBe('Safe');
     opened.unsubscribe();
     await expect(host.commit(Y.encodeStateAsUpdate(doc), 'request-2')).rejects.toThrow('closed');
     doc.destroy();
