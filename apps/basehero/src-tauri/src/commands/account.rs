@@ -1,5 +1,4 @@
 use crate::error::CommandError;
-use crate::kit_store;
 use crate::state::AppState;
 use crate::views::{SecretString, SignInForm, SignUpForm, SignedUp};
 use bh_core::{
@@ -42,7 +41,6 @@ pub async fn sign_up(state: &AppState, form: SignUpForm) -> Result<SignedUp, Com
     let _ = state.listen(id);
     // If the account-data write failed, this one-time displayed kit cannot
     // be shown again; the person can make a new kit after signing in.
-    state.save_kit(id);
     Ok(SignedUp {
         account: summary,
         kit: kit.display().into(),
@@ -68,57 +66,6 @@ pub async fn sign_in_start(state: &AppState, form: SignInForm) -> Result<String,
     Ok(id)
 }
 
-/// Try the saved kit before posting an approval request; it stays out of the WebView.
-pub async fn sign_in_saved_kit(
-    state: &AppState,
-    pending: &str,
-) -> Result<Option<AccountSummary>, CommandError> {
-    let entry = state
-        .pending
-        .lock()
-        .unwrap()
-        .get(pending)
-        .cloned()
-        .ok_or_else(not_found)?;
-    let id = entry.account_id();
-    // If Google Play services is unavailable, ordinary approval and typing still work.
-    let kit = match kit_store::load(state.kit_store.clone(), id).await {
-        Ok(Some(kit)) => kit,
-        _ => return Ok(None),
-    };
-    match entry.with_kit(&kit).await {
-        Ok(account) => {
-            state.pending.lock().unwrap().remove(pending);
-            state.active_pending.lock().unwrap().remove(pending);
-            state.listen(account.id())?;
-            state.save_kit(account.id());
-            if account.bases().is_empty() {
-                let _ = account.create_base("Personal").await;
-            }
-            Ok(Some(
-                state
-                    .core
-                    .accounts()
-                    .into_iter()
-                    .find(|a| a.id == account.id())
-                    .ok_or_else(not_found)?,
-            ))
-        }
-        Err(bh_core::Error::BadKit) => {
-            // Block Store deletion is best-effort cleanup, not a prerequisite
-            // for approval or typing a kit after a stale entry fails.
-            if let Err(error) = state.delete_kit(id).await {
-                eprintln!(
-                    "Could not delete stale saved kit ({}); allowing fallback",
-                    error.kind
-                );
-            }
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 pub async fn sign_in_with_kit(
     state: &AppState,
     pending: &str,
@@ -137,7 +84,6 @@ pub async fn sign_in_with_kit(
     state.pending.lock().unwrap().remove(pending);
     state.active_pending.lock().unwrap().remove(pending);
     state.listen(account.id())?;
-    state.save_kit(account.id());
     if account.bases().is_empty() {
         let _ = account.create_base("Personal").await;
     }
@@ -171,7 +117,6 @@ pub async fn sign_out(state: &AppState, id: AccountId) -> Result<(), CommandErro
         state.notes.close_account(id);
         state.stop_listening(id);
         crate::state::sync_hidden_recents(&state.core);
-        state.delete_kit(id).await?;
     }
     result?;
     Ok(())
@@ -183,26 +128,11 @@ pub async fn new_kit(
     password: &str,
 ) -> Result<SecretString, CommandError> {
     let kit = state.core.account(id)?.new_kit(password).await?;
-    state.save_kit(id);
     Ok(kit.display().into())
 }
 
 pub fn kit_status(state: &AppState, id: AccountId) -> Result<KitStatus, CommandError> {
     Ok(state.core.account(id)?.kit_status()?)
-}
-
-pub async fn kit_kept_here(state: &AppState, id: AccountId) -> Result<bool, CommandError> {
-    if !state.kit_store.enabled() {
-        return Ok(false);
-    }
-    let Some(current) = state.core.account(id)?.recovery_kit()? else {
-        return Ok(false);
-    };
-    let stored = kit_store::load(state.kit_store.clone(), id).await?;
-    let current = zeroize::Zeroizing::new(current.display());
-    Ok(stored
-        .as_ref()
-        .is_some_and(|stored| stored.as_str() == current.as_str()))
 }
 
 pub fn show_kit(state: &AppState, id: AccountId) -> Result<SecretString, CommandError> {
@@ -256,9 +186,6 @@ pub async fn remove_device(
         state.notes.close_account(id);
         state.stop_listening(id);
         crate::state::sync_hidden_recents(&state.core);
-        // Removing this device must await cleanup: stopping the listener may
-        // abort its Removed event before that listener can delete the entry.
-        state.delete_kit(id).await?;
     }
     result?;
     Ok(())

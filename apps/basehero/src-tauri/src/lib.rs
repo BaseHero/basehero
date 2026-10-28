@@ -54,14 +54,6 @@ async fn sign_in_start(
 }
 
 #[tauri::command]
-async fn sign_in_saved_kit(
-    startup: tauri::State<'_, state::Startup>,
-    pending: String,
-) -> Result<Option<bh_core::AccountSummary>, error::CommandError> {
-    commands::account::sign_in_saved_kit(startup.state()?, &pending).await
-}
-
-#[tauri::command]
 async fn sign_in_with_kit(
     startup: tauri::State<'_, state::Startup>,
     pending: String,
@@ -103,14 +95,6 @@ fn kit_status(
     account: bh_core::AccountId,
 ) -> Result<bh_core::KitStatus, error::CommandError> {
     commands::account::kit_status(startup.state()?, account)
-}
-
-#[tauri::command]
-async fn kit_kept_here(
-    startup: tauri::State<'_, state::Startup>,
-    account: bh_core::AccountId,
-) -> Result<bool, error::CommandError> {
-    commands::account::kit_kept_here(startup.state()?, account).await
 }
 
 #[tauri::command]
@@ -266,7 +250,6 @@ pub fn run() {
             reset_device,
             sign_up,
             sign_in_start,
-            sign_in_saved_kit,
             sign_in_with_kit,
             sign_in_cancel,
             commands::approval::ipc::approval_start,
@@ -284,7 +267,6 @@ pub fn run() {
             sign_out,
             new_kit,
             kit_status,
-            kit_kept_here,
             show_kit,
             set_kit_saved,
             devices,

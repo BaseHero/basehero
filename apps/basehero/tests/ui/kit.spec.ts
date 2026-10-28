@@ -111,10 +111,10 @@ test('a kit whose credentials changed offers to make a new one', async ({ page }
   await expect(page.getByRole('button', { name: 'Make a new kit' })).toBeVisible();
 });
 
-test('Android local kit storage does not mark the account saved or hide the manual controls', async ({ page }) => {
+test('Android offers a kit to save, without a Google copy', async ({ page }) => {
   await page.clock.install();
-  await signUp(page, '/?platform=android&kitStored=1');
-  await expect(page.getByText('Google also keeps a copy on this phone to help you sign in again.')).toBeVisible();
+  await signUp(page, '/?platform=android');
+  await expect(page.getByText('Google also keeps a copy on this phone to help you sign in again.')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Copy' })).toBeVisible();
   await expect(page.getByRole('button', { name: "I've saved it" })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Later' })).toBeVisible();
@@ -122,27 +122,6 @@ test('Android local kit storage does not mark the account saved or hide the manu
   await page.getByRole('button', { name: 'Later' }).click();
   await page.clock.fastForward(24 * 60 * 60 * 1000);
   await expect(page.getByText(reminder)).toBeVisible();
-});
-
-test('delayed Android platform save updates the open kit screen without acknowledging it', async ({ page }) => {
-  await signUp(page, '/?platform=android&kitSaveDelayed=1');
-  const notice = 'Google also keeps a copy on this phone to help you sign in again.';
-  await expect(page.getByText(notice)).toHaveCount(0);
-  const account = await page.evaluate(() => window.__fake.accounts().then(accounts => accounts[0].id));
-  await page.evaluate(id => window.__fake.completeKitSave(id), account);
-  await expect(page.getByText(notice)).toBeVisible();
-  expect(await page.evaluate(id => window.__fake.kitStatus(id), account)).toMatchObject({ saved: false });
-});
-
-test('account-wide acknowledgement on another device does not claim local Google storage', async ({ page }) => {
-  await signUp(page, '/?platform=android&kitSaveDelayed=1');
-  const account = await page.evaluate(() => window.__fake.accounts().then(accounts => accounts[0].id));
-  await page.evaluate(async id => window.__fake.setKitSaved(id, await window.__fake.showKit(id)), account);
-  await page.getByRole('button', { name: 'Later' }).click();
-  await page.getByRole('link', { name: 'Devices' }).click();
-  await page.getByRole('button', { name: 'Show', exact: true }).click();
-  await expect(page.getByText('Google also keeps a copy on this phone to help you sign in again.')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: 'Copy' })).toBeVisible();
 });
 
 test('Devices shows a known kit without making a new one', async ({ page }) => {

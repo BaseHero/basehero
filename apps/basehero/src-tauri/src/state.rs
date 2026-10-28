@@ -59,8 +59,6 @@ impl ActiveApproval {
 pub struct AppState {
     pub core: Core,
     listener_core: Arc<Core>,
-    pub kit_store: Arc<dyn kit_store::Store>,
-    pub kit_lock: Arc<tokio::sync::Mutex<()>>,
     pub server: Url,
     pub sink: Sink,
     pub data_dir: PathBuf,
@@ -102,34 +100,37 @@ impl Drop for CachedBase {
 
 impl AppState {
     pub fn open(config: CoreConfig, server: Url, sink: Sink) -> Result<AppState, CommandError> {
-        Self::open_with_store(config, server, sink, Arc::new(kit_store::NativeStore))
-    }
-
-    pub fn open_with_store(
-        config: CoreConfig,
-        server: Url,
-        sink: Sink,
-        kit_store: Arc<dyn kit_store::Store>,
-    ) -> Result<AppState, CommandError> {
         let cache_dir = config.data_dir.join("cache");
-        Self::open_with_cache(config, server, sink, kit_store, cache_dir)
+        Self::open_with_cache(config, server, sink, cache_dir)
     }
 
     pub fn open_with_cache(
         config: CoreConfig,
         server: Url,
         sink: Sink,
-        kit_store: Arc<dyn kit_store::Store>,
         cache_dir: PathBuf,
     ) -> Result<AppState, CommandError> {
+        Self::open_with_cleanup(config, server, sink, cache_dir, kit_store::delete_all)
+    }
+
+    fn open_with_cleanup(
+        config: CoreConfig,
+        server: Url,
+        sink: Sink,
+        cache_dir: PathBuf,
+        cleanup: impl FnOnce() -> Result<(), CommandError> + Send + 'static,
+    ) -> Result<AppState, CommandError> {
+        // Delete old Android entries once per process, even if opening the account fails.
+        // Google Play services must never delay or prevent the app from opening.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = cleanup();
+        });
         crate::commands::files::clear_open_copies(&cache_dir)?;
         let data_dir = config.data_dir.clone();
         let core = Core::open(config)?;
         let state = Self {
             listener_core: Arc::new(core.clone()),
             core,
-            kit_store,
-            kit_lock: Arc::new(tokio::sync::Mutex::new(())),
             server,
             sink,
             data_dir,
@@ -148,34 +149,9 @@ impl AppState {
         };
         for account in state.core.accounts() {
             state.listen(account.id)?;
-            state.save_kit(account.id);
         }
         sync_hidden_recents(&state.core);
         Ok(state)
-    }
-
-    /// Refresh the device's Block Store copy without delaying the shell or sign-up.
-    pub fn save_kit(&self, id: AccountId) {
-        if !self.kit_store.enabled() {
-            return;
-        }
-        let core = self.core.clone();
-        let store = self.kit_store.clone();
-        let lock = self.kit_lock.clone();
-        let sink = self.sink.clone();
-        tauri::async_runtime::spawn(async move {
-            let _guard = lock.lock().await;
-            if let Ok(account) = core.account(id)
-                && kit_store::save_account(store, account).await.is_ok()
-            {
-                sink(AppEvent::KitChanged { account: id });
-            }
-        });
-    }
-
-    pub async fn delete_kit(&self, id: AccountId) -> Result<(), CommandError> {
-        let _guard = self.kit_lock.lock().await;
-        kit_store::delete(self.kit_store.clone(), id).await
     }
 
     pub fn expire_pending(&self, id: String) {
@@ -217,8 +193,6 @@ impl AppState {
         let notes = Arc::downgrade(&self.notes);
         let cache_dir = self.cache_dir.clone();
         let heroes = Arc::downgrade(&self.heroes);
-        let store = self.kit_store.clone();
-        let lock = self.kit_lock.clone();
         let token = Arc::new(());
         let task_token = token.clone();
         let task = tauri::async_runtime::spawn(async move {
@@ -248,8 +222,6 @@ impl AppState {
                             retain_listed_bases(&bases, &notes, &cache_dir, id, &listed);
                         }
                         if removed {
-                            let _guard = lock.lock().await;
-                            let _ = kit_store::delete(store.clone(), id).await;
                             if let Some(bases) = bases.upgrade() {
                                 bases.lock().unwrap().retain(|(owner, base), _| {
                                     if *owner != id {
@@ -266,23 +238,6 @@ impl AppState {
                             }
                             if let Some(heroes) = heroes.upgrade() {
                                 heroes.lock().unwrap().remove(&id);
-                            }
-                        }
-                        if store.enabled()
-                            && !removed
-                            && matches!(
-                                event,
-                                AccountEvent::BasesChanged | AccountEvent::DevicesChanged
-                            )
-                            && let Some(core) = core.upgrade()
-                            && let Ok(account) = core.account(id)
-                        {
-                            let _guard = lock.lock().await;
-                            if kit_store::save_account(store.clone(), account)
-                                .await
-                                .is_ok()
-                            {
-                                sink(AppEvent::KitChanged { account: id });
                             }
                         }
                         if matches!(event, AccountEvent::BasesChanged | AccountEvent::Removed)
@@ -603,13 +558,7 @@ fn open(app: &AppHandle) -> Result<AppState, CommandError> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("bh:event", event);
     });
-    AppState::open_with_cache(
-        CoreConfig { data_dir, secrets },
-        server,
-        sink,
-        Arc::new(kit_store::NativeStore),
-        cache_dir,
-    )
+    AppState::open_with_cache(CoreConfig { data_dir, secrets }, server, sink, cache_dir)
 }
 
 #[cfg(test)]
@@ -769,386 +718,29 @@ mod tests {
         assert!(startup.state().is_ok());
     }
 
-    #[derive(Default)]
-    struct FakeKitStore(
-        Mutex<HashMap<AccountId, String>>,
-        std::sync::atomic::AtomicBool,
-    );
-    impl kit_store::Store for FakeKitStore {
-        fn save(&self, id: AccountId, kit: &str) -> Result<(), CommandError> {
-            self.0.lock().unwrap().insert(id, kit.to_owned());
-            Ok(())
-        }
-        fn load(&self, id: AccountId) -> Result<Option<zeroize::Zeroizing<String>>, CommandError> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .get(&id)
-                .cloned()
-                .map(zeroize::Zeroizing::new))
-        }
-        fn delete(&self, id: AccountId) -> Result<(), CommandError> {
-            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(storage_error("delete failed".into()));
-            }
-            self.0.lock().unwrap().remove(&id);
-            Ok(())
-        }
-    }
-
     #[tokio::test]
-    async fn removing_this_device_waits_for_kit_cleanup_even_if_listener_is_delayed() {
+    async fn startup_deletes_old_block_store_entries_and_ignores_failure() {
         let server = LocalServer::shared();
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        let state = Arc::new(
-            AppState::open_with_store(
-                CoreConfig {
-                    data_dir: dir.path().to_path_buf(),
-                    secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
-                },
-                server.url(),
-                Arc::new(|_| {}),
-                store.clone(),
-            )
-            .unwrap(),
-        );
-        let signed = account::sign_up(
-            &state,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: format!("{}@example.test", AccountId::random()),
-                password: TEST_PASSWORD.into(),
-                device_name: "fold".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let id = signed.account.id;
-        bh_testkit::wait_for(|| store.0.lock().unwrap().contains_key(&id)).await;
-        let device = state.core.account(id).unwrap().device_id();
-        let guard = state.kit_lock.lock().await; // Delay the Removed listener's deletion.
-        let other = state.clone();
-        let removal = tokio::spawn(async move { account::remove_device(&other, id, device).await });
-        bh_testkit::wait_for(|| state.core.account(id).is_err()).await;
-        drop(guard);
-        removal.await.unwrap().unwrap();
-        assert!(!store.0.lock().unwrap().contains_key(&id));
-    }
-
-    #[tokio::test]
-    async fn failed_stale_kit_deletion_still_allows_manual_sign_in() {
-        let server = LocalServer::shared();
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppState::open(
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let state = AppState::open_with_cleanup(
             CoreConfig {
                 data_dir: dir.path().to_path_buf(),
                 secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
             },
             server.url(),
             Arc::new(|_| {}),
-        )
-        .unwrap();
-        let email = format!("{}@example.test", AccountId::random());
-        let signed = account::sign_up(
-            &state,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: email.clone(),
-                password: TEST_PASSWORD.into(),
-                device_name: "first".into(),
+            dir.path().join("cache"),
+            move || {
+                let _ = sent.send(());
+                Err(storage_error("Google Play services unavailable".into()))
             },
-        )
-        .await
-        .unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        store
-            .0
-            .lock()
-            .unwrap()
-            .insert(signed.account.id, "invalid kit".into());
-        store.1.store(true, std::sync::atomic::Ordering::SeqCst);
-        let second_dir = tempfile::tempdir().unwrap();
-        let second = AppState::open_with_store(
-            CoreConfig {
-                data_dir: second_dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(second_dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-            store,
-        )
-        .unwrap();
-        let pending = account::sign_in_start(
-            &second,
-            crate::views::SignInForm {
-                email,
-                password: TEST_PASSWORD.into(),
-                device_name: "second".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            account::sign_in_saved_kit(&second, &pending)
-                .await
-                .unwrap()
-                .is_none()
         );
-        assert!(second.pending.lock().unwrap().contains_key(&pending));
-        account::sign_in_with_kit(&second, &pending, &signed.kit)
+        assert!(state.is_ok(), "cleanup must not block startup");
+        tokio::time::timeout(Duration::from_secs(5), received)
             .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn refresh_reconciles_rotated_kit_without_a_base_change() {
-        let server = LocalServer::shared();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        let first = AppState::open_with_store(
-            CoreConfig {
-                data_dir: dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-            store.clone(),
-        )
-        .unwrap();
-        let email = format!("{}@example.test", AccountId::random());
-        let signed = account::sign_up(
-            &first,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: email.clone(),
-                password: TEST_PASSWORD.into(),
-                device_name: "first".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let id = signed.account.id;
-        bh_testkit::wait_for(|| store.0.lock().unwrap().contains_key(&id)).await;
-        // Isolate the explicit refresh path: no base or device event may do the save.
-        first.stop_listening(id);
-        let second_dir = tempfile::tempdir().unwrap();
-        let second = AppState::open(
-            CoreConfig {
-                data_dir: second_dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(second_dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let pending = account::sign_in_start(
-            &second,
-            crate::views::SignInForm {
-                email,
-                password: TEST_PASSWORD.into(),
-                device_name: "second".into(),
-            },
-        )
-        .await
-        .unwrap();
-        account::sign_in_with_kit(&second, &pending, &signed.kit)
-            .await
-            .unwrap();
-        let rotated = account::new_kit(&second, id, TEST_PASSWORD).await.unwrap();
-        assert_ne!(&*rotated, &*signed.kit);
-        assert!(account::kit_kept_here(&first, id).await.unwrap()); // Its cached kit is still K1.
-        let guard = first.kit_lock.lock().await;
-        crate::commands::hidden::refresh_account(&first, id)
-            .await
-            .unwrap();
-        assert!(!account::kit_kept_here(&first, id).await.unwrap());
-        drop(guard);
-        bh_testkit::wait_for(|| {
-            store
-                .0
-                .lock()
-                .unwrap()
-                .get(&id)
-                .is_some_and(|value| value == &*rotated)
-        })
-        .await;
-        assert!(account::kit_kept_here(&first, id).await.unwrap());
-        assert!(!first.core.account(id).unwrap().kit_status().unwrap().saved);
-    }
-
-    #[tokio::test]
-    async fn save_completion_announces_kit_status_after_a_delayed_save() {
-        let server = LocalServer::shared();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        let events = Arc::new(Mutex::new(Vec::<crate::views::AppEvent>::new()));
-        let sink = events.clone();
-        let state = AppState::open_with_store(
-            CoreConfig {
-                data_dir: dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(move |event| sink.lock().unwrap().push(event)),
-            store.clone(),
-        )
-        .unwrap();
-        let guard = state.kit_lock.lock().await;
-        let signed = account::sign_up(
-            &state,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: format!("{}@example.test", AccountId::random()),
-                password: TEST_PASSWORD.into(),
-                device_name: "first".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let id = signed.account.id;
-        assert!(!events.lock().unwrap().iter().any(|event| matches!(event, crate::views::AppEvent::KitChanged { account } if *account == id)));
-        drop(guard);
-        bh_testkit::wait_for(|| events.lock().unwrap().iter().any(|event| matches!(event, crate::views::AppEvent::KitChanged { account } if *account == id))).await;
-        assert_eq!(
-            store.0.lock().unwrap().get(&id).map(String::as_str),
-            Some(&*signed.kit)
-        );
-    }
-
-    #[tokio::test]
-    async fn kit_store_shell_saves_signs_in_natively_and_deletes_on_sign_out() {
-        let server = LocalServer::shared();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        let state = AppState::open_with_store(
-            CoreConfig {
-                data_dir: dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-            store.clone(),
-        )
-        .unwrap();
-        let email = format!("{}@example.test", AccountId::random());
-        let signed = account::sign_up(
-            &state,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: email.clone(),
-                password: TEST_PASSWORD.into(),
-                device_name: "fold".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let id = signed.account.id;
-        bh_testkit::wait_for(|| store.0.lock().unwrap().contains_key(&id)).await;
-        assert_eq!(
-            store.0.lock().unwrap().get(&id).map(String::as_str),
-            Some(&*signed.kit)
-        );
-        assert!(!state.core.account(id).unwrap().kit_status().unwrap().saved);
-        let second_dir = tempfile::tempdir().unwrap();
-        let second = AppState::open_with_store(
-            CoreConfig {
-                data_dir: second_dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(second_dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-            store.clone(),
-        )
-        .unwrap();
-        let pending = account::sign_in_start(
-            &second,
-            crate::views::SignInForm {
-                email,
-                password: TEST_PASSWORD.into(),
-                device_name: "second".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(second.approvals.lock().unwrap().is_empty());
-        assert_eq!(
-            account::sign_in_saved_kit(&second, &pending)
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            id
-        );
-        assert!(second.approvals.lock().unwrap().is_empty());
-        account::sign_out(&second, id).await.unwrap();
-        assert!(!store.0.lock().unwrap().contains_key(&id));
-    }
-
-    #[tokio::test]
-    async fn kit_store_stale_entry_is_deleted_and_approval_remains_available() {
-        let server = LocalServer::shared();
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppState::open(
-            CoreConfig {
-                data_dir: dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-        )
-        .unwrap();
-        let email = format!("{}@example.test", AccountId::random());
-        let signed = account::sign_up(
-            &state,
-            crate::views::SignUpForm {
-                invite: invite(server),
-                email: email.clone(),
-                password: TEST_PASSWORD.into(),
-                device_name: "fold".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let store = Arc::new(FakeKitStore::default());
-        store
-            .0
-            .lock()
-            .unwrap()
-            .insert(signed.account.id, "invalid kit".into());
-        let second_dir = tempfile::tempdir().unwrap();
-        let second = AppState::open_with_store(
-            CoreConfig {
-                data_dir: second_dir.path().to_path_buf(),
-                secrets: Arc::new(FileSecretStore::new(second_dir.path().join("secrets")).unwrap()),
-            },
-            server.url(),
-            Arc::new(|_| {}),
-            store.clone(),
-        )
-        .unwrap();
-        let pending = account::sign_in_start(
-            &second,
-            crate::views::SignInForm {
-                email,
-                password: TEST_PASSWORD.into(),
-                device_name: "second".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            account::sign_in_saved_kit(&second, &pending)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.0.lock().unwrap().contains_key(&signed.account.id));
-        assert!(second.pending.lock().unwrap().contains_key(&pending));
-        account::sign_in_with_kit(&second, &pending, &signed.kit)
-            .await
-            .unwrap();
+            .expect("cleanup was not called")
+            .expect("cleanup task was dropped");
     }
 
     #[tokio::test]
@@ -1212,9 +804,8 @@ mod tests {
     async fn remote_removal_closes_cached_notes_and_bases() {
         let server = LocalServer::shared();
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FakeKitStore::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = AppState::open_with_store(
+        let state = AppState::open(
             CoreConfig {
                 data_dir: dir.path().to_path_buf(),
                 secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
@@ -1223,7 +814,6 @@ mod tests {
             Arc::new(move |event| {
                 let _ = tx.send(event);
             }),
-            store.clone(),
         )
         .unwrap();
         let (account, kit) = state
@@ -1238,8 +828,6 @@ mod tests {
             .await
             .unwrap();
         state.listen(account.id()).unwrap();
-        state.save_kit(account.id());
-        bh_testkit::wait_for(|| store.0.lock().unwrap().contains_key(&account.id())).await;
         let base = base::create_base(&state, account.id(), "Personal")
             .await
             .unwrap();
@@ -1288,7 +876,6 @@ mod tests {
             state.notes.apply(opened.session, &[]).unwrap_err().kind,
             "NotFound"
         );
-        assert!(!store.0.lock().unwrap().contains_key(&account.id()));
     }
 
     #[tokio::test]

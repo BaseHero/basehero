@@ -554,7 +554,7 @@ fn hero_chats_and_cross_base_answers_use_the_real_binary() {
         );
         let result = scripted(
             home.path(),
-            &[answer, "--chat", chat],
+            &[answer, "--chat", chat, "--use", private_id],
             json!([read, {"text":"Answered"}]),
             Some(readers.clone()),
         );

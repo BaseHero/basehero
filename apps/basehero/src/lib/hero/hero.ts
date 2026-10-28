@@ -10,7 +10,7 @@ export function hero(account: AccountId, base: BaseId) {
     messages: (chat: ObjectId): Promise<ChatMessage[]> => backend.heroMessages(account, base, chat),
     send: (chat: ObjectId, text: string, focus: ObjectId | null) => backend.heroSend(account, base, chat, text, focus),
     stop: (chat: ObjectId) => backend.heroStop(account, base, chat),
-    answer: (chat: ObjectId, allow: boolean) => backend.heroAnswer(account, base, chat, allow),
+    answer: (chat: ObjectId, requested: BaseId, allow: boolean) => backend.heroAnswer(account, base, chat, requested, allow),
     retry: (chat: ObjectId) => backend.heroRetry(account, base, chat),
     onEvent: backend.onEvent.bind(backend),
     getObject: backend.getObject.bind(backend),

@@ -11,25 +11,6 @@ export class FakeBackend implements Backend {
   private passwords = new Map<string, string>();
   private kitStates = new Map<string, KitStatus>();
   private kits = new Map<string, string>();
-  // Model the shell's asynchronous platform save separately from account acknowledgement.
-  private storedOnAndroid = typeof location !== 'undefined' && new URLSearchParams(location.search).get('kitStored') === '1';
-  private delayedKitSave = typeof location !== 'undefined' && new URLSearchParams(location.search).get('kitSaveDelayed') === '1';
-  private storedKits = new Map<string, string>();
-  private pendingKitSaves = new Map<string, string>();
-  private scheduleKitSave(account: string) {
-    if (this.platform !== 'android' || (!this.storedOnAndroid && !this.delayedKitSave)) return;
-    const kit = this.kits.get(account);
-    if (!kit) return;
-    this.pendingKitSaves.set(account, kit);
-    if (!this.delayedKitSave) queueMicrotask(() => this.completeKitSave(account));
-  }
-  completeKitSave(account: string) {
-    const kit = this.pendingKitSaves.get(account);
-    if (!kit) return;
-    this.pendingKitSaves.delete(account);
-    this.storedKits.set(account, kit);
-    this.emit({ kind: 'kitChanged', account, event: null });
-  }
   seedOlderAccount(account: string) {
     this.kits.delete(account);
     this.kitStates.delete(account);
@@ -72,7 +53,7 @@ export class FakeBackend implements Backend {
   private heroByProject = new Map<string, string>();
   private heroMessagesByChat = new Map<string, ChatMessage[]>();
   heroSends: { account: string; base: string; chat: string; text: string; focus: string | null }[] = [];
-  heroAnswers: { account: string; base: string; chat: string; allow: boolean }[] = [];
+  heroAnswers: { account: string; base: string; chat: string; requested: string; allow: boolean }[] = [];
   private newerNotes = new Set<string>();
   private channel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('basehero-fake-notes');
   constructor() {
@@ -114,7 +95,6 @@ export class FakeBackend implements Backend {
       this.accountList = this.accountList.filter(account => account.id !== e.account);
       this.kits.delete(e.account);
       this.kitStates.delete(e.account);
-      this.storedKits.delete(e.account);
       this.passwords.delete(e.account);
       this.baseList.delete(e.account);
       this.hiddenList.delete(e.account);
@@ -189,8 +169,8 @@ export class FakeBackend implements Backend {
     const last = messages.at(-1); if (last?.state === 'working') last.state = 'stopped';
     this.heroChanged(account, base, chat);
   }
-  async heroAnswer(account: string, base: string, chat: string, allow: boolean) {
-    this.log('heroAnswer', account); this.heroAnswers.push({ account, base, chat, allow });
+  async heroAnswer(account: string, base: string, chat: string, requested: string, allow: boolean) {
+    this.log('heroAnswer', account); this.heroAnswers.push({ account, base, chat, requested, allow });
     const last = this.heroMessagesByChat.get(this.heroKey(account, base, chat))?.at(-1);
     if (last?.state === 'asking') { last.state = allow ? 'working' : 'stopped'; last.ask = null; }
     this.heroChanged(account, base, chat);
@@ -228,9 +208,8 @@ export class FakeBackend implements Backend {
   }
   async accounts() { this.log('accounts'); if (this.keyUnavailable) throw new BackendError('KeyUnavailable', 'Keychain status -25308'); return [...this.accountList]; }
   async resetDevice() { this.log('resetDevice'); if (!this.keyUnavailable) throw new BackendError('Invalid', 'No key error'); this.keyUnavailable = false; this.accountList = []; }
-  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full' }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); this.scheduleKitSave(account.id); return { account, kit };  }
+  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full' }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); return { account, kit };  }
   async signInStart(form: SignInForm) { this.log('signInStart'); return form.email; }
-  async signInSavedKit(_pending: string): Promise<AccountSummary | null> { this.log('signInSavedKit'); return null; }
   async signInWithKit(pending: string, kit: string) { this.log('signInWithKit'); const existing = this.accountList.find(a => a.email === pending); if (kit !== (existing ? this.kits.get(existing.id) : '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC')) throw new BackendError('BadKit', 'Bad kit'); if (existing) return existing; const account: AccountSummary = { id: this.id(), email: pending, kind: 'full' }; this.accountList.push(account); this.passwords.set(account.id, 'correct horse battery staple'); this.kits.set(account.id, kit); this.kitStates.set(account.id, { known: true, saved: true, madeAt: Date.now() }); return account; }
   async signInCancel(pending: string) { this.log('signInCancel', pending); }
   async approvalStart(pending: string) { this.log('approvalStart', pending); return this.id(); }
@@ -277,11 +256,9 @@ export class FakeBackend implements Backend {
     const kit = characters.match(/.{1,4}/g)!.join('-');
     this.kits.set(account, kit);
     this.kitStates.set(account, { known: true, saved: false, madeAt: Date.now() });
-    this.scheduleKitSave(account);
     return kit;
   }
   async kitStatus(account: string) { this.log('kitStatus', account); return this.kitStates.get(account) ?? { known: false, saved: false, madeAt: null }; }
-  async kitKeptHere(account: string) { this.log('kitKeptHere', account); return !!this.kits.get(account) && this.storedKits.get(account) === this.kits.get(account); }
   async showKit(account: string) { this.log('showKit', account); const kit = this.kits.get(account); if (!kit) throw new BackendError('NotFound', 'Kit not found'); return kit; }
   async setKitSaved(account: string, kit: string) { this.log('setKitSaved', account); const status = this.kitStates.get(account); if (!status?.known) throw new BackendError('NotFound', 'Kit not found'); if (this.kits.get(account) !== kit) throw new BackendError('Conflict', 'kit_changed'); this.kitStates.set(account, { ...status, saved: true }); }
   async devices(account: string): Promise<DeviceSummary[]> { this.log('devices', account); return [...(this.deviceList.get(account) ?? [])]; }
@@ -339,7 +316,7 @@ export class FakeBackend implements Backend {
     const score = weak || password.length < 10 ? 1 : password.length < 16 ? 2 : password.length < 22 ? 3 : 4;
     return { score, strong: score === 4, warning: weak ? 'This is an easy password to guess.' : null, suggestions: weak ? ['Try a few unrelated words.'] : [] };
   }
-  async refreshAccount(account: string) { this.log('refreshAccount', account); this.emit({ kind: 'kitChanged', account, event: null }); this.scheduleKitSave(account); }
+  async refreshAccount(account: string) { this.log('refreshAccount', account); this.emit({ kind: 'kitChanged', account, event: null }); }
   async fileAdd(r: BaseRef, parent: string | null, name: string, mime: string, bytes: Uint8Array): Promise<FileInfo> {
     this.log('fileAdd', r.account);
     if (bytes.length > 104_857_600) throw new BackendError('TooLarge', 'File is too large');

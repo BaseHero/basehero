@@ -68,7 +68,6 @@ pub fn password_strength(password: &str, context: &[String]) -> PasswordStrength
 pub async fn refresh_account(state: &AppState, account: AccountId) -> Result<(), CommandError> {
     state.core.account(account)?.refresh().await?;
     (state.sink)(AppEvent::KitChanged { account });
-    state.save_kit(account);
     Ok(())
 }
 

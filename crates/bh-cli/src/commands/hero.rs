@@ -40,6 +40,9 @@ pub(crate) enum HeroCommand {
         /// Chat ID.
         #[arg(long)]
         chat: String,
+        /// The base Hero asked to use, by ID or name, as shown in its request.
+        #[arg(long = "use", value_name = "BASE")]
+        requested: String,
     },
     /// Deny a requested cross-base read and resume the turn.
     Deny {
@@ -49,6 +52,9 @@ pub(crate) enum HeroCommand {
         /// Chat ID.
         #[arg(long)]
         chat: String,
+        /// The base Hero asked to use, by ID or name, as shown in its request.
+        #[arg(long = "use", value_name = "BASE")]
+        requested: String,
     },
 }
 
@@ -181,10 +187,26 @@ pub(crate) async fn execute(account: &Account, command: &HeroCommand) -> Result<
             value["user"] = json!(user);
             Ok(value)
         }
-        HeroCommand::Allow { base, chat } | HeroCommand::Deny { base, chat } => {
+        HeroCommand::Allow {
+            base,
+            chat,
+            requested,
+        }
+        | HeroCommand::Deny {
+            base,
+            chat,
+            requested,
+        } => {
             let id = object_id(chat)?;
             let base = chat_base(account, base.as_deref(), id)?;
-            hero.answer(base, id, matches!(command, HeroCommand::Allow { .. }))?;
+            let requested = selected_base(account, Some(requested))?.id();
+            hero.answer(
+                base,
+                id,
+                requested,
+                matches!(command, HeroCommand::Allow { .. }),
+            )
+            .await?;
             hero.wait_idle(id).await;
             let message = hero
                 .messages(base, id)?

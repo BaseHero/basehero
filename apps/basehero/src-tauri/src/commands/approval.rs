@@ -49,7 +49,6 @@ async fn installed(
     account: bh_core::Account,
 ) -> Result<AccountSummary, CommandError> {
     state.listen(account.id())?;
-    state.save_kit(account.id());
     if account.bases().is_empty() {
         let _ = account.create_base("Personal").await;
     }

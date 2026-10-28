@@ -516,6 +516,30 @@ impl Hero {
             .filter(|s| !s.deleted && s.ty.name == "core.chat")
             .ok_or(Error::NotFound)
     }
+    /// Hero's request to read `requested` from a chat in `id`, as this device sees
+    /// it: its name and the readers who'd gain it come from this device's own
+    /// records. None for the chat's own base, a hidden base or an unknown one.
+    fn ask_for(&self, id: BaseId, requested: BaseId) -> Option<Ask> {
+        if requested == id {
+            return None;
+        }
+        let summary = self
+            .inner
+            .account
+            .bases()
+            .into_iter()
+            .find(|b| b.id == requested && !b.hidden)?;
+        let readers = self.inner.account.app_readers(id);
+        let other = self.inner.account.app_readers(requested);
+        Some(Ask {
+            base: requested,
+            base_name: summary.name,
+            readers_without: readers
+                .difference(&other)
+                .map(|r| self.inner.account.app_reader_name(*r))
+                .collect(),
+        })
+    }
     /// Lists a chat's messages, marking interrupted local work after a restart.
     ///
     /// # Errors
@@ -532,6 +556,14 @@ impl Hero {
             .filter(|s| !s.deleted && s.ty.name == "core.message")
         {
             let mut message = parse_message(&entry)?;
+            // An app with this base can write a message: trust only the base ID,
+            // and only on a message that is asking.
+            let asking = message.state == MessageState::Asking;
+            message.ask = message
+                .ask
+                .take()
+                .filter(|_| asking)
+                .and_then(|ask| self.ask_for(id, ask.base));
             if message.state == MessageState::Working
                 && entry.fields.get("device").and_then(Value::as_str)
                     == Some(self.inner.account.device_id().to_string().as_str())
@@ -683,7 +715,7 @@ impl Hero {
             if *cancel.borrow() {
                 return;
             }
-            let mut tools = hero.tools(base.clone(), project, &chat_info, readers_fresh);
+            let mut tools = hero.tools(base.clone(), project, chat_info.id, readers_fresh);
             let model = match &hero.inner.model {
                 Some(model) => model.clone(),
                 None => match hero.inner.account.model_for(id) {
@@ -780,18 +812,13 @@ impl Hero {
         &self,
         chat_base: Base,
         project: Option<ObjectId>,
-        chat: &crate::ObjectSummary,
+        chat: ObjectId,
         readers_fresh: bool,
     ) -> tools::Tools {
         let id = chat_base.id();
         let summaries = self.inner.account.bases();
         let current = summaries.iter().find(|b| b.id == id);
-        let allowed: Vec<BaseId> =
-            serde_json::from_value(chat.fields.get("allowed").cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
-        let denied: Vec<BaseId> =
-            serde_json::from_value(chat.fields.get("denied").cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
+        let (allowed, denied) = self.inner.account.hero_permissions(id, chat);
         let others = summaries
             .iter()
             .filter(|s| s.id != id)
@@ -836,31 +863,10 @@ impl Hero {
                 ResultKind::Answer => ("done", text, None, None),
                 ResultKind::Failed(c) => ("failed", text, Some(c), None),
                 ResultKind::Stopped => ("stopped", text, None, None),
-                ResultKind::Ask(requested) => {
-                    let readers = self.inner.account.app_readers(id);
-                    let other = self.inner.account.app_readers(requested);
-                    let names = readers
-                        .difference(&other)
-                        .map(|r| self.inner.account.app_reader_name(*r))
-                        .collect();
-                    let name = self
-                        .inner
-                        .account
-                        .bases()
-                        .into_iter()
-                        .find(|b| b.id == requested)
-                        .map_or(String::new(), |b| b.name);
-                    (
-                        "asking",
-                        String::new(),
-                        None,
-                        Some(Ask {
-                            base: requested,
-                            base_name: name,
-                            readers_without: names,
-                        }),
-                    )
-                }
+                ResultKind::Ask(requested) => match self.ask_for(id, requested) {
+                    Some(ask) => ("asking", String::new(), None, Some(ask)),
+                    None => ("failed", text, Some("failed"), None),
+                },
             };
             fields.insert("state".into(), json!(state));
             fields.insert("text".into(), json!(text));
@@ -919,34 +925,41 @@ impl Hero {
         self.ensure_chat(&base, chat)?;
         Ok(())
     }
-    /// Answers a permission request and reruns the last user message. The
-    /// resulting live turn needs the network; this method edits locally.
+    /// Answers the pending permission request for `requested`, the base the
+    /// person was shown, and reruns the last user message. The resulting live turn
+    /// needs the network; this method edits locally.
     ///
     /// # Errors
-    /// Returns [`Error::NotFound`] if there is no pending request,
+    /// Returns [`Error::NotFound`] unless the chat's last Hero message is still
+    /// asking for `requested`,
     /// [`Error::Conflict`] if another turn is active, or local edit errors
-    /// including [`Error::ReadOnly`], [`Error::Revoked`], [`Error::NeedsUpdate`]
-    /// and [`Error::Storage`].
-    pub fn answer(&self, id: BaseId, chat: ObjectId, allow: bool) -> Result<(), Error> {
+    /// including [`Error::Forbidden`], [`Error::ReadOnly`], [`Error::Revoked`],
+    /// [`Error::NeedsUpdate`] and [`Error::Storage`], or network errors while
+    /// saving the permission in encrypted account data.
+    pub async fn answer(
+        &self,
+        id: BaseId,
+        chat: ObjectId,
+        requested: BaseId,
+        allow: bool,
+    ) -> Result<(), Error> {
         let messages = self.messages(id, chat)?;
+        // Act only on the prompt the person saw: the last Hero message, still
+        // asking, for the base they were shown.
         let ask = messages
             .iter()
             .rev()
             .find(|m| m.role == ChatRole::Hero)
+            .filter(|m| m.state == MessageState::Asking)
             .and_then(|m| m.ask.as_ref())
+            .filter(|ask| ask.base == requested)
             .ok_or(Error::NotFound)?;
         let base = self.base(id)?;
-        let summary = self.ensure_chat(&base, chat)?;
-        let mut fields = summary.fields;
-        let key = if allow { "allowed" } else { "denied" };
-        let mut ids: Vec<BaseId> =
-            serde_json::from_value(fields.get(key).cloned().unwrap_or(json!([])))
-                .unwrap_or_default();
-        if !ids.contains(&ask.base) {
-            ids.push(ask.base)
-        }
-        fields.insert(key.into(), json!(ids));
-        base.set_fields(chat, fields)?;
+        self.ensure_chat(&base, chat)?;
+        self.inner
+            .account
+            .set_hero_permission(id, chat, ask.base, allow)
+            .await?;
         self.retry(id, chat)
     }
     /// Reruns the last user message without changing chat permissions. The

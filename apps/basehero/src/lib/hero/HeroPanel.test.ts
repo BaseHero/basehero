@@ -112,7 +112,7 @@ test('an ask shows both buttons and Allow calls hero_answer(true)', async () => 
   expect(target.textContent).toContain("Hero wants to use Health in this chat. Demo Raring can read this chat's base but not Health.");
   expect(button('Not now')).toBeTruthy();
   button('Allow in this chat').click(); await flush();
-  expect(fake.backend!.heroAnswers.at(-1)).toEqual({ account, base, chat, allow: true });
+  expect(fake.backend!.heroAnswers.at(-1)).toEqual({ account, base, chat, requested: 'other', allow: true });
 });
 
 test('reply text with <script> renders as text, not markup', async () => {

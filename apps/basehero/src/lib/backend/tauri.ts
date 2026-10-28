@@ -6,7 +6,7 @@ import { BackendError, type Backend, type AppEvent, type BaseRef, type NoteOpene
 // The core-backed commands are introduced by later shell tasks. Keep their mapping here.
 const commands: Record<string, [string, string[]]> = {
   appInfo: ['app_info', []], accounts: ['accounts', []], resetDevice: ['reset_device', []], signUp: ['sign_up', ['form']],
-  signInStart: ['sign_in_start', ['form']], signInSavedKit: ['sign_in_saved_kit', ['pending']], signInWithKit: ['sign_in_with_kit', ['pending', 'kit']],
+  signInStart: ['sign_in_start', ['form']], signInWithKit: ['sign_in_with_kit', ['pending', 'kit']],
   signInCancel: ['sign_in_cancel', ['pending']], signOut: ['sign_out', ['account']],
   approvalStart: ['approval_start', ['pending']], approvalDigits: ['approval_digits', ['pending']],
   approvalWait: ['approval_wait', ['pending']], approvalCancel: ['approval_cancel', ['pending']],
@@ -15,7 +15,7 @@ const commands: Record<string, [string, string[]]> = {
   approvalDecline: ['approval_decline', ['account', 'id']],
   connectOpen: ['connect_open', ['account', 'id']], connectCheck: ['connect_check', ['account', 'id', 'digits']],
   connectApprove: ['connect_approve', ['account', 'id', 'choice']], setAppCap: ['set_app_cap', ['account', 'device', 'capMicroUsd']],
-  newKit: ['new_kit', ['account', 'password']], kitStatus: ['kit_status', ['account']], kitKeptHere: ['kit_kept_here', ['account']], showKit: ['show_kit', ['account']], setKitSaved: ['set_kit_saved', ['account', 'kit']],
+  newKit: ['new_kit', ['account', 'password']], kitStatus: ['kit_status', ['account']], showKit: ['show_kit', ['account']], setKitSaved: ['set_kit_saved', ['account', 'kit']],
   devices: ['devices', ['account']], usage: ['usage', ['account', 'month']], removeDevice: ['remove_device', ['account', 'device']],
   bases: ['bases', ['account']], createBase: ['create_base', ['account', 'name']],
   createHiddenBase: ['create_hidden_base', ['account', 'name', 'password']],
@@ -33,7 +33,7 @@ const commands: Record<string, [string, string[]]> = {
   heroChats: ['hero_chats', ['account', 'base']], heroChatFor: ['hero_chat_for', ['account', 'base', 'project']],
   heroNewChat: ['hero_new_chat', ['account', 'base']], heroMessages: ['hero_messages', ['account', 'base', 'chat']],
   heroSend: ['hero_send', ['account', 'base', 'chat', 'text', 'focus']],
-  heroStop: ['hero_stop', ['account', 'base', 'chat']], heroAnswer: ['hero_answer', ['account', 'base', 'chat', 'allow']],
+  heroStop: ['hero_stop', ['account', 'base', 'chat']], heroAnswer: ['hero_answer', ['account', 'base', 'chat', 'requested', 'allow']],
   heroRetry: ['hero_retry', ['account', 'base', 'chat']],
   openWindow: ['open_window', ['route']], updateCheck: ['update_check', []], updateInstall: ['update_install', []],
 };

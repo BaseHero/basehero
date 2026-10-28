@@ -99,9 +99,9 @@
           {#if message.state === 'working' && message.steps.length}<p class="step">{message.steps.at(-1)?.title ?? message.steps.at(-1)?.tool}</p>{/if}
           {#if message.state === 'stopped'}<p class="status">Stopped.</p>{/if}
           {#if message.state === 'failed'}<p class="status">{message.text && message.error !== 'interrupted' ? "Hero's reply stopped partway." : failure(message.error)}</p>{#if (message.text && message.error !== 'interrupted') || (message.error !== 'rate_limited' && message.error !== 'needs_update')}<button onclick={() => chat && act(() => api.retry(chat!))}>Retry</button>{/if}{/if}
-          {#if message.ask && message.state === 'asking'}
+          {#if message.ask && message.state === 'asking' && message.id === messages.findLast(m => m.role === 'hero')?.id}
             <p>Hero wants to use {message.ask.baseName} in this chat. {message.ask.readersWithout.join(' and ')} can read this chat's base but not {message.ask.baseName}.</p>
-            <div class="actions"><button onclick={() => chat && act(() => api.answer(chat!, true))}>Allow in this chat</button><button onclick={() => chat && act(() => api.answer(chat!, false))}>Not now</button></div>
+            <div class="actions"><button onclick={() => chat && message.ask && act(() => api.answer(chat!, message.ask!.base, true))}>Allow in this chat</button><button onclick={() => chat && message.ask && act(() => api.answer(chat!, message.ask!.base, false))}>Not now</button></div>
           {/if}
           {#each message.created as object (object)}
             {#if Object.hasOwn(createdNames, object)}

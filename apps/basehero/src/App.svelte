@@ -31,7 +31,6 @@
   let signedUp = $state<SignedUp | null>(null);
   let kitStatus = $state<KitStatus>({ known: false, saved: false, madeAt: null });
   let kitStatusAccount = $state<string | null>(null);
-  let kitKeptHere = $state(false);
   let kitRevision = $state(0);
   let reminderDue = $state(false);
   let olderKitOffer = $state(false);
@@ -199,14 +198,10 @@
     }
   }
   async function refreshKit(account: AccountSummary) {
-    const [status, keptHere] = await Promise.all([
-      getBackend().kitStatus(account.id),
-      getBackend().kitKeptHere(account.id).catch(() => false),
-    ]);
+    const status = await getBackend().kitStatus(account.id);
     if (session.account?.id !== account.id) return;
     olderKitOffer = false;
     kitStatusAccount = account.id;
-    kitKeptHere = keptHere;
     setReminder(status);
   }
   async function showKit() {
@@ -340,7 +335,6 @@
     if (reminderTimer) clearTimeout(reminderTimer);
     setReminder({ known: false, saved: false, madeAt: null });
     kitStatusAccount = null;
-    kitKeptHere = false;
     knownAccounts = [];
     accountsLoaded = true;
     currentBase = null;
@@ -465,7 +459,6 @@
         signedUp = null;
         setReminder({ known: false, saved: false, madeAt: null });
         kitStatusAccount = null;
-        kitKeptHere = false;
         pending = null;
         session.account = null;
         currentBase = null;
@@ -557,9 +550,9 @@
 {:else if screen === 'signup'}
   <SignUp {deviceName} oncreated={(result) => { session.account = result.account; knownAccounts = [...knownAccounts, result.account.id]; kitReturn = 'account'; signedUp = result; void refreshKit(result.account); void navigate('kit'); }} onback={() => void navigate('welcome')} />
 {:else if screen === 'kit' && signedUp}
-  <Kit kit={signedUp.kit} androidKeptHere={platform === 'android' && kitKeptHere} mac={platform === 'macos'} notice={kitActionError} onsaved={acknowledgeKit} onlater={() => void leaveKit()} />
+  <Kit kit={signedUp.kit} mac={platform === 'macos'} notice={kitActionError} onsaved={acknowledgeKit} onlater={() => void leaveKit()} />
 {:else if screen === 'signin'}
-  <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onentered={entered} onback={() => void navigate('welcome')} />
+  <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onback={() => void navigate('welcome')} />
 {:else if screen === 'pending' && pending !== null}
   <PendingSignIn {pending} onapproved={entered} oncancel={() => void cancelPending()} onrestart={() => void cancelPending('signin')} />
 {:else if screen === 'removed'}

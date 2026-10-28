@@ -50,14 +50,18 @@ pub fn stop(
 ) -> Result<(), CommandError> {
     Ok(state.hero(account)?.stop(base, chat)?)
 }
-pub fn answer(
+pub async fn answer(
     state: &AppState,
     account: AccountId,
     base: BaseId,
     chat: ObjectId,
+    requested: BaseId,
     allow: bool,
 ) -> Result<(), CommandError> {
-    Ok(state.hero(account)?.answer(base, chat, allow)?)
+    Ok(state
+        .hero(account)?
+        .answer(base, chat, requested, allow)
+        .await?)
 }
 pub fn retry(
     state: &AppState,
@@ -126,14 +130,15 @@ pub mod ipc {
         stop(startup.state()?, account, base, chat)
     }
     #[tauri::command]
-    pub fn hero_answer(
+    pub async fn hero_answer(
         startup: tauri::State<'_, Startup>,
         account: AccountId,
         base: BaseId,
         chat: ObjectId,
+        requested: BaseId,
         allow: bool,
     ) -> Result<(), CommandError> {
-        answer(startup.state()?, account, base, chat, allow)
+        answer(startup.state()?, account, base, chat, requested, allow).await
     }
     #[tauri::command]
     pub fn hero_retry(

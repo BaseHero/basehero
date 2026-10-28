@@ -59,7 +59,6 @@ export interface Backend {
   resetDevice(): Promise<void>;
   signUp(form: SignUpForm): Promise<SignedUp>;
   signInStart(form: SignInForm): Promise<string>;
-  signInSavedKit(pending: string): Promise<AccountSummary | null>;
   signInWithKit(pending: string, kit: string): Promise<AccountSummary>;
   signInCancel(pending: string): Promise<void>;
   approvalStart(pending: string): Promise<ApprovalId>;
@@ -78,7 +77,6 @@ export interface Backend {
   signOut(account: AccountId): Promise<void>;
   newKit(account: AccountId, password: string): Promise<string>;
   kitStatus(account: AccountId): Promise<KitStatus>;
-  kitKeptHere(account: AccountId): Promise<boolean>;
   showKit(account: AccountId): Promise<string>;
   setKitSaved(account: AccountId, kit: string): Promise<void>;
   devices(account: AccountId): Promise<DeviceSummary[]>;
@@ -116,7 +114,7 @@ export interface Backend {
   heroMessages(account: AccountId, base: BaseId, chat: ObjectId): Promise<ChatMessage[]>;
   heroSend(account: AccountId, base: BaseId, chat: ObjectId, text: string, focus: ObjectId | null): Promise<ObjectId>;
   heroStop(account: AccountId, base: BaseId, chat: ObjectId): Promise<void>;
-  heroAnswer(account: AccountId, base: BaseId, chat: ObjectId, allow: boolean): Promise<void>;
+  heroAnswer(account: AccountId, base: BaseId, chat: ObjectId, requested: BaseId, allow: boolean): Promise<void>;
   heroRetry(account: AccountId, base: BaseId, chat: ObjectId): Promise<void>;
   noteOpen(r: BaseRef, note: ObjectId, onUpdate: (update: Uint8Array) => void): Promise<NoteOpened>;
   noteApply(session: number, update: Uint8Array): Promise<void>;

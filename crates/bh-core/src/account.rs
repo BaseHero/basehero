@@ -675,6 +675,54 @@ impl Account {
             .collect()
     }
 
+    /// Permission answers are keyed by both the chat's base and its object ID.
+    /// Missing or unreadable account data does not authorize another base.
+    pub(crate) fn hero_permissions(
+        &self,
+        base: BaseId,
+        chat: crate::ObjectId,
+    ) -> (Vec<BaseId>, Vec<BaseId>) {
+        let data = self.kit_data().ok();
+        let permissions = data
+            .as_ref()
+            .and_then(|data| data.get("heroPermissions"))
+            .and_then(|bases| bases.get(base.to_string()))
+            .and_then(|chats| chats.get(chat.to_string()));
+        let ids = |key| {
+            permissions
+                .and_then(|p| p.get(key))
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default()
+        };
+        (ids("allowed"), ids("denied"))
+    }
+
+    pub(crate) async fn set_hero_permission(
+        &self,
+        base: BaseId,
+        chat: crate::ObjectId,
+        requested: BaseId,
+        allow: bool,
+    ) -> Result<(), Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        self.update_data(move |data| {
+            let chats = entry(entry(data, "heroPermissions"), &base.to_string());
+            let permission = entry(chats, &chat.to_string());
+            let key = if allow { "allowed" } else { "denied" };
+            let mut ids: Vec<BaseId> = permission
+                .get(key)
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            if !ids.contains(&requested) {
+                ids.push(requested);
+            }
+            permission.insert(key.into(), json!(ids));
+        })
+        .await
+    }
+
     /// Reads the kit from cached encrypted account data without the network.
     /// Accounts created by older versions, or whose initial data write failed,
     /// return `None` until a new kit is made or a kit sign-in records one.
