@@ -42,6 +42,64 @@ test('sending shows the user message and disables Send while Hero works', async 
   expect(button('Stop')).toBeTruthy();
 });
 
+test('streamed text replaces Hero is working without reloading', async () => {
+  await send('Ferry?');
+  const working = (await fake.backend!.heroMessages(account, base, chat)).at(-1)!;
+  const calls = fake.backend!.calls.filter(c => c.startsWith('heroMessages')).length;
+  fake.backend!.heroText(account, base, chat, working.id, 'It leaves');
+  fake.backend!.heroText(account, base, chat, working.id, 'It leaves at');
+  await flush();
+  expect(target.textContent).toContain('It leaves at');
+  expect(target.textContent).not.toContain('Hero is working…');
+  expect(button('Stop')).toBeTruthy();
+  expect(fake.backend!.calls.filter(c => c.startsWith('heroMessages')).length).toBe(calls);
+});
+
+test('text for another chat or an older message is ignored', async () => {
+  await send('Ferry?');
+  const working = (await fake.backend!.heroMessages(account, base, chat)).at(-1)!;
+  const calls = fake.backend!.calls.filter(c => c.startsWith('heroMessages')).length;
+  for (const [id, conversation] of [[working.id, 'other-chat'], ['older-message', chat]] as const) {
+    fake.backend!.emit({ kind: 'hero', account, base, chat: conversation, event: { text: { base, chat: conversation, message: id, text: 'Wrong reply' } } });
+  }
+  await flush();
+  expect(target.textContent).not.toContain('Wrong reply');
+  expect(target.textContent).toContain('Hero is working…');
+  expect(fake.backend!.calls.filter(c => c.startsWith('heroMessages')).length).toBe(calls);
+});
+
+test('Stop during a stream keeps the text and shows Stopped.', async () => {
+  await send('Ferry?');
+  const working = (await fake.backend!.heroMessages(account, base, chat)).at(-1)!;
+  fake.backend!.heroText(account, base, chat, working.id, 'It leaves');
+  await flush(); button('Stop').click(); await flush();
+  expect(target.textContent).toContain('It leaves');
+  expect(target.textContent).toContain('Stopped.');
+  expect(button('Stop')).toBeUndefined();
+});
+
+test('a failed reply with partial text offers Retry', async () => {
+  fake.backend!.seedHeroMessages(account, base, chat, [message('failed', { text: 'It lea', error: 'unavailable' })]);
+  fake.backend!.emit({ kind: 'hero', account, base, chat, event: { changed: { base, chat } } }); await flush();
+  expect(target.textContent).toContain("Hero's reply stopped partway.");
+  expect(button('Retry')).toBeTruthy();
+});
+
+test('a rate-limited partial reply can be retried', async () => {
+  fake.backend!.seedHeroMessages(account, base, chat, [message('failed', { text: 'First part', error: 'rate_limited' })]);
+  fake.backend!.emit({ kind: 'hero', account, base, chat, event: { changed: { base, chat } } }); await flush();
+  expect(target.textContent).toContain("Hero's reply stopped partway.");
+  expect(button('Retry')).toBeTruthy();
+});
+
+test('streamed <script> renders as text, not markup', async () => {
+  await send('Ferry?');
+  const working = (await fake.backend!.heroMessages(account, base, chat)).at(-1)!;
+  fake.backend!.emit({ kind: 'hero', account, base, chat, event: { text: { base, chat, message: working.id, text: '<script>alert(1)</script>' } } }); await flush();
+  expect(target.textContent).toContain('<script>alert(1)</script>');
+  expect(target.querySelector('script')).toBeNull();
+});
+
 test('Stop calls hero_stop and the stopped message reads Stopped.', async () => {
   await send('Hello'); button('Stop').click(); await flush();
   expect(fake.backend!.calls).toContain('heroStop a');

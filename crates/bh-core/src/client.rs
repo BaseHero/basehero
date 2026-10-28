@@ -97,6 +97,8 @@ pub(crate) type ApprovalPostPause = Arc<std::sync::Mutex<Option<ApprovalPostGate
 pub(crate) struct Api {
     server: Url,
     token: Option<Arc<Zeroizing<String>>>,
+    /// An app's one-time connect secret, base64url, and the email it typed.
+    connect: Option<Arc<(Zeroizing<String>, String)>>,
     http: reqwest::Client,
     on_revoked: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -121,6 +123,7 @@ impl Api {
         Self {
             server,
             token: token.map(Arc::new),
+            connect: None,
             http: http_client(&tls),
             on_revoked: None,
             #[cfg(test)]
@@ -134,6 +137,12 @@ impl Api {
             #[cfg(feature = "test-support")]
             held_account_get: Arc::default(),
         }
+    }
+
+    /// A client for an app's own connection request, which has no token yet.
+    pub(crate) fn with_connect(mut self, secret: Zeroizing<String>, email: &str) -> Self {
+        self.connect = Some(Arc::new((secret, email.to_string())));
+        self
     }
 
     pub(crate) fn with_revocation(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
@@ -215,6 +224,10 @@ impl Api {
             .header("BH-Protocol", PROTOCOL.to_string());
         if let Some(token) = &self.token {
             request = request.bearer_auth(token.as_str());
+        } else if let Some(connect) = &self.connect {
+            request = request
+                .header("Authorization", format!("Connect {}", connect.0.as_str()))
+                .header("BH-Email", connect.1.as_str());
         }
         #[cfg(any(test, feature = "test-support"))]
         if let Some(bypass) = TEST_BYPASS.read().unwrap().as_deref() {
@@ -561,6 +574,54 @@ impl Api {
         .map(|_| ())
     }
 
+    pub(crate) async fn connect_create(
+        &self,
+        body: &ConnectCreateRequest,
+    ) -> Result<ApprovalCreate, Error> {
+        self.call(Method::POST, "v1/connect", Some(body)).await
+    }
+
+    /// A missing request has ended and been deleted by the relay.
+    pub(crate) async fn connect_state(
+        &self,
+        id: ApprovalId,
+    ) -> Result<Option<ApprovalState>, Error> {
+        match self
+            .call(Method::GET, &format!("v1/connect/{id}"), None::<&()>)
+            .await
+        {
+            Ok(state) => Ok(Some(state)),
+            Err(Error::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn connect_reveal(&self, id: ApprovalId, reveal: Bytes) -> Result<(), Error> {
+        self.call::<serde_json::Value>(
+            Method::POST,
+            &format!("v1/connect/{id}/reveal"),
+            Some(&ConnectRevealRequest { reveal }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The app ends its own request only as cancelled, expired or failed.
+    pub(crate) async fn connect_end(&self, id: ApprovalId, reason: EndReason) -> Result<(), Error> {
+        let reason = match reason {
+            EndReason::Cancelled => ApprovalEndReason::Cancelled,
+            EndReason::Expired => ApprovalEndReason::Expired,
+            _ => ApprovalEndReason::Failed,
+        };
+        self.call::<serde_json::Value>(
+            Method::DELETE,
+            &format!("v1/connect/{id}"),
+            Some(&ConnectEndRequest { reason }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn approvals_live(
         &self,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
@@ -747,6 +808,16 @@ impl Api {
         self.call(Method::POST, "v1/devices", Some(body)).await
     }
 
+    pub(crate) async fn set_app_cap(&self, id: DeviceId, cap_micro_usd: u64) -> Result<(), Error> {
+        self.call::<serde_json::Value>(
+            Method::PUT,
+            &format!("v1/devices/{id}/cap"),
+            Some(&serde_json::json!({ "capMicroUsd": cap_micro_usd })),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn delete_device(&self, id: DeviceId) -> Result<DeleteDeviceResponse, Error> {
         self.call(Method::DELETE, &format!("v1/devices/{id}"), None::<&()>)
             .await
@@ -757,6 +828,7 @@ impl Api {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApprovalRow {
     pub approval_id: ApprovalId,
+    pub kind: ApprovalKind,
     pub device_id: DeviceId,
     pub created_at: i64,
     pub expires_at: i64,

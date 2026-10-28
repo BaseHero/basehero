@@ -92,9 +92,14 @@ fn run(home: &Path, args: &[&str], password: Option<&str>, token: Option<&str>) 
         cmd.env("BH_OPERATOR_TOKEN", token);
     }
     let output = cmd.output().expect("run CLI");
-    // Never print the command or its output on failure: sign-in passes a kit,
-    // and signup deliberately returns one.
-    assert!(output.status.success(), "CLI failed with {}", output.status);
+    // Never print the arguments or output on failure: sign-in passes a kit,
+    // and signup deliberately returns one. The subcommand's name is safe.
+    assert!(
+        output.status.success(),
+        "CLI `{}` failed with {}",
+        args.first().copied().unwrap_or(""),
+        output.status
+    );
     serde_json::from_slice(&output.stdout).expect("one JSON response")
 }
 

@@ -47,14 +47,142 @@ async fn a_reply_arrives_whole_and_decrypts() {
     let seen = &e.requests()[0];
     let p = seen.plaintext.as_ref().unwrap();
     assert_eq!(p["model"], "deepseek-v4-1-flash");
-    assert_eq!(p["stream"], false);
-    assert!(p.get("stream_options").is_none());
+    assert_eq!(p["stream"], true);
+    assert_eq!(p["stream_options"]["include_usage"], true);
     assert_eq!(p["user_cache_secret"], "cache-secret-for-tests");
     assert!(!String::from_utf8_lossy(&seen.body).contains("Reply with one word"));
     assert_eq!(seen.headers["authorization"], "Bearer device-token");
     assert_eq!(seen.headers["x-tinfoil-model"], "deepseek-v4-1-flash");
     assert_eq!(seen.headers["bh-protocol"], "1");
-    assert_eq!(seen.headers["accept"], "application/json");
+    assert_eq!(seen.headers["accept"], "text/event-stream");
+}
+fn stream(gated: bool, cut: bool) -> EnclaveReply {
+    EnclaveReply::Stream {
+        events: vec![
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"It"}}]}),
+            json!({"choices":[{"index":0,"delta":{"content":" leaves"}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}),
+        ],
+        trailer: None,
+        gated,
+        cut,
+        hold_trailer: false,
+    }
+}
+#[tokio::test]
+async fn text_arrives_in_pieces_and_the_completion_is_whole() {
+    let e = TestEnclave::start();
+    e.reply(stream(true, false));
+    let m = model(&e);
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let mut call = m.complete_streaming(ask("When does it leave?"), send);
+    let deadline = std::time::Duration::from_secs(30);
+    // The first piece arrives while the enclave holds back the rest.
+    let first = tokio::time::timeout(deadline, async {
+        tokio::select! {
+            result = &mut call => panic!("the call ended before its first piece: {result:?}"),
+            piece = receive.recv() => piece.unwrap(),
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first, "It");
+    e.release();
+    let c = call.await.unwrap();
+    let mut pieces = vec![first];
+    while let Ok(piece) = receive.try_recv() {
+        pieces.push(piece);
+    }
+    assert_eq!(pieces, ["It", " leaves"]);
+    assert_eq!(c.text.as_deref(), Some("It leaves"));
+    assert_eq!(c.finish, Finish::Stop);
+    assert!(c.tool_calls.is_empty());
+    assert_eq!(
+        c.usage,
+        Some(Usage {
+            prompt: 9,
+            completion: 2
+        })
+    );
+    let seen = &e.requests()[0];
+    let p = seen.plaintext.as_ref().unwrap();
+    assert_eq!(p["stream"], true);
+    assert_eq!(p["stream_options"]["include_usage"], true);
+    assert_eq!(seen.headers["accept"], "text/event-stream");
+    assert_eq!(seen.headers["x-tinfoil-max-output-tokens"], "64");
+}
+#[tokio::test]
+async fn complete_still_returns_the_whole_reply() {
+    let e = TestEnclave::start();
+    e.reply(stream(false, false));
+    let c = model(&e).complete(ask("When?")).await.unwrap();
+    assert_eq!(c.text.as_deref(), Some("It leaves"));
+    assert_eq!(c.finish, Finish::Stop);
+}
+#[tokio::test]
+async fn done_finishes_before_the_trailer_or_connection_close() {
+    let e = TestEnclave::start();
+    let EnclaveReply::Stream {
+        events,
+        trailer,
+        gated,
+        cut,
+        ..
+    } = stream(false, false)
+    else {
+        unreachable!()
+    };
+    e.reply(EnclaveReply::Stream {
+        events,
+        trailer,
+        gated,
+        cut,
+        hold_trailer: true,
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        model(&e).complete(ask("When?")),
+    )
+    .await;
+    // The connection remains open at the trailer gate; waiting for EOF would time out.
+    assert_eq!(
+        result
+            .expect("[DONE] arrives before the trailer")
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("It leaves")
+    );
+    e.release();
+}
+#[tokio::test]
+async fn a_cut_stream_fails() {
+    let e = TestEnclave::start();
+    e.reply(stream(false, true));
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(
+        model(&e)
+            .complete_streaming(ask("When?"), send)
+            .await
+            .unwrap_err(),
+        ModelError::Response
+    );
+    // The text that arrived was still shown.
+    assert_eq!(receive.recv().await.as_deref(), Some("It"));
+}
+#[tokio::test]
+async fn a_whole_reply_is_sent_as_one_piece() {
+    let e = TestEnclave::start();
+    e.reply(EnclaveReply::Completion(reply()));
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let c = model(&e)
+        .complete_streaming(ask("One word"), send)
+        .await
+        .unwrap();
+    assert_eq!(c.text.as_deref(), Some("ferry"));
+    assert_eq!(receive.recv().await.as_deref(), Some("ferry"));
+    assert!(receive.recv().await.is_none());
 }
 #[tokio::test]
 async fn tool_calls_come_back_with_their_arguments() {
@@ -270,4 +398,37 @@ async fn scripted_model_records_requests_and_returns_in_order() {
     assert!(futures_util::poll!(&mut pending).is_pending());
     drop(pending);
     assert_eq!(m.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn a_scripted_stream_sends_text_as_it_is_pushed() {
+    let whole = Completion {
+        text: Some("It leaves".into()),
+        tool_calls: vec![],
+        finish: Finish::Stop,
+        usage: None,
+    };
+    let (script, control) = StreamScript::new();
+    let (dropped, _) = StreamScript::new();
+    let m = ScriptedModel::new(vec![
+        Scripted::Stream(script),
+        Scripted::Reply(whole.clone()),
+        Scripted::Stream(dropped),
+    ]);
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let mut call = m.complete_streaming(ask("one"), send);
+    control.text("It");
+    assert!(futures_util::poll!(&mut call).is_pending());
+    assert_eq!(receive.try_recv().unwrap(), "It");
+    control.text(" leaves");
+    control.finish(whole.clone());
+    assert_eq!(call.await.unwrap(), whole);
+    assert_eq!(receive.try_recv().unwrap(), " leaves");
+
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    assert_eq!(m.complete_streaming(ask("two"), send).await.unwrap(), whole);
+    assert_eq!(receive.try_recv().unwrap(), "It leaves");
+
+    let mut hung = m.complete(ask("three"));
+    assert!(futures_util::poll!(&mut hung).is_pending());
 }

@@ -5,7 +5,7 @@ use crate::{commands, kit_store, secrets};
 use bh_core::hero::{Hero, HeroEvent};
 use bh_core::{
     AccountEvent, AccountId, Approval, ApprovalId, Base, BaseId, BaseSummary, Core, CoreConfig,
-    OpenRequest, PendingSignIn, Url,
+    OpenAppRequest, OpenRequest, PendingSignIn, Url,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -68,6 +68,7 @@ pub struct AppState {
     pub pending: Arc<Mutex<HashMap<String, Arc<PendingSignIn>>>>,
     pub approvals: Arc<Mutex<HashMap<String, Arc<ActiveApproval>>>>,
     pub open_requests: Mutex<HashMap<(AccountId, ApprovalId), OpenRequest>>,
+    pub open_app_requests: Mutex<HashMap<(AccountId, ApprovalId), OpenAppRequest>>,
     pub active_pending: Arc<Mutex<HashSet<String>>>,
     pub starting_approvals: Mutex<HashSet<String>>,
     pub pending_lifetime: Duration,
@@ -136,6 +137,7 @@ impl AppState {
             pending: Arc::default(),
             approvals: Arc::default(),
             open_requests: Mutex::default(),
+            open_app_requests: Mutex::default(),
             active_pending: Arc::default(),
             starting_approvals: Mutex::default(),
             pending_lifetime: Duration::from_secs(10 * 60),
@@ -379,12 +381,15 @@ impl AppState {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        let HeroEvent::Changed { base, chat } = event;
+                        let (base, chat) = match &event {
+                            HeroEvent::Changed { base, chat }
+                            | HeroEvent::Text { base, chat, .. } => (*base, *chat),
+                        };
                         sink(AppEvent::Hero {
                             account,
                             base,
                             chat,
-                            event: HeroEvent::Changed { base, chat },
+                            event,
                         });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

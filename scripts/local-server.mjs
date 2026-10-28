@@ -11,7 +11,8 @@ const args = process.argv.slice(2);
 let persist, port, tinfoilUpstream;
 const vars = { OPERATOR_TOKEN: 'local-operator', PEPPER: 'local-pepper',
   TINFOIL_API_KEY: 'local-tinfoil-key', TINFOIL_MODELS: 'deepseek-v4-1-flash', ALLOW_TEST_BYPASS: '1',
-  GATEWAY_PER_MINUTE: '20', GATEWAY_PER_DAY: '500', GATEWAY_DAILY_COST_USD: '2' };
+  GATEWAY_PER_MINUTE: '20', GATEWAY_PER_DAY: '500', GATEWAY_DAILY_COST_USD: '2',
+  GATEWAY_UNREPORTED_CALL_USD: '0.05', GATEWAY_MAX_OUTPUT_TOKENS: '8192' };
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
   if (arg === '--persist') persist = resolve(args[++i]);
@@ -27,16 +28,18 @@ for (let i = 0; i < args.length; i++) {
 if (!persist || (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535))) {
   throw new Error('usage: local-server.mjs --persist DIR [--port P] [--tinfoil-upstream URL] [--var K=V]...');
 }
-if (tinfoilUpstream && (tinfoilUpstream.protocol !== 'http:' ||
+if (tinfoilUpstream && (tinfoilUpstream.protocol !== 'http:' || !tinfoilUpstream.port ||
     !['127.0.0.1', '[::1]', 'localhost'].includes(tinfoilUpstream.hostname))) {
-  throw new Error('test upstream must be loopback HTTP');
+  throw new Error('test upstream must be loopback HTTP with a port');
 }
+// The gateway connects to the test upstream itself; without one, model calls fail and never reach Tinfoil.
+vars.TINFOIL_CONNECT ??= tinfoilUpstream ? tinfoilUpstream.host : 'none';
 // Miniflare binds port 0 atomically; a restarted server supplies its observed port.
 port ??= 0;
 await mkdir(persist, { recursive: true });
 const bundle = resolve(persist, 'worker.mjs');
 await build({ entryPoints: [resolve(root, 'server/src/index.ts')], outfile: bundle,
-  bundle: true, format: 'esm', platform: 'browser', target: 'es2022', external: ['cloudflare:workers'] });
+  bundle: true, format: 'esm', platform: 'browser', target: 'es2022', external: ['cloudflare:workers', 'cloudflare:sockets'] });
 const mf = new Miniflare({
   modules: true, scriptPath: bundle, modulesRoot: persist,
   compatibilityDate: '2026-08-06', host: '127.0.0.1', port,
@@ -44,14 +47,7 @@ const mf = new Miniflare({
   durableObjects: Object.fromEntries(['ACCOUNT', 'BASE', 'DIRECTORY', 'INVITES', 'GATEWAY'].map(name =>
     [name, { className: `${name[0]}${name.slice(1).toLowerCase()}DO`, useSQLite: true }])),
   r2Buckets: ['FILES'], bindings: vars,
-  outboundService: async request => {
-    if (!tinfoilUpstream) return new Response(null, { status: 599 });
-    const headers = new Headers(request.headers);
-    headers.set('x-test-original-url', request.url);
-    const url = new URL(new URL(request.url).pathname, tinfoilUpstream);
-    return fetch(url, { method: request.method, headers, body: request.body,
-      duplex: 'half', redirect: 'manual' });
-  },
+  outboundService: () => new Response(null, { status: 599 }),
   durableObjectsPersist: resolve(persist, 'do'), r2Persist: resolve(persist, 'r2'),
 });
 let stopping = false;

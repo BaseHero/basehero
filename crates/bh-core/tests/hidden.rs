@@ -587,11 +587,13 @@ async fn hero_resubscribes_to_chats_after_a_hidden_base_is_reopened() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let HeroEvent::Changed {
+            if let HeroEvent::Changed {
                 base,
                 chat: changed,
-            } = events.recv().await.unwrap();
-            if base == h.id() && changed == chat {
+            } = events.recv().await.unwrap()
+                && base == h.id()
+                && changed == chat
+            {
                 break;
             }
         }

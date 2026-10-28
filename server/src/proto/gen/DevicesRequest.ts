@@ -2,4 +2,4 @@
 import type { AppDeviceKind } from "./AppDeviceKind";
 import type { DeviceId } from "./DeviceId";
 
-export type DevicesRequest = { deviceId: DeviceId, kind: AppDeviceKind, };
+export type DevicesRequest = { deviceId: DeviceId, kind: AppDeviceKind, capMicroUsd?: number, };

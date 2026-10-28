@@ -81,8 +81,15 @@ test('a PDF opens in the system viewer', { timeout: 90_000 }, async t => {
   const row = files.locator('li').filter({ hasText: pdfName });
   await row.getByRole('button', { name: 'Open' }).click();
   try {
-    const activities = adb('shell', 'dumpsys', 'activity', 'activities');
-    assert.match(activities, new RegExp(`Intent \\{ act=android\\.intent\\.action\\.VIEW dat=content://app\\.basehero\\.files/open/${baseId}/[0-9a-f]{32}/${pdfName} typ=application/pdf`));
+    // Opening writes the copy first, so the viewer starts a moment after the tap.
+    const viewer = new RegExp(`Intent \\{ act=android\\.intent\\.action\\.VIEW dat=content://app\\.basehero\\.files/open/${baseId}/[0-9a-f]{32}/${pdfName} typ=application/pdf`);
+    const deadline = Date.now() + 30_000;
+    let activities = adb('shell', 'dumpsys', 'activity', 'activities');
+    while (!viewer.test(activities) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      activities = adb('shell', 'dumpsys', 'activity', 'activities');
+    }
+    assert.match(activities, viewer);
   } finally {
     await launch();
   }

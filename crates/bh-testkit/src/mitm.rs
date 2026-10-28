@@ -3,9 +3,9 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_core::{
     AccountId, ApprovalId, Digits,
-    approval::protocol::{self, Ids, Message, Transcript},
+    approval::protocol::{self, Exchange, Ids, Message, Transcript, email_scope},
 };
-use bh_crypto::{KemKey, Secret, decapsulate, encapsulate, random};
+use bh_crypto::{KemKey, Secret, decapsulate, encapsulate, generichash, kdf, random};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
@@ -25,7 +25,8 @@ use std::{
 use tokio::net::TcpStream;
 use url::Url;
 
-struct Exchange {
+struct MitmExchange {
+    kind: protocol::Exchange,
     ids: Ids,
     pending_token: String,
     real_pk: Box<[u8; bh_crypto::XWING_PUBLIC_BYTES]>,
@@ -38,15 +39,17 @@ struct Exchange {
     new_key: Option<Secret<32>>,
     approver_key: Option<Secret<32>>,
     approver_digits: Option<Digits>,
+    approver_hello_key: Option<Secret<32>>,
 }
 
 #[derive(Default)]
 struct State {
     account: Option<AccountId>,
-    exchanges: HashMap<ApprovalId, Exchange>,
+    exchanges: HashMap<ApprovalId, MitmExchange>,
     digits_for_new: Option<Digits>,
     digits_for_approver: Option<Digits>,
     opened_a_transfer: bool,
+    opened_a_hello: bool,
 }
 
 /// A loopback HTTP and WebSocket relay which substitutes its own X-Wing request
@@ -124,7 +127,12 @@ impl ApprovalMitm {
         self.state.lock().unwrap().digits_for_approver.clone()
     }
 
-    /// Whether either of the relay's transfer keys opened a posted account key.
+    /// Whether the relay opened the app's sealed claim before forwarding it.
+    pub fn opened_a_hello(&self) -> bool {
+        self.state.lock().unwrap().opened_a_hello
+    }
+
+    /// Whether either of the relay's transfer keys opened a posted transfer.
     pub fn opened_a_transfer(&self) -> bool {
         self.state.lock().unwrap().opened_a_transfer
     }
@@ -158,61 +166,135 @@ fn token(request: &Request<Incoming>) -> String {
 
 // Envelope AAD is specified by the approval protocol; use the same bytes to
 // attempt a transfer without giving the test kit access to core internals.
-fn transfer_aad(ids: &Ids) -> [u8; 42] {
+fn aad(ids: &Ids, purpose: u8) -> [u8; 42] {
     let mut aad = [0; 42];
     aad[..5].copy_from_slice(b"bh.v1");
-    aad[5] = 8; // ApprovalTransfer
+    aad[5] = purpose;
     aad[6..22].copy_from_slice(&ids.approval.0);
     aad[22..38].copy_from_slice(&ids.new.0);
     aad[38..].copy_from_slice(&1u32.to_be_bytes());
     aad
 }
 
-fn opened(key: &Secret<32>, ids: &Ids, envelope: &[u8]) -> bool {
-    if envelope.len() != 1 + 4 + 24 + 32 + 16
-        || envelope[0] != 1
-        || envelope[1..5] != 1u32.to_be_bytes()
+fn open(key: &Secret<32>, ids: &Ids, purpose: u8, envelope: &[u8]) -> Option<Vec<u8>> {
+    if envelope.len() < 1 + 4 + 24 + 16 || envelope[0] != 1 || envelope[1..5] != 1u32.to_be_bytes()
     {
-        return false;
+        return None;
     }
     let nonce: [u8; 24] = envelope[5..29].try_into().unwrap();
-    bh_crypto::aead_open(key, &nonce, &transfer_aad(ids), &envelope[29..]).is_ok()
+    bh_crypto::aead_open(key, &nonce, &aad(ids, purpose), &envelope[29..])
+        .ok()
+        .map(|opened| opened.to_vec())
 }
 
-fn rewrite_request(state: &mut State, payload: &mut Value, bearer: &str) {
+fn seal(key: &Secret<32>, ids: &Ids, purpose: u8, plaintext: &[u8]) -> Vec<u8> {
+    let (nonce, ciphertext) = bh_crypto::aead_seal(key, &aad(ids, purpose), plaintext);
+    let mut out = vec![1];
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+fn fake_commit(
+    kind: protocol::Exchange,
+    ids: &Ids,
+    pk: &[u8; bh_crypto::XWING_PUBLIC_BYTES],
+    r: &[u8; 32],
+) -> [u8; 32] {
+    match kind {
+        Exchange::Device => protocol::commitment(ids, pk, r),
+        Exchange::App => generichash(
+            None,
+            &[
+                b"bh.v1.app-connect-commit",
+                &ids.account.0,
+                &ids.approval.0,
+                &ids.new.0,
+                pk,
+                r,
+            ],
+        ),
+    }
+}
+
+fn derive(
+    kind: protocol::Exchange,
+    shared: &Secret<32>,
+    transcript: &[u8],
+) -> (Digits, Secret<32>, Option<Secret<32>>) {
+    if kind == Exchange::Device {
+        let (digits, key) = protocol::derive(shared, transcript);
+        return (digits, key, None);
+    }
+    let bound = Secret::from_slice(&generichash(Some(shared.expose()), &[transcript])).unwrap();
+    (
+        protocol::digits_from(&kdf(&bound, b"bhapcdg1", 1)),
+        kdf(&bound, b"bhapctk1", 1),
+        Some(kdf(&bound, b"bhapchl1", 1)),
+    )
+}
+
+fn parse(kind: protocol::Exchange, bytes: &[u8], id: ApprovalId) -> Message {
+    let mut bytes = bytes.to_vec();
+    if kind == Exchange::App {
+        bytes[1] = match bytes[1] {
+            5 => 1,
+            6 => 2,
+            other => panic!("unexpected app message kind {other}"),
+        };
+    }
+    Message::parse(&bytes, id).expect("well-formed approval message")
+}
+
+fn encode(kind: protocol::Exchange, message: Message) -> Vec<u8> {
+    let mut bytes = message.encode();
+    if kind == Exchange::App {
+        bytes[1] = match bytes[1] {
+            1 => 5,
+            2 => 6,
+            _ => unreachable!(),
+        };
+    }
+    bytes
+}
+
+fn rewrite_request(state: &mut State, payload: &mut Value, bearer: &str, kind: protocol::Exchange) {
     let id: ApprovalId = payload["approvalId"].as_str().unwrap().parse().unwrap();
     let Message::Request {
         new,
         pk,
         commitment,
         ..
-    } = Message::parse(&decode(&payload["request"]), id).unwrap()
+    } = parse(kind, &decode(&payload["request"]), id)
     else {
         panic!("not an approval request")
     };
     let ids = Ids {
-        account: state.account.expect("account ID from login"),
+        account: match kind {
+            Exchange::Device => state.account.expect("account ID from login"),
+            Exchange::App => email_scope(payload["email"].as_str().expect("app email")),
+        },
         approval: id,
         new,
     };
     let fake_kem = Box::new(KemKey::generate());
     let fake_pk = Box::new(fake_kem.public());
     let fake_r_new = random::<32>();
-    let fake_commitment = protocol::commitment(&ids, &fake_pk, &fake_r_new);
-    payload["request"] = json!(
-        URL_SAFE_NO_PAD.encode(
-            Message::Request {
-                approval: id,
-                new,
-                pk: fake_pk.clone(),
-                commitment: fake_commitment,
-            }
-            .encode()
-        )
-    );
+    let fake_commitment = fake_commit(kind, &ids, &fake_pk, &fake_r_new);
+    payload["request"] = json!(URL_SAFE_NO_PAD.encode(encode(
+        kind,
+        Message::Request {
+            approval: id,
+            new,
+            pk: fake_pk.clone(),
+            commitment: fake_commitment,
+        }
+    )));
     state.exchanges.insert(
         id,
-        Exchange {
+        MitmExchange {
+            kind,
             ids,
             pending_token: bearer.to_owned(),
             real_pk: pk,
@@ -225,6 +307,7 @@ fn rewrite_request(state: &mut State, payload: &mut Value, bearer: &str) {
             new_key: None,
             approver_key: None,
             approver_digits: None,
+            approver_hello_key: None,
         },
     );
 }
@@ -239,7 +322,7 @@ fn rewrite_respond(state: &mut State, id: ApprovalId, payload: &Value) {
         ct,
         r_approver,
         ..
-    } = Message::parse(&decode(&payload["response"]), id).unwrap()
+    } = parse(exchange.kind, &decode(&payload["response"]), id)
     else {
         panic!("not a response")
     };
@@ -253,24 +336,25 @@ fn rewrite_respond(state: &mut State, id: ApprovalId, payload: &Value) {
         r_approver: &r_approver,
         r_new: &exchange.fake_r_new,
     }
-    .encode();
-    let (digits, key) = protocol::derive(&shared, &approver_transcript);
+    .encode_as(exchange.kind);
+    let (digits, key, hello_key) = derive(exchange.kind, &shared, &approver_transcript);
     exchange.approver_key = Some(key);
+    exchange.approver_hello_key = hello_key;
     exchange.approver_digits = Some(digits);
 
     let (fake_ct, shared) = encapsulate(&exchange.real_pk).expect("real public key");
     let fake_r_approver = random::<32>();
     // The real rN is hidden until the new device sends its reveal.
     // Keep the shared secret for deriving the new side's key on reveal.
-    exchange.response_for_new = Some(
+    exchange.response_for_new = Some(encode(
+        exchange.kind,
         Message::Response {
             approval: id,
             approver,
             ct: Box::new(fake_ct),
             r_approver: fake_r_approver,
-        }
-        .encode(),
-    );
+        },
+    ));
     exchange.new_key = Some(shared);
 }
 
@@ -279,44 +363,69 @@ fn rewrite_reveal(state: &mut State, id: ApprovalId, payload: &mut Value) {
         .exchanges
         .get_mut(&id)
         .expect("request already forwarded");
-    let Message::Reveal { r_new, .. } = Message::parse(&decode(&payload["reveal"]), id).unwrap()
-    else {
-        panic!("not a reveal")
+    let reveal = decode(&payload["reveal"]);
+    let r_new: [u8; 32] = reveal[18..50].try_into().expect("reveal random value");
+    let hello = if exchange.kind == Exchange::App {
+        assert_eq!(reveal[1], 7, "app reveal kind");
+        Some(&reveal[50..])
+    } else {
+        assert_eq!(reveal[1], 3, "device reveal kind");
+        None
     };
     let Message::Response {
         approver,
         ct,
         r_approver,
         ..
-    } = Message::parse(exchange.response_for_new.as_ref().expect("response"), id).unwrap()
+    } = parse(
+        exchange.kind,
+        exchange.response_for_new.as_ref().expect("response"),
+        id,
+    )
     else {
         unreachable!()
     };
-    let (digits, key) = protocol::derive(
+    let transcript = Transcript {
+        ids: &exchange.ids,
+        approver,
+        pk: &exchange.real_pk,
+        commitment: &exchange.real_commitment,
+        ct: &ct,
+        r_approver: &r_approver,
+        r_new: &r_new,
+    }
+    .encode_as(exchange.kind);
+    let (digits, key, hello_key) = derive(
+        exchange.kind,
         exchange.new_key.as_ref().expect("shared secret"),
-        &Transcript {
-            ids: &exchange.ids,
-            approver,
-            pk: &exchange.real_pk,
-            commitment: &exchange.real_commitment,
-            ct: &ct,
-            r_approver: &r_approver,
-            r_new: &r_new,
-        }
-        .encode(),
+        &transcript,
     );
+    let hello = hello.map(|sealed| {
+        let opened = open(
+            &hello_key.expect("app hello key"),
+            &exchange.ids,
+            11,
+            sealed,
+        )
+        .expect("the relay opens the app's hello");
+        state.opened_a_hello = true;
+        seal(
+            exchange.approver_hello_key.as_ref().unwrap(),
+            &exchange.ids,
+            11,
+            &opened,
+        )
+    });
     state.digits_for_new = Some(digits);
     state.digits_for_approver = exchange.approver_digits.clone();
     exchange.new_key = Some(key);
-    payload["reveal"] = json!(
-        URL_SAFE_NO_PAD.encode(
-            Message::Reveal {
-                approval: id,
-                r_new: exchange.fake_r_new,
-            }
-            .encode()
-        )
-    );
+    let mut forwarded = vec![1, if exchange.kind == Exchange::App { 7 } else { 3 }];
+    forwarded.extend_from_slice(&id.0);
+    forwarded.extend_from_slice(&exchange.fake_r_new);
+    if let Some(hello) = hello {
+        forwarded.extend_from_slice(&hello);
+    }
+    payload["reveal"] = json!(URL_SAFE_NO_PAD.encode(forwarded));
 }
 
 fn transform_request(
@@ -326,26 +435,36 @@ fn transform_request(
     bearer: &str,
     body: Vec<u8>,
 ) -> Vec<u8> {
-    if *method != hyper::Method::POST || !path.starts_with("/v1/approvals") {
+    if *method != hyper::Method::POST
+        || !(path.starts_with("/v1/approvals") || path.starts_with("/v1/connect"))
+    {
         return body;
     }
     let mut payload: Value = serde_json::from_slice(&body).expect("approval JSON");
-    if path == "/v1/approvals" {
-        rewrite_request(state, &mut payload, bearer);
-    } else if let Some((id, action)) = approval_action(path) {
+    if path == "/v1/approvals" || path == "/v1/connect" {
+        let kind = if path == "/v1/connect" {
+            Exchange::App
+        } else {
+            Exchange::Device
+        };
+        rewrite_request(state, &mut payload, bearer, kind);
+    } else if let Some((id, action)) = approval_action(path).or_else(|| connect_action(path)) {
         match action {
             "respond" => rewrite_respond(state, id, &payload),
             "reveal" => rewrite_reveal(state, id, &mut payload),
             "transfer" => {
                 if let Some(exchange) = state.exchanges.get(&id) {
                     let bytes = decode(&payload["transfer"]);
-                    if let Ok(Message::Transfer { account_key, .. }) = Message::parse(&bytes, id) {
-                        state.opened_a_transfer |=
-                            [exchange.new_key.as_ref(), exchange.approver_key.as_ref()]
-                                .into_iter()
-                                .flatten()
-                                .any(|key| opened(key, &exchange.ids, &account_key));
-                    }
+                    let (purpose, sealed) = match (exchange.kind, bytes.get(1)) {
+                        (Exchange::Device, Some(4)) if bytes.len() == 18 + 77 => (8, &bytes[18..]),
+                        (Exchange::App, Some(8)) if bytes.len() >= 18 + 45 => (12, &bytes[18..]),
+                        _ => (0, &[][..]),
+                    };
+                    state.opened_a_transfer |=
+                        [exchange.new_key.as_ref(), exchange.approver_key.as_ref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|key| open(key, &exchange.ids, purpose, sealed).is_some());
                 }
             }
             _ => {}
@@ -356,6 +475,12 @@ fn transform_request(
 
 fn approval_action(path: &str) -> Option<(ApprovalId, &str)> {
     let rest = path.strip_prefix("/v1/approvals/")?;
+    let (id, action) = rest.split_once('/')?;
+    Some((id.parse().ok()?, action))
+}
+
+fn connect_action(path: &str) -> Option<(ApprovalId, &str)> {
+    let rest = path.strip_prefix("/v1/connect/")?;
     let (id, action) = rest.split_once('/')?;
     Some((id.parse().ok()?, action))
 }
@@ -380,6 +505,7 @@ fn transform_response(
     }
     let Some(id) = path
         .strip_prefix("/v1/approvals/")
+        .or_else(|| path.strip_prefix("/v1/connect/"))
         .and_then(|id| id.parse::<ApprovalId>().ok())
     else {
         return body;

@@ -1,8 +1,8 @@
-use crate::{ChatModel, ChatRequest, Completion, ModelError, TINFOIL_MODEL, response};
+use crate::{ChatModel, ChatRequest, Completion, ModelError, TINFOIL_MODEL, response, stream};
 use futures_util::{StreamExt, future::BoxFuture};
 use reqwest::{Url, header};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use zeroize::Zeroizing;
 
 const HOST: &str = "inference.tinfoil.sh";
@@ -110,7 +110,11 @@ impl Tinfoil {
         Verified::connect(&self.gateway, &self.credential, &self.tls).await
     }
 
-    async fn run(&self, req: ChatRequest) -> Result<Completion, ModelError> {
+    async fn run(
+        &self,
+        req: ChatRequest,
+        text: &UnboundedSender<String>,
+    ) -> Result<Completion, ModelError> {
         let body = req.encode(&self.cache_secret)?;
         if self.credential.is_empty() {
             return Err(ModelError::InvalidRequest);
@@ -136,7 +140,8 @@ impl Tinfoil {
                 .header("x-tinfoil-model", TINFOIL_MODEL)
                 .header("BH-Protocol", "1")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json")
+                .header(header::ACCEPT, "text/event-stream")
+                .header("x-tinfoil-max-output-tokens", req.max_tokens.to_string())
                 .body(body.clone())
                 .build()
                 .map_err(|_| ModelError::InvalidRequest)?;
@@ -166,24 +171,57 @@ impl Tinfoil {
                     status => ModelError::HttpStatus(status),
                 });
             }
+            let events = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(';').next())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"));
+            let mut chunks = response.bytes_stream();
+            if events {
+                let mut decoder = stream::Decoder::new();
+                while let Some(chunk) = chunks.next().await {
+                    // The stream stopped partway, whether cut or tampered with.
+                    let chunk = chunk.map_err(|_| ModelError::Response)?;
+                    for piece in decoder.push(&chunk)? {
+                        let _ = text.send(piece);
+                    }
+                    // [DONE] is authenticated; the gateway can finish reading the trailer
+                    // without keeping the device's completion waiting for EOF.
+                    if decoder.done() {
+                        return decoder.finish();
+                    }
+                }
+                return decoder.finish();
+            }
             let mut bytes = Vec::new();
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = chunks.next().await {
                 let chunk = chunk.map_err(|_| ModelError::Encryption)?;
                 if chunk.len() > 8 * 1024 * 1024 - bytes.len() {
                     return Err(ModelError::Response);
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            return response::decode(&bytes);
+            let completion = response::decode(&bytes)?;
+            if let Some(whole) = completion.text.as_ref().filter(|t| !t.is_empty()) {
+                let _ = text.send(whole.clone());
+            }
+            return Ok(completion);
         }
         unreachable!()
     }
 }
 impl ChatModel for Tinfoil {
     fn complete(&self, req: ChatRequest) -> BoxFuture<'_, Result<Completion, ModelError>> {
+        self.complete_streaming(req, tokio::sync::mpsc::unbounded_channel().0)
+    }
+    fn complete_streaming(
+        &self,
+        req: ChatRequest,
+        text: UnboundedSender<String>,
+    ) -> BoxFuture<'_, Result<Completion, ModelError>> {
         Box::pin(async move {
-            tokio::time::timeout(Duration::from_secs(120), self.run(req))
+            tokio::time::timeout(Duration::from_secs(120), self.run(req, &text))
                 .await
                 .map_err(|_| ModelError::Transport)?
         })

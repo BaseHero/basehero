@@ -245,10 +245,11 @@ fn approval_messages_match_the_relay() {
     assert_eq!(
         serde_json::to_value(ApprovalLiveMessage::Approval {
             approval_id: ApprovalId([0xab; 16]),
+            kind: ApprovalKind::Device,
             state: ApprovalState::Responded,
             end_reason: None,
         })
         .unwrap(),
-        serde_json::json!({"t":"approval","approvalId":"abababababababababababababababab","state":"responded"})
+        serde_json::json!({"t":"approval","approvalId":"abababababababababababababababab","kind":"device","state":"responded"})
     );
 }

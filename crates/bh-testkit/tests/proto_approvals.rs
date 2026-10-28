@@ -84,7 +84,7 @@ async fn next(live: &mut Live) -> Value {
     }
 }
 fn announced(id: &str, state: &str) -> Value {
-    json!({"t": "approval", "approvalId": id, "state": state})
+    json!({"t": "approval", "approvalId": id, "kind": "device", "state": state})
 }
 
 #[tokio::test]
@@ -123,7 +123,7 @@ async fn only_pending_devices_create_and_only_full_devices_list() {
     assert_eq!(
         list,
         json!({"approvals": [{
-            "approvalId": id, "deviceId": pending.device_id, "createdAt": created_at,
+            "approvalId": id, "kind": "device", "deviceId": pending.device_id, "createdAt": created_at,
             "expiresAt": expires_at, "request": b64(&request)
         }]})
     );
@@ -367,7 +367,7 @@ async fn requests_expire_on_the_server() {
     assert_eq!(listed(&a.full).await, vec![id.clone()]);
     assert_eq!(
         next(&mut full_live).await,
-        json!({"t": "approval", "approvalId": id, "state": "ended", "endReason": "expired"})
+        json!({"t": "approval", "approvalId": id, "kind": "device", "state": "ended", "endReason": "expired"})
     );
     assert!(listed(&a.full).await.is_empty());
     assert_eq!(

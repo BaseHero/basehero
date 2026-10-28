@@ -38,6 +38,38 @@ async function noteWithHero(page) {
   await expect(page.locator('.ProseMirror')).toBeVisible();
 }
 
+test('the conversation follows a growing reply unless scrolled up', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 600 });
+  await page.goto('/');
+  const ref = await page.evaluate(async () => {
+    const { account, kit } = await window.__fake.signUp({ invite: 'DEMO', email: 'scroll@example.test', password: 'password', deviceName: 'Mac' });
+    await window.__fake.setKitSaved(account.id, kit);
+    const base = await window.__fake.createBase(account.id, 'Personal');
+    const note = await window.__fake.createObject({ account: account.id, base: base.id }, { kind: 'note', name: 'Ferry', parent: null, after: null });
+    window.__fake.seedHeroChat(account.id, base.id, null, 'scroll-chat');
+    window.__fake.seedHeroMessages(account.id, base.id, 'scroll-chat', [
+      ...Array.from({ length: 15 }, (_, index) => ({ id: `user-${index}`, role: 'user' as const, text: `Earlier question ${index}`, at: '2026-10-30T00:00:00Z', state: 'done' as const, error: null, steps: [], created: [], ask: null })),
+      { id: 'working-reply', role: 'hero', text: '', at: '2026-10-30T00:00:01Z', state: 'working', error: null, steps: [], created: [], ask: null },
+    ]);
+    return { account: account.id, base: base.id, note };
+  });
+  await page.evaluate(ref => { location.hash = `#/a/${ref.account}/b/${ref.base}/n/${ref.note}`; }, ref);
+  const panel = page.getByRole('region', { name: 'Hero' });
+  await expect(panel.getByText('Hero is working…')).toBeVisible();
+  const conversation = panel.locator('.conversation');
+  await conversation.evaluate(el => { el.scrollTop = el.scrollHeight; });
+  const stream = async (text: string) => page.evaluate(({ ref, text }) => {
+    window.__fake.heroText(ref.account, ref.base, 'scroll-chat', 'working-reply', text);
+  }, { ref, text });
+  await stream('The answer starts.');
+  await expect(panel.getByText('The answer starts.')).toBeVisible();
+  await expect.poll(() => conversation.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(3);
+  await conversation.evaluate(el => { el.scrollTop = 0; });
+  await stream('The answer starts.\n'.repeat(30));
+  await expect(panel.getByText('The answer starts.', { exact: false }).last()).toBeVisible();
+  expect(await conversation.evaluate(el => el.scrollTop)).toBe(0);
+});
+
 test('on an unfolded Fold Hero opens as a sheet wide enough to read', async ({ page }) => {
   await page.setViewportSize({ width: 852, height: 880 });
   await noteWithHero(page);

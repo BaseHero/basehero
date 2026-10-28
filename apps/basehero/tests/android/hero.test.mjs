@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
-import { launch, webview, openBase, newNote } from './lib.mjs';
+import { launch, webview, newNote } from './lib.mjs';
 
 // A screenshot of the panel with a real reply, for people checking a build.
 const screenshot = process.env.BH_HERO_SCREENSHOT ?? resolve(import.meta.dirname, '../../test-results/hero-panel.png');
+const streamingScreenshot = resolve(import.meta.dirname, '../../test-results/hero-panel-streaming.png');
 const prompt = 'Create a note titled Packing list with three items for a ferry trip.';
 
 test('Hero on dev replies, creates a note, and its button opens the editor', { timeout: 150_000 }, async () => {
@@ -17,11 +18,19 @@ test('Hero on dev replies, creates a note, and its button opens the editor', { t
       await page.locator('.hero-toggle').click();
     }
     await panel.getByLabel('Ask Hero').waitFor();
-    // On a rerun, use the already completed turn rather than spending on another call.
-    if (!await panel.getByText(prompt, { exact: true }).count()) {
-      await panel.getByLabel('Ask Hero').fill(prompt);
-      await panel.getByRole('button', { name: 'Send' }).click();
-    }
+    await panel.getByLabel('Ask Hero').fill(prompt);
+    await panel.getByRole('button', { name: 'Send' }).click();
+    // Both the reply and Stop must be visible at the same instant, before completion.
+    await page.waitForFunction(() => {
+      const panel = document.querySelector('[aria-label="Hero"]');
+      const reply = panel?.querySelector('article:not(.user):last-of-type p')?.textContent?.trim();
+      return !!reply && reply !== 'Hero is working…' &&
+        [...(panel?.querySelectorAll('button') ?? [])].some(button => button.textContent?.trim() === 'Stop');
+    }, null, { timeout: 30_000 });
+    const streamingText = await panel.locator('article:not(.user)').last().locator('p').first().textContent();
+    assert(streamingText?.trim(), 'no Hero text while Stop was available');
+    console.log('Hero streaming text:', streamingText);
+    await panel.screenshot({ path: streamingScreenshot });
     const created = panel.locator('button.created', { hasText: 'Packing list' });
     await created.waitFor({ timeout: 90_000 });
     await panel.getByText('Hero is working…').waitFor({ state: 'hidden', timeout: 90_000 });

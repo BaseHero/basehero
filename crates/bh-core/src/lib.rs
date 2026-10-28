@@ -36,7 +36,7 @@
 #![warn(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 
 mod account;
-/// The full-device approval exchange and its protocol types.
+/// The full-device approval and app connection exchanges and their protocol types.
 pub mod approval;
 mod base;
 mod client;
@@ -72,7 +72,11 @@ pub use account::{
     Account, AccountEvent, AccountSummary, AccountUsage, AppCredentials, AppGrant, AppRequest,
     AppSummary, BaseGrantRequest, DeviceKind, DeviceSummary, KitStatus,
 };
-pub use approval::{Approval, ApprovalRequest, OpenRequest, protocol::Digits};
+pub use approval::connect::{
+    AppChoice, AppIdentity, AppOffer, DEFAULT_APP_CAP_MICRO_USD, OldConnection, OpenAppRequest,
+    PendingConnection,
+};
+pub use approval::{Approval, ApprovalRequest, OpenRequest, RequestKind, protocol::Digits};
 pub use base::{Base, BaseSummary, Mode};
 pub use bh_proto::{AccountId, ApprovalId, BaseId, DeviceId, ObjectId};
 pub use clock::{Clock, ManualClock};

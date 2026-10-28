@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
+import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type AppOffer, type AppChoiceInput, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
 
 export class FakeBackend implements Backend {
   calls: string[] = [];
@@ -41,6 +41,9 @@ export class FakeBackend implements Backend {
   private usageList = new Map<string, AccountUsage>();
   private usageDays = new Map<string, UsageRow[]>();
   private approvalList = new Map<string, ApprovalRequest[]>();
+  private appOffers = new Map<string, AppOffer>();
+  private failAppRemoval = false;
+  appChoices: { account: string; id: string; choice: AppChoiceInput }[] = [];
   private approvalDigitsValues = new Map<string, string>();
   private digitWaiters = new Map<string, (digits: string) => void>();
   private approvalWaiters = new Map<string, { resolve: (account: AccountSummary) => void; reject: (error: BackendError) => void }>();
@@ -130,7 +133,10 @@ export class FakeBackend implements Backend {
     }
     for (const handler of this.handlers) handler(e);
   }
-  addApprovalRequest(account: string, request: ApprovalRequest) { this.approvalList.set(account, [...(this.approvalList.get(account) ?? []), request]); }
+  addApprovalRequest(account: string, request: Omit<ApprovalRequest, 'kind'> & Partial<ApprovalRequest>) { this.approvalList.set(account, [...(this.approvalList.get(account) ?? []), { kind: 'Device', ...request }]); }
+  addAppRequest(account: string, request: ApprovalRequest) { this.approvalList.set(account, [...(this.approvalList.get(account) ?? []), request]); }
+  setAppOffer(id: string, offer: AppOffer) { this.appOffers.set(id, offer); }
+  failNextAppRemoval() { this.failAppRemoval = true; }
   setApprovalDigits(pending: string, digits: string) { this.approvalDigitsValues.set(pending, digits); this.digitWaiters.get(pending)?.(digits); this.digitWaiters.delete(pending); }
   completeApproval(pending: string) { const account = this.installPending(pending); this.approvalsDone.set(pending, account); this.approvalWaiters.get(pending)?.resolve(account); this.approvalWaiters.delete(pending); }
   endApproval(pending: string, reason: string) { this.approvalWaiters.get(pending)?.reject(new BackendError('ApprovalEnded', reason)); this.approvalWaiters.delete(pending); }
@@ -149,6 +155,11 @@ export class FakeBackend implements Backend {
   private heroKey(account: string, base: string, chat: string) { return `${account}:${base}:${chat}`; }
   private heroChanged(account: string, base: string, chat: string) {
     this.emit({ kind: 'hero', account, base, chat, event: { changed: { base, chat } } });
+  }
+  heroText(account: string, base: string, chat: string, message: string, text: string) {
+    const last = this.heroMessagesByChat.get(this.heroKey(account, base, chat))?.at(-1);
+    if (last?.id === message && last.state === 'working') last.text = text;
+    this.emit({ kind: 'hero', account, base, chat, event: { text: { base, chat, message, text } } });
   }
   async heroChats(account: string, base: string) { this.log('heroChats', account); return [...(this.heroChatsByBase.get(`${account}:${base}`) ?? [])]; }
   async heroChatFor(account: string, base: string, project: string | null) {
@@ -190,7 +201,12 @@ export class FakeBackend implements Backend {
     if (last?.state === 'failed') { last.state = 'working'; last.error = null; }
     this.heroChanged(account, base, chat);
   }
-  setDevices(account: string, devices: DeviceSummary[]) { this.deviceList.set(account, [...devices]); }
+  setDevices(account: string, devices: (Omit<DeviceSummary, 'capMicroUsd'> & { capMicroUsd?: number | null })[]) {
+    this.deviceList.set(account, devices.map(device => ({
+      ...device,
+      capMicroUsd: device.capMicroUsd ?? (device.kind.toLowerCase() === 'app' ? 1_000_000 : null),
+    })));
+  }
   seedUsage(account: string, usage: AccountUsage) { this.usageList.set(account, usage); }
   seedUsageDays(account: string, month: string, days: UsageRow[]) { this.usageDays.set(`${account}:${month}`, days); }
   setSync(r: BaseRef, s: SyncState) { this.sync.set(this.key(r), s); this.emit({ kind: 'base', account: r.account, base: r.base, event: { sync: s } }); }
@@ -212,7 +228,7 @@ export class FakeBackend implements Backend {
   }
   async accounts() { this.log('accounts'); if (this.keyUnavailable) throw new BackendError('KeyUnavailable', 'Keychain status -25308'); return [...this.accountList]; }
   async resetDevice() { this.log('resetDevice'); if (!this.keyUnavailable) throw new BackendError('Invalid', 'No key error'); this.keyUnavailable = false; this.accountList = []; }
-  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full' }; this.accountList.push(account); this.deviceList.set(account.id, [{ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); this.scheduleKitSave(account.id); return { account, kit };  }
+  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full' }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); this.scheduleKitSave(account.id); return { account, kit };  }
   async signInStart(form: SignInForm) { this.log('signInStart'); return form.email; }
   async signInSavedKit(_pending: string): Promise<AccountSummary | null> { this.log('signInSavedKit'); return null; }
   async signInWithKit(pending: string, kit: string) { this.log('signInWithKit'); const existing = this.accountList.find(a => a.email === pending); if (kit !== (existing ? this.kits.get(existing.id) : '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC')) throw new BackendError('BadKit', 'Bad kit'); if (existing) return existing; const account: AccountSummary = { id: this.id(), email: pending, kind: 'full' }; this.accountList.push(account); this.passwords.set(account.id, 'correct horse battery staple'); this.kits.set(account.id, kit); this.kitStates.set(account.id, { known: true, saved: true, madeAt: Date.now() }); return account; }
@@ -226,6 +242,31 @@ export class FakeBackend implements Backend {
   async approvalOpen(account: string, id: string): Promise<OpenedRequest> { this.log('approvalOpen', account); if (!this.approvalList.get(account)?.some(r => r.id === id)) throw new BackendError('NotFound', 'Not found'); return { id }; }
   async approvalApprove(account: string, id: string, digits: string) { this.log('approvalApprove', account); if (!/^\d{6}$/.test(digits.replace(/[ -]/g, ''))) throw new BackendError('Invalid', 'Invalid digits'); this.approvalList.set(account, (this.approvalList.get(account) ?? []).filter(r => r.id !== id)); return this.id(); }
   async approvalDecline(account: string, id: string) { this.log('approvalDecline', account); this.approvalList.set(account, (this.approvalList.get(account) ?? []).filter(r => r.id !== id)); this.emit({ kind: 'account', account, event: { ApprovalClosed: id } }); }
+  async connectOpen(account: string, id: string): Promise<OpenedRequest> {
+    this.log('connectOpen', account);
+    if (!this.approvalList.get(account)?.some(r => r.id === id && r.kind === 'App')) throw new BackendError('NotFound', 'Not found');
+    return { id };
+  }
+  async connectCheck(account: string, id: string, digits: string): Promise<AppOffer> {
+    this.log('connectCheck', account);
+    const offer = this.appOffers.get(id);
+    if (!offer || !/^482[ -]?913$/.test(digits)) throw new BackendError('ApprovalEnded', 'WrongDigits');
+    return offer;
+  }
+  async connectApprove(account: string, id: string, choice: AppChoiceInput): Promise<[string, boolean]> {
+    this.log('connectApprove', account);
+    this.appChoices.push({ account, id, choice });
+    this.approvalList.set(account, (this.approvalList.get(account) ?? []).filter(r => r.id !== id));
+    const removed = choice.replaces !== null && !this.failAppRemoval;
+    this.failAppRemoval = false;
+    return [this.id(), removed];
+  }
+  async setAppCap(account: string, device: string, capMicroUsd: number): Promise<void> {
+    this.calls.push(`setAppCap ${device} ${capMicroUsd}`);
+    const target = this.deviceList.get(account)?.find(item => item.id === device);
+    if (!target || target.kind.toLowerCase() !== 'app') throw new BackendError('NotFound', 'Not found');
+    target.capMicroUsd = capMicroUsd;
+  }
   async signOut(account: string) { this.log('signOut', account); this.accountList = this.accountList.filter(a => a.id !== account); }
   async newKit(account: string, password: string): Promise<string> {
     this.log('newKit', account);

@@ -80,7 +80,8 @@ impl ChatRequest {
             if let Some(id) = &m.tool_call_id { value["tool_call_id"] = json!(id); }
             value
         }).collect();
-        let mut value = json!({"model":TINFOIL_MODEL,"stream":false,"messages":messages,
+        let mut value = json!({"model":TINFOIL_MODEL,"stream":true,
+            "stream_options":{"include_usage":true},"messages":messages,
             "max_tokens":self.max_tokens,"user_cache_secret":cache_secret});
         if !self.tools.is_empty() {
             value["tools"] = json!(

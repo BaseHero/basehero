@@ -333,6 +333,117 @@ async fn app_device_cannot_read_the_account() {
     assert_eq!(body["bases"], json!([]));
 }
 #[tokio::test]
+async fn an_app_device_gets_a_cap_of_one_dollar_unless_given_one() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let first = id();
+    let second = id();
+    for (device, cap) in [(&first, None), (&second, Some(250_000))] {
+        let mut payload = json!({"deviceId":device,"kind":"app"});
+        if let Some(cap) = cap {
+            payload["capMicroUsd"] = json!(cap);
+        }
+        assert_eq!(
+            f.device(s).post("/v1/devices", payload).await.0,
+            StatusCode::OK
+        );
+    }
+    let (status, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let devices = account["devices"].as_array().unwrap();
+    assert!(
+        devices
+            .iter()
+            .find(|d| d["deviceId"] == f.device_id)
+            .unwrap()
+            .get("capMicroUsd")
+            .is_none()
+    );
+    assert_eq!(
+        devices.iter().find(|d| d["deviceId"] == first).unwrap()["capMicroUsd"],
+        1_000_000
+    );
+    assert_eq!(
+        devices.iter().find(|d| d["deviceId"] == second).unwrap()["capMicroUsd"],
+        250_000
+    );
+}
+#[tokio::test]
+async fn only_full_devices_change_an_app_cap() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let app_id = id();
+    let (_, created) = f
+        .device(s)
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    let app = RawDevice::new(
+        s,
+        f.account_id.clone(),
+        app_id.clone(),
+        created["token"].as_str().unwrap().to_string(),
+    );
+    let path = format!("/v1/devices/{app_id}/cap");
+    assert_eq!(
+        f.device(s)
+            .put(&path, json!({"capMicroUsd":5_000_000}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(
+        account["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["deviceId"] == app_id)
+            .unwrap()["capMicroUsd"],
+        5_000_000
+    );
+    assert_eq!(
+        app.put(&path, json!({"capMicroUsd":1})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.device(s)
+            .put(
+                &format!("/v1/devices/{}/cap", f.device_id),
+                json!({"capMicroUsd":1})
+            )
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for bad in [json!(-1), json!(1.5), json!("1")] {
+        assert_eq!(
+            f.device(s).put(&path, json!({"capMicroUsd":bad})).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+#[tokio::test]
+async fn account_bases_come_in_creation_order() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let first = "ffffffffffffffffffffffffffffffff";
+    let second = "00000000000000000000000000000000";
+    for base in [first, second] {
+        assert_eq!(
+            f.device(s)
+                .post(
+                    "/v1/bases",
+                    json!({"baseId":base,"epoch":1,"wrapper":b64(&random(48))})
+                )
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(account["bases"], json!([first, second]));
+}
+#[tokio::test]
 async fn credentials_rotate_the_verifier_and_envelope() {
     let s = LocalServer::from_env();
     let f = registered(s).await;

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{BaseId, ObjectId};
 use bh_models::{ChatModel, ChatRequest, Message, ModelError, Role, ToolCall, ToolChoice};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 pub(crate) struct TurnLimits {
     pub max_calls: usize,
@@ -22,15 +22,27 @@ impl Default for TurnLimits {
     }
 }
 pub(crate) enum ResultKind {
-    Answer(String),
+    Answer,
     Ask(BaseId),
     Failed(&'static str),
     Stopped,
 }
 pub(crate) struct TurnOutcome {
     pub kind: ResultKind,
+    /// The text of all model calls, joined by a blank line.
+    pub text: String,
     pub steps: Vec<Step>,
     pub created: Vec<ObjectId>,
+}
+impl TurnOutcome {
+    pub fn failed() -> Self {
+        Self {
+            kind: ResultKind::Failed("failed"),
+            text: String::new(),
+            steps: vec![],
+            created: vec![],
+        }
+    }
 }
 fn code(error: ModelError) -> &'static str {
     match error {
@@ -50,15 +62,22 @@ fn message(role: Role, content: Option<String>) -> Message {
     }
 }
 /// Runs calls in sequence and returns the first permission request without making another model call.
+/// `on_text` gets the turn's text so far after each piece, and `true` once a model call ends.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the model, tools, request, limits, cancellation and callbacks are distinct"
+)]
 pub(crate) async fn run(
     model: &dyn ChatModel,
     tools: &mut Tools,
     mut request: Vec<Message>,
     limits: TurnLimits,
     mut cancel: watch::Receiver<bool>,
+    mut on_text: impl FnMut(&str, bool),
     mut progress: impl FnMut(&Step, &[ObjectId]),
     mut guarded_call: impl FnMut(&mut Tools, &ToolCall) -> Option<ToolResult>,
 ) -> TurnOutcome {
+    let mut text = String::new();
     let mut steps = vec![];
     let mut created = vec![];
     let kind = 'turn: {
@@ -83,20 +102,47 @@ pub(crate) async fn run(
             {
                 req.messages.remove(1);
             }
-            let completion = tokio::select! {
-                biased;
-                _ = cancel.changed() => break 'turn ResultKind::Stopped,
-                result = model.complete(req.clone()) => result,
+            // Pieces of this call follow a blank line after an earlier call's text.
+            let start = text.len();
+            let add = |text: &mut String, piece: String| {
+                if piece.is_empty() {
+                    return false;
+                }
+                if text.len() == start && start > 0 {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&piece);
+                true
             };
+            let (sender, mut pieces) = mpsc::unbounded_channel();
+            let call = model.complete_streaming(req.clone(), sender);
+            tokio::pin!(call);
+            let completion = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => break 'turn ResultKind::Stopped,
+                    Some(piece) = pieces.recv() => {
+                        if add(&mut text, piece) && !*cancel.borrow() {
+                            on_text(&text, false);
+                        }
+                    }
+                    result = &mut call => break result,
+                }
+            };
+            // The call may send its last pieces just before it resolves.
+            while let Ok(piece) = pieces.try_recv() {
+                add(&mut text, piece);
+            }
             if *cancel.borrow() {
                 break 'turn ResultKind::Stopped;
             }
+            on_text(&text, true);
             let completion = match completion {
                 Ok(value) => value,
                 Err(err) => break 'turn ResultKind::Failed(code(err)),
             };
             if completion.tool_calls.is_empty() {
-                break 'turn ResultKind::Answer(completion.text.unwrap_or_default());
+                break 'turn ResultKind::Answer;
             }
             // Keep the exact tool-call envelope alongside results for the next request.
             request = req.messages;
@@ -131,6 +177,7 @@ pub(crate) async fn run(
     };
     TurnOutcome {
         kind,
+        text,
         steps,
         created,
     }

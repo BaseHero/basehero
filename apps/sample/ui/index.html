@@ -4,7 +4,10 @@
 <style>body{font:16px system-ui,sans-serif;max-width:36rem;margin:2rem auto;padding:0 1.2rem;background:#f7f8fb;color:#1a2635}button,input{font:inherit;padding:.7rem;margin:.4rem 0}button{display:block;width:100%;background:#185fb4;color:white;border:0;border-radius:.4rem}input{box-sizing:border-box;width:100%}#status{white-space:pre-wrap;overflow-wrap:anywhere;padding:1rem;border-radius:.4rem;background:white}</style>
 </head>
 <body><main id="app"><h1>BaseHero Sample</h1><p>Connect a base, write one reading per day, and read it back.</p>
-<button id="connect">Connect</button><label for="value">Reading value</label><input id="value" type="number" value="42" step="any">
+<label for="email">BaseHero email</label><input id="email" type="email" autocomplete="email">
+<button id="connect">Connect to BaseHero</button><button id="cancel" type="button">Cancel</button>
+<p>Approve only an app you're setting up right now.</p>
+<p id="digits" aria-live="polite"></p><p id="digits-help" hidden>Type these digits in BaseHero.</p><label for="value">Reading value</label><input id="value" type="number" value="42" step="any">
 <button id="write">Write reading</button><button id="read">Read back</button>
 <label for="question">Model question</label><input id="question" value="Reply with the word ferry."><button id="ask">Ask the model</button>
 <p id="status" role="status">Starting…</p></main><script src="./main.js" defer></script></body></html>

@@ -1,34 +1,37 @@
 #[cfg(target_os = "android")]
 mod android_tls;
 
-use basehero_sample_core::{CREDENTIALS_FILE, Sample};
+use basehero_sample_core::Sample;
 use bh_core::FileSecretStore;
 use std::sync::Arc;
 use tauri::Manager;
 
 #[tauri::command]
-fn status(sample: tauri::State<'_, Sample>) -> String {
-    match sample.connected() {
-        Some(c) => format!("connected {} as {}", c.base, c.device),
-        None => "not connected".into(),
+async fn status(sample: tauri::State<'_, Sample>) -> Result<String, String> {
+    match sample.check_connection().await.map_err(|e| e.to_string())? {
+        Some(c) => Ok(format!("connected {} as {}", c.base, c.device)),
+        None => Ok("not connected".into()),
     }
 }
 
 #[tauri::command]
-async fn connect(
-    app: tauri::AppHandle,
-    sample: tauri::State<'_, Sample>,
-) -> Result<String, String> {
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join(CREDENTIALS_FILE);
-    let c = sample
-        .install_file(&path)
+async fn connect_start(sample: tauri::State<'_, Sample>, email: String) -> Result<String, String> {
+    sample
+        .connect_digits(&email)
         .await
-        .map_err(|e| e.to_string())?;
+        .map(|digits| digits.to_string())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn connect_finish(sample: tauri::State<'_, Sample>) -> Result<String, String> {
+    let c = sample.connect_finish().await.map_err(|e| e.to_string())?;
     Ok(format!("connected {} as {}", c.base, c.device))
+}
+
+#[tauri::command]
+async fn connect_cancel(sample: tauri::State<'_, Sample>) -> Result<(), String> {
+    sample.connect_cancel().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -74,7 +77,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             status,
-            connect,
+            connect_start,
+            connect_finish,
+            connect_cancel,
             write_reading,
             read_back,
             ask_model

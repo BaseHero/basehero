@@ -140,6 +140,16 @@ async fn devices(
 }
 
 #[tauri::command]
+async fn set_app_cap(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    device: bh_core::DeviceId,
+    cap_micro_usd: u64,
+) -> Result<(), error::CommandError> {
+    commands::account::set_app_cap(startup.state()?, account, device, cap_micro_usd).await
+}
+
+#[tauri::command]
 async fn usage(
     startup: tauri::State<'_, state::Startup>,
     account: bh_core::AccountId,
@@ -268,6 +278,9 @@ pub fn run() {
             commands::approval::ipc::approval_open,
             commands::approval::ipc::approval_approve,
             commands::approval::ipc::approval_decline,
+            commands::approval::ipc::connect_open,
+            commands::approval::ipc::connect_check,
+            commands::approval::ipc::connect_approve,
             sign_out,
             new_kit,
             kit_status,
@@ -275,6 +288,7 @@ pub fn run() {
             show_kit,
             set_kit_saved,
             devices,
+            set_app_cap,
             usage,
             remove_device,
             commands::note::note_open,

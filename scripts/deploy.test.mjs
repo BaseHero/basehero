@@ -55,6 +55,11 @@ test('production Worker config does not enable test bypass or clock override', (
   assert.doesNotMatch(production, /^\s*(?:ALLOW_TEST_BYPASS|GATEWAY_NOW_MS)\s*=/m);
 });
 
+test('no deployed Worker connects to a test model upstream', () => {
+  const wrangler = readFileSync(resolve(dirname(source), '../server/wrangler.toml'), 'utf8');
+  assert.doesNotMatch(wrangler, /TINFOIL_CONNECT/);
+});
+
 for (const status of ['200', '503']) {
   test(`secret lookup failure with Worker API status ${status} changes nothing`, () => {
     const { result, calls } = runWithFailedList(status);

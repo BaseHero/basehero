@@ -1,47 +1,39 @@
 //! A small native sample: all credentials and records stay out of the WebView.
 use bh_core::{
-    Account, AccountId, Base, BaseId, Core, CoreConfig, DeviceId, Error, FieldDef, FieldKind,
-    Filter, Mode, NewObject, ObjectId, Op, Order, Query, SecretStore, TypeDef, TypeRef,
+    Account, AccountId, AppIdentity, Base, BaseId, Core, CoreConfig, DeviceId, Digits, Error,
+    FieldDef, FieldKind, Filter, Mode, NewObject, ObjectId, Op, Order, PendingConnection, Query,
+    SecretStore, TypeDef, TypeRef, Url,
     models::{ChatRequest, Message, Role},
 };
 use serde_json::{Map, json};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, watch};
 
 pub const READING: &str = "sample.reading";
-pub const CREDENTIALS_FILE: &str = "app-credentials.json";
 
-// snippet:install
-mod install_example {
-    use bh_core::{Account, AppCredentials, BaseId, Core, Error, Mode, TypeDef};
-    use std::{path::Path, time::Duration};
+// snippet:connect
+mod connect_example {
+    use bh_core::{Account, BaseId, Error, Mode, PendingConnection, TypeDef};
+    use std::time::Duration;
 
-    pub async fn install_file(
-        core: &Core,
-        path: &Path,
+    pub async fn finish(
+        pending: &mut PendingConnection,
         ty: TypeDef,
     ) -> Result<(Account, BaseId), Error> {
-        // This file is private app storage, never passed to the WebView.
-        let bytes = std::fs::read(path)?;
-        let credentials: AppCredentials =
-            serde_json::from_slice(&bytes).map_err(|e| Error::Invalid(e.to_string()))?;
-        let base_id = *credentials
-            .bases
+        let account = pending.wait().await?;
+        let base_id = account
+            .bases()
             .first()
-            .ok_or_else(|| Error::Invalid("no base grant".into()))?;
-        let account = core.install_app(credentials).await?;
+            .ok_or_else(|| Error::Invalid("no base grant".into()))?
+            .id;
         let base = account.base(base_id)?;
-        // A second installation must fetch existing records before query-and-create.
+        // A reinstalled app catches up before querying or creating a daily record.
         tokio::time::timeout(Duration::from_secs(30), base.sync_now())
             .await
             .map_err(|_| Error::Network("first catch-up timed out".into()))??;
         if base.mode() == Mode::ReadWrite {
             base.define_type(ty)?;
         }
-        std::fs::remove_file(path)?;
         Ok((account, base_id))
     }
 }
@@ -92,12 +84,30 @@ pub struct Reading {
 }
 pub struct Sample {
     core: Core,
+    server: Url,
+    pending: Mutex<Option<PendingConnection>>,
+    cancelled: watch::Sender<bool>,
 }
 
 impl Sample {
     pub fn open(data_dir: PathBuf, secrets: Arc<dyn SecretStore>) -> Result<Self, Error> {
+        Self::open_with_server(
+            data_dir,
+            secrets,
+            "https://dev-api.basehero.com/".parse().unwrap(),
+        )
+    }
+
+    pub fn open_with_server(
+        data_dir: PathBuf,
+        secrets: Arc<dyn SecretStore>,
+        server: Url,
+    ) -> Result<Self, Error> {
         Ok(Self {
             core: Core::open(CoreConfig { data_dir, secrets })?,
+            server,
+            pending: Mutex::new(None),
+            cancelled: watch::channel(false).0,
         })
     }
 
@@ -120,14 +130,69 @@ impl Sample {
         })
     }
 
-    pub async fn install_file(&self, path: &Path) -> Result<Connected, Error> {
-        let (account, base) =
-            install_example::install_file(&self.core, path, reading_type()).await?;
+    /// Checks the server before presenting a saved connection; a revoked app erases its copy.
+    pub async fn check_connection(&self) -> Result<Option<Connected>, Error> {
+        if let Ok(account) = self.account()
+            && matches!(account.refresh().await, Err(Error::Revoked))
+        {
+            account.sign_out().await?;
+        }
+        Ok(self.connected())
+    }
+
+    pub async fn connect_digits(&self, email: &str) -> Result<Digits, Error> {
+        self.cancelled.send_replace(false);
+        let mut cancelled = self.cancelled.subscribe();
+        let mut pending = self
+            .core
+            .start_connection(
+                self.server.clone(),
+                email,
+                AppIdentity {
+                    name: "BaseHero Sample".into(),
+                    app_id: "app.basehero.sample".into(),
+                },
+            )
+            .await?;
+        let digits = tokio::select! {
+            result = pending.digits() => result,
+            _ = cancelled.changed() => {
+                pending.cancel().await?;
+                return Err(Error::ApprovalEnded(bh_core::EndReason::Cancelled));
+            }
+        }?;
+        *self.pending.lock().await = Some(pending);
+        if *self.cancelled.borrow() {
+            self.connect_cancel().await?;
+            return Err(Error::ApprovalEnded(bh_core::EndReason::Cancelled));
+        }
+        Ok(digits)
+    }
+
+    pub async fn connect_finish(&self) -> Result<Connected, Error> {
+        let mut pending = self.pending.lock().await.take().ok_or(Error::NotFound)?;
+        let mut cancelled = self.cancelled.subscribe();
+        let result = tokio::select! {
+            result = connect_example::finish(&mut pending, reading_type()) => result,
+            _ = cancelled.changed() => {
+                pending.cancel().await?;
+                return Err(Error::ApprovalEnded(bh_core::EndReason::Cancelled));
+            }
+        };
+        let (account, base) = result?;
         Ok(Connected {
             account: account.id(),
             device: account.device_id(),
             base,
         })
+    }
+
+    pub async fn connect_cancel(&self) -> Result<(), Error> {
+        self.cancelled.send_replace(true);
+        if let Some(mut pending) = self.pending.lock().await.take() {
+            pending.cancel().await?;
+        }
+        Ok(())
     }
 
     pub async fn write_reading(&self, day: &str, value: f64) -> Result<ObjectId, Error> {

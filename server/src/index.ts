@@ -4,7 +4,9 @@ import type { CredentialsRequest } from './proto/gen/CredentialsRequest';
 import type { HealthResponse } from './proto/gen/HealthResponse';
 import { accountStub, answer, b64, body, bytes, equal, error, hex, HttpError, id, json, randomBytes, requireDevice, sha, str, testBypass, verifier } from './http';
 import { handleBases } from './bases';
-import { handleApprovals } from './approvals';
+import { handleApprovals, message } from './approvals';
+import type { ConnectCreateRequest } from './proto/gen/ConnectCreateRequest';
+import type { ApprovalEndReason } from './proto/gen/ApprovalEndReason';
 import type { Env, Result } from './http';
 import { gatewayStub, handleModels } from './gateway';
 import { accountUsage, monthQuery, storageRow } from './usage';
@@ -14,7 +16,8 @@ export { BaseDO } from './base';
 export { DirectoryDO } from './directory';
 export { InvitesDO } from './invites';
 
-type DirectoryRpc = { lookup(): Promise<string | null>; claim(id: string): Promise<boolean>; release(id: string): Promise<void> };
+type ConnectRpc = Pick<import('./http').AccountRpc, 'connectCreate' | 'connectState' | 'connectReveal' | 'connectEnd'>;
+type DirectoryRpc = ConnectRpc & { lookup(): Promise<string | null>; claim(id: string): Promise<boolean>; release(id: string): Promise<void> };
 type InvitesRpc = { issue(): Promise<string>; valid(code: string): Promise<boolean>; consume(code: string, id: string): Promise<boolean> };
 function invites(env: Env): InvitesRpc { return env.INVITES.get(env.INVITES.idFromName('invites')) as unknown as InvitesRpc; }
 async function directory(env: Env, email: string): Promise<DirectoryRpc> {
@@ -152,6 +155,35 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const result = await accountStub(env, accountId).login(input.loginKey, input.deviceId, value, hex(await sha(value)));
     return answer(result.status === 200 ? { status: 200, body: { ...(result.body as object), accountId } } : result);
   }
+  if (path === '/v1/connect' && request.method === 'POST') {
+    await limit(request, env);
+    const raw = await body(request);
+    const input: ConnectCreateRequest = { email: address(raw.email), approvalId: id(raw.approvalId), deviceId: id(raw.deviceId), secretHash: str(raw.secretHash), request: message(raw.request) };
+    bytes(input.secretHash, 32);
+    const dir = await directory(env, input.email);
+    const accountId = await dir.lookup();
+    const relay: ConnectRpc = accountId ? accountStub(env, accountId) : dir;
+    return answer(await relay.connectCreate(input.approvalId, input.deviceId, input.secretHash, input.request));
+  }
+  if (path.startsWith('/v1/connect/')) {
+    const match = /^\/v1\/connect\/([^/]+)(\/reveal)?$/.exec(path);
+    if (!match) throw new HttpError(404, 'not_found');
+    const approvalId = id(match[1]);
+    if (match[2] ? request.method !== 'POST' : request.method !== 'GET' && request.method !== 'DELETE') throw new HttpError(404, 'not_found');
+    const secret = /^Connect ([A-Za-z0-9_-]{43})$/.exec(request.headers.get('Authorization') ?? '');
+    if (!secret) throw new HttpError(403, 'forbidden');
+    const secretBytes = bytes(secret[1], 32);
+    const email = address(request.headers.get('BH-Email'));
+    const dir = await directory(env, email);
+    const accountId = await dir.lookup();
+    const relay: ConnectRpc = accountId ? accountStub(env, accountId) : dir;
+    const secretHash = b64(await sha(secretBytes));
+    if (request.method === 'GET') return answer(await relay.connectState(approvalId, secretHash));
+    const raw = await body(request);
+    if (request.method === 'POST') return answer(await relay.connectReveal(approvalId, secretHash, message(raw.reveal)));
+    if (typeof raw.reason !== 'string' || !['cancelled', 'failed', 'expired'].includes(raw.reason)) throw new HttpError(400, 'bad_request');
+    return answer(await relay.connectEnd(approvalId, secretHash, raw.reason as ApprovalEndReason));
+  }
   if (!path.startsWith('/v1/')) throw new HttpError(404, 'not_found');
   if (path === '/v1/bases' || path.startsWith('/v1/bases/')) return handleBases(request, env, path);
   if (path === '/v1/approvals' || path.startsWith('/v1/approvals/')) return handleApprovals(request, env, path);
@@ -179,9 +211,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     result = await account.credentials(principal, input);
   } else if (request.method === 'POST' && path === '/v1/devices') {
     const raw = await body(request); const deviceId = id(raw.deviceId);
-    if (raw.kind !== 'app') throw new HttpError(400, 'bad_request');
+    if (raw.kind !== 'app' || (raw.capMicroUsd !== undefined && (!Number.isSafeInteger(raw.capMicroUsd) || (raw.capMicroUsd as number) < 0))) throw new HttpError(400, 'bad_request');
     const value = token(principal.accountId);
-    result = await account.addDevice(principal, deviceId, value, hex(await sha(value)));
+    result = await account.addDevice(principal, deviceId, value, hex(await sha(value)), raw.capMicroUsd as number | undefined);
+  } else if (request.method === 'PUT' && /^\/v1\/devices\/[^/]+\/cap$/.test(path)) {
+    const deviceId = id(path.slice('/v1/devices/'.length, -'/cap'.length));
+    const raw = await body(request);
+    if (!Number.isSafeInteger(raw.capMicroUsd) || (raw.capMicroUsd as number) < 0) throw new HttpError(400, 'bad_request');
+    result = await account.setCap(principal, deviceId, raw.capMicroUsd as number);
+  } else if (request.method === 'POST' && path === '/v1/devices/test-last-seen' && testBypass(request, env)) {
+    const raw = await body(request);
+    const deviceId = id(raw.deviceId);
+    if (!Number.isSafeInteger(raw.lastSeenAt)) throw new HttpError(400, 'bad_request');
+    result = await account.testLastSeen(principal, deviceId, raw.lastSeenAt as number);
   } else if (request.method === 'POST' && path === '/v1/devices/fail-next-removal' && testBypass(request, env)) {
     result = await account.failRemovalOnce(principal);
   } else if (request.method === 'DELETE' && path.startsWith('/v1/devices/')) {

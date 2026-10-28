@@ -1,47 +1,64 @@
-use basehero_sample_core::{CREDENTIALS_FILE, READING, Sample};
+use basehero_sample_core::{READING, Sample};
 use bh_core::{
-    Account, AppCredentials, AppRequest, BaseGrantRequest, Error, FileSecretStore, Mode, Query,
+    Account, AppChoice, AppOffer, BaseGrantRequest, Error, FileSecretStore, Mode, Query,
     SecretStore,
 };
 use bh_models::{
     Completion, Finish, ToolCall,
     testing::{Scripted, ScriptedModel},
 };
-use bh_testkit::{device, new_signup, wait_for, wait_for_base};
+use bh_testkit::{LocalServer, approve_next_app, device, new_signup, wait_for, wait_for_base};
 use serde_json::json;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 
 fn sample(dir: &Path) -> Sample {
     let secrets: Arc<dyn SecretStore> =
         Arc::new(FileSecretStore::new(dir.join("secrets")).unwrap());
-    Sample::open(dir.join("data"), secrets).unwrap()
+    Sample::open_with_server(dir.join("data"), secrets, LocalServer::from_env().url()).unwrap()
 }
-fn credentials(dir: &Path, creds: &AppCredentials) -> std::path::PathBuf {
-    let path = dir.join(CREDENTIALS_FILE);
-    std::fs::write(&path, serde_json::to_vec(creds).unwrap()).unwrap();
-    path
+fn defaults(offer: &AppOffer) -> AppChoice {
+    AppChoice {
+        bases: offer
+            .bases
+            .iter()
+            .map(|grant| BaseGrantRequest::Existing {
+                base: grant.base,
+                mode: grant.mode,
+            })
+            .collect(),
+        cap_micro_usd: offer.cap_micro_usd,
+        replaces: None,
+    }
 }
-async fn setup(mode: Mode) -> (Account, bh_core::Base, TempDir, Sample, std::path::PathBuf) {
+async fn setup() -> (Account, bh_core::Base, TempDir, Sample) {
     let (full, _) = device("full").sign_up(new_signup()).await.unwrap();
-    let base = full.create_base("Sample readings").await.unwrap();
-    base.flush().await.unwrap();
-    let creds = full
-        .connect_app(AppRequest {
-            app_name: "Tester - BaseHero Sample".into(),
-            app_id: None,
-            bases: vec![BaseGrantRequest::Existing {
-                base: base.id(),
-                mode,
-            }],
-            replaces: None,
-        })
-        .await
-        .unwrap();
+    let base = full.create_base("Personal").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = credentials(dir.path(), &creds);
     let app = sample(dir.path());
-    (full, base, dir, app, path)
+    (full, base, dir, app)
+}
+async fn connect(
+    full: &Account,
+    app: &Sample,
+    choose: impl FnOnce(&AppOffer) -> AppChoice + Send + 'static,
+) -> basehero_sample_core::Connected {
+    let (tx, rx) = oneshot::channel();
+    let email = full.email();
+    let full = full.clone();
+    let approver = tokio::spawn(async move { approve_next_app(&full, rx, choose).await });
+    let digits = tokio::time::timeout(Duration::from_secs(30), app.connect_digits(&email))
+        .await
+        .unwrap()
+        .unwrap();
+    tx.send(digits).unwrap();
+    let connected = tokio::time::timeout(Duration::from_secs(30), app.connect_finish())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(connected.device, approver.await.unwrap().unwrap());
+    connected
 }
 fn records(base: &bh_core::Base) -> Vec<bh_core::ObjectSummary> {
     base.query(&Query {
@@ -54,13 +71,12 @@ fn records(base: &bh_core::Base) -> Vec<bh_core::ObjectSummary> {
 }
 
 #[tokio::test]
-async fn the_sample_connects_writes_and_reads_back() {
-    let (_full, base, _dir, app, path) = setup(Mode::ReadWrite).await;
-    let connected = app.install_file(&path).await.unwrap();
+async fn the_sample_connects_by_approval_writes_and_reads_back() {
+    let (full, base, _dir, app) = setup().await;
+    let connected = connect(&full, &app, defaults).await;
     assert_eq!(connected.base, base.id());
     assert_eq!(app.connected().unwrap().device, connected.device);
-    assert!(!path.exists());
-    let id = app.write_reading("2026-11-01", 42.0).await.unwrap();
+    let id = app.write_reading("2026-10-28", 42.0).await.unwrap();
     assert_eq!(app.readings().unwrap()[0].value, 42.0);
     app.flush().await.unwrap();
     wait_for_base(&base, || records(&base).len() == 1).await;
@@ -76,8 +92,8 @@ async fn the_sample_connects_writes_and_reads_back() {
 
 #[tokio::test]
 async fn one_record_per_day() {
-    let (_, _, _dir, app, path) = setup(Mode::ReadWrite).await;
-    app.install_file(&path).await.unwrap();
+    let (full, _, _dir, app) = setup().await;
+    connect(&full, &app, defaults).await;
     let first = app.write_reading("2026-11-01", 42.0).await.unwrap();
     let second = app.write_reading("2026-11-01", 43.0).await.unwrap();
     assert_eq!(first, second);
@@ -90,31 +106,19 @@ async fn one_record_per_day() {
 }
 
 #[tokio::test]
-async fn a_new_connection_to_the_same_base_does_not_duplicate_a_day() {
-    let (full, base, _dir, first, path) = setup(Mode::ReadWrite).await;
-    first.install_file(&path).await.unwrap();
-    first.write_reading("2026-11-01", 42.0).await.unwrap();
+async fn a_reconnected_sample_finds_its_reading() {
+    let (full, base, dir, first) = setup().await;
+    connect(&full, &first, defaults).await;
+    first.write_reading("2026-10-28", 42.0).await.unwrap();
     first.flush().await.unwrap();
     wait_for_base(&base, || records(&base).len() == 1).await;
-    let second_dir = tempfile::tempdir().unwrap();
-    let creds = full
-        .connect_app(AppRequest {
-            app_name: "Tester - BaseHero Sample".into(),
-            app_id: None,
-            bases: vec![BaseGrantRequest::Existing {
-                base: base.id(),
-                mode: Mode::ReadWrite,
-            }],
-            replaces: None,
-        })
-        .await
-        .unwrap();
-    let second = sample(second_dir.path());
-    second
-        .install_file(&credentials(second_dir.path(), &creds))
-        .await
-        .unwrap();
-    second.write_reading("2026-11-01", 44.0).await.unwrap();
+    drop(first);
+    std::fs::remove_dir_all(dir.path().join("data")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("secrets")).unwrap();
+    let second = sample(dir.path());
+    assert_eq!(connect(&full, &second, defaults).await.base, base.id());
+    assert_eq!(second.readings().unwrap()[0].value, 42.0);
+    second.write_reading("2026-10-28", 44.0).await.unwrap();
     second.flush().await.unwrap();
     wait_for_base(&base, || {
         records(&base).len() == 1 && records(&base)[0].fields["value"] == 44
@@ -123,37 +127,70 @@ async fn a_new_connection_to_the_same_base_does_not_duplicate_a_day() {
 }
 
 #[tokio::test]
-async fn installing_offline_keeps_the_file_for_a_retry() {
-    let (_, _, dir, app, path) = setup(Mode::ReadWrite).await;
-    let original = std::fs::read(&path).unwrap();
-    let mut creds: AppCredentials = serde_json::from_slice(&original).unwrap();
-    creds.server = "http://127.0.0.1:1/".parse().unwrap();
-    std::fs::write(&path, serde_json::to_vec(&creds).unwrap()).unwrap();
-    assert!(matches!(
-        app.install_file(&path).await,
-        Err(Error::Network(_))
-    ));
-    assert!(path.exists());
-    assert!(app.connected().is_none());
-    std::fs::write(&path, original).unwrap();
-    app.install_file(&path).await.unwrap();
-    assert!(!dir.path().join(CREDENTIALS_FILE).exists());
-}
-
-#[tokio::test]
 async fn a_read_only_grant_refuses_writes() {
-    let (_, _, _dir, app, path) = setup(Mode::ReadOnly).await;
-    app.install_file(&path).await.unwrap();
+    let (full, _, _dir, app) = setup().await;
+    connect(&full, &app, |offer| {
+        let mut choice = defaults(offer);
+        if let BaseGrantRequest::Existing { mode, .. } = &mut choice.bases[0] {
+            *mode = Mode::ReadOnly;
+        }
+        choice
+    })
+    .await;
     assert_eq!(
-        app.write_reading("2026-11-01", 42.0).await.unwrap_err(),
+        app.write_reading("2026-10-28", 42.0).await.unwrap_err(),
         Error::ReadOnly
     );
 }
 
 #[tokio::test]
-async fn a_removed_sample_forgets_its_connection() {
-    let (full, _, _dir, app, path) = setup(Mode::ReadWrite).await;
-    let connected = app.install_file(&path).await.unwrap();
+async fn cancelling_the_digits_ends_the_request_and_allows_a_fresh_one() {
+    let (full, _, _dir, app) = setup().await;
+    let email = full.email();
+    let first = app.connect_digits(&email);
+    tokio::pin!(first);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut first => panic!("digits before approval: {result:?}"),
+            _ = async {
+                loop {
+                    if !full.approval_requests().await.unwrap().is_empty() { break; }
+                    tokio::task::yield_now().await;
+                }
+                app.connect_cancel().await.unwrap();
+            } => {}
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(first.await, Err(Error::ApprovalEnded(_))));
+    assert!(app.connected().is_none());
+    connect(&full, &app, defaults).await;
+    assert!(app.connected().is_some());
+}
+
+#[tokio::test]
+async fn a_restarted_sample_checks_revocation_before_reporting_connected() {
+    let (full, _, dir, app) = setup().await;
+    let connected = connect(&full, &app, defaults).await;
+    drop(app);
+    full.remove_device(connected.device).await.unwrap();
+    let restarted = sample(dir.path());
+    assert!(restarted.check_connection().await.unwrap().is_none());
+    assert!(restarted.connected().is_none());
+    assert!(
+        !dir.path()
+            .join("data")
+            .join("accounts")
+            .join(connected.account.to_string())
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn a_disconnected_sample_is_not_connected() {
+    let (full, _, _dir, app) = setup().await;
+    let connected = connect(&full, &app, defaults).await;
     full.remove_device(connected.device).await.unwrap();
     wait_for(|| app.connected().is_none()).await;
 }
@@ -172,12 +209,12 @@ fn call(name: &str, args: serde_json::Value) -> Scripted {
 }
 #[tokio::test]
 async fn hero_reads_the_samples_records() {
-    let (full, base, _dir, app, path) = setup(Mode::ReadWrite).await;
-    app.install_file(&path).await.unwrap();
+    let (full, base, _dir, app) = setup().await;
+    connect(&full, &app, defaults).await;
     let id = app.write_reading("2026-11-01", 42.0).await.unwrap();
     app.flush().await.unwrap();
     wait_for_base(&base, || records(&base).len() == 1).await;
-    let personal = full.create_base("Personal").await.unwrap();
+    let personal = full.create_base("Hero chat").await.unwrap();
     let model = ScriptedModel::new(vec![
         call("list", json!({"base":base.id(),"type":READING})),
         call("read", json!({"base":base.id(),"id":id})),

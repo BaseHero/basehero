@@ -78,6 +78,18 @@ enum Command {
     Approvals,
     Approve {
         id: Option<String>,
+        #[arg(long)]
+        base: Vec<String>,
+        #[arg(long)]
+        new_base: Option<String>,
+        #[arg(long)]
+        read_only: bool,
+        #[arg(long)]
+        cap_usd: Option<String>,
+        #[arg(long, conflicts_with = "remove_old")]
+        keep_old: bool,
+        #[arg(long, conflicts_with = "keep_old")]
+        remove_old: bool,
     },
     Decline {
         id: String,
@@ -202,6 +214,7 @@ enum FolderCommand {
 #[derive(Subcommand)]
 enum DeviceCommand {
     Remove { id: String },
+    Cap { id: String, usd: String },
 }
 #[derive(Subcommand)]
 enum AppCommand {
@@ -573,8 +586,29 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             Ok(json!({ "accountId": account.id(), "deviceId": account.device_id() }))
         }
         Command::Approvals => approve::list(&account(&core)?).await,
-        Command::Approve { id } => {
-            approve::approve(&account(&core)?, id.as_deref(), cli.json).await
+        Command::Approve {
+            id,
+            base,
+            new_base,
+            read_only,
+            cap_usd,
+            keep_old,
+            remove_old,
+        } => {
+            approve::approve(
+                &account(&core)?,
+                id.as_deref(),
+                cli.json,
+                &approve::AppFlags {
+                    bases: base,
+                    new_base: new_base.as_deref(),
+                    read_only: *read_only,
+                    cap_usd: cap_usd.as_deref(),
+                    keep_old: *keep_old,
+                    remove_old: *remove_old,
+                },
+            )
+            .await
         }
         Command::Decline { id } => approve::decline(&account(&core)?, id).await,
         Command::Bases => hidden::summaries(account(&core)?.bases()),
@@ -708,6 +742,14 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             let this_device = account(&core)?.device_id() == id;
             account(&core)?.remove_device(id).await?;
             Ok(json!({ "removed": id, "localCopyErased": this_device }))
+        }
+        Command::Device {
+            command: DeviceCommand::Cap { id, usd },
+        } => {
+            let id: DeviceId = id.parse().map_err(|_| invalid("device ID"))?;
+            let cap = approve::parse_usd(usd)?;
+            account(&core)?.set_app_cap(id, cap).await?;
+            Ok(json!({"device": id, "capMicroUsd": cap}))
         }
         Command::App {
             command:

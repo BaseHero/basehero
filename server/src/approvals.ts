@@ -2,10 +2,11 @@ import type { ApprovalCreateResponse } from './proto/gen/ApprovalCreateResponse'
 import type { ApprovalEndReason } from './proto/gen/ApprovalEndReason';
 import type { ApprovalListResponse } from './proto/gen/ApprovalListResponse';
 import type { ApprovalLiveMessage } from './proto/gen/ApprovalLiveMessage';
+import type { ApprovalKind } from './proto/gen/ApprovalKind';
 import type { ApprovalState } from './proto/gen/ApprovalState';
 import type { ApprovalStateResponse } from './proto/gen/ApprovalStateResponse';
 import type { Env, Principal, Result } from './http';
-import { accountStub, answer, body, bytes, fail, HttpError, id, requireDevice, str } from './http';
+import { accountStub, answer, body, bytes, equal, fail, HttpError, id, requireDevice, str } from './http';
 
 /** Each exchange message is at most this many bytes. */
 const MESSAGE_MAX = 4096;
@@ -19,7 +20,7 @@ export type Step = 'respond' | 'reveal' | 'transfer';
 type Row = {
   approval_id: string; new_device_id: string; approver_device_id: string | null; state: ApprovalState;
   end_reason: ApprovalEndReason | null; request: string; response: string | null; reveal: string | null;
-  transfer: string | null; created_at: number; updated_at: number;
+  transfer: string | null; created_at: number; updated_at: number; kind: ApprovalKind; secret_hash: string | null;
 };
 /** The column each step fills and the state it leads to. */
 const STEPS = {
@@ -28,7 +29,7 @@ const STEPS = {
   transfer: { column: 'transfer', from: 'revealed', to: 'transferred' },
 } as const;
 
-function message(value: unknown): string {
+export function message(value: unknown): string {
   const encoded = str(value);
   if (encoded.length > Math.ceil(MESSAGE_MAX / 3) * 4) throw new HttpError(413, 'too_large');
   if (bytes(encoded).length > MESSAGE_MAX) throw new HttpError(413, 'too_large');
@@ -80,7 +81,11 @@ export class Approvals {
   constructor(private ctx: DurableObjectState, private env: Env) {
     const sql = ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS approvals (approval_id TEXT PRIMARY KEY, new_device_id TEXT NOT NULL, approver_device_id TEXT, state TEXT NOT NULL, end_reason TEXT, request TEXT NOT NULL, response TEXT, reveal TEXT, transfer TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+    const columns = sql.exec<{ name: string }>('PRAGMA table_info(approvals)').toArray().map(c => c.name);
+    if (!columns.includes('kind')) sql.exec("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
+    if (!columns.includes('secret_hash')) sql.exec('ALTER TABLE approvals ADD COLUMN secret_hash TEXT');
     sql.exec('CREATE TABLE IF NOT EXISTS approval_creates (at INTEGER NOT NULL)');
+    sql.exec('CREATE TABLE IF NOT EXISTS connect_creates (at INTEGER NOT NULL)');
   }
   private get sql() { return this.ctx.storage.sql; }
   private get ttl(): number { return Number(this.env.APPROVAL_TTL_MS ?? 120_000); }
@@ -101,8 +106,8 @@ export class Approvals {
   private full(p: Principal): boolean { return p.kind === 'full' && p.status === 'active'; }
   private owns(p: Principal, row: Row): boolean { return p.kind === 'full' && p.status === 'pending' && row.new_device_id === p.deviceId; }
   /** Tells every full device, and the approval's own pending device, its new state. */
-  private notify(approvalId: string, newDeviceId: string, state: ApprovalState, endReason?: ApprovalEndReason): void {
-    const live: ApprovalLiveMessage = { t: 'approval', approvalId, state, ...(endReason ? { endReason } : {}) };
+  private notify(approvalId: string, newDeviceId: string, state: ApprovalState, kind: ApprovalKind, endReason?: ApprovalEndReason): void {
+    const live: ApprovalLiveMessage = { t: 'approval', approvalId, kind, state, ...(endReason ? { endReason } : {}) };
     const text = JSON.stringify(live);
     for (const ws of this.ctx.getWebSockets()) {
       const tag = this.ctx.getTags(ws)[0] ?? '';
@@ -132,8 +137,8 @@ export class Approvals {
       return null;
     });
     if (refused) return refused;
-    for (const old of cancelled) this.notify(old, p.deviceId, 'ended');
-    this.notify(approvalId, p.deviceId, 'requested');
+    for (const old of cancelled) this.notify(old, p.deviceId, 'ended', 'device');
+    this.notify(approvalId, p.deviceId, 'requested', 'device');
     // Wake for the earliest expiry or housekeeping, including requests created earlier.
     await this.scheduleAlarm();
     return { status: 200, body: { createdAt: now, expiresAt: now + this.ttl } };
@@ -141,12 +146,12 @@ export class Approvals {
   list(p: Principal): Result<ApprovalListResponse> {
     if (!this.full(p)) return fail(403, 'forbidden');
     const rows = this.sql.exec<Row>("SELECT * FROM approvals WHERE state = 'requested' AND created_at > ? ORDER BY created_at, approval_id", Date.now() - this.ttl).toArray();
-    return { status: 200, body: { approvals: rows.map(r => ({ approvalId: r.approval_id, deviceId: r.new_device_id, createdAt: r.created_at, expiresAt: r.created_at + this.ttl, request: r.request })) } };
+    return { status: 200, body: { approvals: rows.map(r => ({ approvalId: r.approval_id, kind: r.kind, deviceId: r.new_device_id, createdAt: r.created_at, expiresAt: r.created_at + this.ttl, request: r.request })) } };
   }
   state(p: Principal, approvalId: string): Result<ApprovalStateResponse> {
     const stored = this.row(approvalId);
     if (!stored) return fail(404, 'not_found');
-    if (!this.full(p) && !this.owns(p, stored)) return fail(403, 'forbidden');
+    if (!this.full(p) && !(stored.kind === 'device' && this.owns(p, stored))) return fail(403, 'forbidden');
     const row = this.view(stored, Date.now());
     const body: ApprovalStateResponse = { state: row.state };
     if (row.response !== null) body.response = row.response;
@@ -167,42 +172,96 @@ export class Approvals {
     const now = Date.now();
     const row = this.view(stored, now);
     const allowed = step === 'respond' ? this.full(p)
-      : step === 'reveal' ? this.owns(p, row)
+      : step === 'reveal' ? row.kind === 'device' && this.owns(p, row)
       : this.full(p) && row.approver_device_id === p.deviceId;
     if (!allowed) return fail(403, 'forbidden');
     const { column, from, to } = STEPS[step];
     if (row.state !== from) return fail(409, step === 'respond' && row.state !== 'ended' ? 'exists' : 'version_conflict');
     this.sql.exec(`UPDATE approvals SET state = ?, ${column} = ?, approver_device_id = COALESCE(approver_device_id, ?), updated_at = ? WHERE approval_id = ?`,
       to, message, p.deviceId, now, approvalId);
-    this.notify(approvalId, row.new_device_id, to);
+    this.notify(approvalId, row.new_device_id, to, row.kind);
     return { status: 200, body: {} };
   }
   /** Ends an approval; ending one that already ended keeps its first reason. */
   end(p: Principal, approvalId: string, reason: ApprovalEndReason): Result {
     const stored = this.row(approvalId);
     if (!stored) return fail(404, 'not_found');
-    if (!this.full(p) && !this.owns(p, stored)) return fail(403, 'forbidden');
+    if (!this.full(p) && !(stored.kind === 'device' && this.owns(p, stored))) return fail(403, 'forbidden');
     const now = Date.now();
     if (this.view(stored, now).state === 'ended') return { status: 200, body: {} };
     this.sql.exec("UPDATE approvals SET state = 'ended', end_reason = ?, updated_at = ? WHERE approval_id = ?", reason, now, approvalId);
-    this.notify(approvalId, stored.new_device_id, 'ended');
+    this.notify(approvalId, stored.new_device_id, 'ended', stored.kind);
+    return { status: 200, body: {} };
+  }
+  /** Creates an app exchange, independently limited from device approvals. */
+  async createApp(approvalId: string, deviceId: string, secretHash: string, request: string): Promise<Result<ApprovalCreateResponse>> {
+    const now = Date.now();
+    const refused = this.ctx.storage.transactionSync(() => {
+      if (this.row(approvalId)) return fail(409, 'exists');
+      this.sql.exec('DELETE FROM connect_creates WHERE at <= ?', now - HOUR);
+      if (this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM connect_creates').one().n >= CREATES_PER_HOUR) return fail(429, 'rate_limited');
+      this.sql.exec('DELETE FROM approvals WHERE created_at <= ?', now - KEEP_MS);
+      this.sql.exec("INSERT INTO approvals (approval_id, new_device_id, kind, secret_hash, state, request, created_at, updated_at) VALUES (?, ?, 'app', ?, 'requested', ?, ?, ?)",
+        approvalId, deviceId, secretHash, request, now, now);
+      this.sql.exec('INSERT INTO connect_creates VALUES (?)', now);
+      return null;
+    });
+    if (refused) return refused;
+    this.notify(approvalId, deviceId, 'requested', 'app');
+    await this.scheduleAlarm();
+    return { status: 200, body: { createdAt: now, expiresAt: now + this.ttl } };
+  }
+  private appRow(approvalId: string, secretHash: string): Row | Result<never> {
+    const row = this.row(approvalId);
+    if (!row) return fail(404, 'not_found');
+    if (row.kind !== 'app' || !row.secret_hash || !equal(bytes(row.secret_hash, 32), bytes(secretHash, 32))) return fail(403, 'forbidden');
+    return row;
+  }
+  /** The app may read only its own request. */
+  appState(approvalId: string, secretHash: string): Result<ApprovalStateResponse> {
+    const row = this.appRow(approvalId, secretHash);
+    if ('body' in row) return row;
+    const view = this.view(row, Date.now());
+    const body: ApprovalStateResponse = { state: view.state };
+    if (view.response !== null) body.response = view.response;
+    if (view.reveal !== null) body.reveal = view.reveal;
+    if (view.transfer !== null) body.transfer = view.transfer;
+    if (view.end_reason !== null) body.endReason = view.end_reason;
+    return { status: 200, body };
+  }
+  /** The app alone supplies its reveal. */
+  appReveal(approvalId: string, secretHash: string, reveal: string): Result {
+    const row = this.appRow(approvalId, secretHash);
+    if ('body' in row) return row;
+    if (this.view(row, Date.now()).state !== 'responded') return fail(409, 'version_conflict');
+    this.sql.exec("UPDATE approvals SET state = 'revealed', reveal = ?, updated_at = ? WHERE approval_id = ?", reveal, Date.now(), approvalId);
+    this.notify(approvalId, row.new_device_id, 'revealed', 'app');
+    return { status: 200, body: {} };
+  }
+  /** The app alone may cancel its request. */
+  appEnd(approvalId: string, secretHash: string, reason: ApprovalEndReason): Result {
+    const row = this.appRow(approvalId, secretHash);
+    if ('body' in row) return row;
+    if (this.view(row, Date.now()).state === 'ended') return { status: 200, body: {} };
+    this.sql.exec("UPDATE approvals SET state = 'ended', end_reason = ?, updated_at = ? WHERE approval_id = ?", reason, Date.now(), approvalId);
+    this.notify(approvalId, row.new_device_id, 'ended', 'app');
     return { status: 200, body: {} };
   }
   /** A revoked approver cannot finish the exchange; tell the new device immediately. */
   failAnswered(deviceId: string): void {
     const now = Date.now();
-    const open = this.sql.exec<{ approval_id: string; new_device_id: string }>(
-      "SELECT approval_id, new_device_id FROM approvals WHERE approver_device_id = ? AND state != 'ended' AND created_at > ?",
+    const open = this.sql.exec<{ approval_id: string; new_device_id: string; kind: ApprovalKind }>(
+      "SELECT approval_id, new_device_id, kind FROM approvals WHERE approver_device_id = ? AND state != 'ended' AND created_at > ?",
       deviceId, now - this.ttl).toArray();
     this.sql.exec("UPDATE approvals SET state = 'ended', end_reason = 'failed', updated_at = ? WHERE approver_device_id = ? AND state != 'ended' AND created_at > ?",
       now, deviceId, now - this.ttl);
-    for (const row of open) this.notify(row.approval_id, row.new_device_id, 'ended');
+    for (const row of open) this.notify(row.approval_id, row.new_device_id, 'ended', row.kind);
   }
   /** A device that activates or is revoked has no more use for its approvals. */
   drop(deviceId: string): void {
-    const open = this.sql.exec<{ approval_id: string }>("SELECT approval_id FROM approvals WHERE new_device_id = ? AND state != 'ended'", deviceId).toArray();
-    this.sql.exec('DELETE FROM approvals WHERE new_device_id = ?', deviceId);
-    for (const r of open) this.notify(r.approval_id, deviceId, 'ended');
+    const open = this.sql.exec<{ approval_id: string }>("SELECT approval_id FROM approvals WHERE new_device_id = ? AND kind = 'device' AND state != 'ended'", deviceId).toArray();
+    this.sql.exec("DELETE FROM approvals WHERE new_device_id = ? AND kind = 'device'", deviceId);
+    for (const r of open) this.notify(r.approval_id, deviceId, 'ended', 'device');
   }
   accept(role: 'full' | 'pending', deviceId: string): Response {
     const [client, server] = Object.values(new WebSocketPair());
@@ -226,10 +285,10 @@ export class Approvals {
   /** Expiry is a state change, not just a read-time view: notify idle listeners too. */
   async prune(): Promise<void> {
     const now = Date.now();
-    const expired = this.sql.exec<{ approval_id: string; new_device_id: string }>(
-      "SELECT approval_id, new_device_id FROM approvals WHERE state != 'ended' AND created_at <= ?", now - this.ttl).toArray();
+    const expired = this.sql.exec<{ approval_id: string; new_device_id: string; kind: ApprovalKind }>(
+      "SELECT approval_id, new_device_id, kind FROM approvals WHERE state != 'ended' AND created_at <= ?", now - this.ttl).toArray();
     this.sql.exec("UPDATE approvals SET state = 'ended', end_reason = 'expired', updated_at = ? WHERE state != 'ended' AND created_at <= ?", now, now - this.ttl);
-    for (const row of expired) this.notify(row.approval_id, row.new_device_id, 'ended', 'expired');
+    for (const row of expired) this.notify(row.approval_id, row.new_device_id, 'ended', row.kind, 'expired');
     this.sql.exec('DELETE FROM approvals WHERE created_at <= ?', now - KEEP_MS);
     await this.scheduleAlarm();
   }

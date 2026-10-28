@@ -73,8 +73,9 @@ for stage in "$@"; do
       scripts/android-emulator.sh
       nix develop --command cargo build -p bh-cli
       (cd apps/basehero && npm ci --no-audit --no-fund)
+      scripts/android-dev.sh install
       scripts/sample-android.sh install
-      adb -s emulator-5580 shell pm clear app.basehero.sample
+      node --input-type=module -e "import { adb } from './apps/basehero/tests/android/lib.mjs'; adb('shell', 'pm', 'clear', 'app.basehero'); adb('shell', 'pm', 'clear', 'app.basehero.sample')"
       node --test apps/sample/tests/android/sample.test.mjs
       ;;
     android)

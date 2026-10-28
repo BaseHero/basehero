@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import type { HeroEvent } from '../generated/HeroEvent';
   import type { AccountId, BaseId, ObjectId, ChatMessage, AppEvent } from '../backend/types';
   import { openObject } from '../route.svelte';
   import { errorMessage } from '../errors';
@@ -8,6 +9,12 @@
   let { account, base, focus, project }: { account: AccountId; base: BaseId; focus: ObjectId | null; project: ObjectId | null } = $props();
   let chat = $state<ObjectId | null>(null);
   let messages = $state<ChatMessage[]>([]);
+  let conversation: HTMLDivElement;
+  function showMessages(next: ChatMessage[]) {
+    const follow = conversation && conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight <= 2;
+    messages = next;
+    if (follow) void tick().then(() => { if (conversation) conversation.scrollTop = conversation.scrollHeight; });
+  }
   let text = $state('');
   let error = $state('');
   let createdNames = $state<Record<string, string>>({});
@@ -22,7 +29,7 @@
     try {
       const next = await api.messages(id);
       if (!active || chat !== id || load !== loadNumber) return;
-      messages = next;
+      showMessages(next);
       const names: Record<string, string> = {};
       await Promise.all(next.flatMap(message => message.created).map(async object => {
         // One note that can't be read (gone, or from a newer version) shouldn't hide the rest.
@@ -46,7 +53,15 @@
     active = true;
     let stop = () => {};
     void api.onEvent((event: AppEvent) => {
-      if (event.kind.toLowerCase() === 'hero' && event.account === account && event.base === base && event.chat === chat && chat) void reload(chat);
+      if (event.kind.toLowerCase() !== 'hero' || event.account !== account || event.base !== base || event.chat !== chat || !chat) return;
+      const update = event.event as HeroEvent;
+      if (update && 'text' in update) {
+        const { message, text: reply, base: eventBase, chat: eventChat } = update.text;
+        const current = messages.at(-1);
+        if (eventBase === base && eventChat === chat && current?.id === message && current.role === 'hero' && current.state === 'working') {
+          showMessages([...messages.slice(0, -1), { ...current, text: reply }]);
+        }
+      } else void reload(chat);
     }).then(unsubscribe => { if (active) stop = unsubscribe; else unsubscribe(); });
     return () => { active = false; stop(); };
   });
@@ -74,16 +89,16 @@
 </script>
 <section class="hero-panel" aria-label="Hero">
   <header><span class="eyebrow">ASSISTANT</span><h2>Hero</h2></header>
-  <div class="conversation" aria-live="polite">
+  <div class="conversation" aria-live="polite" bind:this={conversation}>
     {#each messages as message (message.id)}
       <article class:user={message.role === 'user'}>
         <span class="speaker">{message.role === 'user' ? 'You' : 'Hero'}</span>
         {#if message.text}<p>{message.text}</p>{/if}
         {#if message.role === 'hero'}
-          {#if message.state === 'working'}<p class="status">Hero is working…</p>{/if}
+          {#if message.state === 'working' && !message.text}<p class="status">Hero is working…</p>{/if}
           {#if message.state === 'working' && message.steps.length}<p class="step">{message.steps.at(-1)?.title ?? message.steps.at(-1)?.tool}</p>{/if}
           {#if message.state === 'stopped'}<p class="status">Stopped.</p>{/if}
-          {#if message.state === 'failed'}<p class="status">{failure(message.error)}</p>{#if message.error !== 'rate_limited' && message.error !== 'needs_update'}<button onclick={() => chat && act(() => api.retry(chat!))}>Retry</button>{/if}{/if}
+          {#if message.state === 'failed'}<p class="status">{message.text && message.error !== 'interrupted' ? "Hero's reply stopped partway." : failure(message.error)}</p>{#if (message.text && message.error !== 'interrupted') || (message.error !== 'rate_limited' && message.error !== 'needs_update')}<button onclick={() => chat && act(() => api.retry(chat!))}>Retry</button>{/if}{/if}
           {#if message.ask && message.state === 'asking'}
             <p>Hero wants to use {message.ask.baseName} in this chat. {message.ask.readersWithout.join(' and ')} can read this chat's base but not {message.ask.baseName}.</p>
             <div class="actions"><button onclick={() => chat && act(() => api.answer(chat!, true))}>Allow in this chat</button><button onclick={() => chat && act(() => api.answer(chat!, false))}>Not now</button></div>

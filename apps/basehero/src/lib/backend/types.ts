@@ -13,20 +13,32 @@ import type { UsageRow } from '../generated/UsageRow';
 import type { FileInfo } from '../generated/FileInfo';
 import type { FileStatus } from '../generated/FileStatus';
 import type { ObjectVersion } from '../generated/ObjectVersion';
+import type { AppOffer } from '../generated/AppOffer';
+import type { DeviceSummary as GeneratedDeviceSummary } from '../generated/DeviceSummary';
 export type { AppInfo, CommandError, UpdateInfo, SearchHit, SearchResult, ChatSummary, ChatMessage, KitStatus, AccountUsage, UsageRow };
 export type AccountId = string;
 export type BaseId = string;
 export type ObjectId = string;
 export type DeviceId = string;
 export type ApprovalId = string;
-export type ApprovalRequest = { id: ApprovalId; deviceId: DeviceId; createdAt: number; expiresAt: number };
+export type ApprovalRequest = { id: ApprovalId; deviceId: DeviceId; createdAt: number; expiresAt: number; kind: 'Device' | 'App' };
 export type OpenedRequest = { id: ApprovalId };
 export type BaseRef = { account: AccountId; base: BaseId };
 export class BackendError extends Error {
   constructor(public kind: string, message: string) { super(message); this.name = 'BackendError'; }
 }
 export type AccountSummary = { id: AccountId; email: string; kind: 'full' | 'app' };
-export type DeviceSummary = { id: DeviceId; name: string; kind: string; status: string; thisDevice: boolean; createdAt: number; lastSeenAt: number | null };
+export type DeviceSummary = Omit<GeneratedDeviceSummary, 'kind' | 'lastSeenAt'> & { kind: string; lastSeenAt: number | null };
+export type { AppOffer };
+export type BaseChoiceInput = { base?: BaseId; newName?: string; mode: 'readWrite' | 'readOnly' };
+export type AppChoiceInput = { bases: BaseChoiceInput[]; capMicroUsd: number; replaces: DeviceId | null };
+export function dollars(capMicroUsd: number): string { return (capMicroUsd / 1_000_000).toFixed(2); }
+export function microDollars(value: string | number): number {
+  const amount = Number(value);
+  const micro = Math.round(amount * 1_000_000);
+  if (!String(value).trim() || !Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(micro)) throw new BackendError('Invalid', 'Invalid cap');
+  return micro;
+}
 export type BaseSummary = { id: BaseId; name: string; mode: 'readWrite' | 'readOnly'; hidden: boolean };
 export type { PasswordStrength, FileInfo, FileStatus, ObjectVersion };
 export type VersionsPage = { versions: ObjectVersion[]; more: boolean };
@@ -59,6 +71,10 @@ export interface Backend {
   approvalOpen(account: AccountId, id: ApprovalId): Promise<OpenedRequest>;
   approvalApprove(account: AccountId, id: ApprovalId, digits: string): Promise<DeviceId>;
   approvalDecline(account: AccountId, id: ApprovalId): Promise<void>;
+  connectOpen(account: AccountId, id: ApprovalId): Promise<OpenedRequest>;
+  connectCheck(account: AccountId, id: ApprovalId, digits: string): Promise<AppOffer>;
+  connectApprove(account: AccountId, id: ApprovalId, choice: AppChoiceInput): Promise<[DeviceId, boolean]>;
+  setAppCap(account: AccountId, device: DeviceId, capMicroUsd: number): Promise<void>;
   signOut(account: AccountId): Promise<void>;
   newKit(account: AccountId, password: string): Promise<string>;
   kitStatus(account: AccountId): Promise<KitStatus>;

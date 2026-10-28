@@ -2,4 +2,4 @@
 import type { DeviceId } from "./DeviceId";
 import type { DeviceKind } from "./DeviceKind";
 
-export type AccountDevice = { deviceId: DeviceId, kind: DeviceKind, status: string, createdAt: number, lastSeenAt: number, };
+export type AccountDevice = { deviceId: DeviceId, kind: DeviceKind, status: string, createdAt: number, lastSeenAt: number, capMicroUsd?: number, };

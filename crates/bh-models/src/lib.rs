@@ -1,10 +1,11 @@
-//! Whole, attested Tinfoil completions through a credential-holding gateway.
+//! Streamed, attested Tinfoil completions through a credential-holding gateway.
 //! Gateway/provider diagnostics never become public error text.
 
 #![warn(missing_docs)]
 mod probe;
 mod request;
 mod response;
+mod stream;
 #[cfg(feature = "testing")]
 /// Synthetic model and enclave helpers for tests.
 pub mod testing;
@@ -25,6 +26,22 @@ pub trait ChatModel: Send + Sync + 'static {
     /// Completes a request; a live implementation needs the network, while
     /// synthetic implementations can answer locally.
     fn complete(&self, req: ChatRequest) -> BoxFuture<'_, Result<Completion, ModelError>>;
+
+    /// Sends each piece of reply text as it arrives; resolves to the whole completion.
+    /// Tool calls appear only in the completion. Default: `complete`, then the whole text once.
+    fn complete_streaming(
+        &self,
+        req: ChatRequest,
+        text: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> BoxFuture<'_, Result<Completion, ModelError>> {
+        Box::pin(async move {
+            let completion = self.complete(req).await?;
+            if let Some(whole) = completion.text.as_ref().filter(|t| !t.is_empty()) {
+                let _ = text.send(whole.clone());
+            }
+            Ok(completion)
+        })
+    }
 }
 
 /// A model configuration, request, transport or response failure; diagnostics

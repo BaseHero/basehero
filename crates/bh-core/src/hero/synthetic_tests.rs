@@ -57,6 +57,7 @@ async fn asking_and_answering_rechecks_access_without_leaking_content() {
         TurnLimits::default(),
         cancel,
         |_, _| {},
+        |_, _| {},
         |tools, call| Some(tools.call(call)),
     )
     .await;
@@ -80,10 +81,11 @@ async fn asking_and_answering_rechecks_access_without_leaking_content() {
         TurnLimits::default(),
         cancel,
         |_, _| {},
+        |_, _| {},
         |tools, call| Some(tools.call(call)),
     )
     .await;
-    assert!(matches!(outcome.kind, ResultKind::Answer(_)));
+    assert!(matches!(outcome.kind, ResultKind::Answer));
     assert!(format!("{:?}", denied.requests()).contains("not_allowed"));
     let allowed = ScriptedModel::new(vec![
         read(private.id(), id),
@@ -103,9 +105,10 @@ async fn asking_and_answering_rechecks_access_without_leaking_content() {
         TurnLimits::default(),
         cancel,
         |_, _| {},
+        |_, _| {},
         |tools, call| Some(tools.call(call)),
     )
     .await;
-    assert!(matches!(outcome.kind, ResultKind::Answer(_)));
+    assert!(matches!(outcome.kind, ResultKind::Answer));
     assert!(format!("{:?}", allowed.requests()).contains("Private title"));
 }

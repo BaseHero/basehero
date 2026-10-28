@@ -34,6 +34,26 @@ test('devices lists this device first and removes another after confirming', asy
   expect(await page.evaluate(() => window.__fake.calls.some(call => call === 'removeDevice other'))).toBe(true);
 });
 
+test('Devices shows an app cap, changes it and disconnects', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.setDevices(account, [
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, capMicroUsd: null },
+    { id: 'sample', name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, capMicroUsd: 1000000 },
+  ]), account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="sample"]');
+  await expect(row).toContainText('Cap $1.00 a month');
+  await row.getByRole('button', { name: 'Change cap' }).click();
+  await row.getByLabel('Monthly cap (USD)').fill('0.50');
+  await row.getByRole('button', { name: 'Save' }).click();
+  await expect.poll(() => page.evaluate(() => window.__fake.calls.includes('setAppCap sample 500000'))).toBe(true);
+  await expect(row).toContainText('Cap $0.50 a month');
+  page.once('dialog', async dialog => { expect(dialog.message()).toBe('Disconnect Dan - Sample? It erases its copy of your data.'); await dialog.accept(); });
+  await row.getByRole('button', { name: 'Disconnect' }).click();
+  await expect(row).toHaveCount(0);
+  expect(await page.evaluate(() => window.__fake.calls.includes('removeDevice sample'))).toBe(true);
+});
+
 test('removing this device confirms, erases it and shows Removed', async ({ page }) => {
   await signedIn(page);
   await page.getByRole('link', { name: 'Devices' }).click();

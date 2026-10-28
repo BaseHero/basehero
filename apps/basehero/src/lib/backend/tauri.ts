@@ -13,6 +13,8 @@ const commands: Record<string, [string, string[]]> = {
   approvalUseKit: ['approval_use_kit', ['pending', 'kit']], approvalRequests: ['approval_requests', ['account']],
   approvalOpen: ['approval_open', ['account', 'id']], approvalApprove: ['approval_approve', ['account', 'id', 'digits']],
   approvalDecline: ['approval_decline', ['account', 'id']],
+  connectOpen: ['connect_open', ['account', 'id']], connectCheck: ['connect_check', ['account', 'id', 'digits']],
+  connectApprove: ['connect_approve', ['account', 'id', 'choice']], setAppCap: ['set_app_cap', ['account', 'device', 'capMicroUsd']],
   newKit: ['new_kit', ['account', 'password']], kitStatus: ['kit_status', ['account']], kitKeptHere: ['kit_kept_here', ['account']], showKit: ['show_kit', ['account']], setKitSaved: ['set_kit_saved', ['account', 'kit']],
   devices: ['devices', ['account']], usage: ['usage', ['account', 'month']], removeDevice: ['remove_device', ['account', 'device']],
   bases: ['bases', ['account']], createBase: ['create_base', ['account', 'name']],

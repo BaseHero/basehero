@@ -20,12 +20,75 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// How long each device keeps an exchange open, from its own first step.
 pub const TTL_MS: u64 = 120_000;
+/// Maximum length of a claimed app name, in characters.
+pub const HELLO_NAME_MAX: usize = 40;
+/// Maximum length of an app exchange message, in bytes.
+pub const MESSAGE_MAX: usize = 4096;
+
+/// The separate domains of the device approval and app connection exchanges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exchange {
+    /// Ordinary full-device approval.
+    Device,
+    /// Connection for an app device.
+    App,
+}
+
+/// The email's case- and surrounding-space-independent exchange scope.
+pub fn email_scope(email: &str) -> AccountId {
+    let normalized = email.trim().to_lowercase();
+    let hash = generichash(None, &[b"bh.v1.app-connect-email", normalized.as_bytes()]);
+    AccountId(array(&hash[..16]))
+}
+
+/// The app's sealed claim, opened only after the digits match.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppHello {
+    /// Claimed display name.
+    pub name: String,
+    /// Claimed app identifier.
+    pub app_id: String,
+}
+
+/// Whether a character can change or hide the rendering of a device name.
+pub fn is_unsafe_device_name_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+impl AppHello {
+    /// Refuses malformed names and app identifiers.
+    ///
+    /// # Errors
+    /// Returns `ApprovalEnded(BadMessage)` for invalid claims.
+    pub fn validate(&self) -> Result<(), Error> {
+        let name = self.name.trim();
+        if name.is_empty()
+            || name.chars().count() > HELLO_NAME_MAX
+            || name.chars().any(is_unsafe_device_name_char)
+            || self.app_id.is_empty()
+            || self.app_id.len() > 100
+            || !self
+                .app_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+}
 
 const FORMAT: u8 = 1;
 const REQUEST: u8 = 1;
 const RESPONSE: u8 = 2;
 const REVEAL: u8 = 3;
 const TRANSFER: u8 = 4;
+const APP_REQUEST: u8 = 5;
+const APP_RESPONSE: u8 = 6;
+const APP_REVEAL: u8 = 7;
+const APP_TRANSFER: u8 = 8;
 const HEADER: usize = 2 + 16;
 const REQUEST_LEN: usize = HEADER + 16 + XWING_PUBLIC_BYTES + 32;
 const RESPONSE_LEN: usize = HEADER + 16 + XWING_CIPHERTEXT_BYTES + 32;
@@ -143,10 +206,23 @@ pub struct Ids {
 /// The new device's commitment to its public key and hidden random value.
 /// Every input has a fixed length, so concatenation is unambiguous.
 pub fn commitment(ids: &Ids, pk: &[u8; XWING_PUBLIC_BYTES], r_new: &[u8; 32]) -> [u8; 32] {
+    commitment_as(Exchange::Device, ids, pk, r_new)
+}
+
+fn commitment_as(
+    exchange: Exchange,
+    ids: &Ids,
+    pk: &[u8; XWING_PUBLIC_BYTES],
+    r_new: &[u8; 32],
+) -> [u8; 32] {
+    let label: &[u8] = match exchange {
+        Exchange::Device => b"bh.v1.approval-commit",
+        Exchange::App => b"bh.v1.app-connect-commit",
+    };
     generichash(
         None,
         &[
-            b"bh.v1.approval-commit",
+            label,
             &ids.account.0,
             &ids.approval.0,
             &ids.new.0,
@@ -177,7 +253,15 @@ pub struct Transcript<'a> {
 impl Transcript<'_> {
     /// Encodes every length-delimited exchange input for key derivation.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = b"bh.v1.approval-transcript".to_vec();
+        self.encode_as(Exchange::Device)
+    }
+
+    /// Encodes with the selected exchange's independent label.
+    pub fn encode_as(&self, exchange: Exchange) -> Vec<u8> {
+        let mut out = match exchange {
+            Exchange::Device => b"bh.v1.approval-transcript".to_vec(),
+            Exchange::App => b"bh.v1.app-connect-transcript".to_vec(),
+        };
         out.extend_from_slice(&1u32.to_be_bytes());
         for part in [
             &self.ids.account.0[..],
@@ -202,10 +286,24 @@ impl Transcript<'_> {
 
 /// The digits and transfer key from the shared secret and the encoded transcript.
 pub fn derive(shared: &Secret<32>, transcript: &[u8]) -> (Digits, Secret<32>) {
+    derive_as(Exchange::Device, shared, transcript)
+}
+
+fn derive_as(exchange: Exchange, shared: &Secret<32>, transcript: &[u8]) -> (Digits, Secret<32>) {
     let bound = Zeroizing::new(generichash(Some(shared.expose()), &[transcript]));
     let bound = Secret::from_slice(&*bound).expect("32 bytes");
-    let material = kdf(&bound, b"bhaprdg1", 1);
-    (digits_from(&material), kdf(&bound, b"bhaprtk1", 1))
+    let (digits_label, transfer_label): (&[u8; 8], &[u8; 8]) = match exchange {
+        Exchange::Device => (b"bhaprdg1", b"bhaprtk1"),
+        Exchange::App => (b"bhapcdg1", b"bhapctk1"),
+    };
+    let material = kdf(&bound, digits_label, 1);
+    (digits_from(&material), kdf(&bound, transfer_label, 1))
+}
+
+fn hello_key(shared: &Secret<32>, transcript: &[u8]) -> Secret<32> {
+    let bound = Zeroizing::new(generichash(Some(shared.expose()), &[transcript]));
+    let bound = Secret::from_slice(&*bound).expect("32 bytes");
+    kdf(&bound, b"bhapchl1", 1)
 }
 
 /// The four messages, binary and opaque to the server.
@@ -239,6 +337,22 @@ pub enum Message {
         /// Random value committed in the request.
         r_new: [u8; 32],
     },
+    /// App's random reveal and sealed hello.
+    AppReveal {
+        /// Exchange identifier.
+        approval: ApprovalId,
+        /// Committed random value.
+        r_new: [u8; 32],
+        /// Sealed app claim.
+        hello: Vec<u8>,
+    },
+    /// App credentials sealed under the transfer key.
+    AppTransfer {
+        /// Exchange identifier.
+        approval: ApprovalId,
+        /// Sealed credentials.
+        payload: Vec<u8>,
+    },
     /// Account key sealed under the transfer key.
     Transfer {
         /// Exchange identifier.
@@ -251,20 +365,46 @@ pub enum Message {
 impl Message {
     /// Encodes this message in the version-one binary format.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_as(Exchange::Device)
+    }
+
+    fn encode_as(&self, exchange: Exchange) -> Vec<u8> {
         let (kind, approval, parts): (u8, &ApprovalId, [&[u8]; 3]) = match self {
             Self::Request {
                 approval,
                 new,
                 pk,
                 commitment,
-            } => (REQUEST, approval, [&new.0, &pk[..], commitment]),
+            } => (
+                match exchange {
+                    Exchange::Device => REQUEST,
+                    Exchange::App => APP_REQUEST,
+                },
+                approval,
+                [&new.0, &pk[..], commitment],
+            ),
             Self::Response {
                 approval,
                 approver,
                 ct,
                 r_approver,
-            } => (RESPONSE, approval, [&approver.0, &ct[..], r_approver]),
+            } => (
+                match exchange {
+                    Exchange::Device => RESPONSE,
+                    Exchange::App => APP_RESPONSE,
+                },
+                approval,
+                [&approver.0, &ct[..], r_approver],
+            ),
             Self::Reveal { approval, r_new } => (REVEAL, approval, [r_new, &[], &[]]),
+            Self::AppReveal {
+                approval,
+                r_new,
+                hello,
+            } => (APP_REVEAL, approval, [r_new, hello, &[]]),
+            Self::AppTransfer { approval, payload } => {
+                (APP_TRANSFER, approval, [payload, &[], &[]])
+            }
             Self::Transfer {
                 approval,
                 account_key,
@@ -285,6 +425,10 @@ impl Message {
     /// Returns [`Error::NeedsUpdate`] for an unsupported format or
     /// [`Error::ApprovalEnded`] for a malformed message or wrong exchange.
     pub fn parse(bytes: &[u8], approval: ApprovalId) -> Result<Message, Error> {
+        Self::parse_as(Exchange::Device, bytes, approval)
+    }
+
+    fn parse_as(exchange: Exchange, bytes: &[u8], approval: ApprovalId) -> Result<Message, Error> {
         match bytes.first() {
             Some(&FORMAT) => {}
             Some(_) => return Err(Error::NeedsUpdate),
@@ -293,29 +437,59 @@ impl Message {
         if bytes.len() < HEADER || bytes[2..HEADER] != approval.0 {
             return Err(bad());
         }
+        if exchange == Exchange::App && bytes.len() > MESSAGE_MAX {
+            return Err(bad());
+        }
         let body = &bytes[HEADER..];
         let fixed = |len: usize| bytes.len() == len;
+        let (request, response, reveal, transfer) = match exchange {
+            Exchange::Device => (REQUEST, RESPONSE, REVEAL, TRANSFER),
+            Exchange::App => (APP_REQUEST, APP_RESPONSE, APP_REVEAL, APP_TRANSFER),
+        };
         match bytes[1] {
-            REQUEST if fixed(REQUEST_LEN) => Ok(Self::Request {
+            kind if kind == request && fixed(REQUEST_LEN) => Ok(Self::Request {
                 approval,
                 new: DeviceId(array(&body[..16])),
                 pk: Box::new(array(&body[16..16 + XWING_PUBLIC_BYTES])),
                 commitment: array(&body[16 + XWING_PUBLIC_BYTES..]),
             }),
-            RESPONSE if fixed(RESPONSE_LEN) => Ok(Self::Response {
+            kind if kind == response && fixed(RESPONSE_LEN) => Ok(Self::Response {
                 approval,
                 approver: DeviceId(array(&body[..16])),
                 ct: Box::new(array(&body[16..16 + XWING_CIPHERTEXT_BYTES])),
                 r_approver: array(&body[16 + XWING_CIPHERTEXT_BYTES..]),
             }),
-            REVEAL if fixed(REVEAL_LEN) => Ok(Self::Reveal {
-                approval,
-                r_new: array(body),
-            }),
-            TRANSFER if fixed(TRANSFER_LEN) => Ok(Self::Transfer {
-                approval,
-                account_key: body.to_vec(),
-            }),
+            kind if kind == reveal && exchange == Exchange::Device && fixed(REVEAL_LEN) => {
+                Ok(Self::Reveal {
+                    approval,
+                    r_new: array(body),
+                })
+            }
+            kind if kind == reveal
+                && exchange == Exchange::App
+                && bytes.len() >= REVEAL_LEN + envelope::OVERHEAD =>
+            {
+                Ok(Self::AppReveal {
+                    approval,
+                    r_new: array(&body[..32]),
+                    hello: body[32..].to_vec(),
+                })
+            }
+            kind if kind == transfer
+                && exchange == Exchange::App
+                && bytes.len() >= HEADER + envelope::OVERHEAD =>
+            {
+                Ok(Self::AppTransfer {
+                    approval,
+                    payload: body.to_vec(),
+                })
+            }
+            kind if kind == transfer && exchange == Exchange::Device && fixed(TRANSFER_LEN) => {
+                Ok(Self::Transfer {
+                    approval,
+                    account_key: body.to_vec(),
+                })
+            }
             _ => Err(bad()),
         }
     }
@@ -340,6 +514,7 @@ fn end<T>(reason: EndReason) -> Result<T, Error> {
 
 /// The new device's side, from its request until it receives the account key.
 pub struct NewSide {
+    exchange: Exchange,
     ids: Ids,
     deadline: u64,
     state: NewState,
@@ -360,18 +535,24 @@ enum NewState {
 impl NewSide {
     /// Step 1: a fresh key and hidden random value; returns the request.
     pub fn start(ids: Ids, now_ms: u64) -> (NewSide, Vec<u8>) {
+        Self::start_as(Exchange::Device, ids, now_ms)
+    }
+
+    /// Starts a device approval or a separately labelled app connection.
+    pub fn start_as(exchange: Exchange, ids: Ids, now_ms: u64) -> (NewSide, Vec<u8>) {
         let kem = Box::new(KemKey::generate());
         let pk = kem.public();
         let r_new = Zeroizing::new(random::<32>());
-        let commitment = commitment(&ids, &pk, &r_new);
+        let commitment = commitment_as(exchange, &ids, &pk, &r_new);
         let request = Message::Request {
             approval: ids.approval,
             new: ids.new,
             pk: Box::new(pk),
             commitment,
         }
-        .encode();
+        .encode_as(exchange);
         let side = NewSide {
+            exchange,
             ids,
             deadline: now_ms.saturating_add(TTL_MS),
             state: NewState::Requested {
@@ -393,6 +574,35 @@ impl NewSide {
         response: &[u8],
         now_ms: u64,
     ) -> Result<(Vec<u8>, Digits), Error> {
+        self.response_as(Exchange::Device, response, None, now_ms)
+    }
+
+    /// Opens the response and seals the app's claim into its reveal.
+    ///
+    /// # Errors
+    /// Returns `ApprovalEnded` for an invalid claim, message or expired exchange.
+    pub fn on_app_response(
+        &mut self,
+        response: &[u8],
+        hello: &AppHello,
+        now_ms: u64,
+    ) -> Result<(Vec<u8>, Digits), Error> {
+        self.response_as(Exchange::App, response, Some(hello), now_ms)
+    }
+
+    fn response_as(
+        &mut self,
+        exchange: Exchange,
+        response: &[u8],
+        hello: Option<&AppHello>,
+        now_ms: u64,
+    ) -> Result<(Vec<u8>, Digits), Error> {
+        if self.exchange != exchange {
+            return Err(bad());
+        }
+        if let Some(hello) = hello {
+            hello.validate()?;
+        }
         let state = mem::replace(&mut self.state, NewState::Ended(EndReason::BadMessage));
         let (kem, commitment, r_new) = match state {
             NewState::Ended(reason) => {
@@ -415,7 +625,7 @@ impl NewSide {
             ct,
             r_approver,
             ..
-        } = Message::parse(response, self.ids.approval)?
+        } = Message::parse_as(exchange, response, self.ids.approval)?
         else {
             return Err(bad());
         };
@@ -432,13 +642,27 @@ impl NewSide {
             r_approver: &r_approver,
             r_new: &r_new,
         }
-        .encode();
-        let (digits, transfer_key) = derive(&shared, &transcript);
-        let reveal = Message::Reveal {
-            approval: self.ids.approval,
-            r_new: *r_new,
+        .encode_as(exchange);
+        let (digits, transfer_key) = derive_as(exchange, &shared, &transcript);
+        let reveal = match hello {
+            Some(hello) => Message::AppReveal {
+                approval: self.ids.approval,
+                r_new: *r_new,
+                hello: envelope::seal(
+                    &hello_key(&shared, &transcript),
+                    &aad(Purpose::AppConnectHello, &self.ids),
+                    &serde_json::to_vec(hello).map_err(|_| bad())?,
+                ),
+            },
+            None => Message::Reveal {
+                approval: self.ids.approval,
+                r_new: *r_new,
+            },
         }
         .encode();
+        if exchange == Exchange::App && reveal.len() > MESSAGE_MAX {
+            return Err(bad());
+        }
         self.state = NewState::Revealed { transfer_key };
         Ok((reveal, digits))
     }
@@ -449,6 +673,9 @@ impl NewSide {
     /// Returns [`Error::ApprovalEnded`] for an expired, malformed or ended
     /// exchange, or [`Error::NeedsUpdate`] for an unsupported message format.
     pub fn on_transfer(self, transfer: &[u8], now_ms: u64) -> Result<Secret<32>, Error> {
+        if self.exchange != Exchange::Device {
+            return Err(bad());
+        }
         let transfer_key = match self.state {
             NewState::Ended(reason) => return end(reason),
             _ if now_ms >= self.deadline => return end(EndReason::Expired),
@@ -467,11 +694,43 @@ impl NewSide {
         .map_err(|_| bad())?;
         Secret::from_slice(&opened).map_err(|_| bad())
     }
+
+    /// Opens the app credentials only under this exchange's transfer key.
+    ///
+    /// # Errors
+    /// Returns `ApprovalEnded` if the transfer is malformed, wrong-kind or expired.
+    pub fn on_app_transfer(
+        self,
+        transfer: &[u8],
+        now_ms: u64,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        if self.exchange != Exchange::App {
+            return Err(bad());
+        }
+        let transfer_key = match self.state {
+            NewState::Ended(reason) => return end(reason),
+            _ if now_ms >= self.deadline => return end(EndReason::Expired),
+            NewState::Requested { .. } => return Err(bad()),
+            NewState::Revealed { transfer_key } => transfer_key,
+        };
+        let Message::AppTransfer { payload, .. } =
+            Message::parse_as(Exchange::App, transfer, self.ids.approval)?
+        else {
+            return Err(bad());
+        };
+        envelope::open(
+            &transfer_key,
+            &aad(Purpose::AppConnectTransfer, &self.ids),
+            &payload,
+        )
+        .map_err(|_| bad())
+    }
 }
 
 /// The approving device's side, from its one response until it sends the
 /// account key or the digits don't match.
 pub struct ApproverSide {
+    exchange: Exchange,
     ids: Ids,
     me: DeviceId,
     pk: Box<[u8; XWING_PUBLIC_BYTES]>,
@@ -488,6 +747,10 @@ enum ApproverState {
     },
     Revealed {
         digits: Digits,
+        transfer_key: Secret<32>,
+        hello: Option<(Secret<32>, Vec<u8>)>,
+    },
+    Checked {
         transfer_key: Secret<32>,
     },
     Ended(EndReason),
@@ -507,12 +770,27 @@ impl ApproverSide {
         request: &[u8],
         now_ms: u64,
     ) -> Result<(ApproverSide, Vec<u8>), Error> {
+        Self::respond_as(Exchange::Device, account, me, approval, request, now_ms)
+    }
+
+    /// Answers a request using its exchange's independent message kinds.
+    ///
+    /// # Errors
+    /// Returns `ApprovalEnded` for a malformed or wrong-kind request.
+    pub fn respond_as(
+        exchange: Exchange,
+        account: AccountId,
+        me: DeviceId,
+        approval: ApprovalId,
+        request: &[u8],
+        now_ms: u64,
+    ) -> Result<(ApproverSide, Vec<u8>), Error> {
         let Message::Request {
             new,
             pk,
             commitment,
             ..
-        } = Message::parse(request, approval)?
+        } = Message::parse_as(exchange, request, approval)?
         else {
             return Err(bad());
         };
@@ -528,8 +806,9 @@ impl ApproverSide {
             ct: ct.clone(),
             r_approver,
         }
-        .encode();
+        .encode_as(exchange);
         let side = ApproverSide {
+            exchange,
             ids: Ids {
                 account,
                 approval,
@@ -572,13 +851,18 @@ impl ApproverSide {
                 self.state = ApproverState::Ended(EndReason::Expired);
                 return end(EndReason::Expired);
             }
-            ApproverState::Revealed { .. } => return end(EndReason::BadMessage),
+            ApproverState::Revealed { .. } | ApproverState::Checked { .. } => {
+                return end(EndReason::BadMessage);
+            }
             ApproverState::Responded { shared } => shared,
         };
-        let Message::Reveal { r_new, .. } = Message::parse(reveal, self.ids.approval)? else {
-            return Err(bad());
+        let message = Message::parse_as(self.exchange, reveal, self.ids.approval)?;
+        let (r_new, hello) = match (self.exchange, message) {
+            (Exchange::Device, Message::Reveal { r_new, .. }) => (r_new, None),
+            (Exchange::App, Message::AppReveal { r_new, hello, .. }) => (r_new, Some(hello)),
+            _ => return Err(bad()),
         };
-        let opened = commitment(&self.ids, &self.pk, &r_new);
+        let opened = commitment_as(self.exchange, &self.ids, &self.pk, &r_new);
         if !constant_time_eq(&opened, &self.commitment) {
             return Err(bad());
         }
@@ -591,11 +875,12 @@ impl ApproverSide {
             r_approver: &self.r_approver,
             r_new: &r_new,
         }
-        .encode();
-        let (digits, transfer_key) = derive(&shared, &transcript);
+        .encode_as(self.exchange);
+        let (digits, transfer_key) = derive_as(self.exchange, &shared, &transcript);
         self.state = ApproverState::Revealed {
             digits,
             transfer_key,
+            hello: hello.map(|sealed| (hello_key(&shared, &transcript), sealed)),
         };
         Ok(())
     }
@@ -612,6 +897,9 @@ impl ApproverSide {
         account_key: &Secret<32>,
         now_ms: u64,
     ) -> Result<Vec<u8>, Error> {
+        if self.exchange != Exchange::Device {
+            return Err(bad());
+        }
         let (digits, transfer_key) = match self.state {
             ApproverState::Ended(reason) => return end(reason),
             _ if now_ms >= self.deadline => return end(EndReason::Expired),
@@ -619,7 +907,9 @@ impl ApproverSide {
             ApproverState::Revealed {
                 digits,
                 transfer_key,
+                ..
             } => (digits, transfer_key),
+            ApproverState::Checked { .. } => return Err(bad()),
         };
         if *typed != digits {
             return end(EndReason::WrongDigits);
@@ -630,6 +920,75 @@ impl ApproverSide {
                 &transfer_key,
                 &aad(Purpose::ApprovalTransfer, &self.ids),
                 account_key.expose(),
+            ),
+        }
+        .encode())
+    }
+
+    /// Compares the typed digits before opening the app's sealed claim.
+    ///
+    /// # Errors
+    /// Wrong digits end this side permanently; malformed or expired exchanges are refused.
+    pub fn check(&mut self, typed: &Digits, now_ms: u64) -> Result<AppHello, Error> {
+        if self.exchange != Exchange::App {
+            return Err(bad());
+        }
+        let state = mem::replace(&mut self.state, ApproverState::Ended(EndReason::BadMessage));
+        let (digits, transfer_key, hello) = match state {
+            ApproverState::Ended(reason) => {
+                self.state = ApproverState::Ended(reason);
+                return end(reason);
+            }
+            _ if now_ms >= self.deadline => {
+                self.state = ApproverState::Ended(EndReason::Expired);
+                return end(EndReason::Expired);
+            }
+            ApproverState::Revealed {
+                digits,
+                transfer_key,
+                hello: Some(hello),
+            } => (digits, transfer_key, hello),
+            _ => return Err(bad()),
+        };
+        if *typed != digits {
+            self.state = ApproverState::Ended(EndReason::WrongDigits);
+            return end(EndReason::WrongDigits);
+        }
+        let opened = envelope::open(
+            &hello.0,
+            &aad(Purpose::AppConnectHello, &self.ids),
+            &hello.1,
+        )
+        .map_err(|_| bad())?;
+        let claim: AppHello = serde_json::from_slice(&opened).map_err(|_| bad())?;
+        claim.validate()?;
+        self.state = ApproverState::Checked { transfer_key };
+        Ok(claim)
+    }
+
+    /// Seals credentials after a successful app-digit check.
+    ///
+    /// # Errors
+    /// Returns `ApprovalEnded` for an unchecked, expired or ended exchange.
+    pub fn seal_payload(self, payload: &[u8], now_ms: u64) -> Result<Vec<u8>, Error> {
+        if self.exchange != Exchange::App {
+            return Err(bad());
+        }
+        let transfer_key = match self.state {
+            ApproverState::Ended(reason) => return end(reason),
+            _ if now_ms >= self.deadline => return end(EndReason::Expired),
+            ApproverState::Checked { transfer_key } => transfer_key,
+            _ => return Err(bad()),
+        };
+        if HEADER + envelope::OVERHEAD + payload.len() > MESSAGE_MAX {
+            return Err(bad());
+        }
+        Ok(Message::AppTransfer {
+            approval: self.ids.approval,
+            payload: envelope::seal(
+                &transfer_key,
+                &aad(Purpose::AppConnectTransfer, &self.ids),
+                payload,
             ),
         }
         .encode())
@@ -708,6 +1067,314 @@ mod tests {
     fn other_digits(digits: &Digits) -> Digits {
         let n: u32 = digits.as_str().parse().unwrap();
         Digits::parse(&format!("{:06}", (n + 1) % 1_000_000)).unwrap()
+    }
+
+    fn app_hello() -> AppHello {
+        AppHello {
+            name: "Sample".into(),
+            app_id: "app.basehero.sample".into(),
+        }
+    }
+
+    fn app_revealed() -> (NewSide, ApproverSide, Digits) {
+        let ids = ids();
+        let (mut new, request) = NewSide::start_as(Exchange::App, ids, START);
+        let (mut approver, response) = ApproverSide::respond_as(
+            Exchange::App,
+            ids.account,
+            DeviceId::random(),
+            ids.approval,
+            &request,
+            RESPOND,
+        )
+        .unwrap();
+        let (reveal, digits) = new
+            .on_app_response(&response, &app_hello(), START + 1)
+            .unwrap();
+        approver.on_reveal(&reveal, RESPOND + 1).unwrap();
+        (new, approver, digits)
+    }
+
+    #[test]
+    fn an_honest_app_exchange_carries_the_hello_and_the_payload() {
+        let (new, mut approver, digits) = app_revealed();
+        assert_eq!(approver.check(&digits, RESPOND + 2).unwrap(), app_hello());
+        let transfer = approver.seal_payload(b"{creds}", RESPOND + 3).unwrap();
+        assert_eq!(
+            &*new.on_app_transfer(&transfer, START + 2).unwrap(),
+            b"{creds}"
+        );
+    }
+
+    #[test]
+    fn an_app_message_is_never_taken_for_a_device_one() {
+        let ids = ids();
+        let (mut app, request) = NewSide::start_as(Exchange::App, ids, START);
+        assert_eq!(
+            err(ApproverSide::respond(
+                ids.account,
+                DeviceId::random(),
+                ids.approval,
+                &request,
+                RESPOND
+            )),
+            ended(EndReason::BadMessage)
+        );
+        let (mut approver, response) = ApproverSide::respond_as(
+            Exchange::App,
+            ids.account,
+            DeviceId::random(),
+            ids.approval,
+            &request,
+            RESPOND,
+        )
+        .unwrap();
+        assert_eq!(
+            app.on_response(&response, START + 1).unwrap_err(),
+            ended(EndReason::BadMessage)
+        );
+        let (reveal, digits) = app
+            .on_app_response(&response, &app_hello(), START + 1)
+            .unwrap();
+        approver.on_reveal(&reveal, RESPOND + 1).unwrap();
+        approver.check(&digits, RESPOND + 2).unwrap();
+        let app_transfer = approver.seal_payload(b"creds", RESPOND + 3).unwrap();
+        assert_eq!(
+            err(app.on_transfer(&app_transfer, START + 2)),
+            ended(EndReason::BadMessage)
+        );
+        let (mut device, _) = NewSide::start(ids, START);
+        assert_eq!(
+            device.on_response(&response, START + 1).unwrap_err(),
+            ended(EndReason::BadMessage)
+        );
+        let (mut device, device_request) = NewSide::start(ids, START);
+        assert_eq!(
+            err(ApproverSide::respond_as(
+                Exchange::App,
+                ids.account,
+                DeviceId::random(),
+                ids.approval,
+                &device_request,
+                RESPOND
+            )),
+            ended(EndReason::BadMessage)
+        );
+        let (mut device_approver, device_response) = ApproverSide::respond(
+            ids.account,
+            DeviceId::random(),
+            ids.approval,
+            &device_request,
+            RESPOND,
+        )
+        .unwrap();
+        let (device_reveal, device_digits) =
+            device.on_response(&device_response, START + 1).unwrap();
+        device_approver
+            .on_reveal(&device_reveal, RESPOND + 1)
+            .unwrap();
+        let transfer = device_approver
+            .confirm(&device_digits, &Secret::<32>::random(), RESPOND + 2)
+            .unwrap();
+        let (mut app, app_request) = NewSide::start_as(Exchange::App, ids, START);
+        let (_, app_response) = ApproverSide::respond_as(
+            Exchange::App,
+            ids.account,
+            DeviceId::random(),
+            ids.approval,
+            &app_request,
+            RESPOND,
+        )
+        .unwrap();
+        app.on_app_response(&app_response, &app_hello(), START + 1)
+            .unwrap();
+        assert_eq!(
+            err(app.on_app_transfer(&transfer, START + 2)),
+            ended(EndReason::BadMessage)
+        );
+    }
+
+    #[test]
+    fn wrong_digits_end_an_app_exchange_before_the_hello_opens() {
+        let (_, mut approver, digits) = app_revealed();
+        assert_eq!(
+            err(approver.check(&other_digits(&digits), RESPOND + 2)),
+            ended(EndReason::WrongDigits)
+        );
+        assert_eq!(
+            err(approver.check(&digits, RESPOND + 3)),
+            ended(EndReason::WrongDigits)
+        );
+        assert_eq!(
+            err(approver.seal_payload(b"creds", RESPOND + 4)),
+            ended(EndReason::WrongDigits)
+        );
+    }
+
+    #[test]
+    fn the_payload_is_sealed_only_after_a_matching_check() {
+        let (_, approver, _) = app_revealed();
+        assert_eq!(
+            err(approver.seal_payload(b"creds", RESPOND + 2)),
+            ended(EndReason::BadMessage)
+        );
+    }
+
+    #[test]
+    fn an_expired_app_exchange_refuses_every_step() {
+        let (new, mut approver, digits) = app_revealed();
+        assert_eq!(
+            err(approver.check(&digits, RESPOND + TTL_MS)),
+            ended(EndReason::Expired)
+        );
+        assert_eq!(
+            err(approver.seal_payload(b"creds", RESPOND + TTL_MS)),
+            ended(EndReason::Expired)
+        );
+        let (_, mut approver, digits) = app_revealed();
+        approver.check(&digits, RESPOND + 2).unwrap();
+        let transfer = approver.seal_payload(b"creds", RESPOND + 3).unwrap();
+        assert_eq!(
+            err(new.on_app_transfer(&transfer, START + TTL_MS)),
+            ended(EndReason::Expired)
+        );
+    }
+
+    #[test]
+    fn a_bad_hello_is_refused() {
+        for hello in [
+            AppHello {
+                name: "".into(),
+                ..app_hello()
+            },
+            AppHello {
+                name: "a".repeat(41),
+                ..app_hello()
+            },
+            AppHello {
+                name: "a\nb".into(),
+                ..app_hello()
+            },
+            AppHello {
+                name: "Sample\u{202e}".into(),
+                ..app_hello()
+            },
+            AppHello {
+                name: "Sam\u{200e}ple".into(),
+                ..app_hello()
+            },
+            AppHello {
+                app_id: "bad id".into(),
+                ..app_hello()
+            },
+            AppHello {
+                app_id: "a".repeat(101),
+                ..app_hello()
+            },
+        ] {
+            let ids = ids();
+            let (mut new, request) = NewSide::start_as(Exchange::App, ids, START);
+            let (_, response) = ApproverSide::respond_as(
+                Exchange::App,
+                ids.account,
+                DeviceId::random(),
+                ids.approval,
+                &request,
+                RESPOND,
+            )
+            .unwrap();
+            assert_eq!(
+                err(new.on_app_response(&response, &hello, START + 1)),
+                ended(EndReason::BadMessage)
+            );
+        }
+        let ids = ids();
+        let (mut new, request) = NewSide::start_as(Exchange::App, ids, START);
+        let (mut approver, response) = ApproverSide::respond_as(
+            Exchange::App,
+            ids.account,
+            DeviceId::random(),
+            ids.approval,
+            &request,
+            RESPOND,
+        )
+        .unwrap();
+        let (mut reveal, _) = new
+            .on_app_response(&response, &app_hello(), START + 1)
+            .unwrap();
+        reveal.resize(MESSAGE_MAX + 1, 0);
+        assert_eq!(
+            approver.on_reveal(&reveal, RESPOND + 1).unwrap_err(),
+            ended(EndReason::BadMessage)
+        );
+    }
+
+    #[test]
+    fn email_scope_ignores_case_and_spaces() {
+        assert_eq!(email_scope(" Dan@HLD.ca "), email_scope("dan@hld.ca"));
+        assert_ne!(email_scope("dan@hld.com"), email_scope("dan@hld.ca"));
+    }
+
+    #[test]
+    fn the_same_inputs_give_different_digits_for_an_app() {
+        let ids = Ids {
+            account: AccountId([1; 16]),
+            approval: ApprovalId([2; 16]),
+            new: DeviceId([3; 16]),
+        };
+        let transcript = Transcript {
+            ids: &ids,
+            approver: DeviceId([4; 16]),
+            pk: &[5; XWING_PUBLIC_BYTES],
+            commitment: &[6; 32],
+            ct: &[7; XWING_CIPHERTEXT_BYTES],
+            r_approver: &[8; 32],
+            r_new: &[9; 32],
+        };
+        let secret = Secret::from_slice(&[10; 32]).unwrap();
+        let (device_digits, device_key) = derive(&secret, &transcript.encode());
+        let (app_digits, app_key) =
+            derive_as(Exchange::App, &secret, &transcript.encode_as(Exchange::App));
+        assert_ne!(device_digits, app_digits);
+        assert_ne!(device_key.expose(), app_key.expose());
+    }
+
+    #[test]
+    fn app_derivation_matches_its_test_vector() {
+        let ids = Ids {
+            account: AccountId([1; 16]),
+            approval: ApprovalId([2; 16]),
+            new: DeviceId([3; 16]),
+        };
+        let transcript = Transcript {
+            ids: &ids,
+            approver: DeviceId([4; 16]),
+            pk: &[5; XWING_PUBLIC_BYTES],
+            commitment: &[6; 32],
+            ct: &[7; XWING_CIPHERTEXT_BYTES],
+            r_approver: &[8; 32],
+            r_new: &[9; 32],
+        }
+        .encode_as(Exchange::App);
+        let secret = Secret::from_slice(&[10; 32]).unwrap();
+        let (digits, tk) = derive_as(Exchange::App, &secret, &transcript);
+        let bound =
+            Secret::from_slice(&generichash(Some(secret.expose()), &[&transcript])).unwrap();
+        let hello_key = kdf(&bound, b"bhapchl1", 1);
+        assert_eq!(
+            (
+                hex(&generichash(None, &[&transcript])),
+                digits.as_str().to_string(),
+                hex(tk.expose()),
+                hex(hello_key.expose())
+            ),
+            (
+                "66262722aa9bddd4262e6cbb773e3a62103b6a23170ddd4aad6f2e68920d2d42".into(),
+                "227422".into(),
+                "d689641a3ffd15031acef3f69876544e9a55b4b6edaf9f7ab7dac7b5f3a879aa".into(),
+                "8805ccc4c2e485215763e37f2c989e3eaea273db5f71936cff5734b1b52243ff".into()
+            )
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ Pin a release tag in your `Cargo.toml`. Use the [latest release](https://github.
 [dependencies]
 bh-core = { git = "https://github.com/BaseHero/basehero", tag = "vX.Y.Z" }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 zeroize = "1"
 ```
 
@@ -52,7 +53,7 @@ The core links SQLCipher through `rusqlite` 0.41. A Rust binary can link only on
 
 ## Open the core
 
-Give each installation its own data directory and keep it out of device backups. On Android, disable backup or exclude both the database and sealed-secret directories. Keep a random 32-byte sealing key that the platform protects: on Android, wrap it with an Android Keystore key and store the wrapped copy outside backups; on macOS, keep it in the Keychain. Pass that key to `SealedFileSecretStore`, and reuse the same key after a restart. Losing it makes the sealed local secrets unreadable, and the device must connect again. Only one open core may use a data directory at a time.
+Give each installation its own data directory and keep it out of device backups. On Android, disable backup or exclude both the database and sealed-secret directories. Keep a random 32-byte sealing key that the platform protects: on Android, wrap it with an Android Keystore key and store the wrapped copy outside backups; on macOS, keep it in the Keychain. On a Linux desktop, which is for development, a file only your user can read will do. Pass that key to `SealedFileSecretStore`, and reuse the same key after a restart. Losing it makes the sealed local secrets unreadable, and the device must connect again. Only one open core may use a data directory at a time.
 
 ```rust
 use bh_core::{Core, CoreConfig, Error, SealedFileSecretStore};
@@ -71,57 +72,70 @@ Call `Core::shutdown()` as the app quits. The core also stops when its last hand
 
 ## Connect
 
-For development, use a full device signed into the `dev` environment to create a base and issue app credentials. The sample app connects to one new base, **Sample readings**. The current `bh app connect` accepts either `--base` (an existing base ID or name) or `--new-base`, not both. A fresh connection is a new app device.
+Ask the person for their BaseHero email, then start an approval request with your app's display name and **stable app ID**. The app ID should stay the same across reinstallations (for example, your platform's app identifier). Show the digits returned by `digits()` in your app. The person opens BaseHero on one of their devices, types those digits there, chooses a base and a monthly cap, and approves. **Approve only an app you're setting up right now.** Keep the `PendingConnection` until `wait()` returns the installed account; `cancel()` ends a request the person no longer wants.
 
-```sh
-bh app connect --name "Tester - BaseHero Sample" --new-base "Sample readings" --out app-credentials.json
+```rust,no_run
+use bh_core::{AppIdentity, Core, Error, Url};
+
+async fn connect(
+    core: &Core,
+    server: Url,
+    email: &str,
+    show_digits: impl Fn(&str),
+) -> Result<bh_core::Account, Error> {
+    let mut pending = core.start_connection(server, email, AppIdentity {
+        name: "Example".into(),
+        app_id: "app.example.readings".into(),
+    }).await?;
+    let digits = pending.digits().await?;
+    // Show them on your app's screen, for example "482 913"; don't log them.
+    show_digits(&digits.to_string());
+    pending.wait().await
+}
 ```
 
-Choose `--read-only` if an app must not write. Use a **different** data directory from the full device's CLI home. The JSON contains a bearer token and app key; read it in native Rust, install it once, and delete it only after installation and the first catch-up succeed. Never put it in a WebView, a log, a repository or a backup. Its `bases` array holds granted base IDs in request order. The following is the native install helper called by [`Sample::install_file`](../apps/sample/core/src/lib.rs) in the [sample app](../apps/sample/README.md). The sample passes its `reading_type()` definition for `sample.reading` as `ty`; define your own type in your app.
+A request left unanswered ends after two minutes, whether or not that email belongs to an account; the app cannot tell which. A wrong entry or a decline also ends it. On `Error::ApprovalEnded`, ask for the email and start a **new** request rather than retrying the old one. After reinstalling, connect again with the same app ID: BaseHero offers the old connection's granted base so the app can read its records again.
 
-<!-- snippet: apps/sample/core/src/lib.rs#install -->
+The [sample app](../apps/sample/README.md) keeps the pending connection in native Rust; its completion helper catches up before querying or creating a reading and defines `sample.reading` in a writable base:
+
+<!-- snippet: apps/sample/core/src/lib.rs#connect -->
 ```rust,no_run
-mod install_example {
-    use bh_core::{Account, AppCredentials, BaseId, Core, Error, Mode, TypeDef};
-    use std::{path::Path, time::Duration};
+mod connect_example {
+    use bh_core::{Account, BaseId, Error, Mode, PendingConnection, TypeDef};
+    use std::time::Duration;
 
-    pub async fn install_file(
-        core: &Core,
-        path: &Path,
+    pub async fn finish(
+        pending: &mut PendingConnection,
         ty: TypeDef,
     ) -> Result<(Account, BaseId), Error> {
-        // This file is private app storage, never passed to the WebView.
-        let bytes = std::fs::read(path)?;
-        let credentials: AppCredentials =
-            serde_json::from_slice(&bytes).map_err(|e| Error::Invalid(e.to_string()))?;
-        let base_id = *credentials
-            .bases
+        let account = pending.wait().await?;
+        let base_id = account
+            .bases()
             .first()
-            .ok_or_else(|| Error::Invalid("no base grant".into()))?;
-        let account = core.install_app(credentials).await?;
+            .ok_or_else(|| Error::Invalid("no base grant".into()))?
+            .id;
         let base = account.base(base_id)?;
-        // A second installation must fetch existing records before query-and-create.
+        // A reinstalled app catches up before querying or creating a daily record.
         tokio::time::timeout(Duration::from_secs(30), base.sync_now())
             .await
             .map_err(|_| Error::Network("first catch-up timed out".into()))??;
         if base.mode() == Mode::ReadWrite {
             base.define_type(ty)?;
         }
-        std::fs::remove_file(path)?;
         Ok((account, base_id))
     }
 }
 ```
 
-On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` instead of installing again. Before any query-and-create after restart, wait for `base.sync_state().last_synced_at` or call `base.sync_now()`. If `AccountEvent::Removed` arrives, the core has erased its account copy; stop using old base handles and ask the person to reconnect.
+On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` instead of connecting again. Before any query-and-create after restart, wait for `base.sync_state().last_synced_at` or call `base.sync_now()`. When a full device disconnects the app, `AccountEvent::Removed` arrives and the core erases its account copy; stop using old base handles and offer to reconnect.
 
 ### On Android
 
-For development, copy the JSON into the sample's private `app_data_dir()/app-credentials.json` with `adb exec-in run-as app.basehero.sample sh -c 'cat > app-credentials.json'`, piping the JSON as stdin. Install the debug app first so `run-as` can open its private directory. Never put the file on shared storage or pass it through the WebView. Tap **Connect**; the native Rust command calls `Sample::install_file` and deletes the file after catch-up. The sample disables Android backup. For a real app, seal local secrets with a platform-protected key as in [Open the core](#open-the-core).
+The sample connects directly: enter the email, tap **Connect to BaseHero**, and type its digits into BaseHero on another device. The sample disables Android backup. For a real app, seal local secrets with a platform-protected key as in [Open the core](#open-the-core).
 
 ## What your app can see
 
-An app device has access to **all records** in each granted base, including notes and records written by other apps. It cannot open ungranted bases. Each grant is `Mode::ReadOnly` or `Mode::ReadWrite`; local edits to a read-only base return `Error::ReadOnly`. A full device connecting the app chooses its display name; for example, `Developer - Example`. No narrower folder grant is available in this API.
+The person names and grants the app access to whole bases when approving it. An app device can see **all records** in each granted base, including notes and records written by other apps. It cannot open ungranted bases. Each grant is `Mode::ReadOnly` or `Mode::ReadWrite`; local edits to a read-only base return `Error::ReadOnly`. No narrower folder grant is available in this API.
 
 ## Record types
 
@@ -229,7 +243,38 @@ async fn ask(account: &Account, base_id: BaseId, question: &str) -> Result<Optio
 }
 ```
 
-The gateway limits requests per account, shared across the account's devices. Calls beyond a limit return `ModelError::RateLimited`.
+For text as it arrives, `complete_streaming` sends pieces through a channel and returns the whole `Completion` when the call finishes. The pieces contain reply text; any tool calls are in the final completion.
+
+```rust,no_run
+use bh_core::{Account, BaseId, models::{ChatRequest, Message, Role}};
+use std::io::{self, Write};
+
+async fn ask_streaming(
+    account: &Account,
+    base_id: BaseId,
+    question: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let model = account.model_for(base_id)?;
+    let request = ChatRequest {
+        messages: vec![Message {
+            role: Role::User, content: Some(question.into()),
+            tool_calls: vec![], tool_call_id: None,
+        }],
+        tools: vec![], tool_choice: None, max_tokens: 64,
+    };
+    let (send, mut pieces) = tokio::sync::mpsc::unbounded_channel();
+    let call = tokio::spawn(async move { model.complete_streaming(request, send).await });
+    while let Some(piece) = pieces.recv().await {
+        print!("{piece}");
+        io::stdout().flush()?;
+    }
+    let completion = call.await??;
+    println!("\nFinal: {}", completion.text.as_deref().unwrap_or(""));
+    Ok(completion.text)
+}
+```
+
+The gateway limits requests per account, shared across the account's devices. Each app also has a monthly cap, $1 unless the person changes it while approving or later in Devices. After reaching its cap, model calls return `ModelError::RateLimited` until the next month (or until the cap is raised).
 
 ## Test against `dev`
 
@@ -239,14 +284,14 @@ Ask the BaseHero team for a `dev` invite. Install the CLI from the same release 
 cargo install --locked --git https://github.com/BaseHero/basehero --tag vX.Y.Z bh-cli
 ```
 
-Sign up a full device in `dev`, with its own CLI home, then connect your app. `bh signup` prompts for the account password unless `BH_PASSWORD` is set; keep the recovery kit it prints.
+Sign up a full device in `dev`, with its own CLI home, then start your app's connection against `https://dev-api.basehero.com`. `--home` chooses the CLI's data directory; use the same one for every later `bh` command. `bh signup` prompts for the account password unless `BH_PASSWORD` is set; keep the recovery kit it prints.
 
 ```sh
-bh signup --server https://dev-api.basehero.com --invite "$INVITE" --email "$EMAIL" --name "Developer - Desktop"
-bh app connect --name "Developer - Example" --new-base "Example data" --out app-credentials.json
+bh --home ./dev-cli signup --server https://dev-api.basehero.com --invite "$INVITE" --email "$EMAIL" --name "Developer - Desktop"
+bh --home ./dev-cli approve
 ```
 
-Install the file in your app with `Core::install_app`, using the app's own data directory, then delete the file. To see what your app wrote, run `bh sync` and then `bh record query --type example.reading` on the full device. Develop and test against `dev`; production is for real use.
+When your app shows the digits, `bh approve` on that CLI home lets you type them and choose its grants. For scripted automated tests, `bh --home ./dev-cli app connect --name "Developer - Example" --new-base "Example data" --out app-credentials.json` still creates credentials; install that file with `Core::install_app` in the app's own data directory, then delete it. To see what your app wrote, run `bh --home ./dev-cli sync` and then `bh --home ./dev-cli record query --type example.reading` on the full device. Develop and test against `dev`; production is for real use.
 
 ## Stability
 

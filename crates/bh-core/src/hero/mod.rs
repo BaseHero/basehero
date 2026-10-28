@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::sync::{Notify, broadcast, watch};
 use ts_rs::TS;
-use turn::{ResultKind, TurnLimits};
+use turn::{ResultKind, TurnLimits, TurnOutcome};
 
 /// Chat list item, newest first.
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
@@ -121,7 +121,7 @@ pub struct ChatMessage {
     /// Permission prompt, if waiting.
     pub ask: Option<Ask>,
 }
-/// A chat was changed locally or by sync.
+/// A chat was changed locally or by sync, or Hero's reply grew.
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "apps/basehero/src/lib/generated/")]
@@ -135,13 +135,45 @@ pub enum HeroEvent {
         #[ts(type = "string")]
         chat: ObjectId,
     },
+    /// The working message's text so far, at most every 100 ms; not yet saved.
+    Text {
+        /// Base containing the chat.
+        #[ts(type = "string")]
+        base: BaseId,
+        /// Chat ID.
+        #[ts(type = "string")]
+        chat: ObjectId,
+        /// The working Hero message.
+        #[ts(type = "string")]
+        message: ObjectId,
+        /// The reply so far.
+        text: String,
+    },
 }
 
 struct Active {
     base: BaseId,
     message: ObjectId,
     cancel: watch::Sender<bool>,
+    /// The reply so far, saved at most every two seconds.
+    text: String,
 }
+/// Whether a turn task still owns its chat's running turn; the caller holds the turns lock.
+/// The task's own `cancel` also rules out a later turn that reuses the message.
+fn owns_turn(
+    turns: &HashMap<ObjectId, Active>,
+    chat: ObjectId,
+    message: ObjectId,
+    cancel: &watch::Receiver<bool>,
+) -> bool {
+    !*cancel.borrow()
+        && turns
+            .get(&chat)
+            .is_some_and(|a| a.message == message && !*a.cancel.borrow())
+}
+/// How often a running turn shows and saves its reply.
+const SHOW_MS: u64 = 100;
+const SAVE_MS: u64 = 2_000;
 struct Inner {
     account: Account,
     model: Option<Arc<dyn ChatModel>>,
@@ -168,7 +200,7 @@ type Controllers = Mutex<HashMap<(crate::AccountId, crate::DeviceId), Weak<Inner
 static HEROES: OnceLock<Controllers> = OnceLock::new();
 static ALL_HEROES: OnceLock<Mutex<Vec<Weak<Inner>>>> = OnceLock::new();
 
-pub(crate) async fn cancel_account_base(account: &Account, base: BaseId) {
+pub(crate) async fn cancel_account_base(account: &Account, base: &Base) {
     let heroes: Vec<_> = ALL_HEROES
         .get_or_init(Default::default)
         .lock()
@@ -513,6 +545,16 @@ impl Hero {
                 message.error = Some("interrupted".into());
                 self.changed(id, chat);
             }
+            if let Some(active) = self
+                .inner
+                .turns
+                .lock()
+                .unwrap()
+                .get(&chat)
+                .filter(|a| a.message == entry.id)
+            {
+                message.text.clone_from(&active.text);
+            }
             result.push(message);
         }
         Ok(result)
@@ -567,6 +609,7 @@ impl Hero {
                 base: id,
                 message: working,
                 cancel,
+                text: String::new(),
             },
         );
         self.changed(id, chat);
@@ -612,42 +655,21 @@ impl Hero {
             let base = match hero.base(id) {
                 Ok(b) => b,
                 Err(_) => {
-                    hero.finish(
-                        id,
-                        chat,
-                        message,
-                        ResultKind::Failed("failed"),
-                        vec![],
-                        vec![],
-                    );
+                    hero.finish(id, chat, message, TurnOutcome::failed());
                     return;
                 }
             };
             let request = match prompt::build(&base, focus, project, &history) {
                 Ok(r) => r,
                 Err(_) => {
-                    hero.finish(
-                        id,
-                        chat,
-                        message,
-                        ResultKind::Failed("failed"),
-                        vec![],
-                        vec![],
-                    );
+                    hero.finish(id, chat, message, TurnOutcome::failed());
                     return;
                 }
             };
             let chat_info = match hero.ensure_chat(&base, chat) {
                 Ok(c) => c,
                 Err(_) => {
-                    hero.finish(
-                        id,
-                        chat,
-                        message,
-                        ResultKind::Failed("failed"),
-                        vec![],
-                        vec![],
-                    );
+                    hero.finish(id, chat, message, TurnOutcome::failed());
                     return;
                 }
             };
@@ -667,32 +689,59 @@ impl Hero {
                 None => match hero.inner.account.model_for(id) {
                     Ok(model) => model,
                     Err(_) => {
-                        hero.finish(
-                            id,
-                            chat,
-                            message,
-                            ResultKind::Failed("failed"),
-                            vec![],
-                            vec![],
-                        );
+                        hero.finish(id, chat, message, TurnOutcome::failed());
                         return;
                     }
                 },
             };
             drop(hero);
+            let own = cancel.clone();
+            // Text shows at most every SHOW_MS and at the end of each call, and is
+            // saved at most every SAVE_MS; the turn's end saves the whole reply.
+            let (mut shown, mut shown_at) = (0, None::<u64>);
+            let (mut saved, mut saved_at) = (0, clock.now_ms());
             let outcome = turn::run(
                 model.as_ref(),
                 &mut tools,
                 request,
                 TurnLimits::default(),
                 cancel,
+                |text, ended| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let mut turns = inner.turns.lock().unwrap();
+                    if !owns_turn(&turns, chat, message, &own) {
+                        return;
+                    }
+                    if let Some(active) = turns.get_mut(&chat) {
+                        text.clone_into(&mut active.text);
+                    }
+                    let now = clock.now_ms();
+                    if text.len() != shown
+                        && (ended || shown_at.is_none_or(|at| now >= at.saturating_add(SHOW_MS)))
+                    {
+                        (shown, shown_at) = (text.len(), Some(now));
+                        let _ = inner.events.send(HeroEvent::Text {
+                            base: id,
+                            chat,
+                            message,
+                            text: text.to_owned(),
+                        });
+                    }
+                    if text.len() != saved
+                        && now >= saved_at.saturating_add(SAVE_MS)
+                        && let Ok(Some(entry)) = base.get(message)
+                    {
+                        (saved, saved_at) = (text.len(), now);
+                        let mut fields = entry.fields;
+                        fields.insert("text".into(), json!(text));
+                        let _ = base.set_fields(message, fields);
+                    }
+                },
                 |step, created| {
                     let Some(inner) = weak.upgrade() else { return };
                     let hero = Hero { inner };
                     let turns = hero.inner.turns.lock().unwrap();
-                    if turns
-                        .get(&chat)
-                        .is_some_and(|a| a.message == message && !*a.cancel.borrow())
+                    if owns_turn(&turns, chat, message, &own)
                         && let Ok(Some(entry)) = base.get(message)
                     {
                         let mut fields = entry.fields;
@@ -710,10 +759,7 @@ impl Hero {
                 |tools, call| {
                     let inner = weak.upgrade()?;
                     let turns = inner.turns.lock().unwrap();
-                    if turns
-                        .get(&chat)
-                        .is_some_and(|a| a.message == message && !*a.cancel.borrow())
-                    {
+                    if owns_turn(&turns, chat, message, &own) {
                         Some(tools.call(call))
                     } else {
                         None
@@ -722,14 +768,7 @@ impl Hero {
             )
             .await;
             if let Some(inner) = weak.upgrade() {
-                (Hero { inner }).finish(
-                    id,
-                    chat,
-                    message,
-                    outcome.kind,
-                    outcome.steps,
-                    outcome.created,
-                );
+                (Hero { inner }).finish(id, chat, message, outcome);
             }
         });
         let mut tasks = self.inner.tasks.lock().unwrap();
@@ -775,15 +814,13 @@ impl Hero {
             .collect();
         tools::Tools::new(chat_base, others, project)
     }
-    fn finish(
-        &self,
-        id: BaseId,
-        chat: ObjectId,
-        message: ObjectId,
-        kind: ResultKind,
-        steps: Vec<Step>,
-        created: Vec<ObjectId>,
-    ) {
+    fn finish(&self, id: BaseId, chat: ObjectId, message: ObjectId, outcome: TurnOutcome) {
+        let TurnOutcome {
+            kind,
+            text,
+            steps,
+            created,
+        } = outcome;
         let mut turns = self.inner.turns.lock().unwrap();
         if turns
             .get(&chat)
@@ -796,9 +833,9 @@ impl Hero {
         {
             let mut fields = entry.fields;
             let (state, text, error, ask) = match kind {
-                ResultKind::Answer(t) => ("done", t, None, None),
-                ResultKind::Failed(c) => ("failed", String::new(), Some(c), None),
-                ResultKind::Stopped => ("stopped", String::new(), None, None),
+                ResultKind::Answer => ("done", text, None, None),
+                ResultKind::Failed(c) => ("failed", text, Some(c), None),
+                ResultKind::Stopped => ("stopped", text, None, None),
                 ResultKind::Ask(requested) => {
                     let readers = self.inner.account.app_readers(id);
                     let other = self.inner.account.app_readers(requested);
@@ -853,6 +890,10 @@ impl Hero {
     /// errors such as [`Error::Storage`] and [`Error::NeedsUpdate`] if no
     /// active turn exists and the chat cannot be opened.
     pub fn stop(&self, id: BaseId, chat: ObjectId) -> Result<(), Error> {
+        self.stop_in(id, chat, None)
+    }
+    /// Stops a turn, saving through `open` when the account no longer lists the base.
+    fn stop_in(&self, id: BaseId, chat: ObjectId, open: Option<&Base>) -> Result<(), Error> {
         let mut turns = self.inner.turns.lock().unwrap();
         if let Some(active) = turns.get(&chat) {
             if active.base != id {
@@ -860,11 +901,12 @@ impl Hero {
             }
             let _ = active.cancel.send(true);
             // The base may already be gone. Cancellation still wins over a late reply.
-            if let Ok(base) = self.base(id)
+            if let Ok(base) = open.map_or_else(|| self.base(id), |base| Ok(base.clone()))
                 && let Ok(Some(entry)) = base.get(active.message)
             {
                 let mut fields = entry.fields;
                 fields.insert("state".into(), json!("stopped"));
+                fields.insert("text".into(), json!(active.text));
                 let _ = base.set_fields(active.message, fields);
             }
             turns.remove(&chat);
@@ -956,6 +998,7 @@ impl Hero {
                 base: id,
                 message: existing,
                 cancel,
+                text: String::new(),
             },
         );
         self.launch(
@@ -974,12 +1017,13 @@ impl Hero {
         drop(turns);
         Ok(())
     }
-    /// Cancels every turn in `base` and awaits the turn tasks, even if the
-    /// account has already hidden the base. Clears Hero's cached base watcher.
+    /// Cancels every turn in `open` and awaits the turn tasks, even if the
+    /// account has already hidden the base, saving each reply so far as Stopped
+    /// through the still-open handle. Clears Hero's cached base watcher.
     /// Infallible: a cancelled task cannot make another model request or write
-    /// a late reply; an inaccessible working message becomes `interrupted` on
-    /// the next unlock.
-    pub(crate) async fn cancel_base(&self, base: BaseId) {
+    /// a late reply.
+    pub(crate) async fn cancel_base(&self, open: &Base) {
+        let base = open.id();
         let chats: Vec<_> = self
             .inner
             .turns
@@ -990,7 +1034,7 @@ impl Hero {
             .map(|(chat, _)| *chat)
             .collect();
         for chat in chats {
-            let _ = self.stop(base, chat);
+            let _ = self.stop_in(base, chat, Some(open));
         }
         let tasks = self
             .inner

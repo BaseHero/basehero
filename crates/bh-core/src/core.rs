@@ -229,7 +229,7 @@ impl Shared {
 /// dropping the last handle stops the runtime.
 #[derive(Clone)]
 pub struct Core {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     accounts: Arc<Mutex<BTreeMap<AccountId, Account>>>,
 }
 

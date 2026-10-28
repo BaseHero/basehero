@@ -44,6 +44,89 @@ pub async fn send(
     (status, response.json().await.expect("raw JSON"))
 }
 
+/// An app-side approval over the unauthenticated connect routes.
+pub struct RawConnect {
+    pub email: String,
+    pub approval_id: String,
+    pub device_id: String,
+    pub secret: String,
+    server: url::Url,
+    bypass: String,
+}
+impl RawConnect {
+    pub async fn create(server: &LocalServer, email: &str) -> (Self, StatusCode, Value) {
+        let app = Self {
+            email: email.to_string(),
+            approval_id: random_id(),
+            device_id: random_id(),
+            secret: b64(&random(32)),
+            server: server.url(),
+            bypass: server.operator_token().to_string(),
+        };
+        let hash = Sha256::digest(URL_SAFE_NO_PAD.decode(&app.secret).unwrap());
+        let result = app
+            .request(
+                Method::POST,
+                "/v1/connect",
+                json!({
+                    "email": email, "approvalId": app.approval_id, "deviceId": app.device_id,
+                    "secretHash": b64(&hash), "request": b64(&random(1282))
+                }),
+                false,
+            )
+            .await;
+        (app, result.0, result.1)
+    }
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Value,
+        secret: bool,
+    ) -> (StatusCode, Value) {
+        let mut req = reqwest::Client::new()
+            .request(method, self.server.join(path).unwrap())
+            .header("BH-Protocol", "1")
+            .header("BH-Test-Bypass", &self.bypass)
+            .header("BH-Email", &self.email)
+            .json(&payload);
+        if secret {
+            req = req.header("Authorization", format!("Connect {}", self.secret));
+        }
+        let response = req.send().await.expect("connect request");
+        let status = response.status();
+        assert_eq!(response.headers()["BH-Protocol"], "1");
+        (status, response.json().await.expect("connect JSON"))
+    }
+    pub async fn state(&self) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/v1/connect/{}", self.approval_id),
+            json!({}),
+            true,
+        )
+        .await
+    }
+    pub async fn reveal(&self, bytes: &[u8]) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/v1/connect/{}/reveal", self.approval_id),
+            json!({"reveal": b64(bytes)}),
+            true,
+        )
+        .await
+    }
+    pub async fn end(&self, reason: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::DELETE,
+            &format!("/v1/connect/{}", self.approval_id),
+            json!({"reason": reason}),
+            true,
+        )
+        .await
+    }
+}
+
 /// An account made over the wire, with its first full device.
 pub struct RawAccount {
     pub email: String,

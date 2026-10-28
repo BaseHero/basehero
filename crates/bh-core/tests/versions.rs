@@ -597,6 +597,7 @@ async fn a_tick_during_reconnect_waits_for_live_catch_up() {
     base.set_fields(id, Map::from_iter([("title".into(), Value::from("local"))]))
         .unwrap();
     assert!(base.flush().await.is_err());
+    base.test_hold_version_tick();
     manual.advance(Duration::from_secs(6 * 60));
     assert!(base.tick_versions().await.is_err());
     assert!(versions(&a, &base, id).await.is_empty());
@@ -614,6 +615,7 @@ async fn an_edit_after_sealing_gets_its_own_version() {
     let base = account.create_base("Versions").await.unwrap();
     let id = note_with_text(&base, "initial");
     base.flush().await.unwrap();
+    base.test_hold_version_tick();
     manual.advance(Duration::from_secs(6 * 60));
     let entered = base.test_hold_kept_reply();
     let tick_base = base.clone();
@@ -623,7 +625,11 @@ async fn an_edit_after_sealing_gets_its_own_version() {
     base.set_fields(id, Map::from_iter([("title".into(), Value::from("later"))]))
         .unwrap();
     base.test_resume_kept_reply();
-    tick.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), tick)
+        .await
+        .expect("kept reply did not resume")
+        .unwrap()
+        .unwrap();
     base.flush().await.unwrap();
     assert_eq!(versions(&account, &base, id).await.len(), 1);
     manual.advance(Duration::from_secs(60 * 60));
@@ -639,6 +645,7 @@ async fn a_retried_kept_send_does_not_create_a_second_version() {
     let base = account.create_base("Versions").await.unwrap();
     let id = note_with_text(&base, "initial");
     base.flush().await.unwrap();
+    base.test_hold_version_tick();
     manual.advance(Duration::from_secs(6 * 60));
     drop_next_reply(&account, &base);
     assert!(base.tick_versions().await.is_err());
@@ -650,8 +657,12 @@ async fn a_retried_kept_send_does_not_create_a_second_version() {
     let tick = tokio::spawn(async move { tick_base.tick_versions().await });
     tokio::task::yield_now().await;
     base.test_resume_kept_reply();
-    flush.await.unwrap().unwrap();
-    tick.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        flush.await.unwrap().unwrap();
+        tick.await.unwrap().unwrap();
+    })
+    .await
+    .expect("retry and tick did not complete");
     assert_eq!(versions(&account, &base, id).await.len(), 1);
 }
 
@@ -917,7 +928,10 @@ async fn closing_a_base_awaits_the_version_tick() {
     let entered = base.test_hold_version_tick();
     manual.advance(Duration::from_secs(6 * 60));
     bh_testkit::wait_for(|| entered.load(Ordering::SeqCst)).await;
-    account.lock_hidden(base.id()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), account.lock_hidden(base.id()))
+        .await
+        .expect("close did not stop the held version tick")
+        .unwrap();
     assert!(versions(&account, &base, id).await.is_empty());
     let unlocked = account
         .unlock_hidden(zeroize::Zeroizing::new("ferry lantern quartz".into()))

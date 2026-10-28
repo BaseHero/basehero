@@ -1,6 +1,6 @@
 import type { ErrorBody } from './proto/gen/ErrorBody';
 
-export type Principal = { accountId: string; deviceId: string; kind: 'full' | 'app'; status: string };
+export type Principal = { accountId: string; deviceId: string; kind: 'full' | 'app'; status: string; capMicroUsd?: number };
 export type Env = {
   ACCOUNT: DurableObjectNamespace;
   BASE: DurableObjectNamespace;
@@ -15,6 +15,12 @@ export type Env = {
   GATEWAY_PER_MINUTE: string;
   GATEWAY_PER_DAY: string;
   GATEWAY_DAILY_COST_USD: string;
+  /** What a call whose usage never arrives counts against the daily cost cap. */
+  GATEWAY_UNREPORTED_CALL_USD: string;
+  /** The most output tokens any model call may produce. */
+  GATEWAY_MAX_OUTPUT_TOKENS: string;
+  /** Local tests' loopback model upstream, `host:port` over plain TCP; honoured only with ALLOW_TEST_BYPASS. */
+  TINFOIL_CONNECT?: string;
   /** Local tests may pin the gateway clock to avoid minute-boundary races. */
   GATEWAY_NOW_MS?: string;
   ALLOW_TEST_BYPASS?: string;
@@ -107,12 +113,18 @@ export type AccountRpc = {
   usageBases(principal: Principal): Promise<string[]>;
   data(principal: Principal, ciphertext: string, expectedVersion: number): Promise<Result>;
   credentials(principal: Principal, input: import('./proto/gen/CredentialsRequest').CredentialsRequest): Promise<Result>;
-  addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string): Promise<Result>;
+  addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string, capMicroUsd?: number): Promise<Result>;
+  setCap(principal: Principal, deviceId: string, cap: number): Promise<Result>;
   removeDevice(principal: Principal, deviceId: string): Promise<Result>;
   failRemovalOnce(principal: Principal): Promise<Result>;
+  testLastSeen(principal: Principal, deviceId: string, lastSeenAt: number): Promise<Result>;
   addBase(principal: Principal, baseId: string): Promise<void>;
   grantApp(principal: Principal, baseId: string, deviceId: string): Promise<Result>;
   ungrantApp(principal: Principal, baseId: string, deviceId: string): Promise<Result>;
+  connectCreate(approvalId: string, deviceId: string, secretHash: string, request: string): Promise<Result>;
+  connectState(approvalId: string, secretHash: string): Promise<Result>;
+  connectReveal(approvalId: string, secretHash: string, reveal: string): Promise<Result>;
+  connectEnd(approvalId: string, secretHash: string, reason: import('./proto/gen/ApprovalEndReason').ApprovalEndReason): Promise<Result>;
   createApproval(principal: Principal, approvalId: string, request: string): Promise<Result>;
   listApprovals(principal: Principal): Promise<Result>;
   approval(principal: Principal, approvalId: string): Promise<Result>;

@@ -1,17 +1,38 @@
 //! Device approval: a signed-in device gives a new device the account key.
 
+/// Connecting an app by approval: the app's side and the approving side.
+pub mod connect;
 /// Binary exchange messages, bounded state machines and displayed digits.
 pub mod protocol;
 
 use crate::client::{Api, ApprovalLive, ApprovalState};
 use crate::core::PendingSignIn;
 use crate::{Account, Clock, EndReason, Error};
-use bh_proto::{ApprovalId, Bytes, DeviceId};
+use bh_proto::{ApprovalId, ApprovalKind, Bytes, DeviceId};
 use futures_util::StreamExt;
 use protocol::{ApproverSide, Digits, Ids, NewSide, TTL_MS};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use ts_rs::TS;
+
+/// Whether a request comes from a new device or from an app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "apps/basehero/src/lib/generated/")]
+pub enum RequestKind {
+    /// A new device of this account, signed in with the password.
+    Device,
+    /// An app that wants to connect.
+    App,
+}
+
+impl From<ApprovalKind> for RequestKind {
+    fn from(kind: ApprovalKind) -> Self {
+        match kind {
+            ApprovalKind::Device => Self::Device,
+            ApprovalKind::App => Self::App,
+        }
+    }
+}
 
 /// A request's public metadata. Reading it does not answer the request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -30,6 +51,8 @@ pub struct ApprovalRequest {
     /// Server time for display only; device deadlines use their own clock.
     #[ts(type = "number")]
     pub expires_at: i64,
+    /// A new device or an app; an app's request shows nothing it sent.
+    pub kind: RequestKind,
 }
 
 /// An opened request, carrying the approver's one-time secret until approved.

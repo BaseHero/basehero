@@ -1,6 +1,10 @@
 //! `Account`: one signed-in device of one account.
 
-use crate::approval::protocol::{ApproverSide, Digits, TTL_MS};
+use crate::approval::connect::{
+    AppChoice, AppOffer, DEFAULT_APP_CAP_MICRO_USD, OldConnection, OpenAppRequest, WEEK_MS,
+    device_name as app_device_name,
+};
+use crate::approval::protocol::{AppHello, ApproverSide, Digits, Exchange, TTL_MS, email_scope};
 use crate::approval::{self, ApprovalRequest, OpenRequest};
 use crate::base::{BaseKey, BaseWeak, EPOCH};
 use crate::client::Api;
@@ -14,8 +18,8 @@ use crate::{Base, BaseSummary, EndReason, Error, Mode, UsageRow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_crypto::Secret;
 use bh_proto::{
-    AccountDataRequest, AccountId, AppDeviceKind, ApprovalId, BaseId, BasesRequest, Bytes,
-    CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest,
+    AccountDataRequest, AccountId, AppDeviceKind, ApprovalId, ApprovalKind, BaseId, BasesRequest,
+    Bytes, CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -103,6 +107,9 @@ pub struct DeviceSummary {
     pub last_seen_at: i64,
     /// Whether this is the current device.
     pub this_device: bool,
+    /// An app device's monthly model spending cap in micro-dollars; `None` for full devices.
+    #[ts(type = "number | null")]
+    pub cap_micro_usd: Option<u64>,
 }
 
 /// Usage attributed by random ID, named only from this device's decrypted lists.
@@ -794,11 +801,20 @@ impl Account {
         let this = self.clone();
         self.inner
             .shared
-            .run(async move { this.connect_app_here(req).await })
+            .run(async move {
+                this.connect_app_with(req, DeviceId::random(), DEFAULT_APP_CAP_MICRO_USD)
+                    .await
+            })
             .await
     }
 
-    async fn connect_app_here(&self, req: AppRequest) -> Result<AppCredentials, Error> {
+    /// Registers `device_id` as an app device with `cap_micro_usd` and grants it.
+    async fn connect_app_with(
+        &self,
+        req: AppRequest,
+        device_id: DeviceId,
+        cap_micro_usd: u64,
+    ) -> Result<AppCredentials, Error> {
         let name = req.app_name.trim();
         if name.is_empty() || name.chars().count() > 60 {
             return Err(Error::invalid("app name"));
@@ -857,7 +873,6 @@ impl Account {
         if grants.iter().any(|(base, _)| !seen.insert(*base)) {
             return Err(Error::invalid("duplicate base"));
         }
-        let device_id = DeviceId::random();
         let app_key = Secret::<32>::random();
         let key = Zeroizing::new(URL_SAFE_NO_PAD.encode(app_key.expose()));
         let token = match self
@@ -866,6 +881,7 @@ impl Account {
             .add_device(&DevicesRequest {
                 device_id,
                 kind: AppDeviceKind::App,
+                cap_micro_usd: Some(cap_micro_usd),
             })
             .await
         {
@@ -1464,7 +1480,7 @@ impl Account {
         // The account event is a fallback; locking must itself await every turn
         // before flushing or closing the base's store.
         for base in &bases {
-            crate::hero::cancel_account_base(self, base.id()).await;
+            crate::hero::cancel_account_base(self, base).await;
         }
         // Already queued subscriber updates can still be read after locking.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1595,6 +1611,7 @@ impl Account {
                         device_id: r.device_id,
                         created_at: r.created_at,
                         expires_at: r.expires_at,
+                        kind: r.kind.into(),
                     })
                     .collect())
             })
@@ -1621,6 +1638,230 @@ impl Account {
     }
 
     async fn open_request_here(&self, id: ApprovalId) -> Result<OpenRequest, Error> {
+        let (device_id, side, deadline) = self.open_here(id, Exchange::Device).await?;
+        Ok(OpenRequest {
+            id,
+            device_id,
+            side: Some(side),
+            api: self.inner.api.clone(),
+            clock: self.inner.shared.clock.clone(),
+            deadline,
+            handle: self.inner.shared.handle.clone(),
+        })
+    }
+
+    /// Opens an app's request on explicit user action and waits for its reveal.
+    /// It reads "An app wants to connect" until [`OpenAppRequest::check_digits`]
+    /// matches. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device, [`Error::Invalid`] for a
+    /// device's request, [`Error::ApprovalEnded`] if expired, declined or already
+    /// answered, [`Error::Network`] for connection failure, or [`Error::Storage`]
+    /// for a local claim failure.
+    pub async fn open_app_request(&self, id: ApprovalId) -> Result<OpenAppRequest, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                let (device_id, side, deadline) = this.open_here(id, Exchange::App).await?;
+                Ok(OpenAppRequest {
+                    id,
+                    device_id,
+                    side: Some(side),
+                    account: this,
+                    deadline,
+                    checked: None,
+                })
+            })
+            .await
+    }
+
+    /// Registers the app's device with the chosen bases and cap, then sends it
+    /// its credentials under the exchange's key. Registers nothing once the two
+    /// minutes have passed, and removes the device again if the credentials
+    /// can't be sent. Needs the network.
+    ///
+    /// Returns the new device and whether the requested old connection was removed.
+    /// A failed removal does not undo the already transferred connection.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] for another device's request or a hidden
+    /// base, [`Error::Invalid`] before the digits matched or for a bad choice,
+    /// [`Error::ApprovalEnded`] for an ended exchange, or network and server
+    /// errors from registering the device.
+    pub async fn approve_app(
+        &self,
+        mut request: OpenAppRequest,
+        choice: AppChoice,
+    ) -> Result<(DeviceId, bool), Error> {
+        if self.kind() != DeviceKind::Full
+            || (request.account.id(), request.account.device_id()) != (self.id(), self.device_id())
+        {
+            return Err(Error::Forbidden);
+        }
+        let Some(offer) = request.checked.clone() else {
+            return Err(Error::invalid("digits not checked"));
+        };
+        // Only the connection this offer names as the app's old one may be removed.
+        if choice
+            .replaces
+            .is_some_and(|d| offer.old.as_ref().map(|o| o.device_id) != Some(d))
+        {
+            return Err(Error::invalid("replaces is not this app's old connection"));
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                let side = request
+                    .side
+                    .take()
+                    .ok_or(Error::ApprovalEnded(EndReason::Cancelled))?;
+                let api = &this.inner.api;
+                let (id, device) = (request.id, request.device_id);
+                let clock = this.clock();
+                if clock.now_ms() >= request.deadline {
+                    let _ = api.approval_end(id, EndReason::Expired).await;
+                    return Err(Error::ApprovalEnded(EndReason::Expired));
+                }
+                if this.inner.declined_approvals.lock().await.contains(&id) {
+                    return Err(Error::ApprovalEnded(EndReason::Declined));
+                }
+                match api.approval(id).await {
+                    Ok(Some(state)) if state.state == "ended" => {
+                        return Err(Error::ApprovalEnded(
+                            state.end_reason.unwrap_or(EndReason::BadMessage),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = api.approval_end(id, EndReason::BadMessage).await;
+                        return Err(e);
+                    }
+                }
+                let req = AppRequest {
+                    app_name: offer.device_name,
+                    app_id: Some(offer.app_id),
+                    bases: choice.bases,
+                    replaces: None,
+                };
+                let credentials = match this
+                    .connect_app_with(req, device, choice.cap_micro_usd)
+                    .await
+                {
+                    Ok(credentials) => credentials,
+                    Err(e) => {
+                        let _ = api.approval_end(id, EndReason::BadMessage).await;
+                        return Err(e);
+                    }
+                };
+                let sent = async {
+                    let payload = Zeroizing::new(
+                        serde_json::to_vec(&credentials)
+                            .map_err(|_| Error::ApprovalEnded(EndReason::BadMessage))?,
+                    );
+                    let transfer = side.seal_payload(&payload, clock.now_ms())?;
+                    // As for a device: a decline wins before the transfer, or follows it.
+                    let declined = this.inner.declined_approvals.lock().await;
+                    if declined.contains(&id) {
+                        return Err(Error::ApprovalEnded(EndReason::Declined));
+                    }
+                    api.approval_transfer(id, Bytes(transfer)).await
+                }
+                .await;
+                if let Err(e) = sent {
+                    let _ = this.remove_device(device).await;
+                    let _ = api.approval_end(id, EndReason::BadMessage).await;
+                    return Err(e);
+                }
+                let removed = if let Some(old) = choice.replaces {
+                    // The app already has its new credentials: a failed removal
+                    // must not revoke its new device.
+                    this.remove_device(old).await.is_ok()
+                } else {
+                    false
+                };
+                Ok((device, removed))
+            })
+            .await
+    }
+
+    /// What a checked app request starts with: the last active connection's
+    /// available bases and cap, or the first ordinary base and the default cap.
+    pub(crate) async fn app_offer(&self, hello: AppHello) -> Result<AppOffer, Error> {
+        // devices() refreshes the encrypted app listing before apps() reads it.
+        let devices = self.devices().await?;
+        let order = self.inner.api.account().await?.bases;
+        let ordinary: HashSet<BaseId> = self.db().bases()?.iter().map(|r| r.id).collect();
+        let old = self
+            .apps()
+            .into_iter()
+            .filter(|app| app.app_id.as_deref() == Some(&hello.app_id))
+            .filter_map(|app| {
+                devices
+                    .iter()
+                    .find(|device| {
+                        device.id == app.device_id
+                            && device.kind == DeviceKind::App
+                            && device.status == "active"
+                    })
+                    .map(|device| (app, device))
+            })
+            .max_by_key(|(_, device)| device.last_seen_at);
+        let (old, bases, cap_micro_usd, remove_old) = if let Some((app, device)) = old {
+            (
+                Some(OldConnection {
+                    device_id: device.id,
+                    name: app.name,
+                    last_seen_at: device.last_seen_at,
+                }),
+                app.bases
+                    .into_iter()
+                    .filter(|grant| ordinary.contains(&grant.base) && self.base(grant.base).is_ok())
+                    .collect(),
+                device.cap_micro_usd.unwrap_or(DEFAULT_APP_CAP_MICRO_USD),
+                device.last_seen_at == device.created_at
+                    || now_ms().saturating_sub(device.last_seen_at) > WEEK_MS,
+            )
+        } else {
+            (
+                None,
+                order
+                    .into_iter()
+                    .find(|id| ordinary.contains(id))
+                    .map(|base| AppGrant {
+                        base,
+                        mode: Mode::ReadWrite,
+                    })
+                    .into_iter()
+                    .collect(),
+                DEFAULT_APP_CAP_MICRO_USD,
+                false,
+            )
+        };
+        let name = hello.name.trim().to_string();
+        Ok(AppOffer {
+            device_name: app_device_name(&self.email(), &name),
+            name,
+            app_id: hello.app_id,
+            bases,
+            cap_micro_usd,
+            old,
+            remove_old,
+        })
+    }
+
+    /// Answers a listed request of `exchange`'s kind, returning its new device,
+    /// this side and its deadline once the other side has revealed.
+    async fn open_here(
+        &self,
+        id: ApprovalId,
+        exchange: Exchange,
+    ) -> Result<(DeviceId, ApproverSide, u64), Error> {
         if self.inner.declined_approvals.lock().await.contains(&id) {
             return Err(Error::ApprovalEnded(EndReason::Declined));
         }
@@ -1647,9 +1888,16 @@ impl Account {
             .into_iter()
             .find(|r| r.approval_id == id)
             .ok_or(Error::ApprovalEnded(EndReason::AlreadyAnswered))?;
+        let scope = match (exchange, row.kind) {
+            (Exchange::Device, ApprovalKind::Device) => self.id(),
+            (Exchange::App, ApprovalKind::App) => email_scope(&self.email()),
+            (Exchange::Device, ApprovalKind::App) => return Err(Error::invalid("app request")),
+            (Exchange::App, ApprovalKind::Device) => return Err(Error::invalid("device request")),
+        };
         let clock = self.inner.shared.clock.clone();
-        let (mut side, response) = ApproverSide::respond(
-            self.id(),
+        let (mut side, response) = ApproverSide::respond_as(
+            exchange,
+            scope,
             self.device_id(),
             id,
             &row.request.0,
@@ -1691,15 +1939,7 @@ impl Account {
                 if self.inner.declined_approvals.lock().await.contains(&id) {
                     return Err(Error::ApprovalEnded(EndReason::Declined));
                 }
-                Ok(OpenRequest {
-                    id,
-                    device_id: row.device_id,
-                    side: Some(side),
-                    api: api.clone(),
-                    clock,
-                    deadline,
-                    handle: self.inner.shared.handle.clone(),
-                })
+                Ok((row.device_id, side, deadline))
             }
             Err(e) => {
                 let reason = match e {
@@ -2001,8 +2241,30 @@ impl Account {
                         status: d.status,
                         created_at: d.created_at,
                         last_seen_at: d.last_seen_at,
+                        cap_micro_usd: d.cap_micro_usd,
                     })
                     .collect())
+            })
+            .await
+    }
+
+    /// Changes an active app device's monthly model cap. Needs the network.
+    /// Emits [`AccountEvent::DevicesChanged`] after the server accepts it.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] for an app account, [`Error::NotFound`]
+    /// if the target is not an active app device, or a server/network error.
+    pub async fn set_app_cap(&self, device: DeviceId, cap_micro_usd: u64) -> Result<(), Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                this.inner.api.set_app_cap(device, cap_micro_usd).await?;
+                let _ = this.inner.events.send(AccountEvent::DevicesChanged);
+                Ok(())
             })
             .await
     }
@@ -2316,7 +2578,18 @@ impl Account {
         self.inner.shared.clock.clone()
     }
 
-    #[allow(dead_code, reason = "for the Hero plan")]
+    pub(crate) fn api(&self) -> Api {
+        self.inner.api.clone()
+    }
+
+    /// Runs `future` on the core's runtime.
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = Result<T, Error>> + Send + 'static,
+    ) -> Result<T, Error> {
+        self.inner.shared.run(future).await
+    }
+
     pub(crate) fn runtime(&self) -> tokio::runtime::Handle {
         self.inner.shared.handle.clone()
     }
@@ -2409,6 +2682,7 @@ async fn reconcile_approvals(
             device_id: row.device_id,
             created_at: row.created_at,
             expires_at: row.expires_at,
+            kind: row.kind.into(),
         };
         if !seen.contains_key(&request.id) {
             let _ = events.send(AccountEvent::ApprovalRequested(request.clone()));

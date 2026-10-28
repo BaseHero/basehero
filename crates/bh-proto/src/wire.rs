@@ -168,6 +168,9 @@ pub struct AccountDevice {
     pub created_at: i64,
     #[ts(type = "number")]
     pub last_seen_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub cap_micro_usd: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -230,6 +233,17 @@ pub enum AppDeviceKind {
 pub struct DevicesRequest {
     pub device_id: DeviceId,
     pub kind: AppDeviceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub cap_micro_usd: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct DeviceCapRequest {
+    #[ts(type = "number")]
+    pub cap_micro_usd: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -481,6 +495,18 @@ pub struct ApprovalCreateRequest {
     pub request: Bytes,
 }
 
+/// A new app's anonymous request, routed by the account email.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct ConnectCreateRequest {
+    pub email: String,
+    pub approval_id: ApprovalId,
+    pub device_id: DeviceId,
+    pub secret_hash: Bytes,
+    pub request: Bytes,
+}
+
 /// Server times, for display only: each device times the exchange itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -497,6 +523,7 @@ pub struct ApprovalCreateResponse {
 #[ts(export, export_to = "server/src/proto/gen/")]
 pub struct ApprovalListItem {
     pub approval_id: ApprovalId,
+    pub kind: ApprovalKind,
     pub device_id: DeviceId,
     #[ts(type = "number")]
     pub created_at: i64,
@@ -511,6 +538,15 @@ pub struct ApprovalListItem {
 #[ts(export, export_to = "server/src/proto/gen/")]
 pub struct ApprovalListResponse {
     pub approvals: Vec<ApprovalListItem>,
+}
+
+/// The exchange type; app requests never become pending-device approvals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub enum ApprovalKind {
+    Device,
+    App,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -583,6 +619,22 @@ pub struct ApprovalEndRequest {
     pub reason: ApprovalEndReason,
 }
 
+/// The app's opaque reveal message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct ConnectRevealRequest {
+    pub reveal: Bytes,
+}
+
+/// The app's reason for ending the exchange.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct ConnectEndRequest {
+    pub reason: ApprovalEndReason,
+}
+
 /// Messages on `/v1/approvals/live`; clients only send pings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "t", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -590,6 +642,7 @@ pub struct ApprovalEndRequest {
 pub enum ApprovalLiveMessage {
     Approval {
         approval_id: ApprovalId,
+        kind: ApprovalKind,
         state: ApprovalState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]

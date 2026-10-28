@@ -1,14 +1,15 @@
 use bh_core::{
-    Account, AppRequest, Base, BaseGrantRequest, Clock, Core, CoreConfig, DeviceId, Error,
-    FileSecretStore, Mode, NewObject, ObjectId, TypeRef, hero::MessageState,
+    Account, AppRequest, Base, BaseEvent, BaseGrantRequest, Clock, Core, CoreConfig, DeviceId,
+    Error, FileSecretStore, ManualClock, Mode, NewObject, ObjectId, TypeRef,
+    hero::{HeroEvent, MessageState},
 };
 use bh_models::{
     ChatModel, ChatRequest, Completion, Finish, ModelError, ToolCall, ToolChoice,
-    testing::{Scripted, ScriptedModel},
+    testing::{Scripted, ScriptedModel, StreamControl, StreamScript},
 };
 use bh_testkit::{
-    device, device_with_clock, new_signup, note_with_text, two_devices, two_devices_sharing_a_base,
-    wait_for, wait_for_base,
+    device, device_with_clock, new_signup, note_with_text, signin_for, two_devices,
+    two_devices_sharing_a_base, wait_for, wait_for_base,
 };
 use futures_util::future::BoxFuture;
 use serde_json::json;
@@ -17,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 fn reply(text: &str) -> Scripted {
     Scripted::Reply(Completion {
@@ -733,4 +734,358 @@ async fn long_history_stays_under_the_request_limit() {
             .iter()
             .all(|r| serde_json::to_vec(&format!("{r:?}")).unwrap().len() <= 512 * 1024)
     );
+}
+
+fn stream() -> (Scripted, StreamControl) {
+    let (script, control) = StreamScript::new();
+    (Scripted::Stream(script), control)
+}
+fn finished(text: &str) -> Completion {
+    Completion {
+        text: Some(text.into()),
+        tool_calls: vec![],
+        finish: Finish::Stop,
+        usage: None,
+    }
+}
+/// One device on a manual clock, so the turn's time limits never wait on wall time.
+async fn manual_device() -> (Account, Base, ManualClock) {
+    let (clock, manual) = Clock::manual();
+    let (account, _) = device_with_clock("a", &clock)
+        .sign_up(new_signup())
+        .await
+        .unwrap();
+    let base = account.create_base("Health").await.unwrap();
+    (account, base, manual)
+}
+/// The next `Text` event, skipping `Changed`.
+async fn next_text(events: &mut broadcast::Receiver<HeroEvent>) -> (ObjectId, String) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let HeroEvent::Text { message, text, .. } = events.recv().await.unwrap() {
+                return (message, text);
+            }
+        }
+    })
+    .await
+    .expect("a Text event within 30 s")
+}
+/// The `Text` events already sent.
+fn texts(events: &mut broadcast::Receiver<HeroEvent>) -> Vec<(ObjectId, String)> {
+    let mut seen = vec![];
+    while let Ok(event) = events.try_recv() {
+        if let HeroEvent::Text { message, text, .. } = event {
+            seen.push((message, text));
+        }
+    }
+    seen
+}
+/// How many local or synced changes to `id` were announced.
+fn writes(changes: &mut broadcast::Receiver<BaseEvent>, id: ObjectId) -> usize {
+    let mut count = 0;
+    while let Ok(event) = changes.try_recv() {
+        if let BaseEvent::ObjectsChanged(ids) = event
+            && ids.contains(&id)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+fn stored_text(base: &Base, id: ObjectId) -> String {
+    base.get(id).unwrap().unwrap().fields["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn text_shows_while_hero_writes() {
+    let (account, base, _clock) = manual_device().await;
+    let (script, control) = stream();
+    let model = ScriptedModel::new(vec![script]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(base.id()).unwrap();
+    let mut events = hero.events();
+    hero.send(base.id(), chat, "When is the ferry?", None)
+        .unwrap();
+    wait_for(|| model.requests().len() == 1).await;
+    control.text("It leaves");
+    let (message, text) = next_text(&mut events).await;
+    assert_eq!(text, "It leaves");
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(m.id, message);
+    assert_eq!(m.state, MessageState::Working);
+    assert_eq!(m.text, "It leaves");
+    control.finish(finished("It leaves"));
+    hero.wait_idle(chat).await;
+    assert_eq!(
+        hero.messages(base.id(), chat).unwrap()[1].state,
+        MessageState::Done
+    );
+}
+
+#[tokio::test]
+async fn partial_text_is_saved_at_most_every_two_seconds_and_syncs() {
+    let (clock, manual) = Clock::manual();
+    let (a, kit) = device_with_clock("a", &clock)
+        .sign_up(new_signup())
+        .await
+        .unwrap();
+    let b = device("b")
+        .sign_in(signin_for(&a))
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let base = a.create_base("Shared").await.unwrap();
+    base.flush().await.unwrap();
+    b.refresh().await.unwrap();
+    let other = b.base(base.id()).unwrap();
+    let (script, control) = stream();
+    let hero = a.hero_with_model(ScriptedModel::new(vec![script]));
+    let chat = hero.new_chat(base.id()).unwrap();
+    hero.send(base.id(), chat, "Write", None).unwrap();
+    let message = hero.messages(base.id(), chat).unwrap()[1].id;
+    base.flush().await.unwrap();
+    let mut changes = base.events();
+    let shown = |n: usize| hero.messages(base.id(), chat).unwrap()[1].text.len() == n;
+
+    for _ in 0..50 {
+        control.text("x");
+    }
+    wait_for(|| shown(50)).await;
+    assert_eq!(writes(&mut changes, message), 0);
+    assert_eq!(stored_text(&base, message), "");
+
+    manual.advance(Duration::from_secs(2));
+    control.text("y");
+    let partial = format!("{}y", "x".repeat(50));
+    wait_for(|| stored_text(&base, message) == partial).await;
+    assert_eq!(writes(&mut changes, message), 1);
+    wait_for_base(&other, || {
+        other
+            .get(message)
+            .unwrap()
+            .is_some_and(|m| m.fields["text"] == partial.as_str())
+    })
+    .await;
+
+    control.finish(finished(&partial));
+    hero.wait_idle(chat).await;
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(
+        (m.state, m.text.as_str()),
+        (MessageState::Done, partial.as_str())
+    );
+    // Past the per-object send interval, so the final reply goes out.
+    manual.advance(Duration::from_secs(1));
+    wait_for_base(&other, || {
+        other
+            .get(message)
+            .unwrap()
+            .is_some_and(|m| m.fields["state"] == "done")
+    })
+    .await;
+    let seen = &b
+        .hero_with_model(ScriptedModel::new(vec![]))
+        .messages(base.id(), chat)
+        .unwrap()[1];
+    assert_eq!(
+        (seen.state, seen.text.as_str()),
+        (MessageState::Done, partial.as_str())
+    );
+}
+
+#[tokio::test]
+async fn text_events_are_throttled() {
+    let (account, base, _clock) = manual_device().await;
+    let (script, control) = stream();
+    let hero = account.hero_with_model(ScriptedModel::new(vec![script]));
+    let chat = hero.new_chat(base.id()).unwrap();
+    let mut events = hero.events();
+    hero.send(base.id(), chat, "Write", None).unwrap();
+    for _ in 0..100 {
+        control.text("x");
+    }
+    wait_for(|| hero.messages(base.id(), chat).unwrap()[1].text.len() == 100).await;
+    let seen = texts(&mut events);
+    assert!((1..=2).contains(&seen.len()), "{} Text events", seen.len());
+    control.finish(finished(&"x".repeat(100)));
+    hero.wait_idle(chat).await;
+}
+
+#[tokio::test]
+async fn text_before_a_tool_call_stays_and_the_answer_follows() {
+    let (account, base, _clock) = manual_device().await;
+    note_with_text(&base, "Ferry at 9:10");
+    let (first, look) = stream();
+    let (second, answer) = stream();
+    let model = ScriptedModel::new(vec![first, second]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(base.id()).unwrap();
+    hero.send(base.id(), chat, "When is the ferry?", None)
+        .unwrap();
+    look.text("Let me look.");
+    look.finish(Completion {
+        text: Some("Let me look.".into()),
+        tool_calls: vec![ToolCall {
+            id: "call1".into(),
+            name: "search".into(),
+            arguments: json!({"text":"ferry"}).to_string(),
+        }],
+        finish: Finish::ToolCalls,
+        usage: None,
+    });
+    answer.text("It leaves at 9:10.");
+    answer.finish(finished("It leaves at 9:10."));
+    hero.wait_idle(chat).await;
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(m.state, MessageState::Done);
+    assert_eq!(m.text, "Let me look.\n\nIt leaves at 9:10.");
+    assert_eq!(
+        m.steps.iter().map(|s| s.tool.as_str()).collect::<Vec<_>>(),
+        ["search"]
+    );
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn stop_mid_stream_keeps_the_text_so_far() {
+    let (account, base, _clock) = manual_device().await;
+    let (script, control) = stream();
+    let model = ScriptedModel::new(vec![script]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(base.id()).unwrap();
+    let mut events = hero.events();
+    hero.send(base.id(), chat, "When is the ferry?", None)
+        .unwrap();
+    control.text("It leaves");
+    next_text(&mut events).await;
+    hero.stop(base.id(), chat).unwrap();
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(
+        (m.state, m.text.as_str()),
+        (MessageState::Stopped, "It leaves")
+    );
+    control.text(" at 9:10");
+    control.finish(finished("It leaves at 9:10"));
+    hero.wait_idle(chat).await;
+    tokio::task::yield_now().await;
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(
+        (m.state, m.text.as_str()),
+        (MessageState::Stopped, "It leaves")
+    );
+    assert!(texts(&mut events).is_empty());
+    assert_eq!(model.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn stop_then_send_again_starts_clean() {
+    let (account, base, _clock) = manual_device().await;
+    let (old_script, old) = stream();
+    let (new_script, new) = stream();
+    let model = ScriptedModel::new(vec![old_script, new_script]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(base.id()).unwrap();
+    let mut events = hero.events();
+    hero.send(base.id(), chat, "First", None).unwrap();
+    old.text("Old");
+    next_text(&mut events).await;
+    hero.stop(base.id(), chat).unwrap();
+    hero.send(base.id(), chat, "Again", None).unwrap();
+    let stopped = hero.messages(base.id(), chat).unwrap()[1].id;
+    let working = hero.messages(base.id(), chat).unwrap()[3].id;
+    wait_for(|| model.requests().len() == 2).await;
+    old.text("late");
+    old.finish(finished("Oldlate"));
+    new.text("New");
+    new.finish(finished("New"));
+    hero.wait_idle(chat).await;
+    let messages = hero.messages(base.id(), chat).unwrap();
+    assert_eq!(
+        (messages[1].state, messages[1].text.as_str()),
+        (MessageState::Stopped, "Old")
+    );
+    assert_eq!(
+        (messages[3].state, messages[3].text.as_str()),
+        (MessageState::Done, "New")
+    );
+    for (message, text) in texts(&mut events) {
+        assert_eq!((message, text.as_str()), (working, "New"));
+    }
+    assert_ne!(stopped, working);
+}
+
+#[tokio::test]
+async fn an_error_mid_stream_keeps_the_text_and_fails() {
+    let (account, base, _clock) = manual_device().await;
+    let (script, control) = stream();
+    let hero = account.hero_with_model(ScriptedModel::new(vec![script]));
+    let chat = hero.new_chat(base.id()).unwrap();
+    hero.send(base.id(), chat, "When is the ferry?", None)
+        .unwrap();
+    control.text("It lea");
+    control.fail(ModelError::Transport);
+    hero.wait_idle(chat).await;
+    let m = &hero.messages(base.id(), chat).unwrap()[1];
+    assert_eq!(m.state, MessageState::Failed);
+    assert_eq!(m.error.as_deref(), Some("unavailable"));
+    assert_eq!(m.text, "It lea");
+}
+
+#[tokio::test]
+async fn an_app_closed_mid_stream_shows_the_last_saved_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = || CoreConfig {
+        data_dir: dir.path().join("data"),
+        secrets: Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap()),
+    };
+    let (clock, manual) = Clock::manual();
+    let core = Core::open_with_clock(config(), clock).unwrap();
+    let (account, _) = core
+        .sign_up(bh_core::SignUp {
+            device_name: "a".into(),
+            ..new_signup()
+        })
+        .await
+        .unwrap();
+    let base = account.create_base("Health").await.unwrap();
+    let base_id = base.id();
+    let account_id = account.id();
+    let (script, control) = stream();
+    let hero = account.hero_with_model(ScriptedModel::new(vec![script]));
+    let chat = hero.new_chat(base_id).unwrap();
+    hero.send(base_id, chat, "When is the ferry?", None)
+        .unwrap();
+    let message = hero.messages(base_id, chat).unwrap()[1].id;
+    let shown = |text: &str| hero.messages(base_id, chat).unwrap()[1].text == text;
+    control.text("It leaves");
+    wait_for(|| shown("It leaves")).await;
+    manual.advance(Duration::from_secs(2));
+    control.text(" at 9:10");
+    wait_for(|| stored_text(&base, message) == "It leaves at 9:10").await;
+    control.text(" from");
+    wait_for(|| shown("It leaves at 9:10 from")).await;
+    drop(base);
+    drop(hero);
+    drop(account);
+    drop(core);
+    let reopened = Mutex::new(None);
+    wait_for(|| {
+        let mut slot = reopened.lock().unwrap();
+        *slot = Core::open(config()).ok();
+        slot.is_some()
+    })
+    .await;
+    let core = reopened.into_inner().unwrap().unwrap();
+    let account = core.account(account_id).unwrap();
+    let restarted = account.hero_with_model(ScriptedModel::new(vec![]));
+    let m = &restarted.messages(base_id, chat).unwrap()[1];
+    assert_eq!(m.state, MessageState::Failed);
+    assert_eq!(m.error.as_deref(), Some("interrupted"));
+    assert_eq!(m.text, "It leaves at 9:10");
+    drop(control);
 }

@@ -1,7 +1,10 @@
 use crate::error::CommandError;
 use crate::state::{ActiveApproval, AppState};
-use bh_core::{AccountId, AccountSummary, ApprovalId, ApprovalRequest, DeviceId, Digits};
-use serde::Serialize;
+use bh_core::{
+    AccountId, AccountSummary, AppChoice, AppOffer, ApprovalId, ApprovalRequest, BaseGrantRequest,
+    BaseId, DeviceId, Digits, Mode,
+};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::Ordering};
 
 struct Starting<'a> {
@@ -239,9 +242,111 @@ pub async fn approval_decline(
     id: ApprovalId,
 ) -> Result<(), CommandError> {
     let request = state.open_requests.lock().unwrap().remove(&(account, id));
+    let app_request = state
+        .open_app_requests
+        .lock()
+        .unwrap()
+        .remove(&(account, id));
     let result = state.core.account(account)?.decline(id).await;
-    drop(request); // Dropping before decline races the core's best-effort cancellation.
+    drop((request, app_request)); // Drop after decline to avoid racing best-effort cancellation.
     Ok(result?)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseChoiceInput {
+    pub base: Option<BaseId>,
+    pub new_name: Option<String>,
+    pub mode: Mode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppChoiceInput {
+    pub bases: Vec<BaseChoiceInput>,
+    pub cap_micro_usd: u64,
+    pub replaces: Option<DeviceId>,
+}
+
+pub async fn connect_open(
+    state: &AppState,
+    account: AccountId,
+    id: ApprovalId,
+) -> Result<OpenedRequest, CommandError> {
+    let request = state.core.account(account)?.open_app_request(id).await?;
+    state
+        .open_app_requests
+        .lock()
+        .unwrap()
+        .insert((account, id), request);
+    Ok(OpenedRequest { id })
+}
+
+pub async fn connect_check(
+    state: &AppState,
+    account: AccountId,
+    id: ApprovalId,
+    digits: &str,
+) -> Result<AppOffer, CommandError> {
+    let digits = Digits::parse(digits)?;
+    let mut request = state
+        .open_app_requests
+        .lock()
+        .unwrap()
+        .remove(&(account, id))
+        .ok_or_else(not_found)?;
+    let result = request.check_digits(&digits).await;
+    if result.is_ok() {
+        state
+            .open_app_requests
+            .lock()
+            .unwrap()
+            .insert((account, id), request);
+    }
+    Ok(result?)
+}
+
+pub async fn connect_approve(
+    state: &AppState,
+    account: AccountId,
+    id: ApprovalId,
+    choice: AppChoiceInput,
+) -> Result<(DeviceId, bool), CommandError> {
+    let bases = choice
+        .bases
+        .into_iter()
+        .map(|base| match (base.base, base.new_name) {
+            (Some(id), None) => Ok(BaseGrantRequest::Existing {
+                base: id,
+                mode: base.mode,
+            }),
+            (None, Some(name)) => Ok(BaseGrantRequest::New {
+                name,
+                mode: base.mode,
+            }),
+            _ => Err(bh_core::Error::Invalid(
+                "Choose an existing or new base".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = state
+        .open_app_requests
+        .lock()
+        .unwrap()
+        .remove(&(account, id))
+        .ok_or_else(not_found)?;
+    Ok(state
+        .core
+        .account(account)?
+        .approve_app(
+            request,
+            AppChoice {
+                bases,
+                cap_micro_usd: choice.cap_micro_usd,
+                replaces: choice.replaces,
+            },
+        )
+        .await?)
 }
 
 pub mod ipc {
@@ -317,5 +422,32 @@ pub mod ipc {
         id: ApprovalId,
     ) -> Result<(), CommandError> {
         super::approval_decline(state.state()?, account, id).await
+    }
+    #[tauri::command]
+    pub async fn connect_open(
+        state: State<'_, Startup>,
+        account: AccountId,
+        id: ApprovalId,
+    ) -> Result<OpenedRequest, CommandError> {
+        super::connect_open(state.state()?, account, id).await
+    }
+    #[tauri::command]
+    pub async fn connect_check(
+        state: State<'_, Startup>,
+        account: AccountId,
+        id: ApprovalId,
+        digits: String,
+    ) -> Result<AppOffer, CommandError> {
+        let digits = crate::views::SecretString::from(digits);
+        super::connect_check(state.state()?, account, id, &digits).await
+    }
+    #[tauri::command]
+    pub async fn connect_approve(
+        state: State<'_, Startup>,
+        account: AccountId,
+        id: ApprovalId,
+        choice: AppChoiceInput,
+    ) -> Result<(DeviceId, bool), CommandError> {
+        super::connect_approve(state.state()?, account, id, choice).await
     }
 }

@@ -2,7 +2,7 @@ mod common;
 
 use basehero_app_lib::commands::{account, approval};
 use basehero_app_lib::views::{AppEvent, SignInForm, SignUpForm};
-use bh_core::{AccountEvent, ApprovalId, RecoveryKit};
+use bh_core::{AccountEvent, AppIdentity, ApprovalId, RecoveryKit};
 use bh_testkit::{LocalServer, TEST_PASSWORD, invite};
 use common::state_at;
 use std::time::Duration;
@@ -53,6 +53,155 @@ async fn setup() -> (
         signed.kit.to_string(),
         signed.account.id,
     )
+}
+
+#[tokio::test]
+async fn an_app_is_connected_through_the_commands() {
+    let server = LocalServer::shared();
+    let (full, _events) = state_at(server.url());
+    let signed = account::sign_up(
+        &full,
+        SignUpForm {
+            invite: invite(server),
+            email: format!("{}@example.test", bh_core::AccountId::random()),
+            password: TEST_PASSWORD.into(),
+            device_name: "Mac".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let (app, _app_events) = state_at(server.url());
+    let mut pending = app
+        .core
+        .start_connection(
+            server.url(),
+            &signed.account.email,
+            AppIdentity {
+                name: "Sample".into(),
+                app_id: "app.basehero.sample".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let id = pending.id();
+    let (opened, digits) = tokio::time::timeout(WAIT, async {
+        tokio::join!(
+            approval::connect_open(&full, signed.account.id, id),
+            pending.digits()
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(opened.unwrap().id, id);
+    let offer = approval::connect_check(&full, signed.account.id, id, &digits.unwrap().to_string())
+        .await
+        .unwrap();
+    assert_eq!(offer.name, "Sample");
+    assert!(offer.device_name.ends_with(" - Sample"));
+    assert_eq!(offer.bases.len(), 1);
+    let choice = approval::AppChoiceInput {
+        bases: offer
+            .bases
+            .iter()
+            .map(|grant| approval::BaseChoiceInput {
+                base: Some(grant.base),
+                new_name: None,
+                mode: grant.mode,
+            })
+            .collect(),
+        cap_micro_usd: offer.cap_micro_usd,
+        replaces: None,
+    };
+    let (device, removed) = approval::connect_approve(&full, signed.account.id, id, choice)
+        .await
+        .unwrap();
+    assert!(!removed);
+    let connected = tokio::time::timeout(WAIT, pending.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(connected.device_id(), device);
+    assert_eq!(connected.id(), signed.account.id);
+    account::set_app_cap(&full, signed.account.id, device, 500_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        account::devices(&full, signed.account.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == device)
+            .unwrap()
+            .cap_micro_usd,
+        Some(500_000)
+    );
+}
+
+#[tokio::test]
+async fn a_check_with_wrong_digits_ends_the_request() {
+    let server = LocalServer::shared();
+    let (full, _events) = state_at(server.url());
+    let signed = account::sign_up(
+        &full,
+        SignUpForm {
+            invite: invite(server),
+            email: format!("{}@example.test", bh_core::AccountId::random()),
+            password: TEST_PASSWORD.into(),
+            device_name: "Mac".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let (app, _app_events) = state_at(server.url());
+    let mut pending = app
+        .core
+        .start_connection(
+            server.url(),
+            &signed.account.email,
+            AppIdentity {
+                name: "Sample".into(),
+                app_id: "app.basehero.sample".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let id = pending.id();
+    let (_, shown) = tokio::time::timeout(WAIT, async {
+        tokio::join!(
+            approval::connect_open(&full, signed.account.id, id),
+            pending.digits()
+        )
+    })
+    .await
+    .unwrap();
+    let wrong = if shown.unwrap().to_string() == "000 000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    assert_eq!(
+        approval::connect_check(&full, signed.account.id, id, wrong)
+            .await
+            .unwrap_err()
+            .kind,
+        "ApprovalEnded"
+    );
+    assert_eq!(
+        approval::connect_approve(
+            &full,
+            signed.account.id,
+            id,
+            approval::AppChoiceInput {
+                bases: vec![],
+                cap_micro_usd: 1_000_000,
+                replaces: None,
+            }
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        "NotFound"
+    );
 }
 
 #[tokio::test]

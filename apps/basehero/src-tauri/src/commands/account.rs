@@ -223,6 +223,19 @@ pub async fn devices(state: &AppState, id: AccountId) -> Result<Vec<DeviceSummar
     Ok(state.core.account(id)?.devices().await?)
 }
 
+pub async fn set_app_cap(
+    state: &AppState,
+    id: AccountId,
+    device: DeviceId,
+    cap_micro_usd: u64,
+) -> Result<(), CommandError> {
+    Ok(state
+        .core
+        .account(id)?
+        .set_app_cap(device, cap_micro_usd)
+        .await?)
+}
+
 pub async fn usage(
     state: &AppState,
     id: AccountId,

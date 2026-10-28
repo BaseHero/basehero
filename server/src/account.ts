@@ -11,7 +11,7 @@ import { Approvals } from './approvals';
 import type { Step } from './approvals';
 
 type AccountRow = { email: string; salt: string; kdf: string; verifier_salt: string; verifier: string; envelope: string; activation_hash: string; data: string | null; data_version: number; failed_logins: number; window_start: number };
-type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number };
+type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number; cap_micro_usd: number };
 
 export class AccountDO extends DurableObject<Env> {
   private approvals: Approvals;
@@ -20,6 +20,9 @@ export class AccountDO extends DurableObject<Env> {
     const sql = ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY CHECK(id = 1), email TEXT NOT NULL, salt TEXT NOT NULL, kdf TEXT NOT NULL, verifier_salt TEXT NOT NULL, verifier TEXT NOT NULL, envelope TEXT NOT NULL, activation_hash TEXT NOT NULL, data TEXT, data_version INTEGER NOT NULL DEFAULT 0, failed_logins INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0)');
     sql.exec('CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL)');
+    if (!sql.exec<{ name: string }>('PRAGMA table_info(devices)').toArray().some(column => column.name === 'cap_micro_usd')) {
+      sql.exec('ALTER TABLE devices ADD COLUMN cap_micro_usd INTEGER NOT NULL DEFAULT 1000000');
+    }
     sql.exec('CREATE TABLE IF NOT EXISTS bases (base_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)');
     sql.exec('CREATE TABLE IF NOT EXISTS device_bases (device_id TEXT NOT NULL, base_id TEXT NOT NULL, PRIMARY KEY (device_id, base_id))');
     this.approvals = new Approvals(ctx, env);
@@ -39,7 +42,7 @@ export class AccountDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec('INSERT INTO account (id,email,salt,kdf,verifier_salt,verifier,envelope,activation_hash) VALUES (1,?,?,?,?,?,?,?)',
         input.email, input.salt, JSON.stringify(input.kdf), salt, hash, input.accountKeyEnvelope, input.activationHash);
       const now = Date.now();
-      this.ctx.storage.sql.exec('INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?)', input.deviceId, 'full', 'active', tokenHash, now, now);
+      this.ctx.storage.sql.exec('INSERT INTO devices (device_id, kind, status, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)', input.deviceId, 'full', 'active', tokenHash, now, now);
     });
     return { status: 200, body: { token } };
   }
@@ -56,7 +59,7 @@ export class AccountDO extends DurableObject<Env> {
     if (!valid) return fail(401, 'bad_credentials');
     if (this.ctx.storage.sql.exec('SELECT device_id FROM devices WHERE device_id = ?', deviceId).toArray().length) return fail(409, 'exists');
     this.ctx.storage.sql.exec('UPDATE account SET failed_logins = 0, window_start = 0 WHERE id = 1');
-    this.ctx.storage.sql.exec('INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?)', deviceId, 'full', 'pending', tokenHash, now, now);
+    this.ctx.storage.sql.exec('INSERT INTO devices (device_id, kind, status, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)', deviceId, 'full', 'pending', tokenHash, now, now);
     return { status: 200, body: { token, accountKeyEnvelope: row.envelope } };
   }
   // Each device's recent change requests, in memory: a restart only resets the window.
@@ -73,8 +76,10 @@ export class AccountDO extends DurableObject<Env> {
       recent.push(now);
       this.changeTimes.set(device.device_id, recent);
     }
-    this.ctx.storage.sql.exec('UPDATE devices SET last_seen_at = ? WHERE device_id = ?', Date.now(), device.device_id);
-    return { accountId: this.ctx.id.name!, deviceId: device.device_id, kind: device.kind, status: device.status };
+    // Even a first request in the creation millisecond marks the device as used.
+    this.ctx.storage.sql.exec('UPDATE devices SET last_seen_at = ? WHERE device_id = ?', Math.max(Date.now(), device.created_at + 1), device.device_id);
+    return { accountId: this.ctx.id.name!, deviceId: device.device_id, kind: device.kind, status: device.status,
+      ...(device.kind === 'app' ? { capMicroUsd: device.cap_micro_usd } : {}) };
   }
   async activate(principal: Principal, activation: string): Promise<Result> {
     if (principal.status !== 'pending' || principal.kind !== 'full') return fail(403, 'forbidden');
@@ -89,7 +94,7 @@ export class AccountDO extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<{ base_id: string }>('SELECT base_id FROM device_bases WHERE device_id = ? ORDER BY base_id', deviceId).toArray().map(r => r.base_id);
   }
   private accountBases(): string[] {
-    return this.ctx.storage.sql.exec<{ base_id: string }>('SELECT base_id FROM bases ORDER BY base_id').toArray().map(b => b.base_id);
+    return this.ctx.storage.sql.exec<{ base_id: string }>('SELECT base_id FROM bases ORDER BY added_at, base_id').toArray().map(b => b.base_id);
   }
   /** Server-side IDs only; the caller is authenticated by the Worker. */
   usageBases(principal: Principal): string[] {
@@ -103,7 +108,8 @@ export class AccountDO extends DurableObject<Env> {
     if (principal.kind !== 'full') return fail(403, 'forbidden');
     const row = this.row()!;
     const devices = this.ctx.storage.sql.exec<DeviceRow>('SELECT * FROM devices ORDER BY created_at, device_id').toArray()
-      .map(d => ({ deviceId: d.device_id, kind: d.kind, status: d.status, createdAt: d.created_at, lastSeenAt: d.last_seen_at }));
+      .map(d => ({ deviceId: d.device_id, kind: d.kind, status: d.status, createdAt: d.created_at, lastSeenAt: d.last_seen_at,
+        ...(d.kind === 'app' ? { capMicroUsd: d.cap_micro_usd } : {}) }));
     return { status: 200, body: { devices, bases: this.accountBases(), data: row.data === null ? null : { ciphertext: row.data, version: row.data_version }, accountKeyEnvelope: row.envelope } };
   }
   data(principal: Principal, ciphertext: string, expectedVersion: number): Result {
@@ -125,12 +131,22 @@ export class AccountDO extends DurableObject<Env> {
       input.salt, JSON.stringify(input.kdf), salt, hash, input.accountKeyEnvelope);
     return { status: 200, body: {} };
   }
-  addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string): Result {
+  addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string, capMicroUsd = 1_000_000): Result {
     if (principal.kind !== 'full') return fail(403, 'forbidden');
     if (this.ctx.storage.sql.exec('SELECT device_id FROM devices WHERE device_id = ?', deviceId).toArray().length) return fail(409, 'exists');
     const now = Date.now();
-    this.ctx.storage.sql.exec('INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?)', deviceId, 'app', 'active', tokenHash, now, now);
+    this.ctx.storage.sql.exec('INSERT INTO devices (device_id, kind, status, token_hash, created_at, last_seen_at, cap_micro_usd) VALUES (?, ?, ?, ?, ?, ?, ?)', deviceId, 'app', 'active', tokenHash, now, now, capMicroUsd);
     return { status: 200, body: { token } };
+  }
+  setCap(principal: Principal, deviceId: string, cap: number): Result {
+    if (principal.kind !== 'full') return fail(403, 'forbidden');
+    const updated = this.ctx.storage.sql.exec("UPDATE devices SET cap_micro_usd = ? WHERE device_id = ? AND kind = 'app' AND status = 'active' RETURNING device_id", cap, deviceId).toArray();
+    return updated.length ? { status: 200, body: {} } : fail(404, 'not_found');
+  }
+  testLastSeen(principal: Principal, deviceId: string, lastSeenAt: number): Result {
+    if (principal.kind !== 'full') return fail(403, 'forbidden');
+    const changed = this.ctx.storage.sql.exec('UPDATE devices SET last_seen_at = ? WHERE device_id = ? RETURNING device_id', lastSeenAt, deviceId).toArray();
+    return changed.length ? { status: 200, body: {} } : fail(404, 'not_found');
   }
   private failNextRemoval = false;
   failRemovalOnce(principal: Principal): Result {
@@ -179,6 +195,10 @@ export class AccountDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM device_bases WHERE device_id = ? AND base_id = ?', deviceId, baseId);
     return { status: 200, body: {} };
   }
+  connectCreate(approvalId: string, deviceId: string, secretHash: string, request: string): Promise<Result> { return this.approvals.createApp(approvalId, deviceId, secretHash, request); }
+  connectState(approvalId: string, secretHash: string): Result { return this.approvals.appState(approvalId, secretHash); }
+  connectReveal(approvalId: string, secretHash: string, reveal: string): Result { return this.approvals.appReveal(approvalId, secretHash, reveal); }
+  connectEnd(approvalId: string, secretHash: string, reason: ApprovalEndReason): Result { return this.approvals.appEnd(approvalId, secretHash, reason); }
   createApproval(principal: Principal, approvalId: string, request: string): Promise<Result> { return this.approvals.create(principal, approvalId, request); }
   listApprovals(principal: Principal): Result { return this.approvals.list(principal); }
   approval(principal: Principal, approvalId: string): Result { return this.approvals.state(principal, approvalId); }

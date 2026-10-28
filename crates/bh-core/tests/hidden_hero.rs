@@ -1,8 +1,11 @@
 //! Hidden-base Hero isolation against a local account and a scripted model.
-use bh_core::{Error, hero::MessageState};
+use bh_core::{
+    Error,
+    hero::{HeroEvent, MessageState},
+};
 use bh_models::{
     Completion, Finish, ToolCall,
-    testing::{Scripted, ScriptedModel},
+    testing::{Scripted, ScriptedModel, StreamScript},
 };
 use bh_testkit::{device, new_signup, note_with_text, wait_for};
 use serde_json::json;
@@ -232,4 +235,58 @@ async fn a_chat_inside_an_unlocked_hidden_base_reads_it() {
         .unwrap();
     assert!(tool_result.contains("Gelato"));
     assert!(tool_result.contains(&hidden.id().to_string()));
+}
+
+#[tokio::test]
+async fn locking_mid_stream_writes_nothing_more() {
+    let (account, _) = device("mac").sign_up(new_signup()).await.unwrap();
+    let password = || Zeroizing::new("ferry lantern quartz".to_string());
+    let hidden = account
+        .create_hidden_base("Zebra Diary", password())
+        .await
+        .unwrap();
+    let (script, control) = StreamScript::new();
+    let model = ScriptedModel::new(vec![Scripted::Stream(script)]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(hidden.id()).unwrap();
+    let mut events = hero.events();
+    hero.send(hidden.id(), chat, "Write", None).unwrap();
+    control.text("Secret");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let HeroEvent::Text { text, .. } = events.recv().await.unwrap() {
+                assert_eq!(text, "Secret");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the text is shown before the lock");
+
+    tokio::time::timeout(Duration::from_secs(1), account.lock_hidden(hidden.id()))
+        .await
+        .expect("lock must not wait for the stream")
+        .unwrap();
+    control.text(" more");
+    control.finish(Completion {
+        text: Some("Secret more".into()),
+        tool_calls: vec![],
+        finish: Finish::Stop,
+        usage: None,
+    });
+    hero.wait_idle(chat).await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, HeroEvent::Text { .. }),
+            "no text is shown after the lock"
+        );
+    }
+
+    account.unlock_hidden(password()).await.unwrap();
+    let message = &hero.messages(hidden.id(), chat).unwrap()[1];
+    assert_eq!(
+        (message.state, message.text.as_str()),
+        (MessageState::Stopped, "Secret")
+    );
+    assert_eq!(model.requests().len(), 1);
 }

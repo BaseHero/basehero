@@ -397,8 +397,7 @@ async fn me_and_account_list_the_bases() {
     assert_eq!(status, StatusCode::OK);
     let (_, me) = app.get("/v1/me", json!({})).await;
     assert_eq!(me["bases"], json!([first]));
-    let mut both = vec![first, second];
-    both.sort();
+    let both = vec![first, second];
     let (_, account) = a.full.get("/v1/account", json!({})).await;
     assert_eq!(account["bases"], json!(both));
     let (_, me) = a.full.get("/v1/me", json!({})).await;

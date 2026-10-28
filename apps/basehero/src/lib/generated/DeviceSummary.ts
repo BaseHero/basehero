@@ -32,4 +32,8 @@ lastSeenAt: number,
 /**
  * Whether this is the current device.
  */
-thisDevice: boolean, };
+thisDevice: boolean, 
+/**
+ * An app device's monthly model spending cap in micro-dollars; `None` for full devices.
+ */
+capMicroUsd: number | null, };

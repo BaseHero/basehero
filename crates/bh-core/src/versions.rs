@@ -141,9 +141,11 @@ impl VersionTicker {
         let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(feature = "test-support")]
         let (task_hold, task_entered) = (hold.clone(), entered.clone());
+        // The first check is due one interval after the base starts, not after the
+        // task first runs, so a busy runtime can't push it past a clock that moved on.
+        let interval = VersionPolicy::DEFAULT.tick.as_millis() as u64;
+        let mut deadline = clock.now_ms().saturating_add(interval);
         let task = runtime.spawn(async move {
-            let interval = VersionPolicy::DEFAULT.tick.as_millis() as u64;
-            let mut deadline = clock.now_ms().saturating_add(interval);
             loop {
                 clock.sleep_until(deadline).await;
                 let Some(base) = base.upgrade() else { break };

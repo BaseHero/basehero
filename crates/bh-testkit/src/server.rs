@@ -194,6 +194,18 @@ impl LocalServer {
     pub fn persist_dir(&self) -> &Path {
         self.persist.as_ref().expect("local only").path()
     }
+    /// Changes a local Worker's setting for its next restart.
+    pub fn set_var(&mut self, key: &str, value: &str) {
+        assert!(
+            self.persist.is_some(),
+            "remote server cannot change settings"
+        );
+        if let Some((_, current)) = self.vars.iter_mut().find(|(name, _)| name == key) {
+            *current = value.to_owned();
+        } else {
+            self.vars.push((key.to_owned(), value.to_owned()));
+        }
+    }
     pub fn restart(&mut self) {
         assert!(self.persist.is_some(), "remote server cannot restart");
         self.stop();
