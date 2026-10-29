@@ -113,6 +113,9 @@ async fn sign_out_racing_unlock_does_not_leave_a_base_open() {
 
 #[tokio::test]
 async fn lock_all_uses_one_flush_deadline_for_every_base() {
+    // A time budget for the device's own work; over the internet to dev it can
+    // overrun under load, and the server plays no part in it.
+    bh_testkit::local_only!();
     let (a, _) = device("mac").sign_up(new_signup()).await.unwrap();
     let first = a
         .create_hidden_base("First", pw("ferry lantern quartz"))
@@ -501,7 +504,7 @@ async fn locking_awaits_background_work() {
     assert!(!h.sync_state().online);
     // The local socket is dropped when lock returns. The server observes the
     // TCP close on its own scheduler, which can lag the immediate GET.
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let (_, count) = raw.get(&path, serde_json::json!({})).await;
             if count["count"] == 0 {

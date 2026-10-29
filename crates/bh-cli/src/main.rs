@@ -83,6 +83,8 @@ enum Command {
         #[arg(long)]
         new_base: Option<String>,
         #[arg(long)]
+        folder: Vec<String>,
+        #[arg(long)]
         read_only: bool,
         #[arg(long)]
         cap_usd: Option<String>,
@@ -145,8 +147,10 @@ enum Command {
     },
     Mv {
         id: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "base")]
         into: Option<String>,
+        #[arg(long, conflicts_with = "after")]
+        base: Option<String>,
         #[arg(long)]
         after: Option<String>,
     },
@@ -218,17 +222,30 @@ enum DeviceCommand {
 }
 #[derive(Subcommand)]
 enum AppCommand {
+    List,
+    Grant {
+        device: String,
+        #[arg(long, group = "grant", required = true)]
+        base: Option<String>,
+        #[arg(long, group = "grant")]
+        folder: Option<String>,
+        #[arg(long)]
+        read_only: bool,
+    },
+    Ungrant {
+        device: String,
+        #[arg(long)]
+        base: String,
+    },
     Connect {
         #[arg(long)]
         name: String,
-        #[arg(
-            long,
-            conflicts_with = "new_base",
-            required_unless_present = "new_base"
-        )]
+        #[arg(long, group = "grant", required = true)]
         base: Option<String>,
-        #[arg(long)]
+        #[arg(long, group = "grant")]
         new_base: Option<String>,
+        #[arg(long, group = "grant")]
+        folder: Option<String>,
         #[arg(long)]
         read_only: bool,
         #[arg(long)]
@@ -312,9 +329,8 @@ fn selected_base(account: &Account, requested: Option<&str>) -> Result<Base> {
 }
 fn containing_base(account: &Account, id: ObjectId) -> Result<Base> {
     for summary in account.bases() {
-        let base = account.base(summary.id)?;
-        if base.get(id)?.is_some() {
-            return Ok(base);
+        if let Ok(live) = account.locate(summary.id, id) {
+            return Ok(account.base(live)?);
         }
     }
     Err(Box::new(Error::NotFound))
@@ -590,6 +606,7 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             id,
             base,
             new_base,
+            folder,
             read_only,
             cap_usd,
             keep_old,
@@ -602,6 +619,7 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
                 &approve::AppFlags {
                     bases: base,
                     new_base: new_base.as_deref(),
+                    folders: folder,
                     read_only: *read_only,
                     cap_usd: cap_usd.as_deref(),
                     keep_old: *keep_old,
@@ -633,8 +651,10 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             Ok(json!({ "id": base.id(), "name": approve::terminal_device_name(&base.name()) }))
         }
         Command::Ls { base, parent } => {
-            let base = selected_base(&account(&core)?, base.as_deref())?;
-            Ok(serde_json::to_value(base.children(
+            let account = account(&core)?;
+            let base = selected_base(&account, base.as_deref())?;
+            Ok(serde_json::to_value(account.tree_children(
+                base.id(),
                 parent.as_deref().map(object_id).transpose()?,
             )?)?)
         }
@@ -707,14 +727,43 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             })?;
             Ok(json!({ "id": id, "baseId": base.id() }))
         }
-        Command::Mv { id, into, after } => {
+        Command::Mv {
+            id,
+            into,
+            base,
+            after,
+        } => {
+            let account = account(&core)?;
             let id = object_id(id)?;
-            let base = containing_base(&account(&core)?, id)?;
-            base.move_to(
-                id,
-                into.as_deref().map(object_id).transpose()?,
-                after.as_deref().map(object_id).transpose()?,
-            )?;
+            let source = containing_base(&account, id)?;
+            let mut parent = into.as_deref().map(object_id).transpose()?;
+            let target = if let Some(base) = base {
+                selected_base(&account, Some(base))?.id()
+            } else if let Some(id) = parent {
+                let owner = containing_base(&account, id)?;
+                if let Some(mount) = account
+                    .mounts()
+                    .iter()
+                    .find(|m| m.parent == owner.id() && m.folder == id)
+                {
+                    parent = None;
+                    mount.base
+                } else {
+                    owner.id()
+                }
+            } else {
+                source.id()
+            };
+            if target == source.id() {
+                source.move_to(id, parent, after.as_deref().map(object_id).transpose()?)?;
+            } else {
+                if after.is_some() {
+                    return Err(invalid("--after is only for moves within a base"));
+                }
+                account
+                    .move_between(source.id(), id, target, parent)
+                    .await?;
+            }
             Ok(json!({ "id": id }))
         }
         Command::Rm { id } => {
@@ -752,11 +801,56 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             Ok(json!({"device": id, "capMicroUsd": cap}))
         }
         Command::App {
+            command: AppCommand::List,
+        } => Ok(serde_json::to_value(account(&core)?.apps())?),
+        Command::App {
+            command:
+                AppCommand::Grant {
+                    device,
+                    base,
+                    folder,
+                    read_only,
+                },
+        } => {
+            let account = account(&core)?;
+            let device: DeviceId = device.parse().map_err(|_| invalid("device ID"))?;
+            let mode = if *read_only {
+                Mode::ReadOnly
+            } else {
+                Mode::ReadWrite
+            };
+            let grant = if let Some(folder) = folder {
+                let folder = object_id(folder)?;
+                BaseGrantRequest::Folder {
+                    base: containing_base(&account, folder)?.id(),
+                    folder,
+                    mode,
+                }
+            } else {
+                BaseGrantRequest::Existing {
+                    base: selected_base(&account, base.as_deref())?.id(),
+                    mode,
+                }
+            };
+            let base = account.add_app_grant(device, grant).await?;
+            Ok(json!({ "device": device, "base": base }))
+        }
+        Command::App {
+            command: AppCommand::Ungrant { device, base },
+        } => {
+            let account = account(&core)?;
+            let device: DeviceId = device.parse().map_err(|_| invalid("device ID"))?;
+            let base = selected_base(&account, Some(base))?.id();
+            account.remove_app_grant(device, base).await?;
+            Ok(json!({ "device": device, "base": base }))
+        }
+        Command::App {
             command:
                 AppCommand::Connect {
                     name,
                     base,
                     new_base,
+                    folder,
                     read_only,
                     out,
                 },
@@ -767,7 +861,14 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             } else {
                 Mode::ReadWrite
             };
-            let grant = if let Some(base) = base {
+            let grant = if let Some(folder) = folder {
+                let folder = object_id(folder)?;
+                BaseGrantRequest::Folder {
+                    base: containing_base(&account, folder)?.id(),
+                    folder,
+                    mode,
+                }
+            } else if let Some(base) = base {
                 BaseGrantRequest::Existing {
                     base: selected_base(&account, Some(base))?.id(),
                     mode,

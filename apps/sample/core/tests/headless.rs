@@ -91,6 +91,45 @@ async fn the_sample_connects_by_approval_writes_and_reads_back() {
 }
 
 #[tokio::test]
+async fn a_folder_grant_exposes_only_the_folders_name_and_records() {
+    let (full, personal, _dir, app) = setup().await;
+    let folder = personal
+        .create(bh_core::NewObject {
+            ty: bh_core::TypeRef::new("core.folder", 1),
+            parent: None,
+            after: None,
+            fields: serde_json::Map::from_iter([("name".into(), json!("Health"))]),
+        })
+        .unwrap();
+    let personal_id = personal.id();
+    let connected = connect(&full, &app, move |_| AppChoice {
+        bases: vec![BaseGrantRequest::Folder {
+            base: personal_id,
+            folder,
+            mode: Mode::ReadWrite,
+        }],
+        cap_micro_usd: 1_000_000,
+        replaces: None,
+    })
+    .await;
+    assert_eq!(connected.bases, vec!["Health"]);
+    assert_eq!(app.connected().unwrap().bases, vec!["Health"]);
+    assert_ne!(connected.base, personal.id());
+    let id = app.write_reading("2026-10-28", 42.0).await.unwrap();
+    app.flush().await.unwrap();
+    assert_eq!(app.readings().unwrap()[0].value, 42.0);
+    wait_for_base(&full.base(connected.base).unwrap(), || {
+        full.base(connected.base)
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    assert!(personal.get(id).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn one_record_per_day() {
     let (full, _, _dir, app) = setup().await;
     connect(&full, &app, defaults).await;

@@ -2,7 +2,7 @@
 
 ## What you get
 
-Your app embeds `bh-core` to keep records on the device, sync encrypted changes through BaseHero Cloud, and call a model through BaseHero's gateway. A person grants an app access to whole bases. The core opens only the bases granted to that app. Stored data is encrypted on devices; model requests are encrypted on the device for the provider's verified confidential hardware.
+Your app embeds `bh-core` to keep records on the device, sync encrypted changes through BaseHero Cloud, and call a model through BaseHero's gateway. A person grants your app one or more folders, or whole bases, each read-only or read-write. The core opens only what the person granted. Stored data is encrypted on devices; model requests are encrypted on the device for the provider's verified confidential hardware.
 
 ```mermaid
 flowchart LR
@@ -10,7 +10,7 @@ flowchart LR
     Core <-->|Encrypted changes| Cloud[BaseHero Cloud]
     Core -->|Encrypted model requests| Gateway[BaseHero gateway]
     Gateway --> Provider[Verified confidential hardware]
-    Person[Person's account] -->|Grants whole bases| Core
+    Person[Person's account] -->|Grants folders or bases| Core
 ```
 
 ## Add the core
@@ -72,7 +72,7 @@ Call `Core::shutdown()` as the app quits. The core also stops when its last hand
 
 ## Connect
 
-Ask the person for their BaseHero email, then start an approval request with your app's display name and **stable app ID**. The app ID should stay the same across reinstallations (for example, your platform's app identifier). Show the digits returned by `digits()` in your app. The person opens BaseHero on one of their devices, types those digits there, chooses a base and a monthly cap, and approves. **Approve only an app you're setting up right now.** Keep the `PendingConnection` until `wait()` returns the installed account; `cancel()` ends a request the person no longer wants.
+Ask the person for their BaseHero email, then start an approval request with your app's display name and **stable app ID**. The app ID should stay the same across reinstallations (for example, your platform's app identifier). Show the digits returned by `digits()` in your app. The person opens BaseHero on one of their devices, types those digits there, chooses a folder or base and a monthly cap, and approves. **Approve only an app you're setting up right now.** Keep the `PendingConnection` until `wait()` returns the installed account; `cancel()` ends a request the person no longer wants.
 
 ```rust,no_run
 use bh_core::{AppIdentity, Core, Error, Url};
@@ -94,7 +94,7 @@ async fn connect(
 }
 ```
 
-A request left unanswered ends after two minutes, whether or not that email belongs to an account; the app cannot tell which. A wrong entry or a decline also ends it. On `Error::ApprovalEnded`, ask for the email and start a **new** request rather than retrying the old one. After reinstalling, connect again with the same app ID: BaseHero offers the old connection's granted base so the app can read its records again.
+A request left unanswered ends after two minutes, whether or not that email belongs to an account; the app cannot tell which. A wrong entry or a decline also ends it. On `Error::ApprovalEnded`, ask for the email and start a **new** request rather than retrying the old one. After reinstalling, connect again with the same app ID: BaseHero offers the old connection's grants so the app can read its records again.
 
 The [sample app](../apps/sample/README.md) keeps the pending connection in native Rust; its completion helper catches up before querying or creating a reading and defines `sample.reading` in a writable base:
 
@@ -135,7 +135,7 @@ The sample connects directly: enter the email, tap **Connect to BaseHero**, and 
 
 ## What your app can see
 
-The person names and grants the app access to whole bases when approving it. An app device can see **all records** in each granted base, including notes and records written by other apps. It cannot open ungranted bases. Each grant is `Mode::ReadOnly` or `Mode::ReadWrite`; local edits to a read-only base return `Error::ReadOnly`. No narrower folder grant is available in this API.
+The person grants your app one or more folders, or whole bases, each read-only or read-write. A granted folder appears to your app as a base named after the folder: `account.bases()` lists it, and your app sees its contents and nothing above or beside it. An app device can see all records in each granted base, including those other apps wrote. An item moved into a granted folder appears in that base with its ID, without its earlier versions. When a grant is removed, `account.refresh()` erases that base from the device; stop using its handle. Each grant is `Mode::ReadOnly` or `Mode::ReadWrite`; local edits to a read-only base return `Error::ReadOnly`.
 
 ## Record types
 

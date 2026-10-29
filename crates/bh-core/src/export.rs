@@ -1,6 +1,6 @@
-//! A readable, plaintext copy of one base.
+//! A readable, plaintext copy of a base, with the bases its folders show.
 
-use crate::base::Base;
+use crate::base::{self, Base};
 use crate::markdown;
 use crate::objects::ObjectSummary;
 use crate::types::{BASE, FILE, FOLDER, NOTE, PROJECT, TYPE};
@@ -290,7 +290,12 @@ fn relative_link(from: &Path, to: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-pub(crate) async fn run(base: &Base, dir: &Path) -> Result<ExportSummary, Error> {
+/// Exports `bases` together into `dir`: the first as the copy's base, and each
+/// other with its top-level objects under the given folder of one before it.
+pub(crate) async fn run(
+    bases: &[(Base, Option<ObjectId>)],
+    dir: &Path,
+) -> Result<ExportSummary, Error> {
     // DIR is the person's own choice, so a path through symlinks or `..` (as
     // /tmp is on the Mac) is resolved once, not refused. What's checked is that
     // the export never follows a symlink out of the resolved DIR.
@@ -299,11 +304,14 @@ pub(crate) async fn run(base: &Base, dir: &Path) -> Result<ExportSummary, Error>
     {
         return Err(Error::invalid("export directory must be empty"));
     }
-    let offline = match base.sync_now().await {
-        Ok(()) => false,
-        Err(Error::Network(_)) => true,
-        Err(e) => return Err(e),
-    };
+    let mut offline = false;
+    for (base, _) in bases {
+        match base.sync_now().await {
+            Ok(()) => {}
+            Err(Error::Network(_)) => offline = true,
+            Err(e) => return Err(e),
+        }
+    }
     let existed = dir.exists();
     if !existed {
         fs::create_dir_all(dir)?;
@@ -312,7 +320,7 @@ pub(crate) async fn run(base: &Base, dir: &Path) -> Result<ExportSummary, Error>
         root: fs::canonicalize(dir)?,
         created: Vec::new(),
     };
-    let result = write_export(base, &mut writer, offline).await;
+    let result = write_export(bases, &mut writer, offline).await;
     if result.is_err() {
         writer.rollback();
         if !existed {
@@ -323,7 +331,7 @@ pub(crate) async fn run(base: &Base, dir: &Path) -> Result<ExportSummary, Error>
 }
 
 async fn write_export(
-    base: &Base,
+    bases: &[(Base, Option<ObjectId>)],
     writer: &mut Writer,
     offline: bool,
 ) -> Result<ExportSummary, Error> {
@@ -331,7 +339,16 @@ async fn write_export(
         offline,
         ..Default::default()
     };
-    let objects = base.export_objects()?;
+    let (mut objects, mut owners) = (Vec::new(), HashMap::new());
+    for (base, folder) in bases {
+        for mut row in base.export_objects()? {
+            if row.parent.is_none() && !base::structural(&row.ty.name) {
+                row.parent = *folder;
+            }
+            owners.insert(row.id, base);
+            objects.push(row);
+        }
+    }
     let paths = tree_paths(&objects);
     let nodes: HashMap<_, _> = objects.iter().map(|o| (o.id, o)).collect();
     let mut listed = Vec::new();
@@ -369,7 +386,7 @@ async fn write_export(
         };
         match row.ty.name.as_str() {
             NOTE | FOLDER | PROJECT => {
-                let state = base.note(row.id)?.state();
+                let state = owners[&row.id].note(row.id)?.state();
                 let doc = Doc::new();
                 if !state.is_empty() {
                     let mut txn = doc.transact_mut();
@@ -419,7 +436,7 @@ async fn write_export(
                     summary.notes += 1;
                 }
             }
-            FILE => match base.file_bytes(row.id).await {
+            FILE => match owners[&row.id].file_bytes(row.id).await {
                 Ok(bytes) => {
                     writer.write(&path, &bytes)?;
                     summary.files += 1;
@@ -441,19 +458,27 @@ async fn write_export(
         }
         listed.push(json!({"id": row.id, "type": row.ty.name, "version": row.ty.version, "path": path.to_string_lossy(), "deleted": deleted}));
     }
-    for def in base.types()? {
-        let path =
-            PathBuf::from("types").join(format!("{}.v{}.json", safe_name(&def.name), def.version));
-        writer.write(
-            &path,
-            &serde_json::to_vec_pretty(&def).map_err(|_| Error::invalid("invalid type JSON"))?,
-        )?;
+    // A type moved along with an item is defined in both bases: written once.
+    let mut written = HashSet::new();
+    for (base, _) in bases {
+        for def in base.types()? {
+            let path = PathBuf::from("types").join(format!(
+                "{}.v{}.json",
+                safe_name(&def.name),
+                def.version
+            ));
+            if written.insert(path.clone()) {
+                let json = serde_json::to_vec_pretty(&def)
+                    .map_err(|_| Error::invalid("invalid type JSON"))?;
+                writer.write(&path, &json)?;
+            }
+        }
     }
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let manifest = json!({"format": 1, "exportedAt": exported_at, "base": {"id": base.id(), "name": base.name()}, "objects": listed, "missingFiles": summary.missing_files});
+    let manifest = json!({"format": 1, "exportedAt": exported_at, "base": {"id": bases[0].0.id(), "name": bases[0].0.name()}, "objects": listed, "missingFiles": summary.missing_files});
     writer.write(
         Path::new("manifest.json"),
         &serde_json::to_vec_pretty(&manifest)

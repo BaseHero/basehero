@@ -76,6 +76,7 @@ pub struct Connected {
     pub account: AccountId,
     pub device: DeviceId,
     pub base: BaseId,
+    pub bases: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
@@ -122,11 +123,13 @@ impl Sample {
     }
     pub fn connected(&self) -> Option<Connected> {
         let account = self.account().ok()?;
-        let base = account.bases().first()?.id;
+        let bases = account.bases();
+        let base = bases.first()?.id;
         Some(Connected {
             account: account.id(),
             device: account.device_id(),
             base,
+            bases: bases.into_iter().map(|summary| summary.name).collect(),
         })
     }
 
@@ -184,6 +187,11 @@ impl Sample {
             account: account.id(),
             device: account.device_id(),
             base,
+            bases: account
+                .bases()
+                .into_iter()
+                .map(|summary| summary.name)
+                .collect(),
         })
     }
 

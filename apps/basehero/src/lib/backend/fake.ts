@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type AppOffer, type AppChoiceInput, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
+import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type AppOffer, type AppChoiceInput, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type TreeItem, type AppSummary, type BaseChoiceInput, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
 
 export class FakeBackend implements Backend {
   calls: string[] = [];
@@ -16,6 +16,8 @@ export class FakeBackend implements Backend {
     this.kitStates.delete(account);
   }
   private baseList = new Map<string, BaseSummary[]>();
+  private appList = new Map<string, AppSummary[]>();
+  private movedOrigins = new Map<string, string>();
   private hiddenList = new Map<string, { base: BaseSummary; password: string; open: boolean }[]>();
   private hiddenChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('basehero-fake-hidden');
   private deviceList = new Map<string, DeviceSummary[]>();
@@ -97,6 +99,7 @@ export class FakeBackend implements Backend {
       this.kitStates.delete(e.account);
       this.passwords.delete(e.account);
       this.baseList.delete(e.account);
+      this.appList.delete(e.account);
       this.hiddenList.delete(e.account);
       for (const key of this.heroByProject.keys()) if (key.startsWith(`${e.account}:`)) this.heroByProject.delete(key);
       for (const key of this.heroChatsByBase.keys()) if (key.startsWith(`${e.account}:`)) this.heroChatsByBase.delete(key);
@@ -238,7 +241,64 @@ export class FakeBackend implements Backend {
     this.approvalList.set(account, (this.approvalList.get(account) ?? []).filter(r => r.id !== id));
     const removed = choice.replaces !== null && !this.failAppRemoval;
     this.failAppRemoval = false;
-    return [this.id(), removed];
+    const device = this.id();
+    const offer = this.appOffers.get(id);
+    if (offer) {
+      const bases = [];
+      for (const grant of choice.bases) bases.push({ base: await this.resolveGrant(account, grant), mode: grant.mode });
+      this.appList.set(account, [...(this.appList.get(account) ?? []), { deviceId: device, name: offer.name, appId: offer.appId ?? null, bases }]);
+    }
+    return [device, removed];
+  }
+  private async resolveGrant(account: string, choice: BaseChoiceInput): Promise<string> {
+    if (choice.base && choice.folder && !choice.newName) return this.mountFolder(account, choice.base, choice.folder);
+    if (choice.base && !choice.folder && !choice.newName) return choice.base;
+    if (!choice.base && !choice.folder && choice.newName) return (await this.createBase(account, choice.newName)).id;
+    throw new BackendError('Invalid', 'Choose a base, a folder or a new base');
+  }
+  async apps(account: string): Promise<AppSummary[]> { this.log('apps', account); return (this.appList.get(account) ?? []).map(app => ({ ...app, bases: [...app.bases] })); }
+  async appGrantAdd(account: string, device: string, choice: BaseChoiceInput): Promise<string> {
+    this.log('appGrantAdd', account);
+    const app = this.appList.get(account)?.find(app => app.deviceId === device);
+    if (!app) throw new BackendError('NotFound', 'App not found');
+    const base = await this.resolveGrant(account, choice);
+    const prior = app.bases.find(grant => grant.base === base);
+    if (prior) prior.mode = choice.mode; else app.bases.push({ base, mode: choice.mode });
+    this.emit({ kind: 'account', account, event: 'DevicesChanged' });
+    return base;
+  }
+  async appGrantRemove(account: string, device: string, base: string): Promise<void> {
+    this.log('appGrantRemove', account);
+    const app = this.appList.get(account)?.find(app => app.deviceId === device);
+    if (!app) throw new BackendError('NotFound', 'App not found');
+    app.bases = app.bases.filter(grant => grant.base !== base);
+    this.emit({ kind: 'account', account, event: 'DevicesChanged' });
+  }
+  async grantFolder(account: string, base: string, folder: string, app: string): Promise<string> {
+    const device = this.appList.get(account)?.find(entry => entry.name === app) ?? { deviceId: this.id(), name: app, appId: null, bases: [] };
+    if (!this.appList.get(account)?.includes(device)) this.appList.set(account, [...(this.appList.get(account) ?? []), device]);
+    return this.appGrantAdd(account, device.deviceId, { base, folder, mode: 'readWrite' });
+  }
+  private async mountFolder(account: string, base: string, folder: string): Promise<string> {
+    const existing = (this.baseList.get(account) ?? []).find(entry => entry.mount?.parent === base && entry.mount.folder === folder);
+    if (existing) return existing.id;
+    const item = await this.getObject({ account, base }, folder);
+    if (!item || item.deleted) throw new BackendError('NotFound', 'Folder not found');
+    const mounted = await this.createBase(account, item.title);
+    mounted.mount = { base: mounted.id, parent: base, folder };
+    const source = this.items.get(`${account}:${base}`) ?? [];
+    const children = source.filter(row => row.parent === folder && !row.deleted);
+    const ids = new Set(children.map(row => row.id));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const row of source) if (!row.deleted && row.parent && ids.has(row.parent) && !ids.has(row.id)) { ids.add(row.id); changed = true; }
+    }
+    const moved = source.filter(row => ids.has(row.id));
+    this.items.set(`${account}:${base}`, source.filter(row => !ids.has(row.id)));
+    this.items.set(`${account}:${mounted.id}`, moved.map(row => ({ ...row, parent: row.parent === folder ? null : row.parent })));
+    for (const row of moved) this.movedOrigins.set(`${account}:${mounted.id}:${row.id}`, base);
+    this.emit({ kind: 'base', account, base, event: { objectsChanged: [folder] } });
+    return mounted.id;
   }
   async setAppCap(account: string, device: string, capMicroUsd: number): Promise<void> {
     this.calls.push(`setAppCap ${device} ${capMicroUsd}`);
@@ -272,14 +332,15 @@ export class FakeBackend implements Backend {
     this.log('removeDevice', device);
     const mine = this.deviceList.get(account)?.find(item => item.id === device)?.thisDevice;
     this.deviceList.set(account, (this.deviceList.get(account) ?? []).filter(item => item.id !== device));
+    this.appList.set(account, (this.appList.get(account) ?? []).filter(item => item.deviceId !== device));
     this.emit({ kind: 'account', account, event: mine ? 'Removed' : 'DevicesChanged' });
   }
   async bases(account: string) { this.log('bases', account); return [...(this.baseList.get(account) ?? []), ...(this.hiddenList.get(account) ?? []).filter(entry => entry.open).map(entry => entry.base)]; }
-  async createBase(account: string, name: string) { this.log('createBase', account); const base: BaseSummary = { id: this.id(), name, mode: 'readWrite', hidden: false }; this.baseList.set(account, [...(this.baseList.get(account) ?? []), base]); this.emit({ kind: 'account', account, event: 'BasesChanged' }); return base; }
+  async createBase(account: string, name: string) { this.log('createBase', account); const base: BaseSummary = { id: this.id(), name, mode: 'readWrite', hidden: false, mount: null }; this.baseList.set(account, [...(this.baseList.get(account) ?? []), base]); this.emit({ kind: 'account', account, event: 'BasesChanged' }); return base; }
   async createHiddenBase(account: string, name: string, password: string) {
     this.log('createHiddenBase', account);
     if (!name.trim() || !password) throw new BackendError('Invalid', 'Invalid hidden base');
-    const base: BaseSummary = { id: this.id(), name, mode: 'readWrite', hidden: true };
+    const base: BaseSummary = { id: this.id(), name, mode: 'readWrite', hidden: true, mount: null };
     this.hiddenList.set(account, [...(this.hiddenList.get(account) ?? []), { base, password: password.normalize('NFKC'), open: true }]);
     this.emit({ kind: 'account', account, event: 'BasesChanged' });
     return base;
@@ -401,13 +462,61 @@ export class FakeBackend implements Backend {
     for (const session of this.sessions.values()) if (session.id === id) session.onUpdate(update);
   }
   async children(r: BaseRef, parent: string | null) { this.log('children', r); return (this.items.get(this.key(r)) ?? []).filter(x => x.parent === parent && !x.deleted); }
+  private mountedBases(account: string, base: string): string[] {
+    return [base, ...(this.baseList.get(account) ?? []).filter(entry => entry.mount?.parent === base).flatMap(entry => this.mountedBases(account, entry.id))];
+  }
+  async treeChildren(r: BaseRef, parent: string | null): Promise<TreeItem[]> {
+    this.log('treeChildren', r);
+    const own = this.items.get(this.key(r)) ?? [];
+    if (parent !== null && !own.some(row => row.id === parent)) throw new BackendError('NotFound', 'Parent not found');
+    const mount = (this.baseList.get(r.account) ?? []).find(entry => entry.mount?.parent === r.base && entry.mount.folder === parent);
+    const rows = [
+      ...own.filter(row => row.parent === parent && !row.deleted).map(row => ({ row, base: r.base })),
+      ...(mount ? (this.items.get(`${r.account}:${mount.id}`) ?? []).filter(row => row.parent === null && !row.deleted).map(row => ({ row, base: mount.id })) : []),
+    ];
+    return rows.map(({ row, base }) => {
+      const nested = (this.baseList.get(r.account) ?? []).find(entry => entry.mount?.parent === base && entry.mount.folder === row.id);
+      const readers = nested ? (this.appList.get(r.account) ?? []).filter(app => app.bases.some(grant => grant.base === nested.id)).map(app => app.name) : [];
+      return { ...row, base, mounted: nested?.id ?? null, readers };
+    });
+  }
+  async locate(r: BaseRef, id: string): Promise<string> {
+    this.log('locate', r);
+    for (const base of this.mountedBases(r.account, r.base)) {
+      if (this.items.get(`${r.account}:${base}`)?.some(row => row.id === id && !row.deleted)) return base;
+    }
+    throw new BackendError('NotFound', 'Object not found');
+  }
+  async movedFrom(r: BaseRef, id: string): Promise<string | null> { this.log('movedFrom', r); return this.movedOrigins.get(`${r.account}:${r.base}:${id}`) ?? null; }
   async getObject(r: BaseRef, id: string) { this.log('getObject', r); return this.items.get(this.key(r))?.find(x => x.id === id) ?? null; }
   async createObject(r: BaseRef, item: NewItem) { this.log('createObject', r); const id = this.addItem(r, item); this.emit({ kind: 'base', account: r.account, base: r.base, event: { objectsChanged: [id] } }); return id; }
   async renameObject(r: BaseRef, id: string, name: string) { this.log('renameObject', r); const object = await this.getObject(r, id); if (!object) throw new BackendError('NotFound', 'Object not found'); object.title = name; }
-  async moveObject(r: BaseRef, id: string, parent: string | null, _after: string | null) { this.log('moveObject', r); const object = await this.getObject(r, id); if (!object) throw new BackendError('NotFound', 'Object not found'); object.parent = parent; }
+  async moveObject(r: BaseRef, id: string, base: string | null, parent: string | null, after?: string | null) {
+    this.log('moveObject', r);
+    if (after === undefined) { after = parent; parent = base; base = null; }
+    const object = await this.getObject(r, id);
+    if (!object) throw new BackendError('NotFound', 'Object not found');
+    if (base && base !== r.base) {
+      const source = this.items.get(this.key(r)) ?? [];
+      const ids = new Set([id]);
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const row of source) if (row.parent && ids.has(row.parent) && !ids.has(row.id)) { ids.add(row.id); changed = true; }
+      }
+      const moved = source.filter(row => ids.has(row.id));
+      this.items.set(this.key(r), source.filter(row => !ids.has(row.id)));
+      this.items.set(`${r.account}:${base}`, [...(this.items.get(`${r.account}:${base}`) ?? []), ...moved.map(row => row.id === id ? { ...row, parent } : row)]);
+      for (const row of moved) this.movedOrigins.set(`${r.account}:${base}:${row.id}`, r.base);
+      this.emit({ kind: 'base', account: r.account, base, event: { objectsChanged: [id] } });
+    } else object.parent = parent;
+  }
   async deleteObject(r: BaseRef, id: string) { this.log('deleteObject', r); const object = await this.getObject(r, id); if (object) object.deleted = true; }
   async restoreObject(r: BaseRef, id: string) { this.log('restoreObject', r); const object = await this.getObject(r, id); if (object) object.deleted = false; }
-  async trash(r: BaseRef) { this.log('trash', r); return (this.items.get(this.key(r)) ?? []).filter(x => x.deleted); }
+  async trash(r: BaseRef): Promise<TreeItem[]> {
+    this.log('trash', r);
+    return this.mountedBases(r.account, r.base).flatMap(base => (this.items.get(`${r.account}:${base}`) ?? [])
+      .filter(row => row.deleted).map(row => ({ ...row, base, mounted: null, readers: [] })));
+  }
   async search(account: string, base: string | null, text: string, limit: number): Promise<SearchResult[]> {
     this.log('search', account);
     if (limit <= 0) return [];

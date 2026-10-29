@@ -2,7 +2,7 @@ use crate::error::CommandError;
 use crate::state::{ActiveApproval, AppState};
 use bh_core::{
     AccountId, AccountSummary, AppChoice, AppOffer, ApprovalId, ApprovalRequest, BaseGrantRequest,
-    BaseId, DeviceId, Digits, Mode,
+    BaseId, DeviceId, Digits, Mode, ObjectId,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::Ordering};
@@ -255,8 +255,32 @@ pub async fn approval_decline(
 #[serde(rename_all = "camelCase")]
 pub struct BaseChoiceInput {
     pub base: Option<BaseId>,
+    pub folder: Option<ObjectId>,
     pub new_name: Option<String>,
     pub mode: Mode,
+}
+
+impl BaseChoiceInput {
+    pub fn into_grant(self) -> Result<BaseGrantRequest, bh_core::Error> {
+        match (self.base, self.folder, self.new_name) {
+            (Some(base), None, None) => Ok(BaseGrantRequest::Existing {
+                base,
+                mode: self.mode,
+            }),
+            (Some(base), Some(folder), None) => Ok(BaseGrantRequest::Folder {
+                base,
+                folder,
+                mode: self.mode,
+            }),
+            (None, None, Some(name)) => Ok(BaseGrantRequest::New {
+                name,
+                mode: self.mode,
+            }),
+            _ => Err(bh_core::Error::Invalid(
+                "Choose a base, a folder or a new base".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -314,19 +338,7 @@ pub async fn connect_approve(
     let bases = choice
         .bases
         .into_iter()
-        .map(|base| match (base.base, base.new_name) {
-            (Some(id), None) => Ok(BaseGrantRequest::Existing {
-                base: id,
-                mode: base.mode,
-            }),
-            (None, Some(name)) => Ok(BaseGrantRequest::New {
-                name,
-                mode: base.mode,
-            }),
-            _ => Err(bh_core::Error::Invalid(
-                "Choose an existing or new base".into(),
-            )),
-        })
+        .map(BaseChoiceInput::into_grant)
         .collect::<Result<Vec<_>, _>>()?;
     let request = state
         .open_app_requests

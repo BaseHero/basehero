@@ -11,15 +11,16 @@ use crate::client::Api;
 use crate::client::ApprovalLive;
 use crate::core::{Shared, derive, login_salt};
 use crate::envelope;
+use crate::grants;
 use crate::hidden::{self, HiddenKey};
 use crate::keys::{self, DEFAULT_KDF, RecoveryKit};
 use crate::store::{AccountDb, BaseRow};
-use crate::{Base, BaseSummary, EndReason, Error, Mode, UsageRow};
+use crate::{Base, BaseSummary, EndReason, Error, Mode, Mount, UsageRow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_crypto::Secret;
 use bh_proto::{
     AccountDataRequest, AccountId, AppDeviceKind, ApprovalId, ApprovalKind, BaseId, BasesRequest,
-    Bytes, CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest,
+    Bytes, CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest, ObjectId,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -129,7 +130,8 @@ pub struct AccountUsage {
     pub device_names: BTreeMap<DeviceId, String>,
 }
 
-/// A base selected for an app; a new base is created before registering the app device.
+/// A base or folder selected for an app; a new base, or a folder's first base,
+/// is made before registering the app device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseGrantRequest {
     /// Grant an existing base.
@@ -143,6 +145,16 @@ pub enum BaseGrantRequest {
     New {
         /// Name of the new base.
         name: String,
+        /// Requested access mode.
+        mode: Mode,
+    },
+    /// Grant a folder or project. Its first grant makes it a base underneath,
+    /// moving its contents in; the app sees that base and nothing beside it.
+    Folder {
+        /// The base the folder is in.
+        base: BaseId,
+        /// The folder or project.
+        folder: ObjectId,
         /// Requested access mode.
         mode: Mode,
     },
@@ -265,9 +277,10 @@ pub enum AccountEvent {
 /// Account data, `{ "v": 1, "devices": {}, "apps": {},
 /// "kit": { "code": "…", "saved": false, "at": <Unix ms>, "envelope": "<sha256 hex>" } }`,
 /// sealed under `kdf(AK, "bhacdat1", 1)`. Edits keep fields this version doesn't know.
+/// `mounts` and each app's `bases` and `was` are read by `grants`.
 /// Erasure is best effort: JSON map strings and WebView display copies of the
 /// kit can remain in process memory even when serialized buffers are zeroized.
-type Data = Map<String, Value>;
+pub(crate) type Data = Map<String, Value>;
 
 fn new_data() -> Data {
     let Value::Object(data) = json!({ "v": 1, "devices": {}, "apps": {} }) else {
@@ -286,7 +299,7 @@ fn parse_data(json: &[u8]) -> Result<Data, Error> {
     }
 }
 
-fn entry<'a>(data: &'a mut Data, key: &str) -> &'a mut Data {
+pub(crate) fn entry<'a>(data: &'a mut Data, key: &str) -> &'a mut Data {
     let value = data.entry(key).or_insert_with(|| json!({}));
     if !value.is_object() {
         *value = json!({});
@@ -375,6 +388,10 @@ struct Inner {
     hidden_gate: tokio::sync::Mutex<()>,
     /// Synchronous listing cannot block on an async mutex inside an async caller.
     hidden: Mutex<HashMap<BaseId, Base>>,
+    /// Runs one move between bases at a time in this process.
+    moves: tokio::sync::Mutex<()>,
+    /// Serializes grant reconciliation across this account's clones.
+    grants: tokio::sync::Mutex<()>,
     #[cfg(feature = "test-support")]
     held_hidden_open: Mutex<
         Option<(
@@ -471,6 +488,8 @@ impl Account {
                     bases: Mutex::new(HashMap::new()),
                     hidden_gate: tokio::sync::Mutex::new(()),
                     hidden: Mutex::new(HashMap::new()),
+                    moves: tokio::sync::Mutex::new(()),
+                    grants: tokio::sync::Mutex::new(()),
                     #[cfg(feature = "test-support")]
                     held_hidden_open: Mutex::new(None),
                     #[cfg(feature = "test-support")]
@@ -536,6 +555,12 @@ impl Account {
         self.inner.api.hold_next_account_get()
     }
 
+    #[cfg(feature = "test-support")]
+    /// Test only: pause the next grant PUT before it reaches the server.
+    pub fn test_hold_next_grant(&self) -> Arc<tokio::sync::Semaphore> {
+        self.inner.api.hold_next_grant()
+    }
+
     /// Test only: pause the next hidden unlock inside the gate before it opens a base.
     /// The returned flag signals when the gate is held; add a permit to release it.
     #[cfg(feature = "test-support")]
@@ -574,6 +599,10 @@ impl Account {
     /// and starts their background sync; it does not wait for the network.
     pub fn bases(&self) -> Vec<BaseSummary> {
         let rows = self.db().bases().unwrap_or_default();
+        let mounts = self
+            .cached_data()
+            .map(|data| grants::mounts(&data))
+            .unwrap_or_default();
         let mut list: Vec<_> = rows
             .into_iter()
             .filter_map(|row| {
@@ -583,6 +612,7 @@ impl Account {
                     name: base.name(),
                     mode: row.mode,
                     hidden: false,
+                    mount: mounts.get(&row.id).copied(),
                 })
             })
             .collect();
@@ -602,6 +632,7 @@ impl Account {
                 name: base.name(),
                 mode: base.mode(),
                 hidden: true,
+                mount: None,
             })
             .collect();
         hidden.sort_by_cached_key(|s| (s.name.to_lowercase(), s.id));
@@ -609,28 +640,68 @@ impl Account {
         list
     }
 
-    /// App device IDs with a local grant for this base, without a network call.
+    /// Cached account data on full devices; `None` on app devices or when unreadable.
+    pub(crate) fn cached_data(&self) -> Option<Data> {
+        if self.kind() != DeviceKind::Full {
+            return None;
+        }
+        let (_, json) = self.db().account_data().ok().flatten()?;
+        parse_data(json.as_bytes()).ok()
+    }
+
+    /// App device IDs that can read this base, with grants from the bases it's
+    /// mounted in and any change still pending, without a network call.
     pub(crate) fn app_readers(&self, base: BaseId) -> BTreeSet<DeviceId> {
         #[cfg(feature = "test-support")]
         if let Some(readers) = self.inner.synthetic_readers.lock().unwrap().get(&base) {
             return readers.clone();
         }
-        self.apps()
+        self.cached_data()
+            .map(|data| grants::readers(&data, base))
+            .unwrap_or_default()
+    }
+
+    /// Test only: the app devices Hero counts as readers of `base`.
+    #[cfg(feature = "test-support")]
+    pub fn test_app_readers(&self, base: BaseId) -> BTreeSet<DeviceId> {
+        self.app_readers(base)
+    }
+
+    /// Bases shown in folders of other bases, from cached account data; empty
+    /// on app devices. Never contacts the server.
+    pub fn mounts(&self) -> Vec<Mount> {
+        self.cached_data()
+            .map(|data| grants::mounts(&data).into_values().collect())
+            .unwrap_or_default()
+    }
+
+    /// Renames an object in `base`. A granted folder's base takes the name
+    /// too, so its apps see it. Never contacts the server.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] for a note, whose title comes from its body,
+    /// or for a name its type refuses, [`Error::NotFound`] for an unknown base
+    /// or object, or the errors of [`Base::set_fields`].
+    pub fn rename(&self, base: BaseId, id: ObjectId, name: &str) -> Result<(), Error> {
+        let open = self.base(base)?;
+        let object = open.get(id)?.ok_or(Error::NotFound)?;
+        if object.ty.name == crate::types::NOTE {
+            return Err(Error::invalid("a note's title comes from its body"));
+        }
+        open.set_fields(id, Map::from_iter([("name".into(), Value::from(name))]))?;
+        match self
+            .mounts()
             .into_iter()
-            .filter(|app| app.bases.iter().any(|grant| grant.base == base))
-            .map(|app| app.device_id)
-            .collect()
+            .find(|m| (m.parent, m.folder) == (base, id))
+        {
+            Some(mount) => self.base(mount.base)?.set_name(name),
+            None => Ok(()),
+        }
     }
 
     /// Apps known from the encrypted local account data; never contacts the server.
     pub fn apps(&self) -> Vec<AppSummary> {
-        if self.kind() != DeviceKind::Full {
-            return Vec::new();
-        }
-        let Some((_, json)) = self.db().account_data().ok().flatten() else {
-            return Vec::new();
-        };
-        let Ok(data) = parse_data(json.as_bytes()) else {
+        let Some(data) = self.cached_data() else {
             return Vec::new();
         };
         let Some(entries) = data.get("apps").and_then(Value::as_object) else {
@@ -888,19 +959,15 @@ impl Account {
         // Reject malformed requests before creating bases or registering a device.
         let mut seen = HashSet::new();
         for grant in &requested {
-            if let BaseGrantRequest::Existing { base, .. } = grant {
-                if !seen.insert(*base) {
-                    return Err(Error::invalid("duplicate base"));
+            match grant {
+                BaseGrantRequest::Existing { base, .. } => {
+                    if !seen.insert(*base) {
+                        return Err(Error::invalid("duplicate base"));
+                    }
+                    self.check_grantable(*base)?;
                 }
-                if self
-                    .db()
-                    .hidden_wrappers()?
-                    .iter()
-                    .any(|(id, _, _)| id == base)
-                {
-                    return Err(Error::Forbidden);
-                }
-                self.base(*base)?;
+                BaseGrantRequest::Folder { base, .. } => self.check_grantable(*base)?,
+                BaseGrantRequest::New { .. } => {}
             }
         }
         if let Some(old) = req.replaces
@@ -914,6 +981,9 @@ impl Account {
                 BaseGrantRequest::Existing { base, mode } => grants.push((base, mode)),
                 BaseGrantRequest::New { name, mode } => {
                     grants.push((self.create_base(&name).await?.id(), mode))
+                }
+                BaseGrantRequest::Folder { base, folder, mode } => {
+                    grants.push((self.grant_folder(base, folder).await?, mode))
                 }
             }
         }
@@ -950,9 +1020,7 @@ impl Account {
                 return Err(error);
             }
         };
-        let result = self
-            .grant_new_app(device_id, req, &key, &app_key, &grants)
-            .await;
+        let result = self.grant_new_app(device_id, req, &key, &grants).await;
         match result {
             Ok(()) => Ok(AppCredentials {
                 server: self.inner.server.clone(),
@@ -981,65 +1049,48 @@ impl Account {
         }
     }
 
+    /// A hidden base is never granted; any other base must be known here.
+    pub(crate) fn check_grantable(&self, base: BaseId) -> Result<(), Error> {
+        if self.is_hidden(base)? {
+            return Err(Error::Forbidden);
+        }
+        self.base(base).map(|_| ())
+    }
+
+    /// Whether `base` is a hidden base known here, locked or not.
+    pub(crate) fn is_hidden(&self, base: BaseId) -> Result<bool, Error> {
+        Ok(self
+            .db()
+            .hidden_wrappers()?
+            .iter()
+            .any(|(id, _, _)| *id == base))
+    }
+
     async fn grant_new_app(
         &self,
         device_id: DeviceId,
         req: AppRequest,
         key: &str,
-        app_key: &Secret<32>,
         grants: &[(BaseId, Mode)],
     ) -> Result<(), Error> {
-        let mut bases = Map::new();
-        for (id, mode) in grants {
-            bases.insert(
-                id.to_string(),
-                json!(match mode {
-                    Mode::ReadWrite => "rw",
-                    Mode::ReadOnly => "ro",
-                }),
-            );
-        }
+        let bases: grants::Grants = grants.iter().copied().collect();
         let order: Vec<String> = grants.iter().map(|(id, _)| id.to_string()).collect();
         let key = Zeroizing::new(key.to_owned());
         let replaces = req.replaces;
+        // A new app's grants are a pending change from none until the server has them.
         self.update_data(move |data| {
-            entry(data, "apps").insert(
-                device_id.to_string(),
-                json!({
-                    "name": req.app_name.trim(), "appId": req.app_id, "key": key.as_str(), "bases": bases, "baseOrder": order
-                }),
-            );
+            grants::edit(data, |data| {
+                entry(data, "apps").insert(
+                    device_id.to_string(),
+                    json!({
+                        "name": req.app_name.trim(), "appId": req.app_id, "key": key.as_str(),
+                        "bases": grants::to_value(&bases), "baseOrder": order
+                    }),
+                );
+            })
         })
         .await?;
-        for (base, mode) in grants {
-            let row = self
-                .db()
-                .bases()?
-                .into_iter()
-                .find(|row| row.id == *base)
-                .ok_or(Error::NotFound)?;
-            let base_key = self.base_key(&row)?;
-            let wrapper = envelope::seal(
-                &bh_crypto::kdf(app_key, b"bhbasew1", 1),
-                &keys::app_wrapper_aad(base, &device_id, row.epoch),
-                base_key.secret().expose(),
-            );
-            self.inner
-                .api
-                .grant(
-                    *base,
-                    device_id,
-                    &GrantRequest {
-                        mode: match mode {
-                            Mode::ReadWrite => GrantMode::ReadWrite,
-                            Mode::ReadOnly => GrantMode::ReadOnly,
-                        },
-                        epoch: row.epoch,
-                        wrapper: Bytes(wrapper),
-                    },
-                )
-                .await?;
-        }
+        self.settle_app(device_id).await?;
         if let Some(old) = replaces {
             self.inner.api.delete_device(old).await?;
             self.update_data(move |data| {
@@ -1048,6 +1099,241 @@ impl Account {
             .await?;
         }
         Ok(())
+    }
+
+    /// Grants an app another base, or changes its mode on one it has; `New`
+    /// creates the base first. Returns the granted base. The change is kept in
+    /// account data first, so a later [`Self::refresh`] finishes it if this
+    /// stops midway. Full devices only. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device or for a hidden base,
+    /// [`Error::NotFound`] for an unknown app or base, [`Error::Invalid`] for
+    /// an empty name, [`Error::Network`] on connection failure, or server and
+    /// storage errors.
+    pub async fn add_app_grant(
+        &self,
+        device: DeviceId,
+        grant: BaseGrantRequest,
+    ) -> Result<BaseId, Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                if !this.apps().iter().any(|app| app.device_id == device) {
+                    return Err(Error::NotFound);
+                }
+                let (base, mode) = match grant {
+                    BaseGrantRequest::Existing { base, mode } => {
+                        this.check_grantable(base)?;
+                        (base, mode)
+                    }
+                    BaseGrantRequest::New { name, mode } => {
+                        (this.create_base(&name).await?.id(), mode)
+                    }
+                    BaseGrantRequest::Folder { base, folder, mode } => {
+                        (this.grant_folder(base, folder).await?, mode)
+                    }
+                };
+                this.edit_app(device, move |app| {
+                    entry(app, "bases").insert(base.to_string(), json!(grants::mode_text(mode)));
+                    let order = app.entry("baseOrder").or_insert_with(|| json!([]));
+                    if let Some(order) = order.as_array_mut()
+                        && !order
+                            .iter()
+                            .any(|id| id.as_str() == Some(&base.to_string()))
+                    {
+                        order.push(json!(base.to_string()));
+                    }
+                })
+                .await?;
+                this.settle_grants().await?;
+                Ok(base)
+            })
+            .await
+    }
+
+    /// Removes an app's grant on `base`, and the server's grants that came only
+    /// from it. The app erases a base it can no longer read when it next
+    /// refreshes. As with [`Self::add_app_grant`], a later [`Self::refresh`]
+    /// finishes a change that stopped midway. Full devices only. Needs the network.
+    ///
+    /// # Errors
+    /// Returns [`Error::Forbidden`] on an app device, [`Error::NotFound`] for an
+    /// unknown app, [`Error::Network`] on connection failure, or server and
+    /// storage errors.
+    pub async fn remove_app_grant(&self, device: DeviceId, base: BaseId) -> Result<(), Error> {
+        if self.kind() != DeviceKind::Full {
+            return Err(Error::Forbidden);
+        }
+        let this = self.clone();
+        self.inner
+            .shared
+            .run(async move {
+                if !this.apps().iter().any(|app| app.device_id == device) {
+                    return Err(Error::NotFound);
+                }
+                this.edit_app(device, move |app| {
+                    entry(app, "bases").remove(&base.to_string());
+                    if let Some(order) = app.get_mut("baseOrder").and_then(Value::as_array_mut) {
+                        order.retain(|id| id.as_str() != Some(&base.to_string()));
+                    }
+                })
+                .await?;
+                this.settle_grants().await
+            })
+            .await
+    }
+
+    /// Changes one app's entry in account data, marking the change pending.
+    async fn edit_app(
+        &self,
+        device: DeviceId,
+        change: impl Fn(&mut Data) + Send + 'static,
+    ) -> Result<(), Error> {
+        self.update_data(move |data| {
+            grants::edit(data, |data| {
+                if let Some(app) = data
+                    .get_mut("apps")
+                    .and_then(|apps| apps.get_mut(device.to_string()))
+                    .and_then(Value::as_object_mut)
+                {
+                    change(app);
+                }
+            })
+        })
+        .await
+    }
+
+    /// Brings the server's grants in step with each pending change in cached
+    /// account data.
+    pub(crate) async fn settle_grants(&self) -> Result<(), Error> {
+        let _one = self.inner.grants.lock().await;
+        self.refresh_account_data().await?;
+        let pending = self
+            .cached_data()
+            .map(|data| grants::pending(&data))
+            .unwrap_or_default();
+        // Each app settles on its own, so one that fails doesn't hold up the rest.
+        let mut first = None;
+        for device in pending {
+            if let Err(error) = self.settle_app_locked(device).await {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Grants every base `device` can read now, revokes the bases it could read
+    /// only before, then marks the change done if no edit came meanwhile. A base
+    /// this device doesn't know yet is left for a later call.
+    async fn settle_app(&self, device: DeviceId) -> Result<(), Error> {
+        let _one = self.inner.grants.lock().await;
+        self.refresh_account_data().await?;
+        self.settle_app_locked(device).await
+    }
+
+    async fn settle_app_locked(&self, device: DeviceId) -> Result<(), Error> {
+        let Some(data) = self.cached_data() else {
+            return Ok(());
+        };
+        let Some(was) = grants::was(&data, device) else {
+            return Ok(());
+        };
+        let effective = grants::effective(&grants::direct(&data, device), &grants::mounts(&data));
+        let app_key = data
+            .get("apps")
+            .and_then(|apps| apps.get(device.to_string()))
+            .and_then(|app| app.get("key"))
+            .and_then(Value::as_str)
+            .and_then(|key| URL_SAFE_NO_PAD.decode(key).ok())
+            .map(Zeroizing::new)
+            .ok_or_else(|| Error::Storage("unreadable app key".into()))?;
+        let wrap_key = bh_crypto::kdf(&Secret::<32>::from_slice(&app_key)?, b"bhbasew1", 1);
+        let rows = self.db().bases()?;
+        let mut complete = true;
+        for (&base, &mode) in &effective {
+            let Some(row) = rows.iter().find(|row| row.id == base) else {
+                complete = false;
+                continue;
+            };
+            let wrapper = envelope::seal(
+                &wrap_key,
+                &keys::app_wrapper_aad(&base, &device, row.epoch),
+                self.base_key(row)?.secret().expose(),
+            );
+            let request = GrantRequest {
+                mode: match mode {
+                    Mode::ReadWrite => GrantMode::ReadWrite,
+                    Mode::ReadOnly => GrantMode::ReadOnly,
+                },
+                epoch: row.epoch,
+                wrapper: Bytes(wrapper),
+            };
+            match self.inner.api.grant(base, device, &request).await {
+                // The server has no such active app: it was removed, so forget it.
+                Err(Error::NotFound) => {
+                    return self
+                        .update_data(move |data| {
+                            entry(data, "apps").remove(&device.to_string());
+                        })
+                        .await;
+                }
+                result => result?,
+            }
+        }
+        for &base in was.keys().filter(|base| !effective.contains_key(base)) {
+            self.inner.api.revoke(base, device).await?;
+        }
+        if !complete {
+            return Ok(());
+        }
+        self.update_data_with_envelope(move |data, _| {
+            let unchanged = grants::was(data, device).as_ref() == Some(&was)
+                && grants::effective(&grants::direct(data, device), &grants::mounts(data))
+                    == effective;
+            let app = data
+                .get_mut("apps")
+                .and_then(|apps| apps.get_mut(device.to_string()))
+                .and_then(Value::as_object_mut);
+            match app {
+                Some(app) if unchanged => app.remove("was").is_some(),
+                _ => false,
+            }
+        })
+        .await
+    }
+
+    /// Closes and deletes a base this app device can no longer read.
+    async fn erase_base(&self, id: BaseId) -> Result<(), Error> {
+        let open = self.inner.bases.lock().unwrap().remove(&id);
+        if let Some(base) = open.and_then(|weak| weak.upgrade()) {
+            base.close().await;
+        }
+        let path = self
+            .inner
+            .shared
+            .account_dir(self.id())
+            .join("bases")
+            .join(format!("{id}.sqlite"));
+        for file in ["sqlite", "sqlite-wal", "sqlite-shm"] {
+            match std::fs::remove_file(path.with_extension(file)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        match std::fs::remove_dir_all(crate::files::part_root(&path)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        self.inner
+            .shared
+            .secrets
+            .delete(&format!("base.{id}.dbkey"))?;
+        self.db().forget_base(id)
     }
 
     /// Revokes a device and removes its app listing. Removing this device also
@@ -1252,7 +1538,8 @@ impl Account {
     }
 
     /// Creates a base named `name`, with a new key that only this account's
-    /// key opens. Full devices only. Needs the network.
+    /// key opens, and sends its name before returning. Full devices only. Needs
+    /// the network.
     ///
     /// # Errors
     /// Returns [`Error::Invalid`] for an empty name, [`Error::Forbidden`] on
@@ -1260,6 +1547,14 @@ impl Account {
     /// for connection failure, [`Error::Conflict`] if a key conflicts, or
     /// [`Error::Storage`] for a local store failure.
     pub async fn create_base(&self, name: &str) -> Result<Base, Error> {
+        self.create_base_at(BaseId::random(), name).await
+    }
+
+    /// As [`Self::create_base`], with the ID `id`. When the server already has
+    /// `id`, as after a lost reply or a create that stopped midway, it adopts
+    /// that base if its key opens under the account key, and writes the name
+    /// only when the base has none here.
+    pub(crate) async fn create_base_at(&self, id: BaseId, name: &str) -> Result<Base, Error> {
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err(Error::invalid("base name"));
@@ -1274,7 +1569,6 @@ impl Account {
         self.inner
             .shared
             .run(async move {
-                let id = BaseId::random();
                 let key = Secret::<32>::random();
                 let wrapper = envelope::seal(
                     &this.derive_secret(b"bhbasew1")?,
@@ -1287,37 +1581,51 @@ impl Account {
                     wrapper: Bytes(wrapper.clone()),
                 };
                 let api = &this.inner.api;
-                match api.create_base(&request).await {
+                let created = match api.create_base(&request).await {
+                    // The first request may have been stored before its reply was lost.
+                    Err(Error::Network(_)) => api.create_base(&request).await,
+                    other => other,
+                };
+                let mut row = BaseRow {
+                    id,
+                    epoch: EPOCH,
+                    wrapper,
+                    mode: Mode::ReadWrite,
+                };
+                match created {
                     Ok(_) => {}
-                    // The first request may have been stored before its reply
-                    // was lost; then the base's key is the one just sent.
-                    Err(Error::Network(_)) => match api.create_base(&request).await {
-                        Ok(_) => {}
-                        Err(Error::Conflict(code)) if code == "exists" => {
-                            if api.base_key(id).await?.wrapper.0 != wrapper {
-                                return Err(Error::Conflict(code));
-                            }
+                    // Already made: adopted only if it's this account's own base.
+                    Err(Error::Conflict(code)) if code == "exists" => {
+                        let key = api.base_key(id).await?;
+                        (row.epoch, row.wrapper) = (key.epoch, key.wrapper.0);
+                        match this.base_key(&row) {
+                            Ok(_) => {}
+                            Err(Error::Crypto) => return Err(Error::Conflict(code)),
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
-                    },
+                    }
                     Err(e) => return Err(e),
                 }
-                let db = this.db();
-                if this.inner.removal.load(Ordering::SeqCst) != 0 {
+                {
+                    let db = this.db();
+                    if this.inner.removal.load(Ordering::SeqCst) != 0 {
+                        return Err(Error::Revoked);
+                    }
+                    db.put_base(&row, now_ms())?;
+                }
+                let base = this.base(id)?;
+                if base.name().is_empty() {
+                    base.write_info(&name)?;
+                }
+                // Send the name now: a caller may keep no handle, and a base's sync
+                // stops with its last one. The base exists on the server already, so
+                // a failed send isn't an error; the name stays queued for the next sync.
+                // A slow one is bounded, as under repeated rate limits.
+                let sent = tokio::time::timeout(Duration::from_secs(10), base.flush()).await;
+                if let Ok(Err(Error::Revoked)) = sent {
                     return Err(Error::Revoked);
                 }
-                db.put_base(
-                    &BaseRow {
-                        id,
-                        epoch: EPOCH,
-                        wrapper,
-                        mode: Mode::ReadWrite,
-                    },
-                    now_ms(),
-                )?;
-                drop(db);
-                let base = this.base(id)?;
-                base.write_info(&name)?;
+                this.check_active()?;
                 let _ = this.inner.events.send(AccountEvent::BasesChanged);
                 Ok(base)
             })
@@ -1460,6 +1768,7 @@ impl Account {
                             name: base.name(),
                             mode: base.mode(),
                             hidden: true,
+                            mount: None,
                         });
                     }
                 }
@@ -2118,8 +2427,10 @@ impl Account {
     }
 
     /// Learns of bases added on other devices, and asks every open base to
-    /// catch up. Needs the network to fetch grants; sync then continues in
-    /// the background.
+    /// catch up. On full devices it also finishes app grant changes, and moves
+    /// between bases this device started, that stopped midway; on app devices
+    /// it erases bases no longer granted.
+    /// Needs the network to fetch grants; sync then continues in the background.
     ///
     /// # Errors
     /// Returns [`Error::Network`] on connection failure,
@@ -2131,6 +2442,7 @@ impl Account {
             .shared
             .run(async move {
                 let listed = this.inner.api.me().await?.bases;
+                let mounts = this.mounts();
                 let data_error = if this.kind() == DeviceKind::Full {
                     match this.refresh_account_data().await {
                         Err(Error::Revoked) => return Err(Error::Revoked),
@@ -2146,7 +2458,9 @@ impl Account {
                         .into_iter()
                         .map(|(id, _, _)| id),
                 );
-                let mut added = false;
+                let granted: HashSet<BaseId> = listed.iter().copied().collect();
+                // A base mounted or moved elsewhere changes how bases are listed.
+                let mut changed = this.mounts() != mounts;
                 let mut needs_update = false;
                 for id in listed.into_iter().filter(|id| !known.contains(id)) {
                     let key = this.inner.api.base_key(id).await?;
@@ -2173,10 +2487,29 @@ impl Account {
                         Err(e) => return Err(e),
                     }
                     this.db().put_base(&row, now_ms())?;
-                    added = true;
+                    changed = true;
+                }
+                // An app device keeps only the bases it's still granted. One
+                // failed erase must not hold up the others or their catch-up.
+                let mut erase_error = None;
+                if this.kind() == DeviceKind::App {
+                    let rows = this.db().bases()?;
+                    for row in rows.iter().filter(|row| !granted.contains(&row.id)) {
+                        if let Err(error) = this.erase_base(row.id).await {
+                            erase_error.get_or_insert(error);
+                        } else {
+                            changed = true;
+                        }
+                    }
                 }
                 // Collected first: `base` locks the account store too.
-                let all: Vec<BaseId> = this.db().bases()?.iter().map(|r| r.id).collect();
+                let all: Vec<BaseId> = this
+                    .db()
+                    .bases()?
+                    .iter()
+                    .map(|r| r.id)
+                    .filter(|id| this.kind() != DeviceKind::App || granted.contains(id))
+                    .collect();
                 for id in all {
                     match this.base(id) {
                         Ok(base) => {
@@ -2198,12 +2531,25 @@ impl Account {
                 for base in hidden {
                     base.catch_up();
                 }
-                if added {
+                if changed {
                     let _ = this.inner.events.send(AccountEvent::BasesChanged);
                 }
+                // Only fresh account data says which grant changes and moves are
+                // still pending.
+                let (settle_error, move_error) =
+                    if this.kind() == DeviceKind::Full && data_error.is_none() {
+                        (
+                            this.settle_grants().await.err(),
+                            this.resume_moves().await.err(),
+                        )
+                    } else {
+                        (None, None)
+                    };
                 if needs_update {
                     Err(Error::NeedsUpdate)
-                } else if let Some(error) = data_error {
+                } else if let Some(error) =
+                    data_error.or(erase_error).or(settle_error).or(move_error)
+                {
                     Err(error)
                 } else {
                     Ok(())
@@ -2640,6 +2986,10 @@ impl Account {
 
     pub(crate) fn runtime(&self) -> tokio::runtime::Handle {
         self.inner.shared.handle.clone()
+    }
+
+    pub(crate) fn move_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.moves
     }
 
     /// Test kit only: injects `fault` into this device's requests.

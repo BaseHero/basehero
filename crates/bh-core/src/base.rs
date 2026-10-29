@@ -60,6 +60,8 @@ pub struct BaseSummary {
     pub mode: Mode,
     /// Whether this base is hidden and currently unlocked.
     pub hidden: bool,
+    /// Where this base shows in another base, on full devices.
+    pub mount: Option<crate::Mount>,
 }
 
 /// A base's key, `BK`: 32 random bytes. Never printed.
@@ -158,6 +160,8 @@ struct Inner {
     #[cfg(feature = "test-support")]
     held_on_demand_get: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     #[cfg(feature = "test-support")]
+    held_upload_wait: Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(feature = "test-support")]
     held_version_fetch:
         Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>)>>,
     #[cfg(feature = "test-support")]
@@ -199,7 +203,7 @@ struct Applied {
 }
 
 /// Types that the tree, `move_to` and `delete` leave alone.
-fn structural(name: &str) -> bool {
+pub(crate) fn structural(name: &str) -> bool {
     matches!(name, TYPE | BASE)
 }
 
@@ -273,6 +277,8 @@ impl Base {
                 download_stop: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "test-support")]
                 held_on_demand_get: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                held_upload_wait: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 held_version_fetch: Mutex::new(None),
                 #[cfg(feature = "test-support")]
@@ -396,22 +402,8 @@ impl Base {
         }
         let id = ObjectId::random();
         let fk = Secret::<32>::random();
-        let count = files::parts(content.len() as u64);
-        let root = &self.inner.parts_root;
-        std::fs::create_dir_all(root)?;
-        let tmp = root.join(format!("{id}.tmp"));
-        let dir = root.join(id.to_string());
-        std::fs::create_dir(&tmp)?;
+        let count = self.write_parts(id, &fk, content)?;
         let result = (|| -> Result<(), Error> {
-            for n in 0..count {
-                let start = n as usize * FILE_PART;
-                let end = content.len().min(start + FILE_PART);
-                std::fs::write(
-                    tmp.join(n.to_string()),
-                    files::seal_part(&fk, self.id(), id, n, &content[start..end]),
-                )?;
-            }
-            std::fs::rename(&tmp, &dir)?;
             let fields = Map::from_iter([
                 ("name".into(), Value::from(new.name)),
                 ("mime".into(), Value::from(new.mime)),
@@ -428,13 +420,12 @@ impl Base {
                     &position,
                     &fields,
                 )?;
-                db.put_file(id, count)
+                db.put_file(id, count, false)
             })?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(self.inner.parts_root.join(id.to_string()));
         }
         drop(db);
         result?;
@@ -443,6 +434,80 @@ impl Base {
             uploader.changed();
         }
         Ok(id)
+    }
+
+    /// Seals `content`'s parts for this base under the file key `fk` and puts
+    /// them in place for `id`, replacing any there. Returns how many there are.
+    fn write_parts(&self, id: ObjectId, fk: &Secret<32>, content: &[u8]) -> Result<u32, Error> {
+        let count = files::parts(content.len() as u64);
+        let root = &self.inner.parts_root;
+        std::fs::create_dir_all(root)?;
+        let tmp = root.join(format!("{id}.tmp"));
+        let dir = root.join(id.to_string());
+        std::fs::create_dir(&tmp)?;
+        let result = (|| -> Result<(), Error> {
+            for n in 0..count {
+                let start = n as usize * FILE_PART;
+                let end = content.len().min(start + FILE_PART);
+                std::fs::write(
+                    tmp.join(n.to_string()),
+                    files::seal_part(fk, self.id(), id, n, &content[start..end]),
+                )?;
+            }
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            std::fs::rename(&tmp, &dir)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+        result.map(|()| count)
+    }
+
+    /// Seals a moved file's content for this base, with its own file key, and
+    /// records its parts: to be sent, unless this base's earlier copy says the
+    /// server already has them. Parts already here whole are kept.
+    pub(crate) fn add_file_parts(
+        &self,
+        id: ObjectId,
+        key: &Secret<32>,
+        content: &[u8],
+    ) -> Result<(), Error> {
+        if content.len() as u64 > FILE_MAX {
+            return Err(Error::TooLarge);
+        }
+        self.writable()?;
+        let db = self.db()?;
+        if db
+            .file_row(id)?
+            .is_some_and(|row| row.have == row.parts && row.broken.is_none())
+        {
+            return Ok(());
+        }
+        let uploaded = db
+            .summary(id)?
+            .is_some_and(|s| s.fields.get("uploaded") == Some(&Value::Bool(true)));
+        let count = self.write_parts(id, key, content)?;
+        db.put_file(id, count, uploaded)?;
+        drop(db);
+        self.emit(BaseEvent::FilesChanged(vec![id]));
+        if let Some(uploader) = self.inner.uploader.get() {
+            uploader.changed();
+        }
+        Ok(())
+    }
+
+    /// The key a file's parts are sealed with, from its object.
+    pub(crate) fn file_key(&self, id: ObjectId) -> Result<Secret<32>, Error> {
+        let object = self.get(id)?.ok_or(Error::NotFound)?;
+        let encoded = object
+            .fields
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or(Error::NeedsUpdate)?;
+        Secret::<32>::from_slice(&decode_file_key(encoded)?).map_err(|_| Error::Crypto)
     }
 
     /// The local metadata and availability of a file, or `None` for another
@@ -906,6 +971,56 @@ impl Base {
         }
     }
 
+    /// Waits for every queued part in this base to reach the server. An upload
+    /// failure leaves the queue in place for a later attempt.
+    pub(crate) async fn wait_for_file_uploads(&self) -> Result<(), Error> {
+        self.check_removal()?;
+        let uploader = self.inner.uploader.get();
+        let mut progress = uploader.map(Uploader::subscribe);
+        loop {
+            // Mark progress seen before inspecting the queue. Any completion after
+            // this point remains visible to changed() if the snapshot was pending.
+            if let Some(receiver) = progress.as_mut() {
+                receiver.borrow_and_update().clone()?;
+            }
+            let rows = self.db()?.file_rows()?;
+            let mut pending = false;
+            for row in rows {
+                if row.sent.is_some_and(|sent| sent < row.parts)
+                    || (row.sent == Some(row.parts)
+                        && self.get(row.id)?.is_some_and(|object| {
+                            object.fields.get("uploaded") != Some(&Value::Bool(true))
+                        }))
+                {
+                    pending = true;
+                    break;
+                }
+            }
+            if !pending {
+                return Ok(());
+            }
+            let Some(uploader) = uploader else {
+                return Err(Error::Network("base is offline".into()));
+            };
+            if uploader.stopped() {
+                return Err(Error::NotFound);
+            }
+            #[cfg(feature = "test-support")]
+            let held = { lock(&self.inner.held_upload_wait).clone() };
+            #[cfg(feature = "test-support")]
+            if let Some((entered, notify)) = held {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                entered.store(true, Ordering::SeqCst);
+                notified.await;
+            }
+            let receiver = progress.as_mut().expect("uploader has a receiver");
+            receiver.changed().await.map_err(|_| Error::NotFound)?;
+            self.check_removal()?;
+        }
+    }
+
     /// Sends pending edits and catches up with the server once before returning.
     /// A local-only base has nothing to synchronize.
     ///
@@ -1123,6 +1238,7 @@ impl Base {
             parent,
             position,
             deleted,
+            moved,
         } = objects::read_meta(&txn)?;
         let fields = objects::read_fields(&txn);
         let title = self.title(db, &ty, &txn, &fields);
@@ -1174,7 +1290,11 @@ impl Base {
             updated_at: now_ms(),
             updated_by: by,
         };
-        let row = ObjectRow { summary, state };
+        let row = ObjectRow {
+            summary,
+            state,
+            moved: moved.is_some(),
+        };
         db.batch(|db| {
             db.put(&row, outbox, confirmed)?;
             if !outbox.is_empty() {
@@ -1313,6 +1433,18 @@ impl Base {
         )
     }
 
+    /// Sets the name in the base's `core.base` object, writing the object if
+    /// it hasn't arrived here.
+    pub(crate) fn set_name(&self, name: &str) -> Result<(), Error> {
+        let fields = Map::from_iter([("name".to_string(), Value::from(name))]);
+        match self.edit(ObjectId(self.inner.id.0), |_, _, _, txn| {
+            objects::write_fields(txn, &fields)
+        }) {
+            Err(Error::NotFound) => self.write_info(name),
+            result => result,
+        }
+    }
+
     /// A position under `parent` for `moving` (if it's already there): after
     /// `after`, or else last or first.
     fn place(
@@ -1356,7 +1488,7 @@ impl Base {
     /// Returns [`Error::Invalid`] for an unsafe or nonempty directory, or
     /// [`Error::Storage`] when the local store cannot be read.
     pub async fn export(&self, dir: &Path) -> Result<crate::ExportSummary, Error> {
-        crate::export::run(self, dir).await
+        crate::export::run(&[(self.clone(), None)], dir).await
     }
 
     pub(crate) fn export_objects(&self) -> Result<Vec<ObjectSummary>, Error> {
@@ -1365,7 +1497,7 @@ impl Base {
             let db = self.db()?;
             db.summaries(
                 &format!(
-                    "SELECT {} FROM objects ORDER BY position, object_id",
+                    "SELECT {} FROM objects WHERE deleted < 2 ORDER BY position, object_id",
                     crate::store::SUMMARY
                 ),
                 [],
@@ -1567,6 +1699,114 @@ impl Base {
     /// Returns the same variants as [`Self::delete`].
     pub fn undelete(&self, id: ObjectId) -> Result<(), Error> {
         self.set_deleted(id, false)
+    }
+
+    /// `root`, then its descendants, parents before children, deleted ones
+    /// included and type definitions and the base's own object left out.
+    pub(crate) fn subtree(&self, root: ObjectId) -> Result<Vec<ObjectId>, Error> {
+        let db = self.db()?;
+        let ty = db.type_of(root)?.ok_or(Error::NotFound)?;
+        if structural(&ty.name) {
+            return Ok(Vec::new());
+        }
+        let (mut out, mut seen, mut next) = (vec![root], HashSet::from([root]), 0);
+        while let Some(&id) = out.get(next) {
+            for (child, _) in db.siblings(Some(id))? {
+                if seen.insert(child) {
+                    out.push(child);
+                }
+            }
+            next += 1;
+        }
+        Ok(out)
+    }
+
+    /// The base this copy of `id` moved to, if it's a marker left behind.
+    pub(crate) fn moved_to(&self, id: ObjectId) -> Result<Option<BaseId>, Error> {
+        let db = self.db()?;
+        let Some((_, state)) = db.state(id)? else {
+            return Ok(None);
+        };
+        Ok(objects::read_meta(&self.load(&state)?.transact())?.moved)
+    }
+
+    /// A position after the last of `parent`'s children.
+    pub(crate) fn last_position(&self, parent: Option<ObjectId>) -> Result<String, Error> {
+        self.place(&**self.db()?, None, parent, None, true)
+    }
+
+    /// Writes an object moved here from another base: `state` applied to this
+    /// base's copy (new, or the marker it left here before), at `place` (a
+    /// parent and position) or else where `state` puts it, deleted as `state`
+    /// says, no longer a marker. A file's `uploaded` is this base's earlier
+    /// copy's, as it tells whether the server has this base's parts. Returns
+    /// `false`, writing nothing, when this base already has it otherwise.
+    pub(crate) fn import(
+        &self,
+        id: ObjectId,
+        state: &[u8],
+        place: Option<(Option<ObjectId>, &str)>,
+    ) -> Result<bool, Error> {
+        self.writable()?;
+        let unreadable = || Error::invalid("not an object state");
+        let incoming = Update::decode_v1(state).map_err(|_| unreadable())?;
+        let deleted = objects::read_meta(&self.load(state)?.transact())?.deleted;
+        let mut db = self.db()?;
+        let (doc, uploaded) = match db.state(id)? {
+            Some((_, stored)) => {
+                let doc = self.load(&stored)?;
+                if objects::read_meta(&doc.transact())?.moved.is_none() {
+                    return Ok(false);
+                }
+                let uploaded = objects::read_fields(&doc.transact()).remove("uploaded");
+                (doc, uploaded)
+            }
+            None => (Doc::with_client_id(self.inner.client), None),
+        };
+        let before = doc.transact().state_vector();
+        let file = {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(incoming).map_err(|_| unreadable())?;
+            let file = objects::read_meta(&txn)?.ty.name == types::FILE;
+            if let Some((parent, position)) = place {
+                objects::write_place(&mut txn, parent, position);
+            }
+            objects::write_deleted(&mut txn, deleted);
+            objects::write_moved(&mut txn, None);
+            if file {
+                let uploaded = uploaded.unwrap_or(Value::Null);
+                objects::write_fields(&mut txn, &Map::from_iter([("uploaded".into(), uploaded)]))?;
+            }
+            file
+        };
+        let update = doc.transact().encode_state_as_update_v1(&before);
+        if update.len() > MAX_UPDATE {
+            return Err(Error::TooLarge);
+        }
+        self.save(&mut db, id, &doc, &[&update], self.inner.device, None)?;
+        drop(db);
+        self.share_with_origin(id, 0, &update);
+        self.edited(id);
+        if file {
+            // Parts sent before the object arrived still need it marked uploaded.
+            self.emit(BaseEvent::FilesChanged(vec![id]));
+            if let Some(uploader) = self.inner.uploader.get() {
+                uploader.changed();
+            }
+        }
+        Ok(true)
+    }
+
+    /// Leaves a deleted marker of `id` naming the base it moved to.
+    pub(crate) fn mark_moved(&self, id: ObjectId, to: BaseId) -> Result<(), Error> {
+        self.edit(id, |_, meta, _, txn| {
+            if structural(&meta.ty.name) {
+                return Err(Error::invalid("this object can't move"));
+            }
+            objects::write_deleted(txn, true);
+            objects::write_moved(txn, Some(to));
+            Ok(())
+        })
     }
 
     /// Deleted objects, the most recently changed first.
@@ -2133,6 +2373,23 @@ impl Base {
             .clone()
     }
 
+    /// Holds the next upload waiter after it finds pending work, before it waits.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_next_upload_wait(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *lock(&self.inner.held_upload_wait) =
+            Some((entered.clone(), Arc::new(tokio::sync::Notify::new())));
+        entered
+    }
+
+    /// Releases the upload waiter held by `test_hold_next_upload_wait`.
+    #[cfg(feature = "test-support")]
+    pub fn test_resume_upload_wait(&self) {
+        if let Some((_, notify)) = lock(&self.inner.held_upload_wait).take() {
+            notify.notify_one();
+        }
+    }
+
     /// Pauses only the file uploader in tests.
     #[cfg(feature = "test-support")]
     pub fn pause_files(&self) {
@@ -2161,6 +2418,18 @@ impl Base {
             .probe;
         probe.hold.store(true, Ordering::SeqCst);
         probe.held.clone()
+    }
+
+    /// In tests, reports when the uploader has found the queue empty and published progress.
+    #[cfg(feature = "test-support")]
+    pub fn test_uploader_idle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.inner
+            .uploader
+            .get()
+            .expect("the base's sync has started")
+            .probe
+            .idle
+            .clone()
     }
 
     /// In tests, a flag that stays set while this base's uploader task exists.
@@ -2255,6 +2524,11 @@ impl Base {
     /// The outbox's object IDs and updates, oldest first.
     pub fn test_outbox(&self) -> Vec<(ObjectId, Vec<u8>)> {
         self.db().unwrap().outbox().expect("readable outbox")
+    }
+
+    /// Test kit only: create a moved marker as an app could in base content.
+    pub fn test_mark_moved(&self, id: ObjectId, to: BaseId) -> Result<(), Error> {
+        self.mark_moved(id, to)
     }
 
     /// Makes the next store write fail, as a full disk would.
@@ -2602,6 +2876,7 @@ mod tests {
                 &ObjectRow {
                     summary: future.clone(),
                     state,
+                    moved: false,
                 },
                 &[],
                 None,

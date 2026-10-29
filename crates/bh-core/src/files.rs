@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use ts_rs::TS;
 use zeroize::Zeroizing;
 
@@ -271,6 +271,8 @@ impl Downloader {
 /// One background uploader per open base; it never owns the base between attempts.
 pub(crate) struct Uploader {
     wake: Arc<Notify>,
+    progress: watch::Sender<Result<(), Error>>,
+    stopped: std::sync::atomic::AtomicBool,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "test-support")]
     paused: Arc<AtomicBool>,
@@ -288,6 +290,7 @@ pub(crate) struct Probe {
     pub(crate) hold: Arc<AtomicBool>,
     pub(crate) held: Arc<AtomicBool>,
     pub(crate) alive: Arc<AtomicBool>,
+    pub(crate) idle: Arc<AtomicBool>,
 }
 
 /// Clears `Probe::alive` when the task's future is dropped, even unpolled.
@@ -324,6 +327,8 @@ impl Uploader {
         root: PathBuf,
     ) -> Self {
         let wake = Arc::new(Notify::new());
+        let (progress, _) = watch::channel(Ok(()));
+        let task_progress = progress.clone();
         #[cfg(feature = "test-support")]
         let paused = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "test-support")]
@@ -352,6 +357,9 @@ impl Uploader {
                     #[cfg(feature = "test-support")] &task_fail,
                     #[cfg(feature = "test-support")] &task_probe).await;
                 drop(base);
+                let _ = task_progress.send_replace(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                #[cfg(feature = "test-support")]
+                task_probe.idle.store(matches!(&result, Ok(false)), Ordering::SeqCst);
                 match result {
                     Ok(true) => backoff = Duration::from_millis(500),
                     Ok(false) => task_wake.notified().await,
@@ -370,6 +378,8 @@ impl Uploader {
         });
         Self {
             wake,
+            progress,
+            stopped: std::sync::atomic::AtomicBool::new(false),
             task: Mutex::new(Some(task)),
             #[cfg(feature = "test-support")]
             paused,
@@ -385,6 +395,9 @@ impl Uploader {
     }
 
     pub(crate) async fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.progress.send_replace(Err(Error::NotFound));
         let task = self.task.lock().unwrap().take();
         if let Some(task) = task {
             task.abort();
@@ -392,8 +405,19 @@ impl Uploader {
         }
     }
 
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Result<(), Error>> {
+        self.progress.subscribe()
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn pause(&self, value: bool) {
+        if value {
+            self.probe.idle.store(false, Ordering::SeqCst);
+        }
         self.paused.store(value, Ordering::SeqCst);
         self.changed();
     }

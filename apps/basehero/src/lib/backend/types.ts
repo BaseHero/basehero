@@ -14,6 +14,8 @@ import type { FileInfo } from '../generated/FileInfo';
 import type { FileStatus } from '../generated/FileStatus';
 import type { ObjectVersion } from '../generated/ObjectVersion';
 import type { AppOffer } from '../generated/AppOffer';
+import type { AppSummary } from '../generated/AppSummary';
+import type { Mount } from '../generated/Mount';
 import type { DeviceSummary as GeneratedDeviceSummary } from '../generated/DeviceSummary';
 export type { AppInfo, CommandError, UpdateInfo, SearchHit, SearchResult, ChatSummary, ChatMessage, KitStatus, AccountUsage, UsageRow };
 export type AccountId = string;
@@ -29,8 +31,8 @@ export class BackendError extends Error {
 }
 export type AccountSummary = { id: AccountId; email: string; kind: 'full' | 'app' };
 export type DeviceSummary = Omit<GeneratedDeviceSummary, 'kind' | 'lastSeenAt'> & { kind: string; lastSeenAt: number | null };
-export type { AppOffer };
-export type BaseChoiceInput = { base?: BaseId; newName?: string; mode: 'readWrite' | 'readOnly' };
+export type { AppOffer, AppSummary, Mount };
+export type BaseChoiceInput = { base?: BaseId; folder?: ObjectId; newName?: string; mode: 'readWrite' | 'readOnly' };
 export type AppChoiceInput = { bases: BaseChoiceInput[]; capMicroUsd: number; replaces: DeviceId | null };
 export function dollars(capMicroUsd: number): string { return (capMicroUsd / 1_000_000).toFixed(2); }
 export function microDollars(value: string | number): number {
@@ -39,11 +41,12 @@ export function microDollars(value: string | number): number {
   if (!String(value).trim() || !Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(micro)) throw new BackendError('Invalid', 'Invalid cap');
   return micro;
 }
-export type BaseSummary = { id: BaseId; name: string; mode: 'readWrite' | 'readOnly'; hidden: boolean };
+export type BaseSummary = { id: BaseId; name: string; mode: 'readWrite' | 'readOnly'; hidden: boolean; mount?: Mount | null };
 export type { PasswordStrength, FileInfo, FileStatus, ObjectVersion };
 export type VersionsPage = { versions: ObjectVersion[]; more: boolean };
 export type FileImage = { mime: string; bytes: Uint8Array };
 export type ObjectSummary = { id: ObjectId; title: string; parent: ObjectId | null; deleted: boolean; [key: string]: unknown };
+export type TreeItem = ObjectSummary & { base: BaseId; mounted: BaseId | null; readers: string[] };
 export type ItemKind = 'note' | 'folder' | 'project';
 export type NewItem = { kind: ItemKind; parent: ObjectId | null; after: ObjectId | null; name: string | null };
 export type SyncState = { pending: number; online: boolean; lastSyncedAt: number | null };
@@ -73,6 +76,9 @@ export interface Backend {
   connectOpen(account: AccountId, id: ApprovalId): Promise<OpenedRequest>;
   connectCheck(account: AccountId, id: ApprovalId, digits: string): Promise<AppOffer>;
   connectApprove(account: AccountId, id: ApprovalId, choice: AppChoiceInput): Promise<[DeviceId, boolean]>;
+  apps(account: AccountId): Promise<AppSummary[]>;
+  appGrantAdd(account: AccountId, device: DeviceId, choice: BaseChoiceInput): Promise<BaseId>;
+  appGrantRemove(account: AccountId, device: DeviceId, base: BaseId): Promise<void>;
   setAppCap(account: AccountId, device: DeviceId, capMicroUsd: number): Promise<void>;
   signOut(account: AccountId): Promise<void>;
   newKit(account: AccountId, password: string): Promise<string>;
@@ -99,13 +105,17 @@ export interface Backend {
   versionState(r: BaseRef, id: ObjectId, seq: number): Promise<Uint8Array>;
   versionRestore(r: BaseRef, id: ObjectId, seq: number): Promise<void>;
   children(r: BaseRef, parent: ObjectId | null): Promise<ObjectSummary[]>;
+  treeChildren(r: BaseRef, parent: ObjectId | null): Promise<TreeItem[]>;
   getObject(r: BaseRef, id: ObjectId): Promise<ObjectSummary | null>;
   createObject(r: BaseRef, item: NewItem): Promise<ObjectId>;
   renameObject(r: BaseRef, id: ObjectId, name: string): Promise<void>;
+  moveObject(r: BaseRef, id: ObjectId, base: BaseId | null, parent: ObjectId | null, after: ObjectId | null): Promise<void>;
   moveObject(r: BaseRef, id: ObjectId, parent: ObjectId | null, after: ObjectId | null): Promise<void>;
   deleteObject(r: BaseRef, id: ObjectId): Promise<void>;
   restoreObject(r: BaseRef, id: ObjectId): Promise<void>;
-  trash(r: BaseRef): Promise<ObjectSummary[]>;
+  trash(r: BaseRef): Promise<TreeItem[]>;
+  locate(r: BaseRef, id: ObjectId): Promise<BaseId>;
+  movedFrom(r: BaseRef, id: ObjectId): Promise<BaseId | null>;
   search(account: AccountId, base: BaseId | null, text: string, limit: number): Promise<SearchResult[]>;
   syncState(r: BaseRef): Promise<SyncState>;
   heroChats(account: AccountId, base: BaseId): Promise<ChatSummary[]>;

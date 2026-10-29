@@ -111,6 +111,8 @@ pub(crate) struct Api {
     counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     #[cfg(feature = "test-support")]
     held_account_get: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    #[cfg(feature = "test-support")]
+    held_grant: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
 impl Api {
@@ -136,6 +138,8 @@ impl Api {
             counts: Arc::default(),
             #[cfg(feature = "test-support")]
             held_account_get: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_grant: Arc::default(),
         }
     }
 
@@ -183,6 +187,13 @@ impl Api {
     pub(crate) fn hold_next_account_get(&self) -> Arc<tokio::sync::Semaphore> {
         let hold = Arc::new(tokio::sync::Semaphore::new(0));
         *self.held_account_get.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_grant(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_grant.lock().unwrap() = Some(hold.clone());
         hold
     }
 
@@ -247,6 +258,12 @@ impl Api {
             self.fault(&method, path, false)?;
             if method == Method::GET && path == "v1/account" {
                 let held = self.held_account_get.lock().unwrap().take();
+                if let Some(held) = held {
+                    held.acquire().await.expect("test hold is open").forget();
+                }
+            }
+            if method == Method::PUT && path.contains("/grants/") {
+                let held = self.held_grant.lock().unwrap().take();
                 if let Some(held) = held {
                     held.acquire().await.expect("test hold is open").forget();
                 }
@@ -802,6 +819,21 @@ impl Api {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Removes `device`'s grant on `base`; a grant already gone counts as removed.
+    pub(crate) async fn revoke(&self, base: BaseId, device: DeviceId) -> Result<(), Error> {
+        match self
+            .call::<serde_json::Value>(
+                Method::DELETE,
+                &format!("v1/bases/{base}/grants/{device}"),
+                None::<&()>,
+            )
+            .await
+        {
+            Ok(_) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub(crate) async fn add_device(&self, body: &DevicesRequest) -> Result<DevicesResponse, Error> {

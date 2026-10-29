@@ -4,8 +4,9 @@ use serde_json::{Value, to_value};
 use std::path::Path;
 
 pub(crate) async fn execute(core: &Core, base: &str, out: &Path) -> Result<Value> {
-    let base = selected_base(&account(core)?, Some(base))?;
-    let summary = base.export(out).await?;
+    let account = account(core)?;
+    let base = selected_base(&account, Some(base))?;
+    let summary = account.export(base.id(), out).await?;
     if !summary.missing_files.is_empty() {
         let names = summary
             .missing_files

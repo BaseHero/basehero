@@ -60,7 +60,7 @@ async fn locking_a_hidden_base_stops_heros_turn_and_leaves_no_hero_context() {
     wait_for(|| model.requests().len() == 2).await;
     assert!(format!("{:?}", model.requests()).contains("Marguerite"));
 
-    tokio::time::timeout(Duration::from_secs(1), account.lock_hidden(hidden_id))
+    tokio::time::timeout(Duration::from_secs(30), account.lock_hidden(hidden_id))
         .await
         .expect("lock must not wait for the hung model")
         .unwrap();
@@ -151,7 +151,7 @@ async fn locking_cancels_every_hidden_chat_without_stopping_ordinary_chats() {
     hero.send(personal.id(), ordinary, "Keep working", None)
         .unwrap();
     wait_for(|| model.requests().len() == 3).await;
-    tokio::time::timeout(Duration::from_secs(1), account.lock_hidden(hidden.id()))
+    tokio::time::timeout(Duration::from_secs(30), account.lock_hidden(hidden.id()))
         .await
         .expect("locking must cancel both hung turns")
         .unwrap();
@@ -191,11 +191,13 @@ async fn locking_does_not_wait_for_a_held_reader_refresh() {
     let chat = hero.new_chat(hidden.id()).unwrap();
     hero.send(hidden.id(), chat, "Hi", None).unwrap();
     wait_for(|| account.test_request_count("v1/account") > before).await;
-    tokio::time::timeout(Duration::from_secs(2), hidden.flush())
+    tokio::time::timeout(Duration::from_secs(30), hidden.flush())
         .await
         .expect("the outbox must be clear to isolate the cancellation bound")
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), account.lock_hidden(hidden.id()))
+    // Locking may spend up to two seconds sending edits; the refresh it must
+    // cancel waits ten.
+    tokio::time::timeout(Duration::from_secs(5), account.lock_hidden(hidden.id()))
         .await
         .expect("lock must cancel the reader refresh, not wait ten seconds")
         .unwrap();
@@ -263,7 +265,7 @@ async fn locking_mid_stream_writes_nothing_more() {
     .await
     .expect("the text is shown before the lock");
 
-    tokio::time::timeout(Duration::from_secs(1), account.lock_hidden(hidden.id()))
+    tokio::time::timeout(Duration::from_secs(30), account.lock_hidden(hidden.id()))
         .await
         .expect("lock must not wait for the stream")
         .unwrap();

@@ -3,6 +3,7 @@
 use bh_core::{AccountEvent, Error, Mode};
 use bh_testkit::{
     b64, device, new_signup, pending_device_for, random, random_id, raw_device, two_devices,
+    wait_for_base,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -14,6 +15,16 @@ async fn a_second_device_of_the_account_opens_the_same_base() {
     b.refresh().await.unwrap();
     assert!(b.bases().iter().any(|s| s.id == base.id()));
     assert_eq!(b.base(base.id()).unwrap().mode(), Mode::ReadWrite); // the key unwrapped
+}
+
+#[tokio::test]
+async fn a_new_bases_name_reaches_other_devices_when_its_handle_is_dropped_at_once() {
+    let (a, b) = two_devices().await;
+    // As the app's sign-up does: create the base and keep no handle to it.
+    let id = a.create_base("Travel").await.unwrap().id();
+    b.refresh().await.unwrap();
+    let base = b.base(id).unwrap();
+    wait_for_base(&base, || base.name() == "Travel").await;
 }
 
 #[tokio::test]

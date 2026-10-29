@@ -1,12 +1,14 @@
 //! The object document layout, summaries, positions and the folder tree.
 //!
 //! Every object is one yrs document: `Map "meta"` holds `type`, `v`, `parent`
-//! (hex, null or absent at the top level), `pos` and `deleted`; `Map "fields"` holds
-//! the fields as JSON values; `XmlFragment "default"` holds a note's body.
+//! (hex, null or absent at the top level), `pos`, `deleted` and, on a copy left
+//! behind when the object moved to another base, `moved` (that base's hex ID, or
+//! null once it's back); `Map "fields"` holds the fields as JSON values;
+//! `XmlFragment "default"` holds a note's body.
 
 use crate::Error;
 use crate::types::TypeRef;
-use bh_proto::{DeviceId, ObjectId};
+use bh_proto::{BaseId, DeviceId, ObjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -88,6 +90,8 @@ pub(crate) struct Meta {
     pub parent: Option<ObjectId>,
     pub position: String,
     pub deleted: bool,
+    /// The base this copy moved to, if it's a marker left behind.
+    pub moved: Option<BaseId>,
 }
 
 fn meta_map<T: ReadTxn>(txn: &T) -> Option<MapRef> {
@@ -126,6 +130,10 @@ pub(crate) fn read_meta<T: ReadTxn>(txn: &T) -> Result<Meta, Error> {
         parent,
         position,
         deleted: matches!(get("deleted"), Some(Any::Bool(true))),
+        moved: match get("moved") {
+            Some(Any::String(hex)) => hex.parse().ok(),
+            _ => None,
+        },
     })
 }
 
@@ -147,6 +155,13 @@ pub(crate) fn write_place(txn: &mut TransactionMut, parent: Option<ObjectId>, po
 pub(crate) fn write_deleted(txn: &mut TransactionMut, deleted: bool) {
     let meta = txn.get_or_insert_map(META);
     meta.insert(txn, "deleted", deleted);
+}
+
+/// Names the base this copy moved to, or clears it with null.
+pub(crate) fn write_moved(txn: &mut TransactionMut, moved: Option<BaseId>) {
+    let meta = txn.get_or_insert_map(META);
+    let moved = moved.map_or(Any::Null, |b| Any::from(b.to_string()));
+    meta.insert(txn, "moved", moved);
 }
 
 /// The object's fields as JSON. Nested yrs types read as their JSON value.
@@ -600,9 +615,18 @@ mod tests {
         let meta = read_meta(&txn).unwrap();
         assert_eq!(meta.ty, TypeRef::new("demo.trip", 3));
         assert_eq!(
-            (meta.parent, meta.position.as_str(), meta.deleted),
-            (Some(id(1)), "V", true)
+            (
+                meta.parent,
+                meta.position.as_str(),
+                meta.deleted,
+                meta.moved
+            ),
+            (Some(id(1)), "V", true, None)
         );
+        write_moved(&mut txn, Some(BaseId([2; 16])));
+        assert_eq!(read_meta(&txn).unwrap().moved, Some(BaseId([2; 16])));
+        write_moved(&mut txn, None);
+        assert_eq!(read_meta(&txn).unwrap().moved, None);
         assert_eq!(Value::Object(read_fields(&txn)), fields);
         write_place(&mut txn, None, "W");
         write_fields(

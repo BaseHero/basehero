@@ -839,7 +839,14 @@ impl Hero {
                 self.inner.account.base(s.id).ok().map(|b| (b, permission))
             })
             .collect();
-        tools::Tools::new(chat_base, others, project)
+        let mounts = self
+            .inner
+            .account
+            .mounts()
+            .into_iter()
+            .map(|mount| (mount.folder, mount.parent, mount.base))
+            .collect();
+        tools::Tools::new(chat_base, others, project).with_mounts(mounts)
     }
     fn finish(&self, id: BaseId, chat: ObjectId, message: ObjectId, outcome: TurnOutcome) {
         let TurnOutcome {

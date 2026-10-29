@@ -117,7 +117,7 @@ async fn deleting_moves_to_trash_and_restore_brings_it_back() {
     .unwrap();
     base::delete_object(&state, &r, id).unwrap();
     assert!(base::children(&state, &r, None).unwrap().is_empty());
-    assert_eq!(base::trash(&state, &r).unwrap()[0].id, id);
+    assert_eq!(base::trash(&state, &r).unwrap()[0].summary.id, id);
     base::restore_object(&state, &r, id).unwrap();
     assert!(base::trash(&state, &r).unwrap().is_empty());
     assert_eq!(base::children(&state, &r, None).unwrap()[0].id, id);

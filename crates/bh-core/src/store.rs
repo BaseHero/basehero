@@ -355,6 +355,13 @@ impl AccountDb {
         Ok(())
     }
 
+    /// Forgets a base this device may no longer open.
+    pub(crate) fn forget_base(&self, id: BaseId) -> Result<(), Error> {
+        self.0
+            .execute("DELETE FROM bases WHERE base_id = ?", [id.to_string()])?;
+        Ok(())
+    }
+
     /// Remembers an unopened account wrapper without storing a base name or key.
     #[allow(dead_code, reason = "used by upcoming hidden account operations")]
     pub(crate) fn remember_hidden(
@@ -532,10 +539,13 @@ pub(crate) struct SendingRow {
     pub outbox_max_id: i64,
 }
 
-/// An object's stored state and the columns derived from it.
+/// An object's stored state and the columns derived from it. A deleted copy
+/// left behind by a move is stored with `deleted = 2`, so the tree, the trash,
+/// search and queries leave it out.
 pub(crate) struct ObjectRow {
     pub summary: ObjectSummary,
     pub state: Vec<u8>,
+    pub moved: bool,
 }
 
 fn corrupt(what: &str) -> Error {
@@ -687,7 +697,11 @@ impl BaseDb {
                 s.ty.version,
                 hex(s.parent),
                 s.position,
-                s.deleted,
+                match (s.deleted, row.moved) {
+                    (false, _) => 0,
+                    (true, false) => 1,
+                    (true, true) => 2,
+                },
                 s.title,
                 fields,
                 row.state,
@@ -1233,10 +1247,14 @@ impl BaseDb {
         }))
     }
 
-    pub(crate) fn put_file(&self, id: ObjectId, parts: u32) -> Result<(), Error> {
+    /// Records a file whose parts are all here: to be sent, or, when the
+    /// server already has them, as if received.
+    pub(crate) fn put_file(&self, id: ObjectId, parts: u32, uploaded: bool) -> Result<(), Error> {
         self.0.execute(
-            "INSERT INTO files (object_id, parts, have, sent) VALUES (?, ?, ?, 0)",
-            params![id.to_string(), parts, parts],
+            "INSERT INTO files (object_id, parts, have, sent, broken) VALUES (?1, ?2, ?2, ?3, NULL)
+             ON CONFLICT(object_id) DO UPDATE SET parts = excluded.parts, have = excluded.have,
+                 sent = excluded.sent, broken = NULL",
+            params![id.to_string(), parts, (!uploaded).then_some(0)],
         )?;
         Ok(())
     }
@@ -1270,7 +1288,7 @@ impl BaseDb {
     pub(crate) fn file_candidates(&self) -> Result<Vec<ObjectId>, Error> {
         let mut statement = self
             .0
-            .prepare("SELECT object_id FROM objects WHERE type = 'core.file'")?;
+            .prepare("SELECT object_id FROM objects WHERE type = 'core.file' AND deleted < 2")?;
         let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|r| parse_id(&r?)).collect()
     }
@@ -1364,6 +1382,7 @@ mod tests {
                 updated_by: None,
             },
             state: vec![1],
+            moved: false,
         };
         db.put(&row, &[], None).unwrap();
         assert!(
@@ -1415,6 +1434,7 @@ mod tests {
                 updated_by: Some(DeviceId([2; 16])),
             },
             state: vec![1, 2, 3],
+            moved: false,
         };
         db.put(&row, &[&[9]], None).unwrap();
         row.summary.deleted = true;
@@ -1425,6 +1445,13 @@ mod tests {
         assert_eq!(db.summary(id).unwrap().unwrap(), row.summary);
         assert_eq!(db.state(id).unwrap().unwrap().1, vec![1, 2, 3]);
         assert_eq!(db.trash().unwrap().len(), 1);
+        // A copy left behind by a move is deleted, but not in the trash.
+        row.moved = true;
+        db.put(&row, &[], None).unwrap();
+        assert!(db.summary(id).unwrap().unwrap().deleted);
+        assert!(db.trash().unwrap().is_empty());
+        row.moved = false;
+        db.put(&row, &[], None).unwrap();
         assert!(db.top_level().unwrap().is_empty());
         let outbox: i64 =
             db.0.query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
@@ -1595,6 +1622,7 @@ mod tests {
                 updated_by: None,
             },
             state: vec![0, 0],
+            moved: false,
         };
         db.put(&row, &[&[1], &[2]], None).unwrap();
         let end = db.outbox_end().unwrap();

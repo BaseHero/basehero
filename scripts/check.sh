@@ -113,7 +113,7 @@ for stage in "$@"; do
           CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
           BH_TEST_SERVER=https://dev-api.basehero.com \
           BH_TEST_OPERATOR_TOKEN="$(<"$token_file")" \
-          cargo test -p bh-core --features test-support -- --nocapture
+          cargo test -p bh-core --features test-support --no-fail-fast -- --nocapture
       )
       ;;
     server)

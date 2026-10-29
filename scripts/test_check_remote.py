@@ -21,7 +21,7 @@ class RemoteStageTest(unittest.TestCase):
             token_file.write_text("test-only-secret\n")
             cargo = root / "cargo"
             cargo.write_text("#!/bin/sh\n"
-                             "[ \"$*\" = 'test -p bh-core --features test-support -- --nocapture' ] || exit 10\n"
+                             "[ \"$*\" = 'test -p bh-core --features test-support --no-fail-fast -- --nocapture' ] || exit 10\n"
                              "[ \"$BH_TEST_SERVER\" = https://dev-api.basehero.com ] || exit 11\n"
                              "[ \"$BH_TEST_OPERATOR_TOKEN\" = test-only-secret ] || exit 12\n"
                              "[ \"$HOME\" != \"$TEST_ORIGINAL_HOME\" ] || exit 13\n"

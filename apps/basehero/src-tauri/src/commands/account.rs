@@ -2,7 +2,8 @@ use crate::error::CommandError;
 use crate::state::AppState;
 use crate::views::{SecretString, SignInForm, SignUpForm, SignedUp};
 use bh_core::{
-    AccountId, AccountSummary, AccountUsage, DeviceId, DeviceSummary, KitStatus, SignIn, SignUp,
+    AccountId, AccountSummary, AccountUsage, AppSummary, BaseId, DeviceId, DeviceSummary,
+    KitStatus, SignIn, SignUp,
 };
 
 fn not_found() -> CommandError {
@@ -151,6 +152,36 @@ pub async fn set_kit_saved(state: &AppState, id: AccountId, kit: &str) -> Result
 
 pub async fn devices(state: &AppState, id: AccountId) -> Result<Vec<DeviceSummary>, CommandError> {
     Ok(state.core.account(id)?.devices().await?)
+}
+
+pub fn apps(state: &AppState, id: AccountId) -> Result<Vec<AppSummary>, CommandError> {
+    Ok(state.core.account(id)?.apps())
+}
+
+pub async fn app_grant_add(
+    state: &AppState,
+    account: AccountId,
+    device: DeviceId,
+    choice: crate::commands::approval::BaseChoiceInput,
+) -> Result<BaseId, CommandError> {
+    Ok(state
+        .core
+        .account(account)?
+        .add_app_grant(device, choice.into_grant()?)
+        .await?)
+}
+
+pub async fn app_grant_remove(
+    state: &AppState,
+    account: AccountId,
+    device: DeviceId,
+    base: BaseId,
+) -> Result<(), CommandError> {
+    Ok(state
+        .core
+        .account(account)?
+        .remove_app_grant(device, base)
+        .await?)
 }
 
 pub async fn set_app_cap(

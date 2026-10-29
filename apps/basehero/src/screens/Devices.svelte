@@ -1,9 +1,13 @@
 <script lang="ts">
   import { getBackend } from '../lib/backend';
   import { errorMessage } from '../lib/errors';
-  import { dollars, microDollars, type DeviceSummary, type KitStatus } from '../lib/backend/types';
+  import { dollars, microDollars, type AppSummary, type BaseChoiceInput, type BaseSummary, type DeviceSummary, type KitStatus } from '../lib/backend/types';
+  import GrantPicker from '../components/GrantPicker.svelte';
   let { account, kitRevision, onshow, onnewkit }: { account: string; kitRevision: number; onshow: () => Promise<void>; onnewkit: (kit: string) => Promise<void> } = $props();
   let devices = $state<DeviceSummary[]>([]);
+  let apps = $state<AppSummary[]>([]);
+  let bases = $state<BaseSummary[]>([]);
+  let picking = $state<string | null>(null);
   let error = $state('');
   let busy = $state(false);
   let kitStatus = $state<KitStatus>({ known: false, saved: false, madeAt: null });
@@ -13,9 +17,13 @@
   let cap = $state('');
   async function refresh() {
     try {
-      const [list, status] = await Promise.all([getBackend().devices(account), getBackend().kitStatus(account)]);
+      const [list, status, appList, baseList] = await Promise.all([
+        getBackend().devices(account), getBackend().kitStatus(account), getBackend().apps(account), getBackend().bases(account),
+      ]);
       devices = list.sort((a, b) => Number(b.thisDevice) - Number(a.thisDevice));
       kitStatus = status;
+      apps = appList;
+      bases = baseList;
     } catch (cause) { error = errorMessage(cause); }
   }
   $effect(() => { account; kitRevision; void refresh(); });
@@ -39,6 +47,30 @@
       changingCap = null;
       await refresh();
     } catch (cause) { error = errorMessage(cause); }
+    finally { busy = false; }
+  }
+  function grantLabel(baseId: string): string {
+    const base = bases.find(base => base.id === baseId);
+    if (!base) return baseId;
+    const parent = bases.find(candidate => candidate.id === base.mount?.parent);
+    return parent ? `${base.name} in ${parent.name}` : base.name;
+  }
+  async function addGrant(device: DeviceSummary, choice: BaseChoiceInput) {
+    if (busy) return;
+    busy = true; error = '';
+    try {
+      await getBackend().appGrantAdd(account, device.id, choice);
+      picking = null;
+      await refresh();
+    } catch (cause) { error = errorMessage(cause); }
+    finally { busy = false; }
+  }
+  async function removeGrant(device: DeviceSummary, base: string) {
+    const label = grantLabel(base);
+    if (busy || !window.confirm(`Remove ${apps.find(app => app.deviceId === device.id)?.name ?? device.name}'s access to ${label}? The app erases its copy of it.`)) return;
+    busy = true; error = '';
+    try { await getBackend().appGrantRemove(account, device.id, base); await refresh(); }
+    catch (cause) { error = errorMessage(cause); }
     finally { busy = false; }
   }
   async function remove(device: DeviceSummary) {
@@ -79,6 +111,15 @@
             </form>
           {:else}
             <button type="button" disabled={busy} onclick={() => { cap = dollars(device.capMicroUsd!); changingCap = device.id; }}>Change cap</button>
+          {/if}
+          {#if device.kind.toLowerCase() === 'app'}
+            {#each apps.find(app => app.deviceId === device.id)?.bases ?? [] as grant (grant.base)}
+              <div class="actions"><span>{grantLabel(grant.base)} · {grant.mode === 'readOnly' ? 'Read-only' : 'Read-write'}</span>
+                <button type="button" disabled={busy} onclick={() => removeGrant(device, grant.base)}>Remove {grantLabel(grant.base)}</button>
+              </div>
+            {/each}
+            <button type="button" disabled={busy} onclick={() => picking = device.id}>Add a base or folder</button>
+            {#if picking === device.id}<GrantPicker {account} onpick={(choice) => { void addGrant(device, choice); }} oncancel={() => picking = null} />{/if}
           {/if}
         {/if}
       </div>

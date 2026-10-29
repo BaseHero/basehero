@@ -46,6 +46,7 @@ mod envelope;
 mod error;
 mod export;
 mod files;
+mod grants;
 /// Persisted chats and Hero's account controller.
 pub mod hero;
 #[allow(dead_code, reason = "used by the hidden account operations, next")]
@@ -54,6 +55,8 @@ mod keys;
 mod markdown;
 /// Model request and response types, and the account's configured model.
 pub mod models;
+mod mounts;
+mod moves;
 mod note;
 mod objects;
 mod query;
@@ -84,6 +87,7 @@ pub use error::{EndReason, Error};
 pub use export::ExportSummary;
 pub use files::{FILE_MAX, FILE_PART, FileInfo, FileStatus, Image, NewFile, sniff_image};
 pub use keys::RecoveryKit;
+pub use mounts::{Mount, TreeItem};
 pub use note::{NoteDoc, NoteUpdate};
 pub use objects::{NewObject, ObjectSummary};
 pub use query::{Filter, Op, Order, Query};

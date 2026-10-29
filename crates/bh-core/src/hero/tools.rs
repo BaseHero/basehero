@@ -10,6 +10,8 @@ pub(crate) struct Tools {
     chat: Base,
     others: Vec<(Base, Access)>,
     project: Option<ObjectId>,
+    /// Shared folders as (folder, the base it's in, its own base), from account data.
+    mounts: Vec<(ObjectId, BaseId, BaseId)>,
 }
 pub(crate) struct ToolResult {
     pub content: String,
@@ -27,16 +29,22 @@ impl Tools {
             chat: chat_base,
             others,
             project,
+            mounts: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_mounts(mut self, mounts: Vec<(ObjectId, BaseId, BaseId)>) -> Self {
+        self.mounts = mounts;
+        self
     }
 
     pub(crate) fn specs() -> Vec<ToolSpec> {
         [
             ("list_bases", "List bases and types available to this chat.", json!({"type":"object","properties":{}})),
-            ("list", "List objects under a parent in an accessible base.", json!({"type":"object","properties":{"base":{"type":"string"},"parent":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer","maximum":200}}})),
+            ("list", "List objects under a parent in an accessible base. A shared folder has a base ID in its item; its contents live in that base, so list that base with the base argument.", json!({"type":"object","properties":{"base":{"type":"string"},"parent":{"type":"string"},"type":{"type":"string"},"limit":{"type":"integer","maximum":200}}})),
             ("read", "Read a note or record in an accessible base.", json!({"type":"object","properties":{"base":{"type":"string"},"id":{"type":"string"}},"required":["id"]})),
             ("search", "Search notes and records in accessible bases.", json!({"type":"object","properties":{"text":{"type":"string"},"base":{"type":"string"},"limit":{"type":"integer","maximum":20}},"required":["text"]})),
-            ("create_note", "Create a new note in this chat's base.", json!({"type":"object","properties":{"title":{"type":"string"},"text":{"type":"string"},"parent":{"type":"string"}},"required":["title","text"]})),
+            ("create_note", "Create a new note in this chat's base. A shared folder is a mount point and cannot be its parent; chat in the shared folder's base to write there.", json!({"type":"object","properties":{"title":{"type":"string"},"text":{"type":"string"},"parent":{"type":"string"}},"required":["title","text"]})),
         ].into_iter().map(|(name, description, parameters)| ToolSpec {name:name.into(),description:description.into(),parameters}).collect()
     }
 
@@ -113,7 +121,15 @@ impl Tools {
                             more = true;
                             break;
                         }
-                        items.push(json!({"id":s.id,"type":s.ty.name,"title":safe_title(base,&s),"updatedAt":s.updated_at}));
+                        let mut item = json!({"id":s.id,"type":s.ty.name,"title":safe_title(base,&s),"updatedAt":s.updated_at});
+                        if let Some((_, _, mounted)) = self
+                            .mounts
+                            .iter()
+                            .find(|(folder, parent, _)| *folder == s.id && *parent == base.id())
+                        {
+                            item["base"] = json!(mounted);
+                        }
+                        items.push(item);
                     }
                     Ok(json!({"items":items,"more":more}))
                 }
@@ -190,6 +206,14 @@ impl Tools {
                         .ok_or("invalid")?;
                     let text = args.get("text").and_then(Value::as_str).ok_or("invalid")?;
                     let parent = optional_id(args, "parent")?.or(self.project);
+                    let chat = self.chat.id();
+                    if parent.is_some_and(|id| {
+                        self.mounts
+                            .iter()
+                            .any(|(folder, base, _)| *folder == id && *base == chat)
+                    }) {
+                        return Err("mount_point_parent");
+                    }
                     let id = self
                         .chat
                         .create(NewObject {

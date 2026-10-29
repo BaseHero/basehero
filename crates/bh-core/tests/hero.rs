@@ -1,6 +1,7 @@
 use bh_core::{
     Account, AppRequest, Base, BaseEvent, BaseGrantRequest, BaseId, Clock, Core, CoreConfig,
-    DeviceId, Error, FileSecretStore, ManualClock, Mode, NewObject, ObjectId, TypeRef,
+    DeviceId, Error, FieldDef, FieldKind, FileSecretStore, ManualClock, Mode, NewObject, ObjectId,
+    TypeDef, TypeRef,
     hero::{HeroEvent, MessageState},
 };
 use bh_models::{
@@ -237,6 +238,204 @@ async fn hero_creates_a_note_in_the_chat_base_only() {
     assert_eq!(created.len(), 1);
     assert_eq!(base.get(created[0]).unwrap().unwrap().title, "Packing");
     assert!(other.get(created[0]).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn listing_a_granted_folder_points_hero_to_its_base_and_record() {
+    let (account, outer) = setup().await;
+    let folder = object(&outer, "core.folder", None, json!({"name":"Shared"}));
+    let credentials = account
+        .connect_app(AppRequest {
+            app_name: "Records App".into(),
+            app_id: None,
+            bases: vec![BaseGrantRequest::Folder {
+                base: outer.id(),
+                folder,
+                mode: Mode::ReadWrite,
+            }],
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let mounted = account
+        .mounts()
+        .into_iter()
+        .find(|m| m.folder == folder)
+        .unwrap()
+        .base;
+    drop(credentials);
+    let shared = account.base(mounted).unwrap();
+    shared
+        .define_type(TypeDef {
+            name: "demo.entry".into(),
+            version: 1,
+            doc: "An app entry".into(),
+            title_field: Some("name".into()),
+            fields: vec![FieldDef {
+                name: "name".into(),
+                kind: FieldKind::Text,
+                required: false,
+                unit: None,
+                doc: String::new(),
+            }],
+        })
+        .unwrap();
+    let record = object(
+        &shared,
+        "demo.entry",
+        None,
+        json!({"name":"Record in share"}),
+    );
+    let model = ScriptedModel::new(vec![
+        call("list", json!({})),
+        call("list", json!({"base":mounted})),
+        call("read", json!({"base":mounted,"id":record})),
+        reply("Found"),
+    ]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(outer.id()).unwrap();
+    hero.send(outer.id(), chat, "Find the shared record", None)
+        .unwrap();
+    hero.wait_idle(chat).await;
+    let requests = model.requests();
+    let listed = requests[1]
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .as_ref()
+        .unwrap();
+    assert!(
+        listed.contains(&format!("\"base\":\"{mounted}\"")),
+        "mount point must name its base: {listed}"
+    );
+    let in_share = requests[2]
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .as_ref()
+        .unwrap();
+    assert!(
+        in_share.contains("Record in share"),
+        "mounted base must list the app record: {in_share}"
+    );
+    let read = requests[3]
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .as_ref()
+        .unwrap();
+    assert!(
+        read.contains("Record in share"),
+        "Hero must read the app record: {read}"
+    );
+}
+
+#[tokio::test]
+async fn a_shared_folder_is_marked_when_hero_lists_another_base() {
+    let (account, outer) = setup().await;
+    let folder = object(&outer, "core.folder", None, json!({"name":"Shared"}));
+    account
+        .connect_app(AppRequest {
+            app_name: "Records App".into(),
+            app_id: None,
+            bases: vec![BaseGrantRequest::Folder {
+                base: outer.id(),
+                folder,
+                mode: Mode::ReadWrite,
+            }],
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let mounted = account
+        .mounts()
+        .into_iter()
+        .find(|m| m.folder == folder)
+        .unwrap()
+        .base;
+    let trips = account.create_base("Trips").await.unwrap();
+    let model = ScriptedModel::new(vec![
+        call("list", json!({"base": outer.id()})),
+        reply("Done"),
+    ]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(trips.id()).unwrap();
+    hero.send(trips.id(), chat, "What's in my other base?", None)
+        .unwrap();
+    hero.wait_idle(chat).await;
+    let listed = model.requests()[1]
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+    assert!(
+        listed.contains(&format!("\"base\":\"{mounted}\"")),
+        "a mount point in another base must name its base: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn hero_refuses_to_create_a_note_under_a_mount_point() {
+    let (account, outer) = setup().await;
+    let folder = object(&outer, "core.folder", None, json!({"name":"Shared"}));
+    let _credentials = account
+        .connect_app(AppRequest {
+            app_name: "Records App".into(),
+            app_id: None,
+            bases: vec![BaseGrantRequest::Folder {
+                base: outer.id(),
+                folder,
+                mode: Mode::ReadWrite,
+            }],
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let mounted = account
+        .mounts()
+        .into_iter()
+        .find(|m| m.folder == folder)
+        .unwrap()
+        .base;
+    let model = ScriptedModel::new(vec![
+        call(
+            "create_note",
+            json!({"parent":folder,"title":"Outside share","text":"Private"}),
+        ),
+        reply("Not created"),
+    ]);
+    let hero = account.hero_with_model(model.clone());
+    let chat = hero.new_chat(outer.id()).unwrap();
+    hero.send(outer.id(), chat, "Write inside Shared", None)
+        .unwrap();
+    hero.wait_idle(chat).await;
+    assert!(format!("{:?}", model.requests()).contains("mount_point_parent"));
+    assert!(
+        hero.messages(outer.id(), chat).unwrap()[1]
+            .created
+            .is_empty()
+    );
+    assert!(
+        !outer
+            .children(Some(folder))
+            .unwrap()
+            .iter()
+            .any(|s| s.title == "Outside share")
+    );
+    assert!(
+        !account
+            .base(mounted)
+            .unwrap()
+            .children(None)
+            .unwrap()
+            .iter()
+            .any(|s| s.title == "Outside share")
+    );
 }
 
 #[tokio::test]
@@ -1065,6 +1264,10 @@ async fn partial_text_is_saved_at_most_every_two_seconds_and_syncs() {
     })
     .await;
 
+    // B's live update can beat A's HTTP acknowledgement. Wait for A to
+    // record the partial's send time before advancing its manual clock;
+    // otherwise the final reply can wait forever on that frozen clock.
+    wait_for_base(&base, || base.sync_state().pending == 0).await;
     control.finish(finished(&partial));
     hero.wait_idle(chat).await;
     let m = &hero.messages(base.id(), chat).unwrap()[1];

@@ -54,6 +54,36 @@ test('Devices shows an app cap, changes it and disconnects', async ({ page }) =>
   expect(await page.evaluate(() => window.__fake.calls.includes('removeDevice sample'))).toBe(true);
 });
 
+test('Devices adds and removes an app folder', async ({ page }) => {
+  const account = await signedIn(page);
+  const { personal, health, device } = await page.evaluate(async account => {
+    const personal = (await window.__fake.createBase(account, 'Personal')).id;
+    const health = await window.__fake.createObject({ account, base: personal }, { kind: 'folder', parent: null, after: null, name: 'Health' });
+    window.__fake.setAppOffer('request', { name: 'Sample', appId: 'sample', deviceName: 'Dan - Sample', bases: [], capMicroUsd: 1000000, old: null, removeOld: false });
+    const [device] = await window.__fake.connectApprove(account, 'request', { bases: [{ base: personal, mode: 'readWrite' }], capMicroUsd: 1000000, replaces: null });
+    window.__fake.setDevices(account, [
+      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, capMicroUsd: null },
+      { id: device, name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, capMicroUsd: 1000000 },
+    ]);
+    return { personal, health, device };
+  }, account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator(`[data-device-id="${device}"]`);
+  await expect(row).toContainText('Personal');
+  await row.getByRole('button', { name: 'Add a base or folder' }).click();
+  await row.getByRole('radio', { name: 'Health' }).check();
+  await row.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(row).toContainText('Health in Personal');
+  await page.screenshot({ path: '/tmp/bh-folder-devices.png' });
+  const mounted = await page.evaluate(({ account, device }) => window.__fake.apps(account).then(list => list.find(app => app.deviceId === device)!.bases[1].base), { account, device });
+  expect(await page.evaluate(({ account, personal, health }) => window.__fake.bases(account).then(list => list.find(base => base.mount?.folder === health)?.mount?.parent === personal), { account, personal, health })).toBe(true);
+  page.once('dialog', async dialog => { expect(dialog.message()).toBe("Remove Sample's access to Health in Personal? The app erases its copy of it."); await dialog.accept(); });
+  await row.getByRole('button', { name: 'Remove Health in Personal' }).click();
+  await expect(row).not.toContainText('Health in Personal');
+  expect(await page.evaluate(({ account, device, mounted }) => window.__fake.apps(account).then(list => !list.find(app => app.deviceId === device)!.bases.some(grant => grant.base === mounted)), { account, device, mounted })).toBe(true);
+  expect(await page.evaluate(() => window.__fake.calls.some(call => call.startsWith('appGrantRemove')))).toBe(true);
+});
+
 test('removing this device confirms, erases it and shows Removed', async ({ page }) => {
   await signedIn(page);
   await page.getByRole('link', { name: 'Devices' }).click();

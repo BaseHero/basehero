@@ -176,11 +176,11 @@ export async function createNoteEditor(root, host, options={}) {
     for(const file of files) {
       if (file.size>104_857_600) {say('Files can be at most 100 MB.');continue;}
       try {
-        const added=await options.backend.fileAdd(options.r,options.noteId,file.name,file.type,new Uint8Array(await file.arrayBuffer()));
+        const added=await options.backend.fileAdd(options.fileR ?? options.r,options.fileR ? null : options.noteId,file.name,file.type,new Uint8Array(await file.arrayBuffer()));
         if(closed || !canAuthor())return;
         // Never decide from the supplied name or type: the core sniffs bytes.
         try {
-          await options.backend.fileImage(options.r,added.id);
+          await options.backend.fileImage(options.fileR ?? options.r,added.id);
           if(!closed && canAuthor()) editor.chain().focus().insertContent([
             {type:'image',attrs:{file:added.id}},{type:'paragraph'},
           ]).run();
@@ -740,7 +740,7 @@ export async function createNoteEditor(root, host, options={}) {
     });
     editable=!options.readOnly && !tooLarge && !held;
     editor=new Editor({element:content,extensions:[...extensions.filter(ext=>ext.name!=='image'),imageNode.configure({
-      backend:options.backend,r:options.r,objectUrl:options.objectUrl,releaseObjectUrl:options.releaseObjectUrl,
+      backend:options.backend,r:options.r,fileR:options.fileR,objectUrl:options.objectUrl,releaseObjectUrl:options.releaseObjectUrl,
     }),binding],content:'',injectCSS:false,editable});
     for(const event of ['selectionUpdate','focus','blur','transaction'])editor.on(event,()=>queueMicrotask(placeBubble));
     editor.on('selectionUpdate',onSelectionIntent);

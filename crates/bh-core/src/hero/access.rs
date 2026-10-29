@@ -37,6 +37,7 @@ mod tests {
             name: "base".into(),
             mode: Mode::ReadWrite,
             hidden,
+            mount: None,
         }
     }
     fn readers() -> (BTreeSet<DeviceId>, BTreeSet<DeviceId>) {

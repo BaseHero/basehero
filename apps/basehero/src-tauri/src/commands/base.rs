@@ -2,7 +2,8 @@ use crate::error::CommandError;
 use crate::state::AppState;
 use crate::views::{BaseRef, SearchResult};
 use bh_core::{
-    AccountId, BaseId, BaseSummary, NewObject, ObjectId, ObjectSummary, SyncState, TypeRef,
+    AccountId, BaseId, BaseSummary, NewObject, ObjectId, ObjectSummary, SyncState, TreeItem,
+    TypeRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -50,6 +51,7 @@ pub async fn create_base(
         name: base.name(),
         mode: base.mode(),
         hidden: false,
+        mount: None,
     })
 }
 
@@ -59,6 +61,17 @@ pub fn children(
     parent: Option<ObjectId>,
 ) -> Result<Vec<ObjectSummary>, CommandError> {
     Ok(state.base(r)?.children(parent)?)
+}
+
+pub fn tree_children(
+    state: &AppState,
+    r: &BaseRef,
+    parent: Option<ObjectId>,
+) -> Result<Vec<TreeItem>, CommandError> {
+    Ok(state
+        .core
+        .account(r.account)?
+        .tree_children(r.base, parent)?)
 }
 
 pub fn get_object(
@@ -99,23 +112,26 @@ pub fn rename_object(
     id: ObjectId,
     name: &str,
 ) -> Result<(), CommandError> {
-    let base = state.base(r)?;
-    let object = base.get(id)?.ok_or(bh_core::Error::NotFound)?;
-    if object.ty.name == "core.note" {
-        return Err(bh_core::Error::Invalid("a note's title comes from its body".into()).into());
-    }
-    let mut fields = Map::new();
-    fields.insert("name".into(), Value::String(name.to_owned()));
-    Ok(base.set_fields(id, fields)?)
+    Ok(state.core.account(r.account)?.rename(r.base, id, name)?)
 }
 
-pub fn move_object(
+pub async fn move_object(
     state: &AppState,
     r: &BaseRef,
     id: ObjectId,
+    base: Option<BaseId>,
     parent: Option<ObjectId>,
     after: Option<ObjectId>,
 ) -> Result<(), CommandError> {
+    if let Some(to) = base
+        && to != r.base
+    {
+        return Ok(state
+            .core
+            .account(r.account)?
+            .move_between(r.base, id, to, parent)
+            .await?);
+    }
     Ok(state.base(r)?.move_to(id, parent, after)?)
 }
 
@@ -127,8 +143,20 @@ pub fn restore_object(state: &AppState, r: &BaseRef, id: ObjectId) -> Result<(),
     Ok(state.base(r)?.undelete(id)?)
 }
 
-pub fn trash(state: &AppState, r: &BaseRef) -> Result<Vec<ObjectSummary>, CommandError> {
-    Ok(state.base(r)?.trash()?)
+pub fn trash(state: &AppState, r: &BaseRef) -> Result<Vec<TreeItem>, CommandError> {
+    Ok(state.core.account(r.account)?.trash(r.base)?)
+}
+
+pub fn locate(state: &AppState, r: &BaseRef, id: ObjectId) -> Result<BaseId, CommandError> {
+    Ok(state.core.account(r.account)?.locate(r.base, id)?)
+}
+
+pub fn moved_from(
+    state: &AppState,
+    r: &BaseRef,
+    id: ObjectId,
+) -> Result<Option<BaseId>, CommandError> {
+    Ok(state.core.account(r.account)?.moved_from(r.base, id))
 }
 
 pub fn search(
@@ -199,6 +227,14 @@ pub mod ipc {
         super::children(state.state()?, &r, parent)
     }
     #[tauri::command]
+    pub fn tree_children(
+        state: State<'_, crate::state::Startup>,
+        r: BaseRef,
+        parent: Option<ObjectId>,
+    ) -> Result<Vec<TreeItem>, CommandError> {
+        super::tree_children(state.state()?, &r, parent)
+    }
+    #[tauri::command]
     pub fn get_object(
         state: State<'_, crate::state::Startup>,
         r: BaseRef,
@@ -224,14 +260,15 @@ pub mod ipc {
         super::rename_object(state.state()?, &r, id, &name)
     }
     #[tauri::command]
-    pub fn move_object(
+    pub async fn move_object(
         state: State<'_, crate::state::Startup>,
         r: BaseRef,
         id: ObjectId,
+        base: Option<BaseId>,
         parent: Option<ObjectId>,
         after: Option<ObjectId>,
     ) -> Result<(), CommandError> {
-        super::move_object(state.state()?, &r, id, parent, after)
+        super::move_object(state.state()?, &r, id, base, parent, after).await
     }
     #[tauri::command]
     pub fn delete_object(
@@ -253,8 +290,24 @@ pub mod ipc {
     pub fn trash(
         state: State<'_, crate::state::Startup>,
         r: BaseRef,
-    ) -> Result<Vec<ObjectSummary>, CommandError> {
+    ) -> Result<Vec<TreeItem>, CommandError> {
         super::trash(state.state()?, &r)
+    }
+    #[tauri::command]
+    pub fn locate(
+        state: State<'_, crate::state::Startup>,
+        r: BaseRef,
+        id: ObjectId,
+    ) -> Result<BaseId, CommandError> {
+        super::locate(state.state()?, &r, id)
+    }
+    #[tauri::command]
+    pub fn moved_from(
+        state: State<'_, crate::state::Startup>,
+        r: BaseRef,
+        id: ObjectId,
+    ) -> Result<Option<BaseId>, CommandError> {
+        super::moved_from(state.state()?, &r, id)
     }
     #[tauri::command]
     pub fn search(

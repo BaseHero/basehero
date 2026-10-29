@@ -23,6 +23,22 @@ test('the sample connects by approval in BaseHero on the same emulator', { timeo
     bh(['signin', '--server', 'https://dev-api.basehero.com', '--email', email,
       '--name', 'Test CLI', '--kit', kit], options);
   } catch { throw new Error('host CLI could not sign in with the emulator account kit'); }
+  // Sign-up's base name may still be in flight when the host CLI signs in.
+  const deadline = Date.now() + 30_000;
+  let initialBases;
+  do {
+    bh(['sync'], options);
+    initialBases = bh(['bases'], options);
+    if (initialBases.some(b => b.name === 'Personal')) break;
+    if (Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 1000));
+  } while (Date.now() < deadline);
+  assert(initialBases.some(b => b.name === 'Personal'), `Personal not available after sync: ${JSON.stringify(initialBases)}`);
+  bh(['folder', 'new', 'Health'], options);
+  bh(['note', 'new', '--base', 'Personal', 'Outside'], options);
+  bh(['sync'], options);
+  await ownerPage.getByRole('link', { name: 'Personal' }).first().click();
+  await ownerPage.getByTestId('tree-row').filter({ hasText: 'Health' }).waitFor({ timeout: 30_000 });
+  await ownerPage.locator('.location-bar').getByRole('link', { name: 'BaseHero' }).click();
 
   await launch(pkg);
   page = await webview(pkg);
@@ -38,13 +54,25 @@ test('the sample connects by approval in BaseHero on the same emulator', { timeo
   await ownerPage.getByLabel('Digits shown in the app').fill(digits);
   await ownerPage.getByRole('button', { name: 'Check digits' }).click();
   await ownerPage.getByText('Not verified').waitFor({ timeout: 30_000 });
-  assert.equal(await ownerPage.getByLabel('Personal', { exact: true }).isChecked(), true);
+  await ownerPage.getByRole('button', { name: 'Remove Personal' }).click();
+  await ownerPage.getByRole('button', { name: 'Add a base or folder' }).click();
+  await ownerPage.getByRole('combobox', { name: 'Base', exact: true }).selectOption({ label: 'Personal' });
+  await ownerPage.getByRole('radio', { name: 'Health' }).check();
+  await ownerPage.getByRole('button', { name: 'Add', exact: true }).click();
+  await ownerPage.getByRole('combobox', { name: 'Health in Personal access' }).waitFor();
   await ownerPage.locator('.approval-requests').screenshot({ path: '/tmp/bh-connect-approval.png' });
   await ownerPage.getByRole('button', { name: 'Connect app' }).click();
   await launch(pkg);
   const status = page.locator('#status');
-  await status.filter({ hasText: /connected [a-f0-9]{32} as [a-f0-9]{32}/ }).waitFor({ timeout: 30_000 });
-  base = (await status.textContent()).match(/connected ([a-f0-9]{32}) as [a-f0-9]{32}/)[1];
+  await status.filter({ hasText: /connected [a-f0-9]{32} as [a-f0-9]{32}; sees Health$/ }).waitFor({ timeout: 30_000 });
+  base = (await status.textContent()).match(/connected ([a-f0-9]{32}) as [a-f0-9]{32}; sees Health$/)[1];
+  bh(['sync'], options); // The grant creates a mounted base after approval.
+  const bases = bh(['bases'], options);
+  const health = bases.find(b => b.name === 'Health');
+  const personal = bases.find(b => b.name === 'Personal');
+  assert(health && personal, `both bases must be visible on the full device: ${JSON.stringify(bases)}`);
+  assert.equal(health.id, base);
+  assert.equal(health.mount.parent, personal.id);
   await page.locator('#email').evaluate(input => input.blur());
   await page.screenshot({ path: '/tmp/bh-connect-sample.png' });
   sampleName = `${email.split('@')[0][0].toUpperCase()}${email.split('@')[0].slice(1)} - BaseHero Sample`;
@@ -71,6 +99,10 @@ test('it writes a typed record and reads it back', async () => {
     assert(Date.now() < deadline, 'reading did not reach the full device');
   } while (true);
   assert.equal(rows.length, 1);
+  assert(bh(['ls', '--base', base], options).some(row => row.id === rows[0].id),
+    'the reading belongs to Health');
+  assert(!bh(['ls', '--base', 'Personal'], options).some(row => row.id === rows[0].id),
+    'the reading is not in Personal');
 });
 
 test('Hero uses the record', { skip: process.env.BH_SKIP_LIVE_MODEL_TESTS === '1' }, () => {

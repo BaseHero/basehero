@@ -105,6 +105,7 @@ async fn an_app_is_connected_through_the_commands() {
             .iter()
             .map(|grant| approval::BaseChoiceInput {
                 base: Some(grant.base),
+                folder: None,
                 new_name: None,
                 mode: grant.mode,
             })

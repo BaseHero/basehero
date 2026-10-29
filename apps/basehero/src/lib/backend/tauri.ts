@@ -15,6 +15,8 @@ const commands: Record<string, [string, string[]]> = {
   approvalDecline: ['approval_decline', ['account', 'id']],
   connectOpen: ['connect_open', ['account', 'id']], connectCheck: ['connect_check', ['account', 'id', 'digits']],
   connectApprove: ['connect_approve', ['account', 'id', 'choice']], setAppCap: ['set_app_cap', ['account', 'device', 'capMicroUsd']],
+  apps: ['apps', ['account']], appGrantAdd: ['app_grant_add', ['account', 'device', 'choice']],
+  appGrantRemove: ['app_grant_remove', ['account', 'device', 'base']],
   newKit: ['new_kit', ['account', 'password']], kitStatus: ['kit_status', ['account']], showKit: ['show_kit', ['account']], setKitSaved: ['set_kit_saved', ['account', 'kit']],
   devices: ['devices', ['account']], usage: ['usage', ['account', 'month']], removeDevice: ['remove_device', ['account', 'device']],
   bases: ['bases', ['account']], createBase: ['create_base', ['account', 'name']],
@@ -24,11 +26,12 @@ const commands: Record<string, [string, string[]]> = {
   refreshAccount: ['refresh_account', ['account']],
   files: ['files', ['r', 'parent']], fileInfo: ['file_info', ['r', 'id']], fileOpen: ['file_open', ['r', 'id']],
   versions: ['versions', ['r', 'id', 'before']], versionRestore: ['version_restore', ['r', 'id', 'seq']],
-  children: ['children', ['r', 'parent']], getObject: ['get_object', ['r', 'id']],
+  children: ['children', ['r', 'parent']], treeChildren: ['tree_children', ['r', 'parent']], getObject: ['get_object', ['r', 'id']],
   createObject: ['create_object', ['r', 'item']], renameObject: ['rename_object', ['r', 'id', 'name']],
-  moveObject: ['move_object', ['r', 'id', 'parent', 'after']],
+  moveObject: ['move_object', ['r', 'id', 'base', 'parent', 'after']],
   deleteObject: ['delete_object', ['r', 'id']], restoreObject: ['restore_object', ['r', 'id']],
-  trash: ['trash', ['r']], search: ['search', ['account', 'base', 'text', 'limit']],
+  trash: ['trash', ['r']], locate: ['locate', ['r', 'id']], movedFrom: ['moved_from', ['r', 'id']],
+  search: ['search', ['account', 'base', 'text', 'limit']],
   syncState: ['sync_state', ['r']], noteClose: ['note_close', ['session']],
   heroChats: ['hero_chats', ['account', 'base']], heroChatFor: ['hero_chat_for', ['account', 'base', 'project']],
   heroNewChat: ['hero_new_chat', ['account', 'base']], heroMessages: ['hero_messages', ['account', 'base', 'chat']],
@@ -75,6 +78,12 @@ export const tauriBackend: Backend = new Proxy({
   },
   noteApply(session: number, update: Uint8Array) {
     return invoke<void>('note_apply', update, { headers: { 'bh-session': String(session) } }).catch(rethrow);
+  },
+  moveObject(r: BaseRef, id: string, base: string | null, parent: string | null, after?: string | null) {
+    // Keep the existing four-argument tree caller working until it uses destinations.
+    return call<void>('move_object', after === undefined
+      ? { r, id, base: null, parent: base, after: parent }
+      : { r, id, base, parent, after });
   },
   async onEvent(handler: (event: AppEvent) => void) {
     const unlisten = await listen<AppEvent>('bh:event', e => handler(e.payload));

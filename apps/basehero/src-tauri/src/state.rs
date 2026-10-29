@@ -578,6 +578,7 @@ mod tests {
             name: "base".into(),
             mode: bh_core::Mode::ReadWrite,
             hidden,
+            mount: None,
         };
         assert!(!any_hidden_open([vec![], vec![base(false)]]));
         assert!(any_hidden_open([vec![base(false)], vec![base(true)]]));

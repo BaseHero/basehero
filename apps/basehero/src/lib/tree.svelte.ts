@@ -1,5 +1,5 @@
 import { getBackend } from './backend';
-import type { BaseRef, ObjectId, ObjectSummary } from './backend/types';
+import type { BaseRef, ObjectId, ObjectSummary, TreeItem } from './backend/types';
 
 const navigable = new Set(['core.note', 'core.folder', 'core.project']);
 export function itemKind(item: ObjectSummary): string {
@@ -7,30 +7,51 @@ export function itemKind(item: ObjectSummary): string {
   const kind = ty?.name ?? String(item.kind ?? '');
   return kind.startsWith('core.') ? kind : `core.${kind}`;
 }
-const key = (parent: ObjectId | null) => parent ?? '';
+export const treeKey = (base: string, parent: ObjectId | null) => `${base}:${parent ?? ''}`;
 
 export class TreeModel {
-  children = $state<Record<string, ObjectSummary[]>>({});
+  children = $state<Record<string, TreeItem[]>>({});
   expanded = $state<Record<string, boolean>>({});
   constructor(readonly r: BaseRef) {}
-  async expand(id: ObjectId | null) {
-    if (id !== null) this.expanded[id] = true;
-    const parent = key(id);
-    if (!(parent in this.children)) await this.load(id);
+  async expand(base: string, id: ObjectId | null) {
+    if (id !== null) this.expanded[treeKey(base, id)] = true;
+    if (!(treeKey(base, id) in this.children)) await this.load(base, id);
   }
-  collapse(id: ObjectId) { this.expanded[id] = false; }
-  private async load(parent: ObjectId | null) {
-    this.children[key(parent)] = (await getBackend().children(this.r, parent)).filter(item => !item.deleted && navigable.has(itemKind(item)));
+  collapse(base: string, id: ObjectId) { this.expanded[treeKey(base, id)] = false; }
+  private async load(base: string, parent: ObjectId | null) {
+    this.children[treeKey(base, parent)] = (await getBackend().treeChildren({ account: this.r.account, base }, parent))
+      .filter(item => !item.deleted && navigable.has(itemKind(item)));
   }
-  async refresh(ids: ObjectId[]) {
-    const parents = new Set<string>();
-    for (const id of ids) {
-      for (const [parent, items] of Object.entries(this.children)) {
-        if (items.some(item => item.id === id)) parents.add(parent);
-      }
-      const item = await getBackend().getObject(this.r, id);
-      if (item) parents.add(key(item.parent));
+  async refresh() {
+    await Promise.all(Object.keys(this.children).map(key => {
+      const split = key.indexOf(':');
+      return this.load(key.slice(0, split), key.slice(split + 1) || null);
+    }));
+  }
+  async reveal(base: string, id: ObjectId, mounts: { base: string; parent: string; folder: string }[]) {
+    const seen = new Set<string>();
+    let current = id;
+    while (!seen.has(`${base}:${current}`)) {
+      seen.add(`${base}:${current}`);
+      const item = await getBackend().getObject({ account: this.r.account, base }, current);
+      if (!item?.parent) break;
+      await this.expand(base, item.parent);
+      current = item.parent;
     }
-    await Promise.all([...parents].filter(parent => parent in this.children).map(parent => this.load(parent || null)));
+    while (base !== this.r.base) {
+      const mount = mounts.find(row => row.base === base);
+      if (!mount || seen.has(`mount:${base}`)) break;
+      seen.add(`mount:${base}`);
+      base = mount.parent;
+      await this.expand(base, mount.folder);
+      current = mount.folder;
+      while (true) {
+        const item = await getBackend().getObject({ account: this.r.account, base }, current);
+        if (!item?.parent || seen.has(`${base}:${item.parent}`)) break;
+        seen.add(`${base}:${item.parent}`);
+        await this.expand(base, item.parent);
+        current = item.parent;
+      }
+    }
   }
 }

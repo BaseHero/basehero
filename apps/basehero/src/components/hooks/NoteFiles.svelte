@@ -4,7 +4,9 @@
   import type { BaseRef, FileInfo, FileStatus, ObjectId } from '../../lib/backend/types';
   import { errorMessage } from '../../lib/errors';
 
-  let { r, id }: { r: BaseRef; id: ObjectId } = $props();
+  let { r, id, mounted = null }: { r: BaseRef; id: ObjectId; mounted?: string | null } = $props();
+  let target = $derived(mounted ? { account: r.account, base: mounted } : r);
+  let parent = $derived(mounted ? null : id);
   let files = $state<FileInfo[]>([]);
   let error = $state('');
   let picker: HTMLInputElement;
@@ -13,7 +15,7 @@
   async function refresh() {
     const current = ++generation;
     try {
-      const listed = await getBackend().files(r, id);
+      const listed = await getBackend().files(target, parent);
       if (current === generation) { files = listed; error = ''; }
     } catch (cause) { if (current === generation) error = errorMessage(cause); }
   }
@@ -22,7 +24,7 @@
     void refresh();
     let stop = () => {};
     void getBackend().onEvent(event => {
-      if (!active || (event.kind !== 'base' && event.kind !== 'Base') || event.account !== r.account || event.base !== r.base) return;
+      if (!active || (event.kind !== 'base' && event.kind !== 'Base') || event.account !== r.account || event.base !== target.base) return;
       const change = event.event as { filesChanged?: string[]; FilesChanged?: string[]; objectsChanged?: string[]; ObjectsChanged?: string[] };
       if (change?.filesChanged || change?.FilesChanged || change?.objectsChanged || change?.ObjectsChanged) void refresh();
     }).then(unsubscribe => { if (active) stop = unsubscribe; else unsubscribe(); });
@@ -53,18 +55,18 @@
     busy = true;
     for (const file of chosen) {
       try {
-        await getBackend().fileAdd(r, id, file.name, file.type || 'application/octet-stream', new Uint8Array(await file.arrayBuffer()));
+        await getBackend().fileAdd(target, parent, file.name, file.type || 'application/octet-stream', new Uint8Array(await file.arrayBuffer()));
         await refresh();
       } catch (cause) { error = errorMessage(cause); }
     }
     busy = false;
   }
   async function open(file: FileInfo) {
-    try { error = ''; await getBackend().fileOpen(r, file.id); await refresh(); }
+    try { error = ''; await getBackend().fileOpen(target, file.id); await refresh(); }
     catch (cause) { error = errorMessage(cause); await refresh(); }
   }
   async function remove(file: FileInfo) {
-    try { await getBackend().deleteObject(r, file.id); await refresh(); }
+    try { await getBackend().deleteObject(target, file.id); await refresh(); }
     catch (cause) { error = errorMessage(cause); }
   }
 </script>

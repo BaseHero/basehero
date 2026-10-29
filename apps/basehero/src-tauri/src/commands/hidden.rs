@@ -25,6 +25,7 @@ pub async fn create_hidden_base(
         name: base.name(),
         mode: base.mode(),
         hidden: true,
+        mount: None,
     })
 }
 

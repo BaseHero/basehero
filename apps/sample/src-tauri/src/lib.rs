@@ -9,7 +9,12 @@ use tauri::Manager;
 #[tauri::command]
 async fn status(sample: tauri::State<'_, Sample>) -> Result<String, String> {
     match sample.check_connection().await.map_err(|e| e.to_string())? {
-        Some(c) => Ok(format!("connected {} as {}", c.base, c.device)),
+        Some(c) => Ok(format!(
+            "connected {} as {}; sees {}",
+            c.base,
+            c.device,
+            c.bases.join(", ")
+        )),
         None => Ok("not connected".into()),
     }
 }
@@ -26,7 +31,12 @@ async fn connect_start(sample: tauri::State<'_, Sample>, email: String) -> Resul
 #[tauri::command]
 async fn connect_finish(sample: tauri::State<'_, Sample>) -> Result<String, String> {
     let c = sample.connect_finish().await.map_err(|e| e.to_string())?;
-    Ok(format!("connected {} as {}", c.base, c.device))
+    Ok(format!(
+        "connected {} as {}; sees {}",
+        c.base,
+        c.device,
+        c.bases.join(", ")
+    ))
 }
 
 #[tauri::command]

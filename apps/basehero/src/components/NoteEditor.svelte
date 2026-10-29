@@ -7,8 +7,8 @@
   import { objectUrl, releaseObjectUrl } from '../lib/files.svelte';
   import '../lib/editor/editor.css';
 
-  let { r, id, readOnly, host: suppliedHost, onnavigate, onleave, retryleave }: {
-    r: BaseRef; id: ObjectId; readOnly: boolean; host?: NoteHost;
+  let { r, id, mounted = null, readOnly, host: suppliedHost, onnavigate, onleave, retryleave }: {
+    r: BaseRef; id: ObjectId; mounted?: string | null; readOnly: boolean; host?: NoteHost;
     onnavigate: (r: BaseRef, id: ObjectId) => void;
     onleave: (leave: () => Promise<boolean>) => () => void;
     retryleave: () => void;
@@ -27,7 +27,9 @@
     }
     const opening = createNoteEditor(root, host, {
       baseId: r.base,
-      backend: getBackend(), r, noteId: id, objectUrl, releaseObjectUrl,
+      backend: getBackend(), r, noteId: id,
+      fileR: mounted ? { account: r.account, base: mounted } : null,
+      objectUrl, releaseObjectUrl,
       get readOnly() { return readOnly || host.readOnly; },
       navigate: (base: string, note: string) => onnavigate({ account: r.account, base }, note),
     }).then(opened => {

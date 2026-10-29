@@ -124,6 +124,34 @@ async fn devices(
 }
 
 #[tauri::command]
+fn apps(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+) -> Result<Vec<bh_core::AppSummary>, error::CommandError> {
+    commands::account::apps(startup.state()?, account)
+}
+
+#[tauri::command]
+async fn app_grant_add(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    device: bh_core::DeviceId,
+    choice: commands::approval::BaseChoiceInput,
+) -> Result<bh_core::BaseId, error::CommandError> {
+    commands::account::app_grant_add(startup.state()?, account, device, choice).await
+}
+
+#[tauri::command]
+async fn app_grant_remove(
+    startup: tauri::State<'_, state::Startup>,
+    account: bh_core::AccountId,
+    device: bh_core::DeviceId,
+    base: bh_core::BaseId,
+) -> Result<(), error::CommandError> {
+    commands::account::app_grant_remove(startup.state()?, account, device, base).await
+}
+
+#[tauri::command]
 async fn set_app_cap(
     startup: tauri::State<'_, state::Startup>,
     account: bh_core::AccountId,
@@ -271,6 +299,9 @@ pub fn run() {
             set_kit_saved,
             devices,
             set_app_cap,
+            apps,
+            app_grant_add,
+            app_grant_remove,
             usage,
             remove_device,
             commands::note::note_open,
@@ -293,6 +324,7 @@ pub fn run() {
             commands::files::ipc::version_state,
             commands::files::ipc::version_restore,
             commands::base::ipc::children,
+            commands::base::ipc::tree_children,
             commands::base::ipc::get_object,
             commands::base::ipc::create_object,
             commands::base::ipc::rename_object,
@@ -300,6 +332,8 @@ pub fn run() {
             commands::base::ipc::delete_object,
             commands::base::ipc::restore_object,
             commands::base::ipc::trash,
+            commands::base::ipc::locate,
+            commands::base::ipc::moved_from,
             commands::base::ipc::search,
             commands::base::ipc::sync_state,
             hero::ipc::hero_chats,

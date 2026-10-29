@@ -87,6 +87,7 @@ use crate::{Result, invalid};
 pub struct AppFlags<'a> {
     pub bases: &'a [String],
     pub new_base: Option<&'a str>,
+    pub folders: &'a [String],
     pub read_only: bool,
     pub cap_usd: Option<&'a str>,
     pub keep_old: bool,
@@ -97,6 +98,7 @@ impl AppFlags<'_> {
     fn any(&self) -> bool {
         !self.bases.is_empty()
             || self.new_base.is_some()
+            || !self.folders.is_empty()
             || self.read_only
             || self.cap_usd.is_some()
             || self.keep_old
@@ -163,7 +165,7 @@ fn choice(
     let summaries = account.bases();
     let mut bases = Vec::new();
     let mut descriptions = Vec::new();
-    let selected = !flags.bases.is_empty() || flags.new_base.is_some();
+    let selected = !flags.bases.is_empty() || flags.new_base.is_some() || !flags.folders.is_empty();
     if selected {
         for requested in flags.bases {
             let summary = summaries
@@ -188,6 +190,22 @@ fn choice(
             descriptions.push(format!(
                 "{} ({})",
                 terminal_device_name(name),
+                mode_name(mode)
+            ));
+        }
+        for requested in flags.folders {
+            let folder = crate::object_id(requested)?;
+            let base = crate::containing_base(account, folder)?;
+            let summary = base.get(folder)?.ok_or(Error::NotFound)?;
+            bases.push(BaseGrantRequest::Folder {
+                base: base.id(),
+                folder,
+                mode,
+            });
+            descriptions.push(format!(
+                "{} (folder in {}, {})",
+                terminal_device_name(&summary.title),
+                terminal_device_name(&base.name()),
                 mode_name(mode)
             ));
         }

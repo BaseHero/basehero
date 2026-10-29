@@ -10,7 +10,7 @@
   let error = $state('');
   onMount(() => {
     let active = true;
-    const refresh = () => { void getBackend().bases(account).then(list => { if (active) bases = list.filter(base => !base.hidden); }).catch(e => error = errorMessage(e)); };
+    const refresh = () => { void getBackend().bases(account).then(list => { if (active) bases = list.filter(base => !base.hidden && !base.mount); }).catch(e => error = errorMessage(e)); };
     refresh();
     let stop = () => {};
     void getBackend().onEvent(event => {
@@ -21,7 +21,7 @@
   });
   async function create(event: SubmitEvent) {
     event.preventDefault();
-    try { const base = await getBackend().createBase(account, name.trim()); bases = (await getBackend().bases(account)).filter(item => !item.hidden); name = ''; onopen(base.id); }
+    try { const base = await getBackend().createBase(account, name.trim()); bases = (await getBackend().bases(account)).filter(item => !item.hidden && !item.mount); name = ''; onopen(base.id); }
     catch (cause) { error = errorMessage(cause); }
   }
 </script>

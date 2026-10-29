@@ -27,6 +27,33 @@ describe('fake backend', () => {
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
+  it('mounts a folder, lists its contents in place, and moves items into it', async () => {
+    const fake = new FakeBackend();
+    const personal = await fake.createBase('account', 'Personal');
+    const root = { account: 'account', base: personal.id };
+    const folder = await fake.createObject(root, { kind: 'folder', name: 'Health', parent: null, after: null });
+    const inside = await fake.createObject(root, { kind: 'note', name: 'Inside', parent: folder, after: null });
+    const outside = await fake.createObject(root, { kind: 'note', name: 'Outside', parent: null, after: null });
+    const mounted = await fake.grantFolder('account', personal.id, folder, 'Sample');
+    expect((await fake.bases('account')).find(b => b.id === mounted)?.mount).toEqual({ base: mounted, parent: personal.id, folder });
+    expect((await fake.treeChildren(root, null)).find(item => item.id === folder)).toMatchObject({ mounted, readers: ['Sample'] });
+    expect(await fake.treeChildren(root, folder)).toMatchObject([{ id: inside, base: mounted }]);
+    await fake.moveObject(root, outside, mounted, null, null);
+    expect((await fake.treeChildren(root, folder)).map(item => item.id)).toEqual([inside, outside]);
+    expect(await fake.locate(root, outside)).toBe(mounted);
+    expect(await fake.movedFrom({ account: 'account', base: mounted }, outside)).toBe(personal.id);
+    await fake.deleteObject({ account: 'account', base: mounted }, outside);
+    expect(await fake.trash(root)).toMatchObject([{ id: outside, base: mounted }]);
+  });
+
+  it('rejects an unknown tree parent in the requested base', async () => {
+    const fake = new FakeBackend();
+    const personal = await fake.createBase('account', 'Personal');
+    const health = await fake.createBase('account', 'Health');
+    const folder = await fake.createObject({ account: 'account', base: health.id }, { kind: 'folder', name: 'Visits', parent: null, after: null });
+    await expect(fake.treeChildren({ account: 'account', base: personal.id }, folder)).rejects.toMatchObject({ kind: 'NotFound' });
+  });
+
   it('counts note sessions and echoes updates to other sessions only', async () => {
     const fake = new FakeBackend();
     const first = vi.fn();
