@@ -60,6 +60,13 @@ pub(crate) fn seal(key: &Secret<32>, ad: &Aad, plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The epoch named in a sealed value's header; opening checks it.
+pub(crate) fn epoch(sealed: &[u8]) -> Option<u32> {
+    sealed
+        .get(1..5)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four bytes")))
+}
+
 /// A format this version doesn't know is `NeedsUpdate`; anything else that
 /// doesn't authenticate under `key` and `ad` is `Crypto`.
 pub(crate) fn open(key: &Secret<32>, ad: &Aad, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {

@@ -7,6 +7,7 @@ export function messageFor(kind: string, message = ''): string {
     case 'NothingUnlocked': return 'No hidden bases open with that password.';
     case 'Network': return "Can't reach BaseHero. Check your connection.";
     case 'RateLimited': return 'Too many tries. Wait a few minutes, then try again.';
+    case 'StorageFull': return 'Account storage is full.';
     case 'NeedsUpdate': return 'This version of BaseHero is too old. Update it to continue.';
     case 'ApprovalEnded': return ({
       WrongDigits: "The digits didn't match. Run the sign-in again to start over.",

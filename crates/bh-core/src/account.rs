@@ -19,14 +19,15 @@ use crate::{Base, BaseSummary, EndReason, Error, Mode, Mount, UsageRow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bh_crypto::Secret;
 use bh_proto::{
-    AccountDataRequest, AccountId, AppDeviceKind, ApprovalId, ApprovalKind, BaseId, BasesRequest,
-    Bytes, CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest, ObjectId,
+    AccountData, AccountDataRequest, AccountId, AppDeviceKind, ApprovalId, ApprovalKind, BaseId,
+    BasesRequest, Bytes, CredentialsRequest, DeviceId, DevicesRequest, GrantMode, GrantRequest,
+    ObjectId,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, broadcast};
@@ -84,6 +85,9 @@ pub struct AccountSummary {
     pub email: String,
     /// Capability of this installation.
     pub kind: DeviceKind,
+    /// See [`Account::signed_out_by_server`]; a window opened after the
+    /// [`AccountEvent::SignedOutByServer`] event reads it here.
+    pub signed_out_by_server: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -268,6 +272,9 @@ pub enum AccountEvent {
     DevicesChanged,
     /// This account was removed locally.
     Removed,
+    /// The server refused this device without a removal notice from one of the
+    /// person's devices: sync stopped and the local copy and keys stay.
+    SignedOutByServer,
     /// A device requested approval.
     ApprovalRequested(ApprovalRequest),
     /// An approval exchange ended.
@@ -297,6 +304,11 @@ fn parse_data(json: &[u8]) -> Result<Data, Error> {
         Some(v) if v > 1 => Err(Error::NeedsUpdate),
         _ => Err(Error::Storage("malformed account data".into())),
     }
+}
+
+/// Account data's version as its sealing epoch.
+fn data_epoch(version: u64) -> Result<u32, Error> {
+    u32::try_from(version).map_err(|_| Error::Crypto)
 }
 
 pub(crate) fn entry<'a>(data: &'a mut Data, key: &str) -> &'a mut Data {
@@ -405,6 +417,9 @@ struct Inner {
     /// 0 active, 1 erasing, 2 erased, 3 blocked after failed erase.
     removal: Arc<AtomicU8>,
     removal_done: Notify,
+    /// Refused by the server without a valid removal notice: sync stopped, nothing
+    /// erased. Not stored, so the next start tries again.
+    signed_out_by_server: AtomicBool,
 }
 
 impl Inner {
@@ -464,16 +479,14 @@ impl Account {
         let account = Account {
             inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
                 let weak = weak.clone();
-                let api = shared
-                    .api(row.server.clone(), Some(token))
-                    .with_revocation(move || {
-                        if let Some(inner) = weak.upgrade() {
-                            let handle = inner.shared.handle.clone();
-                            handle.spawn(async move {
-                                let _ = (Account { inner }).sign_out().await;
-                            });
-                        }
-                    });
+                let api =
+                    shared
+                        .api(row.server.clone(), Some(token))
+                        .with_revocation(move |notice| {
+                            if let Some(inner) = weak.upgrade() {
+                                (Account { inner }).revoked(notice);
+                            }
+                        });
                 Inner {
                     api,
                     shared,
@@ -497,6 +510,7 @@ impl Account {
                     listener: Mutex::new(None),
                     removal: Arc::new(AtomicU8::new(0)),
                     removal_done: Notify::new(),
+                    signed_out_by_server: AtomicBool::new(false),
                 }
             }),
         };
@@ -540,6 +554,7 @@ impl Account {
             id: self.id(),
             email: self.email(),
             kind: self.kind(),
+            signed_out_by_server: self.signed_out_by_server(),
         }
     }
 
@@ -993,6 +1008,12 @@ impl Account {
         }
         let app_key = Secret::<32>::random();
         let key = Zeroizing::new(URL_SAFE_NO_PAD.encode(app_key.expose()));
+        // Removing an app that never got its credentials still sends its notice.
+        let notice = keys::removal_notice(
+            &bh_crypto::kdf(&app_key, keys::REMOVAL, 1),
+            &self.inner.id,
+            &device_id,
+        );
         let token = match self
             .inner
             .api
@@ -1008,7 +1029,7 @@ impl Account {
                 // A lost reply can follow registration. The ID is known even
                 // without the token, so revoke it before another attempt.
                 if matches!(error, Error::Network(_)) {
-                    match self.inner.api.delete_device(device_id).await {
+                    match self.inner.api.delete_device(device_id, Some(notice)).await {
                         Ok(_) | Err(Error::NotFound) => {}
                         Err(_) => {
                             return Err(Error::Network(
@@ -1033,7 +1054,7 @@ impl Account {
             }),
             Err(error) => {
                 // Revoke first: even an ambiguous grant reply may have installed a grant.
-                let removed = self.inner.api.delete_device(device_id).await;
+                let removed = self.inner.api.delete_device(device_id, Some(notice)).await;
                 if removed.is_ok() || matches!(removed, Err(Error::NotFound)) {
                     self.update_data(move |data| {
                         entry(data, "apps").remove(&device_id.to_string());
@@ -1092,7 +1113,8 @@ impl Account {
         .await?;
         self.settle_app(device_id).await?;
         if let Some(old) = replaces {
-            self.inner.api.delete_device(old).await?;
+            let notice = self.removal_notice_for(old).await?;
+            self.inner.api.delete_device(old, Some(notice)).await?;
             self.update_data(move |data| {
                 entry(data, "apps").remove(&old.to_string());
             })
@@ -1351,7 +1373,8 @@ impl Account {
         self.inner
             .shared
             .run(async move {
-                let removed = this.inner.api.delete_device(id).await;
+                let notice = this.removal_notice_for(id).await?;
+                let removed = this.inner.api.delete_device(id, Some(notice)).await;
                 if id == this.device_id() {
                     if let Err(error) = removed {
                         // A failed DELETE may or may not have revoked us. Only a
@@ -1371,6 +1394,36 @@ impl Account {
                 Ok(())
             })
             .await
+    }
+
+    /// The notice that makes `id` erase itself, keyed from the key it holds: this
+    /// device's own, an app's key from account data, or else the account key.
+    async fn removal_notice_for(&self, id: DeviceId) -> Result<[u8; 32], Error> {
+        let key = if id == self.device_id() {
+            self.derive_secret(keys::REMOVAL)?
+        } else {
+            let app_key = |data: Data| {
+                data.get("apps")?
+                    .get(id.to_string())?
+                    .get("key")?
+                    .as_str()
+                    .and_then(|key| URL_SAFE_NO_PAD.decode(key).ok())
+                    .map(Zeroizing::new)
+            };
+            // An app connected from another device may not be in this one's copy yet.
+            let mut found = self.cached_data().and_then(app_key);
+            if found.is_none() {
+                self.refresh_account_data().await?;
+                found = self.cached_data().and_then(app_key);
+            }
+            match found {
+                Some(app_key) => {
+                    bh_crypto::kdf(&Secret::<32>::from_slice(&app_key)?, keys::REMOVAL, 1)
+                }
+                None => self.derive_secret(keys::REMOVAL)?,
+            }
+        };
+        Ok(keys::removal_notice(&key, &self.inner.id, &id))
     }
 
     /// Synthetic app grants for Hero's access tests.
@@ -1423,6 +1476,85 @@ impl Account {
             .map(|data| device_name(&data, id))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| id.to_string())
+    }
+
+    /// True once the server refused this device without a removal notice from one of
+    /// the person's devices. Sync has stopped; the local copy and keys stay until the
+    /// person signs out. Not stored: after a restart the device tries again.
+    pub fn signed_out_by_server(&self) -> bool {
+        self.inner.signed_out_by_server.load(Ordering::SeqCst)
+    }
+
+    /// The server's `revoked` answer: erase only if `notice` is this device's own,
+    /// made with its key by one of the person's devices; otherwise stop syncing.
+    /// Decides before returning, so a caller that sees [`Error::Revoked`] can wait
+    /// for an erasure with [`Self::settle_removal`].
+    fn revoked(&self, notice: Option<&[u8]>) {
+        if self.inner.removal.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        let genuine = notice.is_some_and(|notice| {
+            self.derive_secret(keys::REMOVAL).is_ok_and(|key| {
+                let expected = keys::removal_notice(&key, &self.inner.id, &self.inner.device_id);
+                bh_crypto::constant_time_eq(&expected, notice)
+            })
+        });
+        let this = self.clone();
+        if genuine {
+            if self.begin_removal() {
+                self.inner.shared.handle.spawn(async move {
+                    let _ = this.finish_removal().await;
+                });
+            }
+        } else if !self.inner.signed_out_by_server.swap(true, Ordering::SeqCst) {
+            self.inner.shared.handle.spawn(async move {
+                this.stop_for_server().await;
+            });
+        }
+    }
+
+    /// Stops sync and the approvals listener, keeping every store and key.
+    async fn stop_for_server(&self) {
+        if let Some(task) = self.inner.stop_listener() {
+            let _ = task.await;
+        }
+        let bases: Vec<_> = self
+            .inner
+            .bases
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(BaseWeak::upgrade)
+            .collect();
+        // Hidden bases open under this gate, after checking the flag set above.
+        let _gate = self.inner.hidden_gate.lock().await;
+        let hidden: Vec<_> = self
+            .inner
+            .hidden
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for base in bases.into_iter().chain(hidden) {
+            base.set_sync_stopped();
+            base.stop_sync().await;
+        }
+        // Erasing meanwhile, at the person's request, says Removed instead.
+        if self.inner.removal.load(Ordering::SeqCst) == 0 {
+            let _ = self.inner.events.send(AccountEvent::SignedOutByServer);
+        }
+    }
+
+    /// Waits for an erasure that a removal notice started; returns at once otherwise.
+    ///
+    /// # Errors
+    /// Returns [`Error::Revoked`] if that erasure failed; it finishes at the next start.
+    pub async fn settle_removal(&self) -> Result<(), Error> {
+        if self.inner.removal.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        self.wait_for_removal().await
     }
 
     pub(crate) fn check_active(&self) -> Result<(), Error> {
@@ -1483,11 +1615,15 @@ impl Account {
         )?;
         base.set_full(self.kind() == DeviceKind::Full);
         self.attach_version_names(&base);
-        base.start_sync(
-            self.inner.api.clone(),
-            &self.inner.shared.handle,
-            self.inner.shared.clock.clone(),
-        );
+        if self.signed_out_by_server() {
+            base.set_sync_stopped();
+        } else {
+            base.start_sync(
+                self.inner.api.clone(),
+                &self.inner.shared.handle,
+                self.inner.shared.clock.clone(),
+            );
+        }
         open.insert(id, base.downgrade());
         Ok(base)
     }
@@ -1518,11 +1654,15 @@ impl Account {
         base.set_removal(self.inner.removal.clone());
         base.set_full(self.kind() == DeviceKind::Full);
         self.attach_version_names(&base);
-        base.start_sync(
-            self.inner.api.clone(),
-            &self.inner.shared.handle,
-            self.inner.shared.clock.clone(),
-        );
+        if self.signed_out_by_server() {
+            base.set_sync_stopped();
+        } else {
+            base.start_sync(
+                self.inner.api.clone(),
+                &self.inner.shared.handle,
+                self.inner.shared.clock.clone(),
+            );
+        }
         self.inner.hidden.lock().unwrap().insert(id, base.clone());
         Ok(base)
     }
@@ -1860,32 +2000,46 @@ impl Account {
     /// Returns [`Error::Storage`] if local erasure fails, or [`Error::Revoked`]
     /// after an earlier erasure failed.
     pub async fn sign_out(&self) -> Result<(), Error> {
+        if !self.begin_removal() {
+            return self.wait_for_removal().await;
+        }
+        self.finish_removal().await
+    }
+
+    /// Starts erasing: blocks writes and takes the account off the list. False if
+    /// an erasure already started.
+    fn begin_removal(&self) -> bool {
         // Serialize the transition with base(): a base must not start sync
         // after we've collected the tasks to stop.
+        let _bases = self.inner.bases.lock().unwrap();
+        if self
+            .inner
+            .removal
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
-            let _bases = self.inner.bases.lock().unwrap();
-            if self
-                .inner
-                .removal
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                drop(_bases);
-                loop {
-                    let notified = self.inner.removal_done.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    match self.inner.removal.load(Ordering::SeqCst) {
-                        1 => notified.await,
-                        2 => return Ok(()),
-                        _ => return Err(Error::Revoked),
-                    }
-                }
-            }
-            if let Some(accounts) = self.inner.shared.accounts.lock().unwrap().upgrade() {
-                accounts.lock().unwrap().remove(&self.inner.id);
+            return false;
+        }
+        if let Some(accounts) = self.inner.shared.accounts.lock().unwrap().upgrade() {
+            accounts.lock().unwrap().remove(&self.inner.id);
+        }
+        true
+    }
+
+    async fn wait_for_removal(&self) -> Result<(), Error> {
+        loop {
+            let notified = self.inner.removal_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.inner.removal.load(Ordering::SeqCst) {
+                1 => notified.await,
+                2 => return Ok(()),
+                _ => return Err(Error::Revoked),
             }
         }
+    }
+
+    async fn finish_removal(&self) -> Result<(), Error> {
         let result = self.erase_local().await;
         self.inner
             .removal
@@ -2593,13 +2747,13 @@ impl Account {
                 }
                 let record = this.inner.api.account().await?;
                 this.cache_envelope(&record.account_key_envelope.0)?;
-                match record.data {
-                    Some(sealed) => {
-                        let data = this.open_data(&sealed.ciphertext.0)?;
-                        this.cache(sealed.version, &data)
-                    }
-                    None => this.cache(0, &new_data()),
+                let (version, data, versioned) = this.accept_data(record.data.as_ref())?;
+                // Older-format data is rewritten with its version sealed in. If
+                // that fails, the next read tries again.
+                if record.data.is_some() && !versioned {
+                    let _ = this.write_data(version, &data).await;
                 }
+                Ok(())
             })
             .await
     }
@@ -2616,14 +2770,7 @@ impl Account {
             .shared
             .run(async move {
                 let response = this.inner.api.account().await?;
-                let data = match &response.data {
-                    Some(sealed) => {
-                        let data = this.open_data(&sealed.ciphertext.0)?;
-                        this.cache(sealed.version, &data)?;
-                        data
-                    }
-                    None => new_data(),
-                };
+                let (_, data, _) = this.accept_data(response.data.as_ref())?;
                 Ok(response
                     .devices
                     .into_iter()
@@ -2881,54 +3028,81 @@ impl Account {
             let record = api.account().await?;
             let hash = envelope_hash(&record.account_key_envelope.0);
             self.db().set_envelope_hash(&hash)?;
-            let (version, mut data) = match record.data {
-                Some(sealed) => (sealed.version, self.open_data(&sealed.ciphertext.0)?),
-                None => (0, new_data()),
-            };
+            let (version, mut data, _) = self.accept_data(record.data.as_ref())?;
             if !edit(&mut data, &hash) {
                 return Ok(());
             }
-            let json = Zeroizing::new(serde_json::to_vec(&data).expect("JSON map"));
-            let ciphertext = envelope::seal(
-                &keys::account_data_key(&self.account_key()?),
-                &keys::account_data_aad(&self.inner.id),
-                &json,
-            );
-            match api
-                .put_account_data(&AccountDataRequest {
-                    ciphertext: Bytes(ciphertext),
-                    expected_version: version,
-                })
-                .await
-            {
-                Ok(response) => return self.cache(response.version, &data),
+            match self.write_data(version, &data).await {
                 Err(Error::Conflict(code)) if code == "version_conflict" => continue,
-                Err(e) => return Err(e),
+                result => return result,
             }
         }
         Err(Error::Conflict("version_conflict".into()))
+    }
+
+    /// Seals `data` as the version after `expected` and stores it if the
+    /// server is still at `expected`.
+    async fn write_data(&self, expected: u64, data: &Data) -> Result<(), Error> {
+        let version = expected.checked_add(1).ok_or(Error::Crypto)?;
+        let json = Zeroizing::new(serde_json::to_vec(data).expect("JSON map"));
+        let ciphertext = envelope::seal(
+            &keys::account_data_key(&self.account_key()?),
+            &keys::account_data_aad(&self.inner.id, data_epoch(version)?),
+            &json,
+        );
+        self.inner
+            .api
+            .put_account_data(&AccountDataRequest {
+                ciphertext: Bytes(ciphertext),
+                expected_version: expected,
+            })
+            .await?;
+        // This device has seen the version it sealed, whatever the reply says.
+        self.cache(version, data, version > 1)
     }
 
     fn cache_envelope(&self, envelope: &[u8]) -> Result<(), Error> {
         self.db().set_envelope_hash(&envelope_hash(envelope))
     }
 
-    fn open_data(&self, ciphertext: &[u8]) -> Result<Data, Error> {
+    /// Opens the server's account data and caches it, returning its version,
+    /// contents and whether that version was sealed in. Data older than this
+    /// device has seen, or sealed as another version, is [`Error::Crypto`].
+    fn accept_data(&self, sealed: Option<&AccountData>) -> Result<(u64, Data, bool), Error> {
+        let Some(sealed) = sealed else {
+            let data = new_data();
+            self.cache(0, &data, false)?;
+            return Ok((0, data, false));
+        };
+        let epoch = data_epoch(sealed.version)?;
+        let (seen, latched) = self.db().account_data_seen()?.unwrap_or((0, false));
+        if sealed.version < seen {
+            return Err(Error::Crypto);
+        }
+        // Data from before versions were sealed has epoch 1, as has version 1.
+        // It's accepted only until this device has seen a later version sealed.
+        let older_format = envelope::epoch(&sealed.ciphertext.0) == Some(1);
+        if older_format && latched {
+            return Err(Error::Crypto);
+        }
         let json = Zeroizing::new(envelope::open(
             &keys::account_data_key(&self.account_key()?),
-            &keys::account_data_aad(&self.inner.id),
-            ciphertext,
+            &keys::account_data_aad(&self.inner.id, if older_format { 1 } else { epoch }),
+            &sealed.ciphertext.0,
         )?);
-        parse_data(&json)
+        let data = parse_data(&json)?;
+        self.cache(sealed.version, &data, !older_format)?;
+        Ok((sealed.version, data, !older_format))
     }
 
-    fn cache(&self, version: u64, data: &Data) -> Result<(), Error> {
+    /// Caches opened account data; the store refuses it if it's older than
+    /// what this device has already seen.
+    fn cache(&self, version: u64, data: &Data, versioned: bool) -> Result<(), Error> {
         let json = Zeroizing::new(serde_json::to_string(data).expect("JSON map"));
-        self.inner
-            .db
-            .lock()
-            .unwrap()
-            .set_account_data(version, &json)
+        match self.db().accept_account_data(version, &json, versioned)? {
+            true => Ok(()),
+            false => Err(Error::Crypto),
+        }
     }
 
     fn account_key(&self) -> Result<Secret<32>, Error> {
@@ -3221,8 +3395,234 @@ mod tests {
         let (version, _) = full.db().account_data().unwrap().unwrap();
         assert!(version > 0);
         // A GET started before the grant must not replace its newer cached readers.
-        full.cache(version - 1, &new_data()).unwrap();
+        assert_eq!(
+            full.cache(version - 1, &new_data(), true).unwrap_err(),
+            Error::Crypto
+        );
         assert_eq!(full.app_readers(granted), [device].into());
+    }
+
+    async fn signed_up(dir: &std::path::Path) -> (Account, RecoveryKit) {
+        let server = LocalServer::from_env();
+        core(dir)
+            .sign_up(SignUp {
+                server: server.url(),
+                invite: invite(server),
+                email: format!("{}@example.test", AccountId::random()),
+                password: Zeroizing::new(PASSWORD.into()),
+                device_name: "first".into(),
+            })
+            .await
+            .unwrap()
+    }
+
+    fn set(key: &'static str) -> impl Fn(&mut Data) + Send + 'static {
+        move |data| {
+            data.insert(key.into(), json!(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn account_data_older_than_this_device_has_seen_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (full, _) = signed_up(tmp.path()).await;
+        full.update_data(set("first")).await.unwrap();
+        let older = full.inner.api.account().await.unwrap().data.unwrap();
+        full.update_data(set("second")).await.unwrap();
+        assert_eq!(full.accept_data(Some(&older)).unwrap_err(), Error::Crypto);
+        assert_eq!(full.accept_data(None).unwrap_err(), Error::Crypto);
+        // The same blob under a higher number doesn't open either.
+        let relabelled = AccountData {
+            version: older.version + 2,
+            ..older
+        };
+        assert_eq!(
+            full.accept_data(Some(&relabelled)).unwrap_err(),
+            Error::Crypto
+        );
+    }
+
+    /// Seals `data` at `version` and stores it as the server's next version.
+    async fn put_versioned(full: &Account, data: &Data, version: u64) {
+        let ciphertext = envelope::seal(
+            &keys::account_data_key(&full.account_key().unwrap()),
+            &keys::account_data_aad(&full.inner.id, version as u32),
+            &serde_json::to_vec(data).unwrap(),
+        );
+        full.inner
+            .api
+            .put_account_data(&AccountDataRequest {
+                ciphertext: Bytes(ciphertext),
+                expected_version: version - 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_read_before_an_edit_raises_the_floor_even_without_a_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (full, _) = signed_up(tmp.path()).await;
+        full.update_data(set("baseline")).await.unwrap();
+        let old = full.inner.api.account().await.unwrap().data.unwrap();
+        put_versioned(&full, &full.cached_data().unwrap(), old.version + 1).await;
+        full.update_data_with_envelope(|_, _| false).await.unwrap();
+        assert_eq!(full.accept_data(Some(&old)).unwrap_err(), Error::Crypto);
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_lost_write_keeps_the_floor_of_the_read_before_it() {
+        for lost_reply in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (full, _) = signed_up(tmp.path()).await;
+            full.update_data(set("baseline")).await.unwrap();
+            let old = full.inner.api.account().await.unwrap().data.unwrap();
+            put_versioned(&full, &full.cached_data().unwrap(), old.version + 1).await;
+            full.test_inject_fault(crate::client::Fault {
+                method: "PUT",
+                path: "v1/account/data",
+                lost_reply,
+                times: 1,
+            });
+            assert!(matches!(
+                full.update_data(set("edit")).await,
+                Err(Error::Network(_))
+            ));
+            assert_eq!(full.accept_data(Some(&old)).unwrap_err(), Error::Crypto);
+            // The floor is what the device read, never above the server.
+            full.refresh_account_data().await.unwrap();
+            assert_eq!(full.cached_data().unwrap().contains_key("edit"), lost_reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_data_at_the_cached_version_closes_the_older_format_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (full, _) = signed_up(tmp.path()).await;
+        let legacy = full.inner.api.account().await.unwrap().data.unwrap();
+        let mut data = full.cached_data().unwrap();
+        let version = legacy.version + 1;
+        // An older-format reply labelled `version` was cached; its rewrite failed.
+        full.cache(version, &data, false).unwrap();
+        data.insert("current".into(), json!(true));
+        let authenticated = AccountData {
+            version,
+            ciphertext: Bytes(envelope::seal(
+                &keys::account_data_key(&full.account_key().unwrap()),
+                &keys::account_data_aad(&full.inner.id, version as u32),
+                &serde_json::to_vec(&data).unwrap(),
+            )),
+        };
+        let (_, _, versioned) = full.accept_data(Some(&authenticated)).unwrap();
+        assert!(versioned);
+        assert_eq!(full.cached_data().unwrap()["current"], json!(true));
+        let replay = AccountData {
+            version: version + 1,
+            ..legacy
+        };
+        assert_eq!(full.accept_data(Some(&replay)).unwrap_err(), Error::Crypto);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_version_is_refused_without_touching_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (full, _) = signed_up(tmp.path()).await;
+        let legacy = full.inner.api.account().await.unwrap().data.unwrap();
+        let before = full.db().account_data_seen().unwrap();
+        let oversized = AccountData {
+            version: u64::from(u32::MAX) + 1,
+            ..legacy
+        };
+        assert_eq!(
+            full.accept_data(Some(&oversized)).unwrap_err(),
+            Error::Crypto
+        );
+        assert_eq!(full.db().account_data_seen().unwrap(), before);
+        assert_eq!(
+            full.write_data(u64::MAX, &new_data()).await.unwrap_err(),
+            Error::Crypto
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_from_two_full_devices_both_land() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, kit) = signed_up(&tmp.path().join("a")).await;
+        let b = core(&tmp.path().join("b"))
+            .sign_in(SignIn {
+                server: LocalServer::from_env().url(),
+                email: a.email(),
+                password: Zeroizing::new(PASSWORD.into()),
+                device_name: "second".into(),
+            })
+            .await
+            .unwrap()
+            .with_kit(&kit.display())
+            .await
+            .unwrap();
+        let path = "v1/account/data";
+        let puts = || a.test_request_count(path) + b.test_request_count(path);
+        let before = puts();
+        for (x, y) in [("a1", "b1"), ("a2", "b2"), ("a3", "b3")] {
+            let (ra, rb) = tokio::join!(a.update_data(set(x)), b.update_data(set(y)));
+            ra.unwrap();
+            rb.unwrap();
+        }
+        // Each round's second write lost the race and was sealed again.
+        assert!(puts() - before > 6, "no version_conflict was retried");
+        b.refresh_account_data().await.unwrap();
+        a.refresh_account_data().await.unwrap();
+        for device in [&a, &b] {
+            let data = device.cached_data().unwrap();
+            for key in ["a1", "b1", "a2", "b2", "a3", "b3"] {
+                assert_eq!(data[key], json!(true), "{key}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn older_format_account_data_is_read_once_then_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (full, _) = signed_up(tmp.path()).await;
+        let record = full.inner.api.account().await.unwrap();
+        let current = record.data.map_or(0, |d| d.version);
+        // An app from before this change seals every version as epoch 1.
+        let mut data = full.cached_data().unwrap();
+        data.insert("old".into(), json!(true));
+        let legacy = envelope::seal(
+            &keys::account_data_key(&full.account_key().unwrap()),
+            &keys::account_data_aad(&full.inner.id, 1),
+            &serde_json::to_vec(&data).unwrap(),
+        );
+        let put = |expected| AccountDataRequest {
+            ciphertext: Bytes(legacy.clone()),
+            expected_version: expected,
+        };
+        full.inner
+            .api
+            .put_account_data(&put(current))
+            .await
+            .unwrap();
+
+        full.refresh_account_data().await.unwrap();
+        assert_eq!(full.cached_data().unwrap()["old"], json!(true));
+        let rewritten = full.inner.api.account().await.unwrap().data.unwrap();
+        assert_eq!(rewritten.version, current + 2);
+        assert!(
+            envelope::open(
+                &keys::account_data_key(&full.account_key().unwrap()),
+                &keys::account_data_aad(&full.inner.id, rewritten.version as u32),
+                &rewritten.ciphertext.0,
+            )
+            .is_ok()
+        );
+        // Once a device has read the new format, an older-format blob is a replay.
+        full.inner
+            .api
+            .put_account_data(&put(rewritten.version))
+            .await
+            .unwrap();
+        assert_eq!(full.refresh_account_data().await, Err(Error::Crypto));
     }
 
     #[tokio::test]

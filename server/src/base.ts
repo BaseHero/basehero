@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import type { LiveMessage } from './proto/gen/LiveMessage';
 import type { BaseKeyResponse } from './proto/gen/BaseKeyResponse';
 import type { ChangeResult } from './proto/gen/ChangeResult';
 import type { ChangesResponse } from './proto/gen/ChangesResponse';
@@ -118,22 +119,24 @@ export class BaseDO extends DurableObject<Env> {
     return { status: 200, body: {} };
   }
   /** A removed account device may still have an open socket on this base. */
-  closeDevice(deviceId: string, removed = false): void {
+  closeDevice(deviceId: string, removed = false, notice: string | null = null): void {
     if (this.failNextDeviceClose) {
       this.failNextDeviceClose = false;
       throw new Error('test closeDevice failure');
     }
+    const revoked: LiveMessage = { t: 'revoked', ...(notice ? { notice } : {}) };
+    const message = JSON.stringify(revoked);
     if (removed) this.sql.exec('INSERT OR IGNORE INTO removed_devices VALUES (?)', deviceId);
     for (const ws of this.ctx.getWebSockets(`dev:${deviceId}`)) {
       try {
-        if (removed) ws.send(JSON.stringify({ t: 'revoked' }));
+        if (removed) ws.send(message);
         ws.close(4001, 'revoked');
       } catch { /* already closed */ }
     }
     // Full devices also have sockets opened before principal tags were added.
     for (const ws of this.ctx.getWebSockets(deviceId)) {
       try {
-        if (removed) ws.send(JSON.stringify({ t: 'revoked' }));
+        if (removed) ws.send(message);
         ws.close(4001, 'revoked');
       } catch { /* already closed */ }
     }

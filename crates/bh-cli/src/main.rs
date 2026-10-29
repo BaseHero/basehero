@@ -524,13 +524,27 @@ async fn execute(cli: &Cli) -> Result<Value> {
     } else {
         execute_command(core.clone(), cli).await
     };
-    // A refused request starts erasing a removed device's copy in the background.
-    // Finish it before the core stops, or the copy outlives every run.
-    if let (Some(account), Err(error)) = (&current, &result)
-        && matches!(error.downcast_ref::<Error>(), Some(Error::Revoked))
-    {
-        let _ = account.sign_out().await;
-    }
+    // A removal notice starts erasing a removed device's copy in the background.
+    // Finish it before the core stops, or the copy outlives every run. Without
+    // one, the server alone signed this device out, and the copy stays.
+    let result = match (&current, result) {
+        (Some(account), Err(error))
+            if matches!(error.downcast_ref::<Error>(), Some(Error::Revoked)) =>
+        {
+            let _ = account.settle_removal().await;
+            if account.signed_out_by_server() {
+                Err(format!(
+                    "the server signed this device out, but none of your devices removed it; \
+                     its copy is kept. To erase it: bh device remove {}",
+                    account.device_id()
+                )
+                .into())
+            } else {
+                Err(error)
+            }
+        }
+        (_, result) => result,
+    };
     if let Some(account) = unlocked {
         account.lock_all_hidden().await;
     }

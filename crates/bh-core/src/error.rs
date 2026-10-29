@@ -33,6 +33,8 @@ pub enum Error {
     Conflict(String),
     /// The request or local change exceeds its size limit.
     TooLarge,
+    /// Account storage has reached its server-side limit.
+    StorageFull,
     /// A request limit has been reached.
     RateLimited,
     /// A newer core is needed to read this data.
@@ -87,6 +89,7 @@ impl fmt::Display for Error {
             Self::NothingUnlocked => f.write_str("no hidden bases unlocked"),
             Self::Conflict(code) => write!(f, "conflict: {code}"),
             Self::TooLarge => f.write_str("too large"),
+            Self::StorageFull => f.write_str("account storage is full"),
             Self::RateLimited => f.write_str("too many attempts"),
             Self::NeedsUpdate => f.write_str("a newer version of BaseHero is needed"),
             Self::Invalid(m) => write!(f, "invalid: {m}"),

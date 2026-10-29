@@ -1,5 +1,5 @@
 import type { Env, Principal, Result } from './http';
-import { answer, HttpError, id, json, requireDevice } from './http';
+import { accountStub, answer, HttpError, id, json, limitedBytes, requireDevice } from './http';
 
 const FILE_PART_SEALED_MAX = 4_194_304 + 45;
 type BaseRpc = { fileAccess(p: Principal, write: boolean): Promise<Result> };
@@ -27,21 +27,23 @@ export async function handleFiles(request: Request, env: Env, baseId: string, ob
   const length = request.headers.get('Content-Length');
   if (length === null || !/^(0|[1-9]\d*)$/.test(length)) throw new HttpError(400, 'bad_request');
   if (Number(length) > FILE_PART_SEALED_MAX) throw new HttpError(413, 'too_large');
-  const bytes = await request.arrayBuffer();
+  const bytes = await limitedBytes(request, FILE_PART_SEALED_MAX);
   if (bytes.byteLength !== Number(length)) throw new HttpError(400, 'bad_request');
+  if (!await accountStub(env, principal.accountId).reserveStorage(bytes.byteLength)) {
+    throw new HttpError(413, 'storage_limit');
+  }
   const written = await env.FILES.put(key, bytes, { onlyIf: { etagDoesNotMatch: '*' } });
   if (!written) {
     // A retry of the same bytes succeeds, so a client whose reply was lost can
     // tell; different bytes never replace a part.
     const existing = await env.FILES.get(key);
     const stored = existing && new Uint8Array(await existing.arrayBuffer());
-    const sent = new Uint8Array(bytes);
+    const sent = bytes;
     if (!stored || stored.length !== sent.length || stored.some((b, i) => b !== sent[i])) {
       throw new HttpError(409, 'exists');
     }
   }
-  // Known limits: parts count against the change rate, but nothing caps an
-  // account's total storage yet. Parts are never deleted, so deleting a file
-  // does not free its storage.
+  // Parts count against the change rate. Parts are never deleted, so deleting
+  // a file does not free its storage.
   return json({});
 }

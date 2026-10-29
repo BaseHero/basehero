@@ -213,6 +213,8 @@ const ACCOUNT_MIGRATIONS: &[&str] = &[
         wrapper BLOB NOT NULL
     );",
     "CREATE TABLE credential_envelope (id INTEGER PRIMARY KEY CHECK (id = 1), hash TEXT NOT NULL);",
+    // Whether the cached account data was sealed with its version.
+    "ALTER TABLE account_data ADD COLUMN versioned INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// A base this device may open: its key as the server's wrapper, which only
@@ -299,6 +301,18 @@ impl AccountDb {
             .optional()?)
     }
 
+    /// The cached account data's version, and whether it was sealed with it.
+    pub(crate) fn account_data_seen(&self) -> Result<Option<(u64, bool)>, Error> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT version, versioned FROM account_data WHERE id = 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// The last fetched credential envelope's SHA-256, independent of account-data version.
     pub(crate) fn envelope_hash(&self) -> Result<Option<String>, Error> {
         Ok(self
@@ -328,14 +342,41 @@ impl AccountDb {
         )? == 1)
     }
 
-    pub(crate) fn set_account_data(&self, version: u64, json: &str) -> Result<(), Error> {
-        self.0.execute(
-            "INSERT INTO account_data (id, version, json) VALUES (1, ?, ?)
-             ON CONFLICT (id) DO UPDATE SET version = excluded.version, json = excluded.json
-             WHERE excluded.version > account_data.version",
-            params![version as i64, json],
-        )?;
-        Ok(())
+    /// Caches account data this device has opened, unless it's older than the
+    /// cached version, or in the older format once a versioned one was cached.
+    /// Versioned data replaces older-format data of the same version. Returns
+    /// whether it was accepted.
+    pub(crate) fn accept_account_data(
+        &mut self,
+        version: u64,
+        json: &str,
+        versioned: bool,
+    ) -> Result<bool, Error> {
+        let version = i64::try_from(version).map_err(|_| Error::Crypto)?;
+        let tx = self.0.transaction()?;
+        let seen: Option<(i64, bool)> = tx
+            .query_row(
+                "SELECT version, versioned FROM account_data WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let replace = match seen {
+            Some((seen, latched)) if version < seen || (latched && !versioned) => {
+                return Ok(false);
+            }
+            Some((seen, latched)) => version > seen || (versioned && !latched),
+            None => true,
+        };
+        if replace {
+            tx.execute(
+                "INSERT OR REPLACE INTO account_data (id, version, json, versioned)
+                 VALUES (1, ?, ?, ?)",
+                params![version, json, versioned],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Adds a base or updates its key and mode.
@@ -1511,8 +1552,8 @@ mod tests {
     fn the_account_database_is_encrypted_and_needs_its_key() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a/account.sqlite");
-        let db = AccountDb::open(&path, &[1; 32]).unwrap();
-        db.set_account_data(3, "{\"marker\":\"plain-marker\"}")
+        let mut db = AccountDb::open(&path, &[1; 32]).unwrap();
+        db.accept_account_data(3, "{\"marker\":\"plain-marker\"}", true)
             .unwrap();
         drop(db);
         let raw = std::fs::read(&path).unwrap();
@@ -1524,24 +1565,25 @@ mod tests {
         ));
         let db = AccountDb::open(&path, &[1; 32]).unwrap();
         assert_eq!(db.account_data().unwrap().unwrap().0, 3);
+        assert_eq!(db.account_data_seen().unwrap(), Some((3, true)));
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
     fn older_account_response_cannot_replace_current_app_readers() {
         let tmp = tempfile::tempdir().unwrap();
-        let db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        let mut db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
         let current = r#"{"apps":{"reader":{"bases":{"health":"ro"}}}}"#;
         let older = r#"{"apps":{}}"#;
-        db.set_account_data(2, current).unwrap();
-        db.set_account_data(1, older).unwrap();
+        db.accept_account_data(2, current, true).unwrap();
+        assert!(!db.accept_account_data(1, older, true).unwrap());
         let (version, json) = db.account_data().unwrap().unwrap();
         assert_eq!(version, 2);
         assert_eq!(json.as_str(), current);
-        db.set_account_data(2, older).unwrap();
+        db.accept_account_data(2, older, true).unwrap();
         assert_eq!(db.account_data().unwrap().unwrap().1.as_str(), current);
     }
 
@@ -1567,7 +1609,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1585,7 +1627,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1650,6 +1692,42 @@ mod tests {
     }
 
     #[test]
+    fn accepting_account_data_keeps_the_floor_and_the_versioned_latch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        assert!(db.accept_account_data(2, "{\"n\":2}", false).unwrap());
+        // The same version, now sealed with its version, replaces the older format.
+        assert!(db.accept_account_data(2, "{\"n\":\"2v\"}", true).unwrap());
+        assert_eq!(
+            db.account_data().unwrap().unwrap().1.as_str(),
+            "{\"n\":\"2v\"}"
+        );
+        // A late older-format commit can't clear the latch or move the floor.
+        assert!(!db.accept_account_data(3, "{\"n\":3}", false).unwrap());
+        assert!(!db.accept_account_data(1, "{\"n\":1}", true).unwrap());
+        assert_eq!(db.account_data_seen().unwrap(), Some((2, true)));
+        assert!(db.accept_account_data(3, "{\"n\":3}", true).unwrap());
+        assert_eq!(db.account_data_seen().unwrap(), Some((3, true)));
+    }
+
+    #[test]
+    fn cached_account_data_from_before_sealed_versions_is_not_marked_versioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("account.sqlite");
+        let mut connection = open_encrypted(&path, &[1; 32]).unwrap();
+        migrate(&mut connection, &ACCOUNT_MIGRATIONS[..5]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_data (id, version, json) VALUES (1, 7, '{}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let db = AccountDb::open(&path, &[1; 32]).unwrap();
+        assert_eq!(db.account_data_seen().unwrap(), Some((7, false)));
+    }
+
+    #[test]
     fn old_account_database_migrates_to_answered_commitments() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("account.sqlite");
@@ -1665,7 +1743,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let count: u32 =
             db.0.query_row("SELECT count(*) FROM approvals_answered", [], |r| r.get(0))
                 .unwrap();

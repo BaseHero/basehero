@@ -314,6 +314,64 @@ async fn large_bodies_round_trip_through_r2() {
 }
 
 #[tokio::test]
+async fn production_disables_test_routes_even_with_bypass_secret() {
+    local_only!();
+    let s = LocalServer::start_with_vars(&[("BH_ENV", "production"), ("ALLOW_TEST_BYPASS", "1")]);
+    let (status, body) = bh_testkit::send(
+        &s,
+        reqwest::Method::POST,
+        &format!("/v1/admin/test/legacy-usage?account={}", random_id()),
+        json!({}),
+        Some(s.operator_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = bh_testkit::send(
+        &s,
+        reqwest::Method::GET,
+        &format!("/v1/admin/usage?account={}", random_id()),
+        json!({}),
+        Some(s.operator_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let owner = RawAccount::signup(&s).await;
+    let (status, body) = owner
+        .full
+        .post(
+            "/v1/devices/test-last-seen",
+            json!({"deviceId": owner.full.device_id, "lastSeenAt": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn oversized_json_body_is_limited_by_actual_bytes() {
+    let s = LocalServer::from_env();
+    let stream =
+        futures_util::stream::iter((0..3).map(|_| Ok::<_, std::io::Error>(vec![b' '; MIB])));
+    let client = reqwest::Client::new();
+    let request = client
+        .post(s.url().join("/v1/login/params").unwrap())
+        .header("BH-Protocol", "1")
+        .body(reqwest::Body::wrap_stream(stream))
+        .build()
+        .unwrap();
+    assert!(
+        !request
+            .headers()
+            .contains_key(reqwest::header::CONTENT_LENGTH)
+    );
+    let response = client.execute(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "too_large"
+    );
+}
+
+#[tokio::test]
 async fn oversized_bodies_and_fetches_are_refused() {
     let s = LocalServer::from_env();
     let base = Base::new(s).await;

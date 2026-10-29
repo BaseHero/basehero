@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './http';
+import { testMode } from './http';
 
 export type UsageDay = { day: string; requests: number; prompt: number; completion: number; costUsd: number; missing: number };
 export type DayTotals = { day: string; requests: number; prompt: number; completion: number; costMicroUsd: number; missing: number };
@@ -10,7 +11,7 @@ export type Limits = { perMinute: number; perDay: number; dailyCostMicroUsd: num
 
 function day(now: number): string { return new Date(now).toISOString().slice(0, 10); }
 function gatewayNow(env: Env): number {
-  return env.ALLOW_TEST_BYPASS === '1' && env.GATEWAY_NOW_MS !== undefined
+  return testMode(env) && env.GATEWAY_NOW_MS !== undefined
     ? Number(env.GATEWAY_NOW_MS) : Date.now();
 }
 
@@ -77,7 +78,7 @@ export class GatewayDO extends DurableObject<Env> {
   }
   /** Test-only simulation of a pre-breakdown day. */
   seedLegacyDay(): void {
-    if (this.env.ALLOW_TEST_BYPASS !== '1') throw new Error('unavailable');
+    if (!testMode(this.env)) throw new Error('unavailable');
     this.ctx.storage.sql.exec('INSERT INTO days (day, requests, prompt, completion, cost_micro_usd, missing) VALUES (?, 2, 10, 5, 101, 1)', day(gatewayNow(this.env)));
   }
   breakdown(): Breakdown[] {

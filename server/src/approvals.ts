@@ -6,7 +6,7 @@ import type { ApprovalKind } from './proto/gen/ApprovalKind';
 import type { ApprovalState } from './proto/gen/ApprovalState';
 import type { ApprovalStateResponse } from './proto/gen/ApprovalStateResponse';
 import type { Env, Principal, Result } from './http';
-import { accountStub, answer, body, bytes, equal, fail, HttpError, id, requireDevice, str } from './http';
+import { accountStub, answer, body, bytes, equal, fail, HttpError, id, requireDevice, revoked, str } from './http';
 
 /** Each exchange message is at most this many bytes. */
 const MESSAGE_MAX = 4096;
@@ -98,9 +98,9 @@ export class Approvals {
   }
   /** The Worker authenticated earlier; its principal may have changed before this RPC. */
   private current(p: Principal): Principal | Result<never> {
-    const device = this.sql.exec<{ kind: Principal['kind']; status: string }>('SELECT kind, status FROM devices WHERE device_id = ?', p.deviceId).toArray()[0];
+    const device = this.sql.exec<{ kind: Principal['kind']; status: string; removal_notice: string | null }>('SELECT kind, status, removal_notice FROM devices WHERE device_id = ?', p.deviceId).toArray()[0];
     if (!device) return fail(401, 'unauthorized');
-    if (device.status === 'revoked') return fail(401, 'revoked');
+    if (device.status === 'revoked') return revoked(device.removal_notice);
     return { ...p, kind: device.kind, status: device.status };
   }
   private full(p: Principal): boolean { return p.kind === 'full' && p.status === 'active'; }

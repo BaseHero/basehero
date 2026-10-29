@@ -154,13 +154,14 @@ pub(crate) fn account_key_aad(account: &bh_proto::AccountId) -> Aad {
     }
 }
 
-/// The associated data of sealed account data.
-pub(crate) fn account_data_aad(account: &bh_proto::AccountId) -> Aad {
+/// The associated data of account data at `version`, which is its epoch.
+/// Data sealed before the version was bound used epoch 1 for every version.
+pub(crate) fn account_data_aad(account: &bh_proto::AccountId, version: u32) -> Aad {
     Aad {
         purpose: Purpose::AccountData,
         base: [0; 16],
         object: account.0,
-        epoch: 1,
+        epoch: version,
     }
 }
 
@@ -172,6 +173,20 @@ pub(crate) fn activation(account_key: &Secret<32>) -> Secret<32> {
 /// `kdf(AK, "bhacdat1", 1)`, which seals account data.
 pub(crate) fn account_data_key(account_key: &Secret<32>) -> Secret<32> {
     bh_crypto::kdf(account_key, b"bhacdat1", 1)
+}
+
+/// Context of `kdf(K, "bhremov1", 1)`, the key of a removal notice, where K is the
+/// removed device's own key: the account key on a full device, its app key on an app.
+pub(crate) const REMOVAL: &[u8; 8] = b"bhremov1";
+
+/// `generichash(key = kdf(K, "bhremov1", 1), accountId ‖ deviceId)`: what a person's
+/// device sends when it removes `device`, so the removed device erases itself.
+pub(crate) fn removal_notice(
+    removal_key: &Secret<32>,
+    account: &bh_proto::AccountId,
+    device: &bh_proto::DeviceId,
+) -> [u8; 32] {
+    bh_crypto::generichash(Some(removal_key.expose()), &[&account.0, &device.0])
 }
 
 /// The associated data of an account's base key wrapper.

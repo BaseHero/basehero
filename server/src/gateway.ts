@@ -1,4 +1,4 @@
-import { answer, error, id, requireDevice } from './http';
+import { answer, error, id, requireDevice, testMode } from './http';
 import type { Env, Principal, Result } from './http';
 import { post } from './http1';
 import type { Http1Response, Target } from './http1';
@@ -40,7 +40,7 @@ function parseUsage(value: string | null): Usage | null {
 /** Tinfoil, or a loopback test upstream over plain TCP when the test bypass allows it; null if misconfigured. */
 function upstreamTarget(env: Env): Target | null {
   if (env.TINFOIL_CONNECT === undefined) return TINFOIL;
-  if (env.ALLOW_TEST_BYPASS !== '1') return null;
+  if (!testMode(env)) return null;
   const match = /^(127\.0\.0\.1|\[::1\]|localhost):(\d{1,5})$/.exec(env.TINFOIL_CONNECT);
   const port = Number(match?.[2]);
   if (!match || port < 1 || port > 65535) return null;

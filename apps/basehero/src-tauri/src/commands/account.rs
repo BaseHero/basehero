@@ -38,6 +38,7 @@ pub async fn sign_up(state: &AppState, form: SignUpForm) -> Result<SignedUp, Com
         id,
         email: account.email(),
         kind: account.kind(),
+        signed_out_by_server: account.signed_out_by_server(),
     };
     let _ = state.listen(id);
     // If the account-data write failed, this one-time displayed kit cannot

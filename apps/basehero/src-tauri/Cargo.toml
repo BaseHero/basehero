@@ -41,6 +41,8 @@ ndk-context = "0.1.1"
 rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
+tauri = { version = "2.12", features = ["macos-private-api", "test"] }
+tauri-plugin-updater = "2"
 tempfile = "3"
 bh-testkit = { path = "../../../crates/bh-testkit" }
 yrs = "0.28"

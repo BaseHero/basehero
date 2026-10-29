@@ -806,6 +806,70 @@ fn device_remove_revokes_the_other_home_and_erases_its_copy() {
     );
 }
 
+#[tokio::test]
+async fn a_device_the_server_revokes_without_a_notice_keeps_its_copy() {
+    let server = LocalServer::start();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let signup = enrolled(&server, a.path(), "server-revoke-cli@example.com");
+    let account = signup["accountId"].as_str().unwrap();
+    let url = server.url().to_string();
+    let signed = run(
+        b.path(),
+        &[
+            "signin",
+            "--server",
+            &url,
+            "--email",
+            "server-revoke-cli@example.com",
+            "--name",
+            "Other",
+            "--kit",
+            signup["kit"].as_str().unwrap(),
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let device = signed["deviceId"].as_str().unwrap();
+    // What a hostile server, or a stolen token, can do: revoke with no notice.
+    use bh_core::SecretStore;
+    let token = bh_core::FileSecretStore::new(a.path().join("secrets"))
+        .unwrap()
+        .get(&format!("acct.{account}.token"))
+        .unwrap()
+        .unwrap();
+    let owner = bh_testkit::RawDevice::new(
+        &server,
+        account.into(),
+        String::new(),
+        String::from_utf8(token.to_vec()).unwrap(),
+    );
+    let (status, _) = owner
+        .delete(&format!("/v1/devices/{device}"), json!({}))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let home = b.path().join("accounts").join(account);
+    let rejected = output(b.path(), &["sync"]);
+    assert!(!rejected.status.success());
+    let err: Value = serde_json::from_slice(&rejected.stderr).unwrap();
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the server signed this device out"),
+        "{err}"
+    );
+    assert!(home.exists());
+    // Erasing it stays the person's choice.
+    let removed = output(b.path(), &["device", "remove", device]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!home.exists());
+}
+
 struct WatchChild(Child);
 impl Drop for WatchChild {
     fn drop(&mut self) {

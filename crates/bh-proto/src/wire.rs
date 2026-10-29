@@ -45,7 +45,6 @@ empty!(
     MeRequest,
     AccountRequest,
     CredentialsResponse,
-    DeleteDeviceRequest,
     DeleteDeviceResponse,
     BasesResponse,
     BaseKeyRequest,
@@ -483,7 +482,13 @@ pub enum LiveMessage {
         #[ts(optional)]
         body: Option<Bytes>,
     },
-    Revoked,
+    /// This device was removed. `notice` is the removing device's, as in
+    /// [`ErrorBody::notice`]; text, so a malformed one can't break the message.
+    Revoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        notice: Option<String>,
+    },
 }
 
 /// A pending device's request for approval; `request` is the exchange's opaque message.
@@ -690,4 +695,22 @@ pub struct UsageResponse {
 pub struct ErrorBody {
     pub error: String,
     pub message: String,
+    /// With `revoked`: the removal notice the removing device sent, if any. Kept as
+    /// text so a malformed notice can't change how the error is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub notice: Option<String>,
+}
+
+/// `DELETE /v1/devices/{id}`. `notice` is
+/// `generichash(key = kdf(K, "bhremov1", 1), accountId ‖ deviceId)`, where K is the
+/// removed device's own key: the account key for a full device, its app key for an
+/// app. Older clients send no body.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct DeleteDeviceRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub notice: Option<Bytes>,
 }

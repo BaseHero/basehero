@@ -91,6 +91,9 @@ pub(crate) struct ApprovalPostGate {
 #[cfg(feature = "test-support")]
 pub(crate) type ApprovalPostPause = Arc<std::sync::Mutex<Option<ApprovalPostGate>>>;
 
+/// Told of every `revoked` answer, with the removal notice that came with it.
+type OnRevoked = Arc<dyn Fn(Option<&[u8]>) + Send + Sync>;
+
 /// One client per account or sign-in, so its connections belong to the
 /// runtime that uses it.
 #[derive(Clone)]
@@ -100,7 +103,7 @@ pub(crate) struct Api {
     /// An app's one-time connect secret, base64url, and the email it typed.
     connect: Option<Arc<(Zeroizing<String>, String)>>,
     http: reqwest::Client,
-    on_revoked: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_revoked: Option<OnRevoked>,
     #[cfg(test)]
     tls: Arc<rustls::ClientConfig>,
     #[cfg(feature = "test-support")]
@@ -149,15 +152,38 @@ impl Api {
         self
     }
 
-    pub(crate) fn with_revocation(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
+    pub(crate) fn with_revocation(
+        mut self,
+        callback: impl Fn(Option<&[u8]>) + Send + Sync + 'static,
+    ) -> Self {
         self.on_revoked = Some(Arc::new(callback));
         self
     }
 
-    pub(crate) fn revoked(&self) {
+    /// Passes on a `revoked` answer and its base64url notice; a malformed notice is none.
+    pub(crate) fn revoked(&self, notice: Option<&str>) {
         if let Some(callback) = &self.on_revoked {
-            callback();
+            let notice = notice.and_then(|n| {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(n)
+                    .ok()
+            });
+            callback(notice.as_deref());
         }
+    }
+
+    /// The error in a refused answer. A `revoked` one is passed on unless it
+    /// answers a removal, which is confirmed separately with `GET /v1/me`.
+    fn refused(&self, status: StatusCode, bytes: &[u8], removal: bool) -> Error {
+        let (error, notice) = match serde_json::from_slice::<ErrorBody>(bytes) {
+            Ok(body) => (map_error(status, &body.error, body.message), body.notice),
+            Err(_) => (map_error(status, "", status.to_string()), None),
+        };
+        if error == Error::Revoked && !removal {
+            self.revoked(notice.as_deref());
+        }
+        error
     }
 
     #[cfg(feature = "test-support")]
@@ -298,26 +324,28 @@ impl Api {
             _ if status == StatusCode::UPGRADE_REQUIRED => return Err(Error::NeedsUpdate),
             _ => return Err(Error::Network(format!("unexpected response ({status})"))),
         }
-        let bytes = response
-            .bytes()
+        // Fetch normally targets 16 MiB decoded, but always includes the first
+        // object even if larger; leave generous room for base64 JSON framing.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        const API_RESPONSE_MAX: usize = 64 * 1024 * 1024;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+            .map_err(|e| Error::Network(e.without_url().to_string()))?
+        {
+            if chunk.len() > API_RESPONSE_MAX - bytes.len() {
+                return Err(Error::Network("API response too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         #[cfg(feature = "test-support")]
         self.fault(&method, path, true)?;
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(|_| Error::Network("malformed response".into()))
         } else {
-            let error = match serde_json::from_slice::<ErrorBody>(&bytes) {
-                Ok(body) => map_error(status, &body.error, body.message),
-                Err(_) => map_error(status, "", status.to_string()),
-            };
-            // A failed removal is confirmed separately with GET /v1/me.
-            if error == Error::Revoked
-                && !(method == Method::DELETE && path.starts_with("v1/devices/"))
-            {
-                self.revoked();
-            }
-            Err(error)
+            let removal = method == Method::DELETE && path.starts_with("v1/devices/");
+            Err(self.refused(status, &bytes, removal))
         }
     }
 
@@ -411,14 +439,7 @@ impl Api {
         if status.is_success() {
             return Ok(bytes);
         }
-        let error = match serde_json::from_slice::<ErrorBody>(&bytes) {
-            Ok(body) => map_error(status, &body.error, body.message),
-            Err(_) => map_error(status, "", status.to_string()),
-        };
-        if error == Error::Revoked {
-            self.revoked();
-        }
-        Err(error)
+        Err(self.refused(status, &bytes, false))
     }
 
     /// Uploads the *persisted* sealed bytes, not a fresh sealing on retry.
@@ -472,23 +493,26 @@ impl Api {
                 },
             );
         }
-        let body = response
-            .bytes()
+        // Successful uploads have no useful response body; errors are small JSON.
+        let mut response = response;
+        let mut body = Vec::new();
+        const UPLOAD_RESPONSE_MAX: usize = 1024 * 1024;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Network(e.without_url().to_string()))?;
+            .map_err(|e| Error::Network(e.without_url().to_string()))?
+        {
+            if chunk.len() > UPLOAD_RESPONSE_MAX - body.len() {
+                return Err(Error::Network("API response too large".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
         #[cfg(feature = "test-support")]
         self.fault(&Method::PUT, &path, true)?;
         if status.is_success() {
             return Ok(());
         }
-        let error = match serde_json::from_slice::<ErrorBody>(&body) {
-            Ok(body) => map_error(status, &body.error, body.message),
-            Err(_) => map_error(status, "", status.to_string()),
-        };
-        if error == Error::Revoked {
-            self.revoked();
-        }
-        Err(error)
+        Err(self.refused(status, &body, false))
     }
 
     #[allow(dead_code, reason = "used by the approval exchange")]
@@ -696,13 +720,14 @@ impl Api {
             Ok(Ok((socket, _))) => Ok(socket),
             Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
                 let status = response.status();
-                let code = response
+                let body = response
                     .body()
                     .as_deref()
-                    .and_then(|body| serde_json::from_slice::<ErrorBody>(body).ok())
-                    .map(|body| body.error);
-                if status == StatusCode::UNAUTHORIZED && code.as_deref() == Some("revoked") {
-                    self.revoked();
+                    .and_then(|body| serde_json::from_slice::<ErrorBody>(body).ok());
+                if status == StatusCode::UNAUTHORIZED
+                    && body.as_ref().is_some_and(|body| body.error == "revoked")
+                {
+                    self.revoked(body.and_then(|body| body.notice).as_deref());
                     Err(Error::Revoked)
                 } else {
                     Err(Error::Network(format!(
@@ -850,8 +875,15 @@ impl Api {
         .map(|_| ())
     }
 
-    pub(crate) async fn delete_device(&self, id: DeviceId) -> Result<DeleteDeviceResponse, Error> {
-        self.call(Method::DELETE, &format!("v1/devices/{id}"), None::<&()>)
+    pub(crate) async fn delete_device(
+        &self,
+        id: DeviceId,
+        notice: Option<[u8; 32]>,
+    ) -> Result<DeleteDeviceResponse, Error> {
+        let body = DeleteDeviceRequest {
+            notice: notice.map(|n| Bytes(n.to_vec())),
+        };
+        self.call(Method::DELETE, &format!("v1/devices/{id}"), Some(&body))
             .await
     }
 }
@@ -933,6 +965,7 @@ fn map_error(status: StatusCode, code: &str, message: String) -> Error {
             Error::Conflict(code.to_string())
         }
         "too_large" => Error::TooLarge,
+        "storage_limit" => Error::StorageFull,
         "needs_update" => Error::NeedsUpdate,
         "rate_limited" => Error::RateLimited,
         _ => match status.as_u16() {
@@ -951,6 +984,14 @@ fn map_error(status: StatusCode, code: &str, message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_limit_is_not_an_individual_request_size_error() {
+        assert_eq!(
+            map_error(StatusCode::PAYLOAD_TOO_LARGE, "storage_limit", "m".into()),
+            Error::StorageFull
+        );
+    }
 
     #[test]
     fn every_protocol_error_code_maps_to_an_error() {
@@ -972,6 +1013,7 @@ mod tests {
                 Error::Conflict("version_conflict".into()),
             ),
             ("too_large", 413, Error::TooLarge),
+            ("storage_limit", 413, Error::StorageFull),
             ("needs_update", 426, Error::NeedsUpdate),
             ("rate_limited", 429, Error::RateLimited),
             ("bad_gateway", 502, Error::Network("m".into())),
@@ -1143,6 +1185,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_response_rejects_an_oversized_stream_without_content_length() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nBH-Protocol: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let payload = vec![b' '; 1024 * 1024];
+            for _ in 0..66 {
+                if stream.write_all(b"100000\r\n").is_err()
+                    || stream.write_all(&payload).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let result = Api::new(url, None).me().await;
+        assert!(
+            matches!(&result, Err(Error::Network(message)) if message == "API response too large"),
+            "{result:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn file_part_rejects_an_oversized_stream_without_content_length() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1200,14 +1273,19 @@ mod tests {
     async fn only_a_401_revoked_answer_triggers_local_removal() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            for (status, code) in [(401, "unauthorized"), (503, "revoked"), (401, "revoked")] {
+            for (status, code, notice) in [
+                (401, "unauthorized", None),
+                (503, "revoked", None),
+                (401, "revoked", None),
+                (401, "revoked", Some("AQI")),
+                (401, "revoked", Some("not base64!")),
+            ] {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -1225,22 +1303,28 @@ mod tests {
                     .unwrap();
                 let mut bytes = [0; 8192];
                 let _ = stream.read(&mut bytes).unwrap();
-                let body =
-                    serde_json::json!({ "error": code, "message": "unavailable" }).to_string();
+                let mut body = serde_json::json!({ "error": code, "message": "unavailable" });
+                if let Some(notice) = notice {
+                    body["notice"] = notice.into();
+                }
+                let body = body.to_string();
                 write!(stream, "HTTP/1.1 {status} Error\r\nBH-Protocol: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let removals = Arc::new(AtomicUsize::new(0));
-        let count = removals.clone();
-        let api = Api::new(url, None).with_revocation(move || {
-            count.fetch_add(1, Ordering::SeqCst);
+        let removals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = removals.clone();
+        let api = Api::new(url, None).with_revocation(move |notice| {
+            seen.lock().unwrap().push(notice.map(<[u8]>::to_vec));
         });
         assert_eq!(api.me().await.unwrap_err(), Error::Unauthorized);
-        assert_eq!(removals.load(Ordering::SeqCst), 0);
+        assert!(removals.lock().unwrap().is_empty());
         assert!(matches!(api.me().await.unwrap_err(), Error::Network(_)));
-        assert_eq!(removals.load(Ordering::SeqCst), 0);
-        assert_eq!(api.me().await.unwrap_err(), Error::Revoked);
-        assert_eq!(removals.load(Ordering::SeqCst), 1);
+        assert!(removals.lock().unwrap().is_empty());
+        for _ in 0..3 {
+            assert_eq!(api.me().await.unwrap_err(), Error::Revoked);
+        }
+        // The notice is passed on as bytes; a malformed one is none.
+        assert_eq!(*removals.lock().unwrap(), [None, Some(vec![1, 2]), None]);
         server.join().unwrap();
     }
 

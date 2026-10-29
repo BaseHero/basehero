@@ -127,7 +127,7 @@ mod connect_example {
 }
 ```
 
-On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` instead of connecting again. Before any query-and-create after restart, wait for `base.sync_state().last_synced_at` or call `base.sync_now()`. When a full device disconnects the app, `AccountEvent::Removed` arrives and the core erases its account copy; stop using old base handles and offer to reconnect.
+On later launches, `Core::open` loads the installed account; use `core.accounts()` and `core.account(id)` instead of connecting again. Before any query-and-create after restart, wait for `base.sync_state().last_synced_at` or call `base.sync_now()`. When a full device disconnects the app, `AccountEvent::Removed` arrives and the core erases its account copy; stop using old base handles and offer to reconnect. If the server refuses the app without a disconnect from one of the person's devices, `AccountEvent::SignedOutByServer` arrives instead: sync stops and the app's copy stays readable until it calls `account.sign_out()`.
 
 ### On Android
 
@@ -225,7 +225,7 @@ Use one record per day, not one per measurement. Keep a bounded set of samples i
 
 ## Models
 
-`account.model()` returns a `ChatModel` for calls without a base. Use `account.model_for(base_id)` to attribute calls to a granted base; it refuses a base this device cannot open, and the gateway checks the grant again before forwarding each call. `complete` takes a `ChatRequest` and returns a `Completion` with optional text, tool calls and usage. It needs the network. The core uses the app device's token through BaseHero Cloud; the app does not need a model API key. The request is encrypted on the device for the provider's verified hardware. Handle `ModelError` separately from core `Error`, including `RateLimited`, `Verification`, `Transport` and `NeedsUpdate`.
+`account.model()` returns a `ChatModel` for calls without a base. Use `account.model_for(base_id)` to attribute calls to a granted base; it refuses a base this device cannot open, and the gateway checks the grant again before forwarding each call. `complete` takes a `ChatRequest` and returns a `Completion` with optional text, tool calls and usage. It needs the network. The core uses the app device's token through BaseHero Cloud; the app does not need a model API key. The request is encrypted on the device for the provider's verified hardware. Handle `ModelError` separately from core `Error`, including `RateLimited`, `Verification`, `Transport` and `NeedsUpdate`. Hero on an app device reads only the base its chat is in; a tool call for another base returns `not_allowed`.
 
 ```rust,no_run
 use bh_core::{Account, BaseId, models::{ChatRequest, Message, Role}};

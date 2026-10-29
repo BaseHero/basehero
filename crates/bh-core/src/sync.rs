@@ -232,6 +232,8 @@ impl SyncTask {
             task.abort();
             let _ = task.await;
         }
+        // An aborted task can't report it went offline.
+        self.status.lock().unwrap_or_else(|p| p.into_inner()).online = false;
     }
 
     /// `(online, last_synced_at)`.
@@ -574,12 +576,12 @@ impl Engine {
     ) -> Result<(), Error> {
         let mut batch: Vec<(ObjectId, u64, Vec<Incoming>)> = Vec::new();
         let mut by_id = HashMap::<ObjectId, usize>::new();
-        if messages.iter().any(|message| {
+        if let Some(revoked) = messages.iter().find_map(|message| {
             serde_json::from_str::<serde_json::Value>(message)
                 .ok()
-                .is_some_and(|value| value["t"] == "revoked")
+                .filter(|value| value["t"] == "revoked")
         }) {
-            self.api.revoked();
+            self.api.revoked(revoked["notice"].as_str());
             return Err(Error::Revoked);
         }
         let sending: HashSet<_> = self

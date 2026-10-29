@@ -29,7 +29,7 @@ export type BaseRef = { account: AccountId; base: BaseId };
 export class BackendError extends Error {
   constructor(public kind: string, message: string) { super(message); this.name = 'BackendError'; }
 }
-export type AccountSummary = { id: AccountId; email: string; kind: 'full' | 'app' };
+export type AccountSummary = { id: AccountId; email: string; kind: 'full' | 'app'; signedOutByServer: boolean };
 export type DeviceSummary = Omit<GeneratedDeviceSummary, 'kind' | 'lastSeenAt'> & { kind: string; lastSeenAt: number | null };
 export type { AppOffer, AppSummary, Mount };
 export type BaseChoiceInput = { base?: BaseId; folder?: ObjectId; newName?: string; mode: 'readWrite' | 'readOnly' };

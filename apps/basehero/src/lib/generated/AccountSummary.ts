@@ -16,4 +16,9 @@ email: string,
 /**
  * Capability of this installation.
  */
-kind: DeviceKind, };
+kind: DeviceKind, 
+/**
+ * See [`Account::signed_out_by_server`]; a window opened after the
+ * [`AccountEvent::SignedOutByServer`] event reads it here.
+ */
+signedOutByServer: boolean, };

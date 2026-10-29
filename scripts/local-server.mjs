@@ -9,7 +9,7 @@ const { Miniflare } = require('miniflare');
 const { build } = require('esbuild');
 const args = process.argv.slice(2);
 let persist, port, tinfoilUpstream;
-const vars = { OPERATOR_TOKEN: 'local-operator', PEPPER: 'local-pepper',
+const vars = { BH_ENV: 'dev', OPERATOR_TOKEN: 'local-operator', PEPPER: 'local-pepper',
   TINFOIL_API_KEY: 'local-tinfoil-key', TINFOIL_MODELS: 'deepseek-v4-1-flash', ALLOW_TEST_BYPASS: '1',
   GATEWAY_PER_MINUTE: '20', GATEWAY_PER_DAY: '500', GATEWAY_DAILY_COST_USD: '2',
   GATEWAY_UNREPORTED_CALL_USD: '0.05', GATEWAY_MAX_OUTPUT_TOKENS: '8192' };

@@ -156,6 +156,8 @@ struct Inner {
     version_device_name: OnceLock<Arc<dyn Fn(DeviceId) -> Option<String> + Send + Sync>>,
     download_lock: tokio::sync::Mutex<()>,
     downloads_stopped: std::sync::atomic::AtomicBool,
+    /// The server signed this device out: local edits stay queued, never sent.
+    sync_stopped: std::sync::atomic::AtomicBool,
     download_stop: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "test-support")]
     held_on_demand_get: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
@@ -274,6 +276,7 @@ impl Base {
                 version_device_name: OnceLock::new(),
                 download_lock: tokio::sync::Mutex::new(()),
                 downloads_stopped: std::sync::atomic::AtomicBool::new(false),
+                sync_stopped: std::sync::atomic::AtomicBool::new(false),
                 download_stop: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "test-support")]
                 held_on_demand_get: Mutex::new(None),
@@ -861,6 +864,20 @@ impl Base {
         }
     }
 
+    /// After the server signed this device out: a base opened since has no sync
+    /// task, but isn't local-only, so it must not report its outbox as sent.
+    pub(crate) fn set_sync_stopped(&self) {
+        self.inner.sync_stopped.store(true, Ordering::SeqCst);
+    }
+
+    fn check_sync_stopped(&self) -> Result<(), Error> {
+        if self.inner.sync_stopped.load(Ordering::SeqCst) {
+            Err(Error::Network("sync has stopped".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Stops sync, upload and download tasks before account erasure or base close.
     pub(crate) async fn stop_sync(&self) {
         self.inner.downloads_stopped.store(true, Ordering::SeqCst);
@@ -965,6 +982,7 @@ impl Base {
     /// device was removed, or server errors such as [`Error::TooLarge`].
     pub async fn flush(&self) -> Result<(), Error> {
         self.check_removal()?;
+        self.check_sync_stopped()?;
         match self.inner.sync.get() {
             Some(sync) => sync.flush().await,
             None => Ok(()),
@@ -1028,6 +1046,7 @@ impl Base {
     /// Returns [`Error::Network`] when unreachable, or [`Error::Revoked`] when removed.
     pub async fn sync_now(&self) -> Result<(), Error> {
         self.check_removal()?;
+        self.check_sync_stopped()?;
         match self.inner.sync.get() {
             Some(sync) => sync.sync_now().await,
             None => Ok(()),

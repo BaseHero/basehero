@@ -29,7 +29,8 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4RDMwREFDOTkwQ0E1MTcKUldRWHBReVpyQTNUS045VjVRWU1mOEE4bGtORTd1S21uZFJhUTk4MVVFTk02YjdGcGNObGpjQ0gK",
-      "endpoints": ["https://github.com/BaseHero/basehero/releases/latest/download/latest.json"]
+      "endpoints": ["https://github.com/BaseHero/basehero/releases/latest/download/latest.json"],
+      "requireSignedVersion": true
     }
   }
 }

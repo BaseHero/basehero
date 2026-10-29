@@ -270,6 +270,53 @@ async fn a_grant_change_that_stopped_midway_finishes_on_refresh() {
 }
 
 #[tokio::test]
+async fn replayed_account_data_does_not_settle_an_old_grant_again() {
+    let Setup {
+        full, app, notes, ..
+    } = setup(false).await;
+    let notes_path = format!("v1/bases/{}/grants/{}", notes.id(), app.device_id());
+    full.test_inject_fault(Fault {
+        method: "PUT",
+        path: Box::leak(notes_path.into_boxed_str()),
+        lost_reply: false,
+        times: 1,
+    });
+    let grant = BaseGrantRequest::Existing {
+        base: notes.id(),
+        mode: Mode::ReadWrite,
+    };
+    assert!(matches!(
+        full.add_app_grant(app.device_id(), grant).await,
+        Err(Error::Network(_))
+    ));
+    // A hostile server keeps the account data that still has Notes to grant.
+    let raw = raw_device(&full);
+    let (_, stale) = raw.get("/v1/account", json!({})).await;
+    full.refresh().await.unwrap();
+    full.remove_app_grant(app.device_id(), notes.id())
+        .await
+        .unwrap();
+    let (_, current) = raw.get("/v1/account", json!({})).await;
+    let (status, _) = raw
+        .put(
+            "/v1/account/data",
+            json!({
+                "ciphertext": stale["data"]["ciphertext"],
+                "expectedVersion": current["data"]["version"],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(full.refresh().await, Err(Error::Crypto));
+    let (status, _) = raw_device(&app)
+        .get(&format!("/v1/bases/{}/key", notes.id()), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(full.test_app_readers(notes.id()).is_empty());
+}
+
+#[tokio::test]
 async fn a_pending_change_for_a_removed_app_does_not_hold_up_others() {
     let Setup {
         full, app, notes, ..

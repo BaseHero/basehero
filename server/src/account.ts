@@ -5,16 +5,22 @@ import type { LoginParamsResponse } from './proto/gen/LoginParamsResponse';
 import type { AccountResponse } from './proto/gen/AccountResponse';
 import type { MeResponse } from './proto/gen/MeResponse';
 import type { ApprovalEndReason } from './proto/gen/ApprovalEndReason';
-import type { Env, Principal, Result } from './http';
-import { b64, bytes, equal, error, fail, randomBytes, sha, verifier } from './http';
+import type { Env, Principal, Result, Revoked } from './http';
+import { b64, bytes, equal, error, fail, randomBytes, sha, testMode, verifier } from './http';
 import { Approvals } from './approvals';
 import type { Step } from './approvals';
+import { listedBytes } from './storage';
 
 type AccountRow = { email: string; salt: string; kdf: string; verifier_salt: string; verifier: string; envelope: string; activation_hash: string; data: string | null; data_version: number; failed_logins: number; window_start: number };
-type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number; cap_micro_usd: number };
+type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number; cap_micro_usd: number; removal_notice: string | null };
+
+// Abuse guard, not a billing allowance. Writes count conservatively until the
+// next over-limit check re-measures real usage, no more than once a day.
+const STORAGE_CAP_BYTES = 50 * 1024 * 1024 * 1024; // 50 GiB per account
 
 export class AccountDO extends DurableObject<Env> {
   private approvals: Approvals;
+  private measuringStorage?: Promise<void>;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = ctx.storage.sql;
@@ -23,8 +29,16 @@ export class AccountDO extends DurableObject<Env> {
     if (!sql.exec<{ name: string }>('PRAGMA table_info(devices)').toArray().some(column => column.name === 'cap_micro_usd')) {
       sql.exec('ALTER TABLE devices ADD COLUMN cap_micro_usd INTEGER NOT NULL DEFAULT 1000000');
     }
+    // The removing device's notice, returned with every `revoked` answer; the server can't make one.
+    if (!sql.exec<{ name: string }>('PRAGMA table_info(devices)').toArray().some(column => column.name === 'removal_notice')) {
+      sql.exec('ALTER TABLE devices ADD COLUMN removal_notice TEXT');
+    }
     sql.exec('CREATE TABLE IF NOT EXISTS bases (base_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)');
     sql.exec('CREATE TABLE IF NOT EXISTS device_bases (device_id TEXT NOT NULL, base_id TEXT NOT NULL, PRIMARY KEY (device_id, base_id))');
+    sql.exec('CREATE TABLE IF NOT EXISTS storage_guard (bytes INTEGER NOT NULL, measured_at INTEGER NOT NULL DEFAULT 0)');
+    if (!sql.exec<{ name: string }>('PRAGMA table_info(storage_guard)').toArray().some(column => column.name === 'measured_at')) {
+      sql.exec('ALTER TABLE storage_guard ADD COLUMN measured_at INTEGER NOT NULL DEFAULT 0');
+    }
     this.approvals = new Approvals(ctx, env);
   }
   private row(): AccountRow | null { return this.ctx.storage.sql.exec<AccountRow>('SELECT * FROM account WHERE id = 1').toArray()[0] ?? null; }
@@ -64,10 +78,10 @@ export class AccountDO extends DurableObject<Env> {
   }
   // Each device's recent change requests, in memory: a restart only resets the window.
   private changeTimes = new Map<string, number[]>();
-  auth(tokenHash: string, countChange = false): Principal | 'revoked' | 'rate_limited' | null {
+  auth(tokenHash: string, countChange = false): Principal | Revoked | 'rate_limited' | null {
     const device = this.ctx.storage.sql.exec<DeviceRow>('SELECT * FROM devices WHERE token_hash = ?', tokenHash).toArray()[0];
     if (!device) return null;
-    if (device.status === 'revoked') return 'revoked';
+    if (device.status === 'revoked') return { revoked: device.removal_notice };
     if (countChange) {
       const now = Date.now();
       const window = Number((this.env as Env).CHANGE_RATE_WINDOW_MS ?? 1000);
@@ -95,6 +109,49 @@ export class AccountDO extends DurableObject<Env> {
   }
   private accountBases(): string[] {
     return this.ctx.storage.sql.exec<{ base_id: string }>('SELECT base_id FROM bases ORDER BY added_at, base_id').toArray().map(b => b.base_id);
+  }
+  private storageNow(): number {
+    return testMode(this.env) && this.env.STORAGE_NOW_MS !== undefined
+      ? Number(this.env.STORAGE_NOW_MS) : Date.now();
+  }
+  /** Measure the same base SQLite and R2 bytes as /v1/usage; preserve writes reserved during the read. */
+  private async measureStorage(): Promise<void> {
+    const sql = this.ctx.storage.sql;
+    const previous = sql.exec<{ bytes: number }>('SELECT bytes FROM storage_guard').toArray()[0];
+    let total = 0;
+    for (const baseId of this.accountBases()) {
+      const stub = this.env.BASE.get(this.env.BASE.idFromName(baseId)) as unknown as { storageBytes(): Promise<number> };
+      total += await stub.storageBytes();
+      total += await listedBytes(this.env, `b/${baseId}/`);
+      total += await listedBytes(this.env, `f/${baseId}/`);
+    }
+    const measuredAt = this.storageNow();
+    if (previous) {
+      // In-flight reservations may not yet appear in the measured R2/SQLite sizes.
+      sql.exec('UPDATE storage_guard SET bytes = ? + max(bytes - ?, 0), measured_at = ?', total, previous.bytes, measuredAt);
+    } else {
+      sql.exec('INSERT INTO storage_guard (bytes, measured_at) VALUES (?, ?)', total, measuredAt);
+    }
+  }
+  private async refreshStorage(): Promise<void> {
+    this.measuringStorage ??= this.measureStorage().finally(() => { this.measuringStorage = undefined; });
+    await this.measuringStorage;
+  }
+  /** Reserve before writing; synchronous check-and-add serializes concurrent devices. */
+  async reserveStorage(bytes: number): Promise<boolean> {
+    const sql = this.ctx.storage.sql;
+    type Guard = { bytes: number; measured_at: number };
+    if (!sql.exec<Guard>('SELECT bytes, measured_at FROM storage_guard').toArray().length) await this.refreshStorage();
+    let { bytes: used, measured_at: measuredAt } = sql.exec<Guard>('SELECT bytes, measured_at FROM storage_guard').one();
+    const cap = testMode(this.env) && this.env.STORAGE_CAP_TEST_BYTES !== undefined
+      ? Number(this.env.STORAGE_CAP_TEST_BYTES) : STORAGE_CAP_BYTES;
+    if (used + bytes > cap && this.storageNow() - measuredAt >= 24 * 60 * 60 * 1000) {
+      await this.refreshStorage();
+      ({ bytes: used, measured_at: measuredAt } = sql.exec<Guard>('SELECT bytes, measured_at FROM storage_guard').one());
+    }
+    if (used + bytes > cap) return false;
+    sql.exec('UPDATE storage_guard SET bytes = bytes + ?', bytes);
+    return true;
   }
   /** Server-side IDs only; the caller is authenticated by the Worker. */
   usageBases(principal: Principal): string[] {
@@ -154,7 +211,7 @@ export class AccountDO extends DurableObject<Env> {
     this.failNextRemoval = true;
     return { status: 200, body: {} };
   }
-  async removeDevice(principal: Principal, deviceId: string): Promise<Result> {
+  async removeDevice(principal: Principal, deviceId: string, notice: string | null = null): Promise<Result> {
     if (principal.kind !== 'full' && principal.deviceId !== deviceId) return fail(403, 'forbidden');
     if (!this.ctx.storage.sql.exec('SELECT device_id FROM devices WHERE device_id = ?', deviceId).toArray().length) return fail(404, 'not_found');
     if (this.failNextRemoval) {
@@ -164,16 +221,18 @@ export class AccountDO extends DurableObject<Env> {
     // Use the account's base list for both full devices and granted apps. It also
     // covers a grant whose device_bases entry was already removed by a revoke.
     const bases = this.accountBases();
-    this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("UPDATE devices SET status = 'revoked' WHERE device_id = ?", deviceId);
+    // A later removal without a notice, such as an older app's, keeps an earlier notice.
+    const stored = this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec<{ removal_notice: string | null }>("UPDATE devices SET status = 'revoked', removal_notice = COALESCE(?, removal_notice) WHERE device_id = ? RETURNING removal_notice", notice, deviceId).one();
       this.ctx.storage.sql.exec('DELETE FROM device_bases WHERE device_id = ?', deviceId);
+      return row.removal_notice;
     });
     this.approvals.close(deviceId);
     this.approvals.drop(deviceId);
     this.approvals.failAnswered(deviceId);
     const results = await Promise.allSettled(bases.map(baseId => {
-      const base = this.env.BASE.get(this.env.BASE.idFromName(baseId)) as unknown as { closeDevice(id: string, removed: boolean): Promise<void> };
-      return base.closeDevice(deviceId, true);
+      const base = this.env.BASE.get(this.env.BASE.idFromName(baseId)) as unknown as { closeDevice(id: string, removed: boolean, notice: string | null): Promise<void> };
+      return base.closeDevice(deviceId, true, stored);
     }));
     if (results.some(result => result.status === 'rejected')) return fail(502, 'bad_gateway');
     return { status: 200, body: {} };
@@ -209,7 +268,7 @@ export class AccountDO extends DurableObject<Env> {
     const deviceId = request.headers.get('BH-Device');
     const device = this.ctx.storage.sql.exec<DeviceRow>('SELECT * FROM devices WHERE device_id = ?', deviceId).toArray()[0];
     // A device revoked since the Worker's check is refused here, where revocation closes sockets.
-    if (device?.kind !== 'full' || device.status === 'revoked') return error('revoked', 401, 'revoked');
+    if (device?.kind !== 'full' || device.status === 'revoked') return error('revoked', 401, 'revoked', device?.removal_notice ?? null);
     return this.approvals.accept(device.status === 'pending' ? 'pending' : 'full', device.device_id);
   }
   webSocketMessage(): void { /* clients send only pings */ }

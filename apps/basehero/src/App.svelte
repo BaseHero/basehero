@@ -27,6 +27,13 @@
   type Screen = 'welcome' | 'signup' | 'kit' | 'signin' | 'pending' | 'account' | 'search' | 'devices' | 'usage' | 'removed';
   let screen = $state<Screen>('welcome');
   let keyError = $state<{ kind: string; message: string } | null>(null);
+  // Accounts the server refused without a notice from the person's devices: from
+  // events for any account, and the account list for those refused before this window.
+  let serverSignedOut = $state<string[]>([]);
+  function markSignedOut(account: AccountSummary) {
+    if (account.signedOutByServer && !serverSignedOut.includes(account.id)) serverSignedOut = [...serverSignedOut, account.id];
+  }
+  let erasing = $state(false);
   let deviceName = $state('Mac');
   let signedUp = $state<SignedUp | null>(null);
   let kitStatus = $state<KitStatus>({ known: false, saved: false, madeAt: null });
@@ -265,6 +272,7 @@
     } finally { transitioning = false; }
   }
   async function openAccount(account: AccountSummary) {
+    markSignedOut(account);
     session.account = account;
     if (!knownAccounts.includes(account.id)) knownAccounts = [...knownAccounts, account.id];
     refreshAccount(account.id);
@@ -327,6 +335,12 @@
       try { await getBackend().signInCancel(id); } catch { /* A cancelled sign-in cannot be retried here. */ }
     }
   }
+  async function eraseDevice(account: string) {
+    if (erasing || !window.confirm("Erase BaseHero's notes and keys on this device? Changes that haven't synced are lost.")) return;
+    erasing = true;
+    // Erasing emits Removed, which shows the Removed screen.
+    try { await getBackend().signOut(account); } finally { erasing = false; }
+  }
   async function resetDevice() {
     await getBackend().resetDevice();
     session.account = null;
@@ -361,7 +375,7 @@
     getBackend().accounts().then(accounts => {
       if (!active) return;
       knownAccounts = accounts.map(account => account.id);
-      for (const account of accounts) refreshAccount(account.id);
+      for (const account of accounts) { markSignedOut(account); refreshAccount(account.id); }
       accountsLoaded = true;
       if (screen !== 'welcome') return;
       const requested = /^#\/a\/([^/]+)/.exec(hash)?.[1];
@@ -451,7 +465,13 @@
       }).then(stop => { if (active) unlistenClose = stop; else stop(); });
     }
     void getBackend().onEvent(event => {
-      if (!active || event.account !== session.account?.id) return;
+      if (!active) return;
+      if (event.kind.toLowerCase() === 'account' && event.event === 'SignedOutByServer' && !serverSignedOut.includes(event.account)) {
+        serverSignedOut = [...serverSignedOut, event.account];
+      } else if (event.kind.toLowerCase() === 'account' && event.event === 'Removed') {
+        serverSignedOut = serverSignedOut.filter(account => account !== event.account);
+      }
+      if (event.account !== session.account?.id) return;
       if (event.kind.toLowerCase() === 'account' && event.event === 'Removed') {
         removedAccounts.add(event.account);
         requestedHash = '';
@@ -475,7 +495,13 @@
         if (event.event === 'needsUpdate' || event.event === 'NeedsUpdate' || (typeof event.event === 'object' && event.event !== null && 'NeedsUpdate' in event.event)) sync.needsUpdate = true;
         else { const r = ref(); if (r) void sync.refresh(getBackend(), r); }
       }
-    }).then(stop => { if (active) unsubscribe = stop; else stop(); });
+    }).then(stop => {
+      if (!active) { stop(); return; }
+      unsubscribe = stop;
+      // A refusal between the first account list and this subscription sent its
+      // event to no one: read the list again now that later events arrive. Marks only add.
+      void getBackend().accounts().then(accounts => { if (active) accounts.forEach(markSignedOut); }).catch(() => {});
+    });
     const shortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && session.account) {
         event.preventDefault(); searchField?.focus();
@@ -538,6 +564,13 @@
     <a href={`#/a/${session.account.id}/devices`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/devices`); }}>Devices</a>
     <a href={`#/a/${session.account.id}/usage`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/usage`); }}>Usage</a></nav>
 {/if}
+{#if !keyError && session.account && serverSignedOut.includes(session.account.id)}
+  {@const account = session.account.id}
+  <div class="server-signed-out" role="alert">
+    <p>The server signed this device out, but none of your devices removed it. Its notes stay here and won't sync.</p>
+    <button disabled={erasing} onclick={() => void eraseDevice(account)}>Erase this device</button>
+  </div>
+{/if}
 {#if keyError}
   <KeyError kind={keyError.kind} message={keyError.message} onreset={resetDevice} />
 {:else if route?.[2] && knownRoute && (screen === 'account' || screen === 'welcome')}
@@ -589,6 +622,8 @@
   .location-bar a { color: var(--on-bar); font-weight: 600; }
   .location-bar form { flex: 1; display: block; }
   .location-bar input { width: 100%; padding: .5rem; background: var(--bar-2); color: var(--on-bar); border: 1px solid var(--bar-line); font: .85rem var(--sans); }
+  .server-signed-out { display: flex; align-items: center; gap: 1rem; padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
+  .server-signed-out p { flex: 1; margin: 0; }
   .workspace-nav { display: flex; gap: 1.5rem; padding: 1rem 1.5rem; border-bottom: 1px solid var(--line); }
   :global(.workspace) { padding: clamp(1rem, 4vw, 3rem); max-width: 60rem; margin: auto; }
 </style>

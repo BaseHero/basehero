@@ -1,4 +1,5 @@
 """Release packaging contracts; no credentials or network required."""
+import base64
 import hashlib
 from pathlib import Path
 import plistlib
@@ -12,12 +13,20 @@ from scripts.mac_package import check_loads, verify_helper
 from scripts.update_manifest import manifest
 
 
+def fixture_signature(version):
+    # This fixture exercises the release script's parsing, not cryptography.
+    # The updater's signature verification is exercised separately in Rust.
+    comment = f"timestamp:1\tfile:archive\tversion:{version}"
+    return base64.b64encode(f"untrusted comment: test\nbytes\ntrusted comment: {comment}\nbytes\n".encode()).decode()
+
+
 class ReleaseScriptsTests(unittest.TestCase):
     def test_manifest_points_at_this_release(self):
-        m = manifest("0.1.3", signature="SIG", notes="n", pub_date="2026-10-28T00:00:00Z")
+        signature = fixture_signature("0.1.3")
+        m = manifest("0.1.3", signature=signature, notes="n", pub_date="2026-10-28T00:00:00Z")
         self.assertEqual(m["version"], "0.1.3")
         self.assertEqual(m["platforms"]["darwin-aarch64"], {
-            "signature": "SIG",
+            "signature": signature,
             "url": "https://github.com/BaseHero/basehero/releases/download/v0.1.3/BaseHero-0.1.3-macos-arm64.app.tar.gz",
         })
         self.assertEqual(m["pub_date"], "2026-10-28T00:00:00Z")
@@ -26,7 +35,18 @@ class ReleaseScriptsTests(unittest.TestCase):
     def test_a_version_must_be_x_y_z(self):
         for version in ("1.2", "v1.2.3", "01.2.3", "1.2.3/evil"):
             with self.subTest(version=version):
-                self.assertRaises(ValueError, manifest, version, "S", "n", "d")
+                self.assertRaises(ValueError, manifest, version, fixture_signature("0.1.3"), "n", "d")
+
+    def test_manifest_refuses_an_older_signed_archive_offered_as_newer(self):
+        with self.assertRaisesRegex(ValueError, "signed version"):
+            manifest("0.1.4", fixture_signature("0.1.3"), "n", "d")
+
+    def test_manifest_refuses_a_signature_without_a_version(self):
+        unsigned_version = base64.b64encode(
+            b"untrusted comment: test\nbytes\ntrusted comment: timestamp:1\tfile:archive\nbytes\n"
+        ).decode()
+        with self.assertRaisesRegex(ValueError, "signed version"):
+            manifest("0.1.4", unsigned_version, "n", "d")
 
     def test_a_changed_helper_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,7 +104,7 @@ class ReleaseScriptsTests(unittest.TestCase):
 
     def test_updater_signer_uses_env_key_not_conflicting_file_option(self):
         workflow = (mac_package.ROOT.parent / ".github/workflows/app-release.yml").read_text()
-        self.assertIn('"$RUNNER_TEMP/cargo-tauri" signer sign "signed/$archive"', workflow)
+        self.assertIn('"$RUNNER_TEMP/cargo-tauri" signer sign --app-version "$VERSION" "signed/$archive"', workflow)
         self.assertNotIn("signer sign -f", workflow)
 
     def test_mac_sign_refuses_wrong_helper_identifier(self):

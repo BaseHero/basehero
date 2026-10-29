@@ -19,7 +19,8 @@
     // Events received while a snapshot is in flight are newer than that snapshot.
     const changes = new Map<string, ApprovalRequest | null>();
     void getBackend().onEvent(event => {
-      if (!active || event.kind.toLowerCase() !== 'account' || event.account !== account || typeof event.event !== 'object' || event.event === null) return;
+      // Removed clears the session before this runs, so check the event's shape before `account`.
+      if (!active || event.kind.toLowerCase() !== 'account' || typeof event.event !== 'object' || event.event === null || event.account !== account) return;
       if ('ApprovalRequested' in event.event) {
         const request = event.event.ApprovalRequested as ApprovalRequest;
         changes.set(request.id, request);

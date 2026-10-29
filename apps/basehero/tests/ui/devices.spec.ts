@@ -93,6 +93,46 @@ test('removing this device confirms, erases it and shows Removed', async ({ page
   expect(await page.evaluate(() => window.__fake.accounts().then(accounts => accounts.length))).toBe(0);
 });
 
+test('a server sign-out keeps the notes and leaves erasing to the person', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.emit({ kind: 'account', account, event: 'SignedOutByServer' }), account);
+  const alert = page.getByRole('alert').filter({ hasText: 'The server signed this device out' });
+  await expect(alert).toHaveText(/none of your devices removed it\. Its notes stay here and won't sync\./);
+  await expect(page.getByRole('link', { name: 'Personal' })).toBeVisible();
+  expect(await page.evaluate(() => window.__fake.accounts().then(accounts => accounts.length))).toBe(1);
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toBe("Erase BaseHero's notes and keys on this device? Changes that haven't synced are lost.");
+    await dialog.accept();
+  });
+  await alert.getByRole('button', { name: 'Erase this device' }).click();
+  await expect(page.getByRole('heading', { name: 'Device removed' })).toBeVisible();
+  expect(await page.evaluate(() => window.__fake.accounts().then(accounts => accounts.length))).toBe(0);
+});
+
+test('a server sign-out of an account not on screen shows when it opens', async ({ page }) => {
+  await signedIn(page);
+  const other = await page.evaluate(async () => {
+    const result = await window.__fake.signUp({ invite: 'WELCOME', email: 'two@example.com', password: 'correct horse battery staple', deviceName: 'Mac' });
+    window.__fake.emit({ kind: 'account', account: result.account.id, event: 'SignedOutByServer' });
+    return result.account.id;
+  });
+  await expect(page.getByRole('alert').filter({ hasText: 'The server signed this device out' })).toHaveCount(0);
+  await page.evaluate(id => { location.hash = `#/a/${id}`; }, other);
+  await expect(page.getByRole('link', { name: 'Devices' })).toHaveAttribute('href', `#/a/${other}/devices`);
+  await expect(page.getByRole('alert').filter({ hasText: 'The server signed this device out' })).toBeVisible();
+});
+
+test('a window opened after a server sign-out shows it', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, '__fake', { configurable: true, set(fake: typeof window.__fake) {
+      Object.defineProperty(window, '__fake', { configurable: true, value: fake });
+      fake.accounts = async () => [{ id: 'known', email: 'known@example.com', kind: 'full', signedOutByServer: true }];
+    } });
+  });
+  await page.goto('/');
+  await expect(page.getByRole('alert').filter({ hasText: 'The server signed this device out' })).toBeVisible();
+});
+
 test('removal clears kit state without a leave warning', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Create account' }).click();

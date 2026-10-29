@@ -447,3 +447,82 @@ async fn ids_must_be_lowercase_hex() {
         "bad_request",
     );
 }
+
+/// The server keeps a removing device's notice and returns it with every `revoked`
+/// answer, so the removed device can check who removed it.
+#[tokio::test]
+async fn a_removal_notice_comes_back_with_every_revoked_answer() {
+    let s = LocalServer::from_env();
+    let a = RawAccount::signup(s).await;
+    let (base, _) = create_base(&a.full).await;
+    let full = a.second_full(s).await;
+    let mut socket = full.live(&format!("/v1/bases/{base}/live")).await;
+    let remove = format!("/v1/devices/{}", full.device_id);
+    for bad in [
+        json!({"notice": b64(&random(31))}),
+        json!({"notice": "not base64!"}),
+        json!({"notice": 7}),
+    ] {
+        refused(
+            a.full.delete(&remove, bad).await,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        );
+    }
+    assert_eq!(full.get("/v1/me", json!({})).await.0, StatusCode::OK);
+    let notice = b64(&random(32));
+    let (status, body) = a.full.delete(&remove, json!({ "notice": notice })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let live = tokio::time::timeout(Duration::from_secs(30), socket.next())
+        .await
+        .expect("no revocation message");
+    match live {
+        Some(Ok(Message::Text(text))) => assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"t": "revoked", "notice": notice})
+        ),
+        other => panic!("expected the revocation message, got {other:?}"),
+    }
+    let (status, body) = full.get("/v1/me", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        (&body["error"], &body["notice"]),
+        (&json!("revoked"), &json!(notice))
+    );
+    // Socket upgrades are refused too. tungstenite can hand back a refusal before
+    // its body arrives, so the core reads the notice from its next HTTP answer.
+    for path in [
+        format!("/v1/bases/{base}/live"),
+        "/v1/approvals/live".into(),
+    ] {
+        match full.try_live(&path).await {
+            Err(WsError::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}")
+            }
+            other => panic!("{path}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// Old clients remove devices with no body at all, and get the old answers back.
+#[tokio::test]
+async fn a_removal_without_a_body_revokes_without_a_notice() {
+    let s = LocalServer::from_env();
+    let a = RawAccount::signup(s).await;
+    let full = a.second_full(s).await;
+    let response = reqwest::Client::new()
+        .delete(
+            s.url()
+                .join(&format!("/v1/devices/{}", full.device_id))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "1")
+        .bearer_auth(&a.full.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, body) = full.get("/v1/me", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "revoked", "message": "revoked"}));
+}

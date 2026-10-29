@@ -20,6 +20,7 @@ type BaseRpc = {
   grant(p: Principal, deviceId: string, mode: GrantMode, epoch: number, wrapper: string): Promise<Result>;
   revoke(p: Principal, deviceId: string): Promise<Result>;
   changes(p: Principal, changes: NewChange[]): Promise<Result>;
+  fileAccess(p: Principal, write: boolean): Promise<Result>;
   since(p: Principal, after: number, limit: number): Promise<Result>;
   fetchObjects(p: Principal, objectIds: string[]): Promise<Result<Fetched>>;
   versions(p: Principal, objectId: string, before: number | null, limit: number): Promise<Result>;
@@ -86,12 +87,17 @@ async function changes(request: Request, env: Env, baseId: string): Promise<Resp
   // The base64 bodies plus their JSON, bounded before the request is read.
   if (Number(request.headers.get('Content-Length') ?? 0) > CHANGES_BODY_MAX / 3 * 4 + MIB) throw new HttpError(413, 'too_large');
   const principal = await requireDevice(request, env, true);
-  const raw = await body(request);
+  const raw = await body(request, CHANGES_BODY_MAX / 3 * 4 + MIB);
   if (!Array.isArray(raw.changes)) throw new HttpError(400, 'bad_request');
   if (raw.changes.length > CHANGES_MAX) throw new HttpError(413, 'too_large');
   const input = raw.changes.map(change);
   if (input.reduce((n, c) => n + c.body.length, 0) > CHANGES_BODY_MAX) throw new HttpError(413, 'too_large');
   const base = baseStub(env, baseId);
+  const access = await base.fileAccess(principal, true);
+  if (access.status !== 200) return answer(access);
+  if (!await accountStub(env, principal.accountId).reserveStorage(input.reduce((n, c) => n + c.body.length, 0))) {
+    throw new HttpError(413, 'storage_limit');
+  }
   const result = await base.changes(principal, input);
   if (testBypass(request, env) && await base.takeHeldReply(principal.deviceId)) {
     while (await base.replyHeld(principal.deviceId)) {

@@ -86,8 +86,19 @@ fn live_change_omits_missing_body() {
     assert!(v.get("body").is_none());
     assert_eq!(v["prevHead"], 4);
     assert_eq!(
-        serde_json::to_value(LiveMessage::Revoked).unwrap(),
+        serde_json::to_value(LiveMessage::Revoked { notice: None }).unwrap(),
         serde_json::json!({"t":"revoked"})
+    );
+    // The removing device's notice round-trips; older servers send none.
+    let revoked = LiveMessage::Revoked {
+        notice: Some("AQI".into()),
+    };
+    let v = serde_json::to_value(&revoked).unwrap();
+    assert_eq!(v, serde_json::json!({"t":"revoked","notice":"AQI"}));
+    assert_eq!(serde_json::from_value::<LiveMessage>(v).unwrap(), revoked);
+    assert_eq!(
+        serde_json::from_value::<LiveMessage>(serde_json::json!({"t":"revoked"})).unwrap(),
+        LiveMessage::Revoked { notice: None }
     );
 }
 
@@ -192,10 +203,31 @@ fn protocol_constants_and_empty_bodies() {
     assert_eq!(
         serde_json::to_value(ErrorBody {
             error: "needs_update".into(),
-            message: "update".into()
+            message: "update".into(),
+            notice: None,
         })
         .unwrap(),
         serde_json::json!({"error":"needs_update","message":"update"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ErrorBody>(
+            serde_json::json!({"error":"revoked","message":"revoked","notice":"AQI"})
+        )
+        .unwrap()
+        .notice
+        .as_deref(),
+        Some("AQI")
+    );
+    assert_eq!(
+        serde_json::to_value(DeleteDeviceRequest {
+            notice: Some(Bytes(vec![1, 2]))
+        })
+        .unwrap(),
+        serde_json::json!({"notice":"AQI"})
+    );
+    assert_eq!(
+        serde_json::from_value::<DeleteDeviceRequest>(serde_json::json!({})).unwrap(),
+        DeleteDeviceRequest::default()
     );
 }
 

@@ -67,6 +67,81 @@ fn bytes(row: &Value) -> u64 {
 }
 
 #[tokio::test]
+async fn first_write_counts_existing_sqlite_bytes() {
+    bh_testkit::local_only!();
+    let mut server = LocalServer::start();
+    let (base, owner) = base(&server).await;
+    let existing = bytes(&storage(&owner, &base).await);
+    assert!(existing > 1);
+    server.set_var("STORAGE_CAP_TEST_BYTES", &(existing - 1).to_string());
+    server.restart();
+    let path = format!("/v1/bases/{base}/files/{}/0", random_id());
+    let (status, body) = owner.full.put_bytes(&path, b"a").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"], "storage_limit");
+}
+
+#[tokio::test]
+async fn old_overcount_remeasures_compacted_storage_on_limit() {
+    bh_testkit::local_only!();
+    let mut server = LocalServer::start_with_vars(&[
+        ("STORAGE_CAP_TEST_BYTES", "350000"),
+        ("STORAGE_NOW_MS", "1000000000000"),
+    ]);
+    let (base, owner) = base(&server).await;
+    let object = random_id();
+    let large = vec![7; 80 * 1024];
+    change(&owner, &base, &object, "update", &large, None, false).await;
+    change(&owner, &base, &object, "update", &large, None, false).await;
+    change(&owner, &base, &object, "state", &large, Some(2), false).await;
+    let stored = bytes(&storage(&owner, &base).await);
+    assert!(
+        stored + (large.len() as u64) < 350000,
+        "real stored bytes: {stored}"
+    );
+    let path = format!("/v1/bases/{base}/changes");
+    let request = json!({"changes": [{"changeId": random_id(), "objectId": object, "kind": "update", "body": b64(&large)}]});
+    assert_eq!(
+        owner.full.post(&path, request.clone()).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    server.set_var("STORAGE_NOW_MS", "1000086400001");
+    server.restart();
+    let (status, response) = owner.full.post(&path, request).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+}
+
+#[tokio::test]
+async fn writes_stop_when_account_storage_is_over_the_cap() {
+    bh_testkit::local_only!();
+    let mut server = LocalServer::start();
+    let (base, owner) = base(&server).await;
+    let object = random_id();
+    change(
+        &owner,
+        &base,
+        &object,
+        "update",
+        b"already stored",
+        None,
+        false,
+    )
+    .await;
+    server.set_var("STORAGE_CAP_TEST_BYTES", "1");
+    server.restart();
+    let part = format!("/v1/bases/{base}/files/{object}/0");
+    assert_eq!(
+        owner.full.put_bytes(&part, b"part").await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let (status, body) = owner.full.post(&format!("/v1/bases/{base}/changes"),
+        json!({"changes": [{"changeId": random_id(), "objectId": object, "kind": "update", "body": b64(b"another")}]})
+    ).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"], "storage_limit");
+}
+
+#[tokio::test]
 async fn sqlite_database_size_exists_and_grows_after_writes() {
     let server = LocalServer::from_env();
     let (base, owner) = base(server).await;

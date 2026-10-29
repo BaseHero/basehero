@@ -57,6 +57,66 @@ async fn setup() -> (Account, Base) {
 }
 
 #[tokio::test]
+async fn hero_on_an_app_device_never_reads_another_base_into_a_chat() {
+    let (account, health) = setup().await;
+    let personal = account.create_base("Personal").await.unwrap();
+    let private = note_with_text(&personal, "Private text");
+    let own = note_with_text(&health, "Health text");
+    personal.flush().await.unwrap();
+    health.flush().await.unwrap();
+    let grant = |base: &Base, mode| BaseGrantRequest::Existing {
+        base: base.id(),
+        mode,
+    };
+    let credentials = account
+        .connect_app(AppRequest {
+            app_name: "Hero app".into(),
+            app_id: None,
+            replaces: None,
+            bases: vec![
+                grant(&health, Mode::ReadWrite),
+                grant(&personal, Mode::ReadWrite),
+            ],
+        })
+        .await
+        .unwrap();
+    // Another app reads Health, so a chat there has a reader Personal doesn't.
+    account
+        .connect_app(AppRequest {
+            app_name: "Health only".into(),
+            app_id: None,
+            replaces: None,
+            bases: vec![grant(&health, Mode::ReadOnly)],
+        })
+        .await
+        .unwrap();
+    let app = device("Hero app").install_app(credentials).await.unwrap();
+    app.refresh().await.unwrap();
+    let (app_personal, app_health) = (
+        app.base(personal.id()).unwrap(),
+        app.base(health.id()).unwrap(),
+    );
+    wait_for_base(&app_personal, || {
+        app_personal.get(private).unwrap().is_some()
+    })
+    .await;
+    wait_for_base(&app_health, || app_health.get(own).unwrap().is_some()).await;
+    let model = ScriptedModel::new(vec![
+        call("read", json!({"base": personal.id(), "id": private})),
+        call("read", json!({"base": health.id(), "id": own})),
+        reply("Done"),
+    ]);
+    let hero = app.hero_with_model(model.clone());
+    let chat = hero.new_chat(health.id()).unwrap();
+    hero.send(health.id(), chat, "Read Personal", None).unwrap();
+    hero.wait_idle(chat).await;
+    let requests = format!("{:?}", model.requests());
+    assert!(requests.contains("not_allowed"));
+    assert!(!requests.contains("Private text"));
+    assert!(requests.contains("Health text"));
+}
+
+#[tokio::test]
 async fn another_full_device_refreshes_app_grants_before_a_turn() {
     let (first, second) = two_devices().await;
     let health = first.create_base("Health").await.unwrap();

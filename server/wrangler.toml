@@ -48,6 +48,7 @@ name = "basehero-api-dev"
 workers_dev = false
 routes = [{ pattern = "dev-api.basehero.com", custom_domain = true }]
 [env.dev.vars]
+BH_ENV = "dev"
 ALLOW_TEST_BYPASS = "1"
 TINFOIL_MODELS = "deepseek-v4-1-flash"
 GATEWAY_PER_MINUTE = "20"
@@ -90,6 +91,7 @@ name = "basehero-api"
 workers_dev = false
 routes = [{ pattern = "api.basehero.com", custom_domain = true }]
 [env.production.vars]
+BH_ENV = "production"
 TINFOIL_MODELS = "deepseek-v4-1-flash"
 GATEWAY_PER_MINUTE = "20"
 GATEWAY_PER_DAY = "500"

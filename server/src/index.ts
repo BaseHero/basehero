@@ -2,7 +2,7 @@ import type { SignupRequest } from './proto/gen/SignupRequest';
 import type { LoginRequest } from './proto/gen/LoginRequest';
 import type { CredentialsRequest } from './proto/gen/CredentialsRequest';
 import type { HealthResponse } from './proto/gen/HealthResponse';
-import { accountStub, answer, b64, body, bytes, equal, error, hex, HttpError, id, json, randomBytes, requireDevice, sha, str, testBypass, verifier } from './http';
+import { accountStub, answer, b64, body, bytes, equal, error, hex, HttpError, id, json, randomBytes, removalNotice, requireDevice, sha, str, testBypass, testMode, verifier } from './http';
 import { handleBases } from './bases';
 import { handleApprovals, message } from './approvals';
 import type { ConnectCreateRequest } from './proto/gen/ConnectCreateRequest';
@@ -10,6 +10,7 @@ import type { ApprovalEndReason } from './proto/gen/ApprovalEndReason';
 import type { Env, Result } from './http';
 import { gatewayStub, handleModels } from './gateway';
 import { accountUsage, monthQuery, storageRow } from './usage';
+import { listedBytes } from './storage';
 export { GatewayDO } from './gateway_do';
 export { AccountDO } from './account';
 export { BaseDO } from './base';
@@ -52,16 +53,6 @@ async function fakeParams(env: Env, email: string) {
   const hash = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(email)));
   return { salt: b64(hash.slice(0, 16)), kdf: { opsLimit: 3, memLimitKib: 65536 } };
 }
-async function listedBytes(env: Env, prefix: string): Promise<number> {
-  let total = 0;
-  let cursor: string | undefined;
-  do {
-    const page = await env.FILES.list({ prefix, cursor });
-    for (const object of page.objects) total += object.size;
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  return total;
-}
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (request.headers.get('BH-Protocol') !== '1') throw new HttpError(426, 'needs_update', 'Protocol version 1 is required');
@@ -73,7 +64,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (request.method === 'GET' && path === '/v1/usage') {
     const principal = await requireDevice(request, env);
     if (principal.kind !== 'full') throw new HttpError(403, 'forbidden');
-    const pinned = env.ALLOW_TEST_BYPASS === '1' && env.GATEWAY_NOW_MS !== undefined ? Number(env.GATEWAY_NOW_MS) : Date.now();
+    const pinned = testMode(env) && env.GATEWAY_NOW_MS !== undefined ? Number(env.GATEWAY_NOW_MS) : Date.now();
     const month = monthQuery(new URL(request.url).searchParams.get('month'), pinned);
     if (month === null) throw new HttpError(400, 'bad_request');
     const gateway = gatewayStub(env, principal.accountId);
@@ -94,13 +85,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     report.months.push(...storage);
     return json(report);
   }
-  if (request.method === 'POST' && path === '/v1/admin/test/legacy-usage' && env.ALLOW_TEST_BYPASS === '1') {
+  if (request.method === 'POST' && path === '/v1/admin/test/legacy-usage' && testMode(env)) {
     if (!operator(request, env)) throw new HttpError(401, 'unauthorized');
     const accountId = id(new URL(request.url).searchParams.get('account'));
     await gatewayStub(env, accountId).seedLegacyDay();
     return json({});
   }
-  if (request.method === 'GET' && path === '/v1/admin/usage') {
+  // Testkit reads raw gateway usage; it is never exposed to the production operator.
+  if (request.method === 'GET' && path === '/v1/admin/usage' && env.BH_ENV === 'dev') {
     if (!operator(request, env)) throw new HttpError(401, 'unauthorized');
     const accountId = id(new URL(request.url).searchParams.get('account'));
     return json({ days: await gatewayStub(env, accountId).usage() });
@@ -227,7 +219,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   } else if (request.method === 'POST' && path === '/v1/devices/fail-next-removal' && testBypass(request, env)) {
     result = await account.failRemovalOnce(principal);
   } else if (request.method === 'DELETE' && path.startsWith('/v1/devices/')) {
-    result = await account.removeDevice(principal, id(path.slice('/v1/devices/'.length)));
+    const deviceId = id(path.slice('/v1/devices/'.length));
+    result = await account.removeDevice(principal, deviceId, await removalNotice(request));
   } else throw new HttpError(404, 'not_found');
   return answer(result);
 }
@@ -235,7 +228,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try { return await route(request, env, ctx); }
     catch (e) {
-      if (e instanceof HttpError) return error(e.code, e.status, e.message);
+      if (e instanceof HttpError) return error(e.code, e.status, e.message, e.notice);
       // Do not include exception details: they may contain sensitive request data.
       return error('bad_gateway', 502, 'Internal server error');
     }

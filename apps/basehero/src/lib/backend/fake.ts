@@ -7,6 +7,8 @@ export class FakeBackend implements Backend {
   setPlatform(platform: AppInfo['platform']) { this.platform = platform; }
   private handlers = new Set<(event: AppEvent) => void>();
   private accountList: AccountSummary[] = [];
+  // Like the core's in-memory flag: accounts() reports it until the account is erased.
+  private signedOut = new Set<string>();
   private keyUnavailable = typeof location !== 'undefined' && new URLSearchParams(location.search).has('keyError');
   private passwords = new Map<string, string>();
   private kitStates = new Map<string, KitStatus>();
@@ -93,7 +95,9 @@ export class FakeBackend implements Backend {
       const closed = e.event.ApprovalClosed;
       this.approvalList.set(e.account, (this.approvalList.get(e.account) ?? []).filter(r => r.id !== closed));
     }
+    if (e.kind.toLowerCase() === 'account' && e.event === 'SignedOutByServer') this.signedOut.add(e.account);
     if (e.kind.toLowerCase() === 'account' && e.event === 'Removed') {
+      this.signedOut.delete(e.account);
       this.accountList = this.accountList.filter(account => account.id !== e.account);
       this.kits.delete(e.account);
       this.kitStates.delete(e.account);
@@ -125,7 +129,7 @@ export class FakeBackend implements Backend {
   endApproval(pending: string, reason: string) { this.approvalWaiters.get(pending)?.reject(new BackendError('ApprovalEnded', reason)); this.approvalWaiters.delete(pending); }
   private installPending(pending: string): AccountSummary {
     let account = this.accountList.find(a => a.email === pending);
-    if (!account) { account = { id: this.id(), email: pending, kind: 'full' }; this.accountList.push(account); }
+    if (!account) { account = { id: this.id(), email: pending, kind: 'full', signedOutByServer: false }; this.accountList.push(account); }
     return account;
   }
   seedHeroChat(account: string, base: string, project: string | null, chat: string) {
@@ -209,11 +213,11 @@ export class FakeBackend implements Backend {
     this.platform = platform;
     return { version: '0.1.0', server: 'https://dev-api.basehero.com', platform };
   }
-  async accounts() { this.log('accounts'); if (this.keyUnavailable) throw new BackendError('KeyUnavailable', 'Keychain status -25308'); return [...this.accountList]; }
+  async accounts() { this.log('accounts'); if (this.keyUnavailable) throw new BackendError('KeyUnavailable', 'Keychain status -25308'); return this.accountList.map(account => ({ ...account, signedOutByServer: this.signedOut.has(account.id) })); }
   async resetDevice() { this.log('resetDevice'); if (!this.keyUnavailable) throw new BackendError('Invalid', 'No key error'); this.keyUnavailable = false; this.accountList = []; }
-  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full' }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); return { account, kit };  }
+  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full', signedOutByServer: false }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); return { account, kit };  }
   async signInStart(form: SignInForm) { this.log('signInStart'); return form.email; }
-  async signInWithKit(pending: string, kit: string) { this.log('signInWithKit'); const existing = this.accountList.find(a => a.email === pending); if (kit !== (existing ? this.kits.get(existing.id) : '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC')) throw new BackendError('BadKit', 'Bad kit'); if (existing) return existing; const account: AccountSummary = { id: this.id(), email: pending, kind: 'full' }; this.accountList.push(account); this.passwords.set(account.id, 'correct horse battery staple'); this.kits.set(account.id, kit); this.kitStates.set(account.id, { known: true, saved: true, madeAt: Date.now() }); return account; }
+  async signInWithKit(pending: string, kit: string) { this.log('signInWithKit'); const existing = this.accountList.find(a => a.email === pending); if (kit !== (existing ? this.kits.get(existing.id) : '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC')) throw new BackendError('BadKit', 'Bad kit'); if (existing) return existing; const account: AccountSummary = { id: this.id(), email: pending, kind: 'full', signedOutByServer: false }; this.accountList.push(account); this.passwords.set(account.id, 'correct horse battery staple'); this.kits.set(account.id, kit); this.kitStates.set(account.id, { known: true, saved: true, madeAt: Date.now() }); return account; }
   async signInCancel(pending: string) { this.log('signInCancel', pending); }
   async approvalStart(pending: string) { this.log('approvalStart', pending); return this.id(); }
   async approvalDigits(pending: string) { this.log('approvalDigits', pending); return this.approvalDigitsValues.get(pending) ?? new Promise<string>(resolve => this.digitWaiters.set(pending, resolve)); }
@@ -306,7 +310,8 @@ export class FakeBackend implements Backend {
     if (!target || target.kind.toLowerCase() !== 'app') throw new BackendError('NotFound', 'Not found');
     target.capMicroUsd = capMicroUsd;
   }
-  async signOut(account: string) { this.log('signOut', account); this.accountList = this.accountList.filter(a => a.id !== account); }
+  // Like the core, signing out erases the account and says it was removed.
+  async signOut(account: string) { this.log('signOut', account); this.emit({ kind: 'account', account, event: 'Removed' }); }
   async newKit(account: string, password: string): Promise<string> {
     this.log('newKit', account);
     if (this.passwords.get(account) !== password) throw new BackendError('BadCredentials', 'Wrong password');

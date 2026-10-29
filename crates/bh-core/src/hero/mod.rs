@@ -8,7 +8,7 @@ pub(crate) mod tools;
 mod turn;
 
 use crate::base::BaseWeak;
-use crate::{Account, AccountEvent, Base, BaseId, Error, NewObject, ObjectId, TypeRef};
+use crate::{Account, AccountEvent, Base, BaseId, DeviceKind, Error, NewObject, ObjectId, TypeRef};
 use bh_models::ChatModel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -819,12 +819,16 @@ impl Hero {
         let summaries = self.inner.account.bases();
         let current = summaries.iter().find(|b| b.id == id);
         let (allowed, denied) = self.inner.account.hero_permissions(id, chat);
+        // An app device can't know who else reads a base, nor answer a prompt.
+        let app_device = self.inner.account.kind() == DeviceKind::App;
         let others = summaries
             .iter()
             .filter(|s| s.id != id)
             .filter_map(|s| {
                 let current = current?;
-                let permission = if !readers_fresh && !s.hidden && !denied.contains(&s.id) {
+                let permission = if app_device {
+                    access::Access::Never
+                } else if !readers_fresh && !s.hidden && !denied.contains(&s.id) {
                     access::Access::Ask
                 } else {
                     access::access(

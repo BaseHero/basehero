@@ -25,7 +25,7 @@ const send = async (text: string) => {
 beforeEach(async () => {
   fake.backend = new FakeBackend();
   fake.backend.seedHeroChat(account, base, null, chat);
-  session.account = { id: account, email: 'test@example.test', kind: 'full' };
+  session.account = { id: account, email: 'test@example.test', kind: 'full', signedOutByServer: false };
   target = document.createElement('div'); document.body.append(target);
   component = mount(HeroPanelHarness, { target });
   await flush();

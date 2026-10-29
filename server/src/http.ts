@@ -23,7 +23,12 @@ export type Env = {
   TINFOIL_CONNECT?: string;
   /** Local tests may pin the gateway clock to avoid minute-boundary races. */
   GATEWAY_NOW_MS?: string;
+  BH_ENV?: string;
   ALLOW_TEST_BYPASS?: string;
+  /** Local tests only: exercise the production storage guard with tiny writes. */
+  STORAGE_CAP_TEST_BYTES?: string;
+  /** Local tests may advance the storage guard's one-day measurement window. */
+  STORAGE_NOW_MS?: string;
   /** Tests lengthen the change-rate window so its limit doesn't depend on timing. */
   CHANGE_RATE_WINDOW_MS?: string;
   /** How long the relay keeps an approval open; tests shorten it. */
@@ -33,33 +38,82 @@ export type Env = {
   LOGIN_RATE_LIMITER?: { limit(input: { key: string }): Promise<{ success: boolean }> };
 };
 export type Result<T = object> = { status: number; body: T | ErrorBody };
+/** A removed device, with its removal notice if the removing device sent one. */
+export type Revoked = { revoked: string | null };
 
 export class HttpError extends Error {
-  constructor(public status: number, public code: string, message = code) { super(message); }
+  constructor(public status: number, public code: string, message = code, public notice: string | null = null) { super(message); }
 }
 export function json(body: object, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status, headers: { 'Content-Type': 'application/json', 'BH-Protocol': '1' },
   });
 }
-export function error(code: string, status: number, message: string): Response {
-  const body: ErrorBody = { error: code, message };
+export function error(code: string, status: number, message: string, notice: string | null = null): Response {
+  const body: ErrorBody = { error: code, message, ...(notice ? { notice } : {}) };
   return json(body, status);
 }
 export function fail(status: number, code: string, message = code): Result<never> {
   return { status, body: { error: code, message } };
 }
-export function answer(result: Result): Response { return json(result.body, result.status); }
-export async function body(request: Request): Promise<Record<string, unknown>> {
+/** A removed device's answer, with the removing device's notice if it sent one. */
+export function revoked(notice: string | null): Result<never> {
+  return { status: 401, body: { error: 'revoked', message: 'revoked', ...(notice ? { notice } : {}) } };
+}
+/** `{ notice }` from a removal's optional body; older clients send none. */
+export async function removalNotice(request: Request): Promise<string | null> {
+  const text = await request.text();
+  if (!text) return null;
   let value: unknown;
-  try { value = await request.json(); } catch { throw new HttpError(400, 'bad_request'); }
+  try { value = JSON.parse(text); } catch { throw new HttpError(400, 'bad_request'); }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new HttpError(400, 'bad_request');
+  const notice = (value as Record<string, unknown>).notice;
+  if (notice === undefined) return null;
+  bytes(notice, 32);
+  return notice as string;
+}
+export function answer(result: Result): Response { return json(result.body, result.status); }
+/** Reads no more than `max` actual bytes, regardless of Content-Length. */
+export async function limitedBytes(request: Request, max: number): Promise<Uint8Array> {
+  const length = request.headers.get('Content-Length');
+  if (length !== null && Number(length) > max) throw new HttpError(413, 'too_large');
+  const reader = request.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        try { await reader.cancel(); } catch { /* keep the 413 if cancellation fails */ }
+        throw new HttpError(413, 'too_large');
+      }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+  return result;
+}
+export async function body(request: Request, max = 2 * 1024 * 1024): Promise<Record<string, unknown>> {
+  let value: unknown;
+  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await limitedBytes(request, max))); }
+  catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, 'bad_request');
+  }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new HttpError(400, 'bad_request');
   return value as Record<string, unknown>;
 }
+/** Test controls are available only in the dev environment, never production. */
+export function testMode(env: Env): boolean { return env.BH_ENV === 'dev' && env.ALLOW_TEST_BYPASS === '1'; }
 /** True only on a server that allows test bypass, for a request carrying the operator token. */
 export function testBypass(request: Request, env: Env): boolean {
   const bypass = request.headers.get('BH-Test-Bypass');
-  return env.ALLOW_TEST_BYPASS === '1' && !!env.OPERATOR_TOKEN && bypass !== null &&
+  return testMode(env) && !!env.OPERATOR_TOKEN && bypass !== null &&
     equal(new TextEncoder().encode(bypass), new TextEncoder().encode(env.OPERATOR_TOKEN));
 }
 export function id(value: unknown): string {
@@ -106,16 +160,17 @@ export type AccountRpc = {
   create(input: import('./proto/gen/SignupRequest').SignupRequest, token: string, tokenHash: string): Promise<Result>;
   params(): Promise<import('./proto/gen/LoginParamsResponse').LoginParamsResponse | null>;
   login(key: string, deviceId: string, token: string, tokenHash: string): Promise<Result>;
-  auth(tokenHash: string, countChange: boolean): Promise<Principal | 'revoked' | 'rate_limited' | null>;
+  auth(tokenHash: string, countChange: boolean): Promise<Principal | Revoked | 'rate_limited' | null>;
   activate(principal: Principal, activation: string): Promise<Result>;
   me(principal: Principal): Promise<Result>;
   account(principal: Principal): Promise<Result>;
   usageBases(principal: Principal): Promise<string[]>;
+  reserveStorage(bytes: number): Promise<boolean>;
   data(principal: Principal, ciphertext: string, expectedVersion: number): Promise<Result>;
   credentials(principal: Principal, input: import('./proto/gen/CredentialsRequest').CredentialsRequest): Promise<Result>;
   addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string, capMicroUsd?: number): Promise<Result>;
   setCap(principal: Principal, deviceId: string, cap: number): Promise<Result>;
-  removeDevice(principal: Principal, deviceId: string): Promise<Result>;
+  removeDevice(principal: Principal, deviceId: string, notice: string | null): Promise<Result>;
   failRemovalOnce(principal: Principal): Promise<Result>;
   testLastSeen(principal: Principal, deviceId: string, lastSeenAt: number): Promise<Result>;
   addBase(principal: Principal, baseId: string): Promise<void>;
@@ -137,9 +192,9 @@ export async function requireDevice(request: Request, env: Env, countChange = fa
   if (!match) throw new HttpError(401, 'unauthorized');
   const token = `${match[1]}.${match[2]}`;
   const principal = await accountStub(env, match[1]).auth(hex(await sha(token)), countChange);
-  if (principal === 'revoked') throw new HttpError(401, 'revoked');
   if (principal === 'rate_limited') throw new HttpError(429, 'rate_limited');
   if (!principal) throw new HttpError(401, 'unauthorized');
+  if ('revoked' in principal) throw new HttpError(401, 'revoked', 'revoked', principal.revoked);
   if (principal.status === 'pending' && !pendingMayReach(request.method, new URL(request.url).pathname)) {
     throw new HttpError(403, 'pending');
   }
