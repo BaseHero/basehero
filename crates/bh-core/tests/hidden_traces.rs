@@ -63,7 +63,7 @@ async fn a_locked_base_leaves_no_readable_trace_in_ordinary_stores() {
     let temp = tempfile::tempdir().unwrap();
     let (core, secrets) = local_core(temp.path());
     core.set_test_device_name("mac");
-    let (account, _) = core.sign_up(new_signup()).await.unwrap();
+    let (account, kit) = core.sign_up(new_signup()).await.unwrap();
     let personal = account.create_base("Personal").await.unwrap();
     let second_ordinary = account.create_base("Shared").await.unwrap();
     let hidden = account
@@ -82,6 +82,66 @@ async fn a_locked_base_leaves_no_readable_trace_in_ordinary_stores() {
     );
     hidden.flush().await.unwrap();
     account.lock_hidden(hidden.id()).await.unwrap();
+    let removed = device("removed")
+        .sign_in(signin_for(&account))
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    account.refresh().await.unwrap();
+    removed.refresh().await.unwrap();
+    account
+        .remove_device(
+            removed.device_id(),
+            bh_core::Removal::Full {
+                password: pw(bh_testkit::TEST_PASSWORD),
+                lost: false,
+            },
+        )
+        .await
+        .unwrap();
+    account.unlock_hidden(pw(PASSWORD)).await.unwrap();
+    account.refresh().await.unwrap();
+    let response: serde_json::Value = reqwest::Client::new()
+        .get(
+            LocalServer::shared()
+                .url()
+                .join(&format!("/v1/bases/{}/key", hidden.id()))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", LocalServer::shared().operator_token())
+        .bearer_auth(bh_testkit::raw_device(&account).token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        response["epoch"], 2,
+        "trace scan must inspect a re-keyed hidden base"
+    );
+    account.lock_hidden(hidden.id()).await.unwrap();
+    let errors = [
+        account
+            .unlock_hidden(pw("incorrect Pistachio"))
+            .await
+            .unwrap_err(),
+        hidden.children(None).unwrap_err(),
+        account.connect_app(grant(hidden.id())).await.unwrap_err(),
+    ];
+    for error in errors {
+        for needle in NEEDLES {
+            assert!(
+                !format!("{error} {error:?}").contains(needle),
+                "error exposes {needle} after re-key"
+            );
+        }
+    }
     let account_dir = temp
         .path()
         .join("data/accounts")
@@ -326,9 +386,18 @@ async fn removal_erases_hidden_stores() {
         hidden_path.exists(),
         "removal test must start with a hidden store"
     );
-    a.remove_device(b.device_id()).await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: Zeroizing::new(bh_testkit::TEST_PASSWORD.into()),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
     wait_for(|| core.accounts().is_empty()).await;
-    assert!(!hidden_path.exists());
+    // Erasing finishes a few milliseconds after the account leaves the list.
+    wait_for(|| !hidden_path.exists()).await;
     assert!(!account_dir.exists());
     assert!(
         secrets

@@ -184,17 +184,18 @@ async fn locking_does_not_wait_for_a_held_reader_refresh() {
         .create_hidden_base("Zebra Diary", Zeroizing::new("ferry lantern quartz".into()))
         .await
         .unwrap();
-    let held = account.test_hold_next_account_get();
-    let before = account.test_request_count("v1/account");
+    hidden.flush().await.unwrap();
     let model = ScriptedModel::new(vec![Scripted::Hang]);
     let hero = account.hero_with_model(model.clone());
+    let (release, entered) = hero.test_hold_next_reader_refresh();
     let chat = hero.new_chat(hidden.id()).unwrap();
+    let before = account.test_request_count("v1/account");
     hero.send(hidden.id(), chat, "Hi", None).unwrap();
-    wait_for(|| account.test_request_count("v1/account") > before).await;
-    tokio::time::timeout(Duration::from_secs(30), hidden.flush())
-        .await
-        .expect("the outbox must be clear to isolate the cancellation bound")
-        .unwrap();
+    bh_testkit::wait_entered(&entered, std::panic::Location::caller()).await;
+    assert!(
+        account.test_request_count("v1/account") > before,
+        "Hero's reader refresh must issue its account request before it is held"
+    );
     // Locking may spend up to two seconds sending edits; the refresh it must
     // cancel waits ten.
     tokio::time::timeout(Duration::from_secs(5), account.lock_hidden(hidden.id()))
@@ -206,7 +207,7 @@ async fn locking_does_not_wait_for_a_held_reader_refresh() {
         model.requests().is_empty(),
         "a cancelled pre-model turn never calls the model"
     );
-    drop(held);
+    drop(release);
 }
 
 #[tokio::test]

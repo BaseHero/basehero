@@ -213,7 +213,9 @@ async fn a_restarted_sample_checks_revocation_before_reporting_connected() {
     let (full, _, dir, app) = setup().await;
     let connected = connect(&full, &app, defaults).await;
     drop(app);
-    full.remove_device(connected.device).await.unwrap();
+    full.remove_device(connected.device, bh_core::Removal::Plain)
+        .await
+        .unwrap();
     let restarted = sample(dir.path());
     assert!(restarted.check_connection().await.unwrap().is_none());
     assert!(restarted.connected().is_none());
@@ -230,7 +232,9 @@ async fn a_restarted_sample_checks_revocation_before_reporting_connected() {
 async fn a_disconnected_sample_is_not_connected() {
     let (full, _, _dir, app) = setup().await;
     let connected = connect(&full, &app, defaults).await;
-    full.remove_device(connected.device).await.unwrap();
+    full.remove_device(connected.device, bh_core::Removal::Plain)
+        .await
+        .unwrap();
     wait_for(|| app.connected().is_none()).await;
 }
 

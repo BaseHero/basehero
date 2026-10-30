@@ -25,6 +25,22 @@ fn code((status, body): (StatusCode, Value)) -> (StatusCode, Option<String>) {
 fn refused(status: StatusCode, error: &str) -> (StatusCode, Option<String>) {
     (status, Some(error.to_string()))
 }
+async fn revoke(s: &LocalServer, owner: &RawDevice, device: &RawDevice) -> StatusCode {
+    reqwest::Client::new()
+        .delete(
+            s.url()
+                .join(&format!("/v1/devices/{}", device.device_id))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", s.operator_token())
+        .bearer_auth(&owner.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
 async fn try_create(device: &RawDevice, id: &str, request: &[u8]) -> (StatusCode, Value) {
     device
         .post(
@@ -434,11 +450,7 @@ async fn revoking_a_device_closes_its_approval_sockets() {
     assert_eq!(next(&mut a_live).await, announced(&id, "requested"));
 
     for device in [&b, &pending] {
-        let (status, body) = a
-            .full
-            .delete(&format!("/v1/devices/{}", device.device_id), json!({}))
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(revoke(s, &a.full, device).await, StatusCode::OK);
     }
     for live in [&mut b_live, &mut pending_live] {
         loop {
@@ -489,13 +501,7 @@ async fn revoking_the_approver_ends_the_exchange_as_failed() {
     );
     assert_eq!(next(&mut pending_live).await, announced(&id, "responded"));
 
-    assert_eq!(
-        a.full
-            .delete(&format!("/v1/devices/{}", approver.device_id), json!({}))
-            .await
-            .0,
-        StatusCode::OK
-    );
+    assert_eq!(revoke(s, &a.full, &approver).await, StatusCode::OK);
     assert_eq!(next(&mut pending_live).await, announced(&id, "ended"));
     assert_eq!(state(&pending, &id).await["endReason"], "failed");
     assert_eq!(

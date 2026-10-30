@@ -56,6 +56,62 @@ fn ids(account: &Account) -> Vec<BaseId> {
 }
 
 #[tokio::test]
+async fn ghost_grant_does_not_interrupt_app_refresh_or_its_other_base() {
+    let Setup {
+        full,
+        app,
+        personal,
+        notes,
+    } = setup(false).await;
+    let app_personal = app.base(personal.id()).unwrap();
+    let note = personal.create(bh_testkit::note()).unwrap();
+    personal.flush().await.unwrap();
+    bh_testkit::wait_for_base(&app_personal, || app_personal.note(note).is_ok()).await;
+
+    // Raise the ungranted base's floor, then submit an older grant decision.
+    let full_raw = raw_device(&full);
+    let rekey = format!("/v1/bases/{}/rekey", notes.id());
+    assert_eq!(
+        full_raw
+            .post(
+                &rekey,
+                json!({"from":1,"accountEpoch":1,
+        "dataVersion":3,"wrapper":"AQI","previous":"AwQ","apps":[]})
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let server = bh_testkit::LocalServer::from_env();
+    let grant = format!("/v1/bases/{}/grants/{}", notes.id(), app.device_id());
+    let response = reqwest::Client::new()
+        .put(server.url().join(&grant).unwrap())
+        .header("BH-Protocol", "2")
+        .bearer_auth(&full_raw.token)
+        .json(&json!({"mode":"ro","epoch":2,"accountEpoch":1,"dataVersion":2,"wrapper":"AQI"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"],
+        "stale_grant"
+    );
+    let (_, me) = raw_device(&app).get("/v1/me", json!({})).await;
+    assert!(
+        me["bases"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(notes.id().to_string()))
+    );
+
+    app.refresh().await.unwrap();
+    assert_eq!(ids(&app), vec![personal.id()]);
+    assert!(app.base(notes.id()).is_err());
+    assert!(app.base(personal.id()).unwrap().note(note).is_ok());
+}
+
+#[tokio::test]
 async fn adding_a_base_grant_reaches_the_app_on_refresh() {
     let Setup {
         full,
@@ -126,6 +182,98 @@ async fn removing_a_grant_erases_that_base_from_the_app() {
         (StatusCode::FORBIDDEN, Some("forbidden"))
     );
     assert!(full.test_app_readers(notes.id()).is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_settle_cannot_restore_a_removed_apps_key() {
+    let Setup {
+        full: remover,
+        app,
+        personal,
+        ..
+    } = setup(false).await;
+    let other = device("fold")
+        .sign_in(bh_core::SignIn {
+            device_name: "fold".into(),
+            ..bh_testkit::signin_for(&remover)
+        })
+        .await
+        .unwrap()
+        .with_kit(&remover.recovery_kit().unwrap().unwrap().display())
+        .await
+        .unwrap();
+    other.refresh().await.unwrap();
+    let path = format!("v1/bases/{}/grants/{}", personal.id(), app.device_id());
+    let before = other.test_request_count(&path);
+    let held = other.test_hold_next_grant();
+    let settling = {
+        let other = other.clone();
+        let app = app.device_id();
+        let base = personal.id();
+        tokio::spawn(async move {
+            other
+                .add_app_grant(
+                    app,
+                    BaseGrantRequest::Existing {
+                        base,
+                        mode: Mode::ReadOnly,
+                    },
+                )
+                .await
+        })
+    };
+    wait_for(|| other.test_request_count(&path) > before).await;
+    remover
+        .remove_app_grant(app.device_id(), personal.id())
+        .await
+        .unwrap();
+    held.add_permits(1);
+    let settle = settling.await.unwrap();
+    assert!(
+        settle.is_ok(),
+        "stale grant should refresh and settle again: {settle:?}"
+    );
+    // Match the new base epoch while presenting readers from before the
+    // pending removal: the floor, not the epoch, must reject this grant.
+    let server = bh_testkit::LocalServer::from_env();
+    let raw = raw_device(&other);
+    let key: serde_json::Value = reqwest::Client::new()
+        .get(
+            server
+                .url()
+                .join(&format!("/v1/bases/{}/key", personal.id()))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(&raw.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(key["dataFloor"].as_u64().unwrap() > 0);
+    let stale = reqwest::Client::new()
+        .put(server.url().join(&path).unwrap())
+        .header("BH-Protocol", "2").header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(&raw.token)
+        .json(&json!({"mode":"ro", "epoch": key["epoch"], "accountEpoch": 1, "dataVersion": 0, "wrapper": "AQI"}))
+        .send().await.unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        stale.json::<serde_json::Value>().await.unwrap()["error"],
+        "stale_grant"
+    );
+    let (status, response) = raw_device(&app)
+        .get(&format!("/v1/bases/{}/key", personal.id()), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert!(
+        !other
+            .test_app_readers(personal.id())
+            .contains(&app.device_id())
+    );
 }
 
 #[tokio::test]
@@ -254,10 +402,16 @@ async fn a_grant_change_that_stopped_midway_finishes_on_refresh() {
         lost_reply: false,
         times: 1,
     });
-    assert!(matches!(
-        full.remove_app_grant(app.device_id(), notes.id()).await,
-        Err(Error::Network(_))
-    ));
+    full.remove_app_grant(app.device_id(), notes.id())
+        .await
+        .unwrap();
+    assert!(
+        full.devices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == app.device_id() && d.pending_removal)
+    );
     // Pending: the old and new readers count together.
     assert_eq!(
         full.test_app_readers(notes.id()),
@@ -358,11 +512,9 @@ async fn a_pending_change_for_a_removed_app_does_not_hold_up_others() {
         .await
         .is_err()
     );
-    assert!(
-        full.remove_app_grant(second.device_id(), notes.id())
-            .await
-            .is_err()
-    );
+    full.remove_app_grant(second.device_id(), notes.id())
+        .await
+        .unwrap();
     // The first app's device goes from the server, but its entry stays in account data.
     let (status, _) = raw_device(&full)
         .delete(&format!("/v1/devices/{}", app.device_id()), json!({}))

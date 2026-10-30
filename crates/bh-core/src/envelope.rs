@@ -9,7 +9,7 @@ pub(crate) const FORMAT: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code, reason = "purposes of later tasks and plans")]
+#[allow(dead_code, reason = "reserved purposes and future key operations")]
 pub(crate) enum Purpose {
     ObjectUpdate = 1,
     ObjectState = 2,
@@ -23,6 +23,8 @@ pub(crate) enum Purpose {
     HiddenBaseKey = 10,
     AppConnectHello = 11,
     AppConnectTransfer = 12,
+    DeviceKey = 13,
+    PreviousBaseKey = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

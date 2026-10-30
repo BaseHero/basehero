@@ -1,6 +1,8 @@
+pub mod backup;
 mod bases;
 mod connect;
 mod device;
+pub mod folder;
 pub mod generate;
 pub mod inspect;
 mod mitm;
@@ -10,7 +12,8 @@ mod server;
 
 pub use bases::{
     DeviceBase, append_text, drop_next_reply, found_under, insert_text, note, note_with_text,
-    pause_sync, resume_sync, two_devices, two_devices_sharing_a_base, wait_for, wait_for_base,
+    pause_sync, resume_sync, two_devices, two_devices_sharing_a_base, wait_entered, wait_for,
+    wait_for_base,
 };
 pub use connect::{app_identity, approve_next_app};
 pub use device::{
@@ -20,4 +23,4 @@ pub use device::{
 pub use mitm::ApprovalMitm;
 pub use proxy::DelayProxy;
 pub use raw::{RawAccount, RawConnect, b64, random, random_id, send, unb64};
-pub use server::{LocalServer, LocalServerOptions};
+pub use server::{LocalServer, LocalServerOptions, register_exit_cleanup};

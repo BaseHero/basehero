@@ -4,14 +4,15 @@ import type { CredentialsRequest } from './proto/gen/CredentialsRequest';
 import type { LoginParamsResponse } from './proto/gen/LoginParamsResponse';
 import type { AccountResponse } from './proto/gen/AccountResponse';
 import type { MeResponse } from './proto/gen/MeResponse';
+import type { DeleteDeviceRequest } from './proto/gen/DeleteDeviceRequest';
 import type { ApprovalEndReason } from './proto/gen/ApprovalEndReason';
 import type { Env, Principal, Result, Revoked } from './http';
-import { b64, bytes, equal, error, fail, randomBytes, sha, testMode, verifier } from './http';
+import { b64, bytes, envelopeEpoch, equal, error, fail, randomBytes, sha, testMode, verifier } from './http';
 import { Approvals } from './approvals';
 import type { Step } from './approvals';
 import { listedBytes } from './storage';
 
-type AccountRow = { email: string; salt: string; kdf: string; verifier_salt: string; verifier: string; envelope: string; activation_hash: string; data: string | null; data_version: number; failed_logins: number; window_start: number };
+type AccountRow = { email: string; salt: string; kdf: string; verifier_salt: string; verifier: string; envelope: string; activation_hash: string; data: string | null; data_version: number; epoch: number; failed_logins: number; window_start: number };
 type DeviceRow = { device_id: string; kind: 'full' | 'app'; status: string; token_hash: string; created_at: number; last_seen_at: number; cap_micro_usd: number; removal_notice: string | null };
 
 // Abuse guard, not a billing allowance. Writes count conservatively until the
@@ -25,6 +26,10 @@ export class AccountDO extends DurableObject<Env> {
     super(ctx, env);
     const sql = ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY CHECK(id = 1), email TEXT NOT NULL, salt TEXT NOT NULL, kdf TEXT NOT NULL, verifier_salt TEXT NOT NULL, verifier TEXT NOT NULL, envelope TEXT NOT NULL, activation_hash TEXT NOT NULL, data TEXT, data_version INTEGER NOT NULL DEFAULT 0, failed_logins INTEGER NOT NULL DEFAULT 0, window_start INTEGER NOT NULL DEFAULT 0)');
+    if (!sql.exec<{ name: string }>('PRAGMA table_info(account)').toArray().some(column => column.name === 'epoch')) {
+      sql.exec('ALTER TABLE account ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1');
+    }
+    sql.exec('CREATE TABLE IF NOT EXISTS device_keys (device_id TEXT NOT NULL, epoch INTEGER NOT NULL, sealed TEXT NOT NULL, PRIMARY KEY (device_id, epoch))');
     sql.exec('CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL)');
     if (!sql.exec<{ name: string }>('PRAGMA table_info(devices)').toArray().some(column => column.name === 'cap_micro_usd')) {
       sql.exec('ALTER TABLE devices ADD COLUMN cap_micro_usd INTEGER NOT NULL DEFAULT 1000000');
@@ -92,14 +97,18 @@ export class AccountDO extends DurableObject<Env> {
     }
     // Even a first request in the creation millisecond marks the device as used.
     this.ctx.storage.sql.exec('UPDATE devices SET last_seen_at = ? WHERE device_id = ?', Math.max(Date.now(), device.created_at + 1), device.device_id);
-    return { accountId: this.ctx.id.name!, deviceId: device.device_id, kind: device.kind, status: device.status,
+    return { accountId: this.ctx.id.name!, deviceId: device.device_id, kind: device.kind, status: device.status, epoch: this.row()!.epoch, protocol: 1,
       ...(device.kind === 'app' ? { capMicroUsd: device.cap_micro_usd } : {}) };
   }
   async activate(principal: Principal, activation: string): Promise<Result> {
     if (principal.status !== 'pending' || principal.kind !== 'full') return fail(403, 'forbidden');
-    const row = this.row();
-    if (!row || !equal(await sha(bytes(activation, 32)), bytes(row.activation_hash, 32))) return fail(401, 'unauthorized');
-    this.ctx.storage.sql.exec("UPDATE devices SET status = 'active' WHERE device_id = ? AND status = 'pending'", principal.deviceId);
+    const digest = await sha(bytes(activation, 32));
+    const activated = this.ctx.storage.transactionSync(() => {
+      const row = this.row();
+      if (!row || !equal(digest, bytes(row.activation_hash, 32))) return false;
+      return this.ctx.storage.sql.exec("UPDATE devices SET status = 'active' WHERE device_id = ? AND status = 'pending' RETURNING device_id", principal.deviceId).toArray().length > 0;
+    });
+    if (!activated) return fail(401, 'unauthorized');
     this.approvals.closePending(principal.deviceId);
     this.approvals.drop(principal.deviceId);
     return { status: 200, body: {} };
@@ -157,21 +166,28 @@ export class AccountDO extends DurableObject<Env> {
   usageBases(principal: Principal): string[] {
     return principal.kind === 'full' && principal.status === 'active' ? this.accountBases() : [];
   }
-  me(principal: Principal): Result<MeResponse> {
-    const bases = principal.kind === 'full' ? this.accountBases() : this.bases(principal.deviceId);
-    return { status: 200, body: { accountId: principal.accountId, deviceId: principal.deviceId, kind: principal.kind, bases } };
+  private deviceKeys(deviceId: string, afterEpoch: number): { epoch: number; sealed: string }[] {
+    return this.ctx.storage.sql.exec<{ epoch: number; sealed: string }>('SELECT epoch, sealed FROM device_keys WHERE device_id = ? AND epoch > ? ORDER BY epoch', deviceId, afterEpoch).toArray();
   }
-  account(principal: Principal): Result<AccountResponse> {
+  me(principal: Principal, afterEpoch = 0): Result<MeResponse> {
+    const bases = principal.kind === 'full' ? this.accountBases() : this.bases(principal.deviceId);
+    const epoch = this.row()!.epoch;
+    return { status: 200, body: { accountId: principal.accountId, deviceId: principal.deviceId, kind: principal.kind, bases, epoch,
+      deviceKeys: this.deviceKeys(principal.deviceId, afterEpoch) } };
+  }
+  account(principal: Principal, afterEpoch = 0): Result<AccountResponse> {
     if (principal.kind !== 'full') return fail(403, 'forbidden');
     const row = this.row()!;
     const devices = this.ctx.storage.sql.exec<DeviceRow>('SELECT * FROM devices ORDER BY created_at, device_id').toArray()
       .map(d => ({ deviceId: d.device_id, kind: d.kind, status: d.status, createdAt: d.created_at, lastSeenAt: d.last_seen_at,
         ...(d.kind === 'app' ? { capMicroUsd: d.cap_micro_usd } : {}) }));
-    return { status: 200, body: { devices, bases: this.accountBases(), data: row.data === null ? null : { ciphertext: row.data, version: row.data_version }, accountKeyEnvelope: row.envelope } };
+    return { status: 200, body: { devices, bases: this.accountBases(), data: row.data === null ? null : { ciphertext: row.data, version: row.data_version }, accountKeyEnvelope: row.envelope, epoch: row.epoch,
+      deviceKeys: this.deviceKeys(principal.deviceId, afterEpoch) } };
   }
-  data(principal: Principal, ciphertext: string, expectedVersion: number): Result {
+  data(principal: Principal, ciphertext: string, expectedVersion: number, accountEpoch: number): Result {
     if (principal.kind !== 'full') return fail(403, 'forbidden');
     const row = this.row()!;
+    if (accountEpoch !== row.epoch) return fail(409, 'epoch_conflict');
     if (row.data_version !== expectedVersion) return fail(409, 'version_conflict');
     const version = expectedVersion + 1;
     this.ctx.storage.sql.exec('UPDATE account SET data = ?, data_version = ? WHERE id = 1', ciphertext, version);
@@ -184,9 +200,12 @@ export class AccountDO extends DurableObject<Env> {
     if (!valid) return fail(401, 'bad_credentials');
     const salt = b64(randomBytes(16));
     const hash = b64(await verifier(bytes(input.loginKey, 32), bytes(salt)));
-    this.ctx.storage.sql.exec('UPDATE account SET salt = ?, kdf = ?, verifier_salt = ?, verifier = ?, envelope = ? WHERE id = 1',
-      input.salt, JSON.stringify(input.kdf), salt, hash, input.accountKeyEnvelope);
-    return { status: 200, body: {} };
+    return this.ctx.storage.transactionSync(() => {
+      if (envelopeEpoch(input.accountKeyEnvelope) !== this.row()!.epoch) return fail(409, 'epoch_conflict');
+      this.ctx.storage.sql.exec('UPDATE account SET salt = ?, kdf = ?, verifier_salt = ?, verifier = ?, envelope = ? WHERE id = 1',
+        input.salt, JSON.stringify(input.kdf), salt, hash, input.accountKeyEnvelope);
+      return { status: 200, body: {} };
+    });
   }
   addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string, capMicroUsd = 1_000_000): Result {
     if (principal.kind !== 'full') return fail(403, 'forbidden');
@@ -211,22 +230,54 @@ export class AccountDO extends DurableObject<Env> {
     this.failNextRemoval = true;
     return { status: 200, body: {} };
   }
-  async removeDevice(principal: Principal, deviceId: string, notice: string | null = null): Promise<Result> {
-    if (principal.kind !== 'full' && principal.deviceId !== deviceId) return fail(403, 'forbidden');
-    if (!this.ctx.storage.sql.exec('SELECT device_id FROM devices WHERE device_id = ?', deviceId).toArray().length) return fail(404, 'not_found');
+  async removeDevice(principal: Principal, deviceId: string, input: DeleteDeviceRequest = {}): Promise<Result> {
+    if (principal.kind !== 'full' && (principal.deviceId !== deviceId || input.data || input.rotation)) return fail(403, 'forbidden');
+    if (input.rotation && (principal.kind !== 'full' || principal.deviceId === deviceId)) return fail(403, 'forbidden');
+    // Every epoch change must also advance data_version, fencing a protocol-1 write
+    // that passed the Worker gate before this rotation committed.
+    if (input.rotation && !input.data) return fail(400, 'bad_request');
+    if (input.rotation?.deviceKeys.some(key => key.deviceId === deviceId)) return fail(400, 'bad_request');
+    const target = this.ctx.storage.sql.exec<{ kind: 'full' | 'app' }>('SELECT kind FROM devices WHERE device_id = ?', deviceId).toArray()[0];
+    if (!target) return fail(404, 'not_found');
+    // Released protocol-1 clients cannot revoke another full device without
+    // rotating keys, even on accounts that have never rotated before.
+    if (principal.protocol === 1 && deviceId !== principal.deviceId && target.kind === 'full') return fail(426, 'needs_update');
     if (this.failNextRemoval) {
       this.failNextRemoval = false;
       return fail(502, 'bad_gateway', 'pre-revocation fault');
+    }
+    const verifiedRow = input.rotation ? this.row()! : null;
+    if (input.rotation && verifiedRow) {
+      const valid = equal(await verifier(bytes(input.rotation.loginKey, 32), bytes(verifiedRow.verifier_salt, 16)), bytes(verifiedRow.verifier, 32));
+      if (!valid) return fail(401, 'bad_credentials');
+      if (envelopeEpoch(input.rotation.accountKeyEnvelope) !== input.rotation.epoch) return fail(400, 'bad_request');
     }
     // Use the account's base list for both full devices and granted apps. It also
     // covers a grant whose device_bases entry was already removed by a revoke.
     const bases = this.accountBases();
     // A later removal without a notice, such as an older app's, keeps an earlier notice.
-    const stored = this.ctx.storage.transactionSync(() => {
-      const row = this.ctx.storage.sql.exec<{ removal_notice: string | null }>("UPDATE devices SET status = 'revoked', removal_notice = COALESCE(?, removal_notice) WHERE device_id = ? RETURNING removal_notice", notice, deviceId).one();
+    const result = this.ctx.storage.transactionSync(() => {
+      const row = this.row()!;
+      if (input.rotation && verifiedRow && (row.verifier !== verifiedRow.verifier || row.verifier_salt !== verifiedRow.verifier_salt)) return { error: fail(401, 'bad_credentials') };
+      if (input.rotation && input.rotation.epoch !== row.epoch + 1) return { error: fail(409, 'epoch_conflict') };
+      if (input.data && input.data.accountEpoch !== (input.rotation?.epoch ?? row.epoch)) return { error: fail(409, 'epoch_conflict') };
+      if (input.data && row.data_version !== input.data.expectedVersion) return { error: fail(409, 'version_conflict') };
+      const revoked = this.ctx.storage.sql.exec<{ removal_notice: string | null }>("UPDATE devices SET status = 'revoked', removal_notice = COALESCE(?, removal_notice) WHERE device_id = ? RETURNING removal_notice", input.notice ?? null, deviceId).one();
       this.ctx.storage.sql.exec('DELETE FROM device_bases WHERE device_id = ?', deviceId);
-      return row.removal_notice;
+      this.ctx.storage.sql.exec('DELETE FROM device_keys WHERE device_id = ?', deviceId);
+      if (input.rotation) {
+        this.ctx.storage.sql.exec('UPDATE account SET epoch = ?, envelope = ?, activation_hash = ? WHERE id = 1',
+          input.rotation.epoch, input.rotation.accountKeyEnvelope, input.rotation.activationHash);
+        for (const key of input.rotation.deviceKeys) {
+          this.ctx.storage.sql.exec('INSERT INTO device_keys (device_id, epoch, sealed) VALUES (?, ?, ?)', key.deviceId, input.rotation.epoch, key.sealed);
+        }
+      }
+      if (input.data) this.ctx.storage.sql.exec('UPDATE account SET data = ?, data_version = ? WHERE id = 1',
+        input.data.ciphertext, input.data.expectedVersion + 1);
+      return { notice: revoked.removal_notice };
     });
+    if ('error' in result) return result.error!;
+    const stored = result.notice;
     this.approvals.close(deviceId);
     this.approvals.drop(deviceId);
     this.approvals.failAnswered(deviceId);

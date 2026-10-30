@@ -100,7 +100,14 @@ fn run(home: &Path, args: &[&str], password: Option<&str>, token: Option<&str>) 
         args.first().copied().unwrap_or(""),
         output.status
     );
-    serde_json::from_slice(&output.stdout).expect("one JSON response")
+    serde_json::from_slice(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .rfind(|line| !line.is_empty())
+            .expect("JSON response"),
+    )
+    .expect("valid JSON response")
 }
 
 #[test]
@@ -770,7 +777,7 @@ fn an_app_home_writes_records_the_owner_reads() {
 }
 
 #[test]
-fn device_remove_revokes_the_other_home_and_erases_its_copy() {
+fn removing_a_full_device_asks_for_the_password_and_the_question() {
     let server = LocalServer::start();
     let a = TempDir::new().unwrap();
     let b = TempDir::new().unwrap();
@@ -793,7 +800,57 @@ fn device_remove_revokes_the_other_home_and_erases_its_copy() {
         None,
     );
     let device = signed["deviceId"].as_str().unwrap();
-    run(a.path(), &["device", "remove", device], None, None);
+    let no_answer = output(a.path(), &["device", "remove", device]);
+    assert!(!no_answer.status.success());
+    assert!(String::from_utf8_lossy(&no_answer.stderr).contains("--lost or --kept"));
+    let without_password = output(a.path(), &["device", "remove", device, "--kept"]);
+    assert!(!without_password.status.success());
+    let removed = run(
+        a.path(),
+        &["device", "remove", device, "--kept"],
+        Some("test CLI password"),
+        None,
+    );
+    assert!(removed["newKit"].is_null());
+    let c = TempDir::new().unwrap();
+    let next = run(
+        c.path(),
+        &[
+            "signin",
+            "--server",
+            &url,
+            "--email",
+            "remove-cli@example.com",
+            "--name",
+            "Next",
+            "--kit",
+            signup["kit"].as_str().unwrap(),
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let plain = Command::new("timeout")
+        .args(["30s", env!("CARGO_BIN_EXE_bh")])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", a.path().join("isolated-user"))
+        .env("XDG_CONFIG_HOME", a.path().join("isolated-config"))
+        .env("GH_CONFIG_DIR", a.path().join("isolated-gh"))
+        .env("BH_PASSWORD", "test CLI password")
+        .args([
+            "--home",
+            a.path().to_str().unwrap(),
+            "device",
+            "remove",
+            next["deviceId"].as_str().unwrap(),
+            "--kept",
+        ])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    assert!(plain_text.contains("Finishing…"), "{plain_text}");
+    assert!(plain_text.contains("Device removed."), "{plain_text}");
     let rejected = output(b.path(), &["sync"]);
     assert!(!rejected.status.success());
     let err: Value = serde_json::from_slice(&rejected.stderr).unwrap();
@@ -804,6 +861,184 @@ fn device_remove_revokes_the_other_home_and_erases_its_copy() {
             .join(signup["accountId"].as_str().unwrap())
             .exists()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_lost_removal_emits_kit_even_when_finishing_fails() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    use bh_core::{Core, CoreConfig, FileSecretStore};
+    use std::sync::Arc;
+    let server = LocalServer::start();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let signup = enrolled(&server, a.path(), "unfinished-cli@example.com");
+    let signed = run(
+        b.path(),
+        &[
+            "signin",
+            "--server",
+            server.url().as_ref(),
+            "--email",
+            "unfinished-cli@example.com",
+            "--name",
+            "Other",
+            "--kit",
+            signup["kit"].as_str().unwrap(),
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let base = run(a.path(), &["base", "create", "Shared"], None, None);
+    let base_id = base["id"].as_str().unwrap();
+    let account_id: bh_core::AccountId = signup["accountId"].as_str().unwrap().parse().unwrap();
+    let core = Core::open(CoreConfig {
+        data_dir: a.path().into(),
+        secrets: Arc::new(FileSecretStore::new(a.path().join("secrets")).unwrap()),
+    })
+    .unwrap();
+    let account = core.account(account_id).unwrap();
+    let token = account
+        .test_secrets()
+        .get(&format!("acct.{account_id}.token"))
+        .unwrap()
+        .unwrap();
+    drop(account);
+    core.shutdown();
+    drop(core);
+    let reply = reqwest::Client::new()
+        .post(
+            server
+                .url()
+                .join(&format!("/v1/bases/{base_id}/rekey"))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(String::from_utf8(token.to_vec()).unwrap())
+        .json(
+            &json!({"from": 1, "wrapper": "AQ", "previous": "AQ", "apps": [],
+            "accountEpoch": 1, "dataVersion": 1_000_000}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), reqwest::StatusCode::OK);
+    let mut cmd = Command::new("timeout");
+    let output = cmd
+        .args(["30s", env!("CARGO_BIN_EXE_bh")])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", a.path().join("isolated-user"))
+        .env("XDG_CONFIG_HOME", a.path().join("isolated-config"))
+        .env("GH_CONFIG_DIR", a.path().join("isolated-gh"))
+        .env("BH_PASSWORD", "test CLI password")
+        .args([
+            "--home",
+            a.path().to_str().unwrap(),
+            "--json",
+            "device",
+            "remove",
+            signed["deviceId"].as_str().unwrap(),
+            "--lost",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "error must not write a second document"
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).expect("single error document");
+    assert!(error["error"].as_str().is_some());
+    assert!(error["newKit"].as_str().is_some());
+}
+
+#[test]
+fn removing_a_lost_device_prints_a_new_kit() {
+    let server = LocalServer::start();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let signup = enrolled(&server, a.path(), "lost-cli@example.com");
+    let signed = run(
+        b.path(),
+        &[
+            "signin",
+            "--server",
+            server.url().as_ref(),
+            "--email",
+            "lost-cli@example.com",
+            "--name",
+            "Other",
+            "--kit",
+            signup["kit"].as_str().unwrap(),
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let removed_output = Command::new("timeout")
+        .args(["30s", env!("CARGO_BIN_EXE_bh")])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", a.path().join("isolated-user"))
+        .env("XDG_CONFIG_HOME", a.path().join("isolated-config"))
+        .env("GH_CONFIG_DIR", a.path().join("isolated-gh"))
+        .env("BH_PASSWORD", "test CLI password")
+        .args([
+            "--home",
+            a.path().to_str().unwrap(),
+            "--json",
+            "device",
+            "remove",
+            signed["deviceId"].as_str().unwrap(),
+            "--lost",
+        ])
+        .output()
+        .unwrap();
+    assert!(removed_output.status.success());
+    let removed: Value =
+        serde_json::from_slice(&removed_output.stdout).expect("single success document");
+    let kit = removed["newKit"].as_str().expect("new recovery kit");
+    assert_eq!(kit.replace('-', "").len(), 26);
+    assert_ne!(kit, signup["kit"]);
+    let c = TempDir::new().unwrap();
+    let next = run(
+        c.path(),
+        &[
+            "signin",
+            "--server",
+            server.url().as_ref(),
+            "--email",
+            "lost-cli@example.com",
+            "--name",
+            "Next",
+            "--kit",
+            kit,
+        ],
+        Some("test CLI password"),
+        None,
+    );
+    let plain = Command::new("timeout")
+        .args(["30s", env!("CARGO_BIN_EXE_bh")])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", a.path().join("isolated-user"))
+        .env("XDG_CONFIG_HOME", a.path().join("isolated-config"))
+        .env("GH_CONFIG_DIR", a.path().join("isolated-gh"))
+        .env("BH_PASSWORD", "test CLI password")
+        .args([
+            "--home",
+            a.path().to_str().unwrap(),
+            "device",
+            "remove",
+            next["deviceId"].as_str().unwrap(),
+            "--lost",
+        ])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let output = String::from_utf8_lossy(&plain.stdout);
+    assert!(output.find("Recovery kit:").unwrap() < output.find("Finishing…").unwrap());
+    assert!(output.find("Finishing…").unwrap() < output.find("Device removed.").unwrap());
 }
 
 #[tokio::test]
@@ -838,16 +1073,17 @@ async fn a_device_the_server_revokes_without_a_notice_keeps_its_copy() {
         .get(&format!("acct.{account}.token"))
         .unwrap()
         .unwrap();
-    let owner = bh_testkit::RawDevice::new(
-        &server,
-        account.into(),
-        String::new(),
-        String::from_utf8(token.to_vec()).unwrap(),
-    );
-    let (status, _) = owner
-        .delete(&format!("/v1/devices/{device}"), json!({}))
-        .await;
-    assert_eq!(status, reqwest::StatusCode::OK);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let reply = reqwest::Client::new()
+        .delete(server.url().join(&format!("/v1/devices/{device}")).unwrap())
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(String::from_utf8(token.to_vec()).unwrap())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), reqwest::StatusCode::OK);
     let home = b.path().join("accounts").join(account);
     let rejected = output(b.path(), &["sync"]);
     assert!(!rejected.status.success());

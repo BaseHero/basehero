@@ -14,7 +14,7 @@ async fn local_server_answers_health() {
         .json()
         .await
         .unwrap();
-    assert_eq!(r, serde_json::json!({ "ok": true, "protocol": 1 }));
+    assert_eq!(r, serde_json::json!({ "ok": true, "protocol": 2 }));
 }
 
 #[tokio::test]

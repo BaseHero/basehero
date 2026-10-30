@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { LiveMessage } from './proto/gen/LiveMessage';
 import type { BaseKeyResponse } from './proto/gen/BaseKeyResponse';
+import type { AppWrapper } from './proto/gen/AppWrapper';
 import type { ChangeResult } from './proto/gen/ChangeResult';
 import type { ChangesResponse } from './proto/gen/ChangesResponse';
 import type { GrantMode } from './proto/gen/GrantMode';
@@ -25,9 +26,9 @@ export type FetchedObject = {
 export type Fetched = { objects: FetchedObject[]; more: string[] };
 export type Stored = { changes: { seq: number; kind: string; keep: boolean; inR2: boolean }[] };
 export type StoredVersion = { seq: number; covers: number; deviceId: string; at: number; body: StoredBody };
-export type Created = 'created' | 'yours' | 'taken';
+export type Created = 'created' | 'yours' | 'taken' | 'epoch_conflict';
 
-type AccessRow = { mode: GrantMode; epoch: number; wrapper: string };
+type AccessRow = { mode: GrantMode; epoch: number; wrapper: string; account_epoch: number; data_floor: number };
 type ObjectState = { head: number; state_seq: number | null; state_covers: number; tail: number };
 type BodyRow = { seq: number; device_id: string; body: ArrayBuffer | null; r2_key: string | null; size: number; covers: number | null };
 type Decision = { result: ChangeResult } | { object: ObjectState; seq: number };
@@ -54,7 +55,13 @@ export class BaseDO extends DurableObject<Env> {
     super(ctx, env);
     const sql = ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS access (principal TEXT PRIMARY KEY, mode TEXT NOT NULL, epoch INTEGER NOT NULL, wrapper TEXT NOT NULL)');
+    for (const column of ['account_epoch INTEGER NOT NULL DEFAULT 1', 'data_floor INTEGER NOT NULL DEFAULT 0']) {
+      if (!sql.exec<{ name: string }>('PRAGMA table_info(access)').toArray().some(row => row.name === column.split(' ')[0])) {
+        sql.exec(`ALTER TABLE access ADD COLUMN ${column}`);
+      }
+    }
     sql.exec('CREATE TABLE IF NOT EXISTS removed_devices (device_id TEXT PRIMARY KEY)');
+    sql.exec('CREATE TABLE IF NOT EXISTS previous_keys (epoch INTEGER PRIMARY KEY, sealed TEXT NOT NULL)');
     // prev_head is kept so a repeated change gets its original result, which the client invariant relies on.
     sql.exec('CREATE TABLE IF NOT EXISTS changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, change_id TEXT NOT NULL UNIQUE, object_id TEXT NOT NULL, kind TEXT NOT NULL, body BLOB, r2_key TEXT, size INTEGER NOT NULL, covers INTEGER, keep INTEGER NOT NULL, prev_head INTEGER NOT NULL, device_id TEXT NOT NULL, at INTEGER NOT NULL)');
     sql.exec('CREATE INDEX IF NOT EXISTS changes_by_object ON changes (object_id, seq)');
@@ -63,7 +70,7 @@ export class BaseDO extends DurableObject<Env> {
   }
   private get sql() { return this.ctx.storage.sql; }
   private access(principal: string): AccessRow | null {
-    return this.sql.exec<AccessRow>('SELECT mode, epoch, wrapper FROM access WHERE principal = ?', principal).toArray()[0] ?? null;
+    return this.sql.exec<AccessRow>('SELECT mode, epoch, wrapper, account_epoch, data_floor FROM access WHERE principal = ?', principal).toArray()[0] ?? null;
   }
   // A full device of a member account uses the account's row; an app device also needs its own.
   private member(p: Principal): AccessRow | null {
@@ -79,11 +86,15 @@ export class BaseDO extends DurableObject<Env> {
     const row = this.member(p);
     if (!row) return fail(403, 'forbidden');
     if (write && row.mode !== 'rw') return fail(403, 'read_only');
+    if (p.protocol === 1 && this.access(`acct:${p.accountId}`)!.epoch > 1) return fail(426, 'needs_update');
     return null;
   }
   /** Apply exactly the same grant and device checks as change and fetch routes. */
-  fileAccess(p: Principal, write: boolean): Result {
-    return this.denied(p, write) ?? { status: 200, body: {} };
+  fileAccess(p: Principal, write: boolean, changesRetry = false): Result {
+    const denied = this.denied(p, write);
+    if (denied) return denied;
+    if (write && !changesRetry && p.epoch > this.access(`acct:${p.accountId}`)!.account_epoch) return fail(409, 'rekey_needed');
+    return { status: 200, body: {} };
   }
   private owns(p: Principal): boolean {
     return p.kind === 'full' && p.status === 'active' && !this.removed(p.deviceId) && this.access(`acct:${p.accountId}`) !== null;
@@ -96,24 +107,66 @@ export class BaseDO extends DurableObject<Env> {
       ?? { head: 0, state_seq: null, state_covers: 0, tail: 0 };
   }
 
-  create(p: Principal, epoch: number, wrapper: string): Created {
-    if (this.sql.exec("SELECT principal FROM access WHERE principal LIKE 'acct:%' LIMIT 1").toArray().length) return this.owns(p) ? 'yours' : 'taken';
-    this.sql.exec('INSERT INTO access VALUES (?, ?, ?, ?)', `acct:${p.accountId}`, 'rw', epoch, wrapper);
+  create(p: Principal, epoch: number, wrapper: string, accountEpoch: number): Created {
+    if (this.sql.exec("SELECT principal FROM access WHERE principal LIKE 'acct:%' LIMIT 1").toArray().length) {
+      if (!this.owns(p)) return 'taken';
+      return accountEpoch === p.epoch && accountEpoch >= this.access(`acct:${p.accountId}`)!.account_epoch ? 'yours' : 'epoch_conflict';
+    }
+    if (accountEpoch !== p.epoch) return 'epoch_conflict';
+    this.sql.exec('INSERT INTO access (principal, mode, epoch, wrapper, account_epoch) VALUES (?, ?, ?, ?, ?)', `acct:${p.accountId}`, 'rw', epoch, wrapper, accountEpoch);
     return 'created';
   }
   key(p: Principal): Result<BaseKeyResponse> {
     const denied = this.denied(p);
     if (denied) return denied;
     const row = this.member(p)!;
-    return { status: 200, body: { epoch: row.epoch, wrapper: row.wrapper, mode: row.mode } };
+    const previous = this.sql.exec<{ epoch: number; sealed: string }>('SELECT epoch, sealed FROM previous_keys ORDER BY epoch').toArray();
+    const account = this.access(`acct:${p.accountId}`)!;
+    return { status: 200, body: { epoch: row.epoch, wrapper: row.wrapper, mode: row.mode, previous,
+      accountEpoch: account.account_epoch, dataFloor: account.data_floor } };
   }
-  grant(p: Principal, deviceId: string, mode: GrantMode, epoch: number, wrapper: string): Result {
+  /** Replace all wrappers under the next key in a single synchronous compare-and-set. */
+  rekey(p: Principal, from: number, wrapper: string, previous: string, apps: AppWrapper[], accountEpoch: number, dataVersion: number): Result {
     if (!this.owns(p)) return fail(403, 'forbidden');
-    this.sql.exec('INSERT OR REPLACE INTO access VALUES (?, ?, ?, ?)', `dev:${deviceId}`, mode, epoch, wrapper);
+    const account = `acct:${p.accountId}`;
+    const current = this.access(account)!;
+    if (p.protocol === 1 && current.epoch > 1) return fail(426, 'needs_update');
+    if (accountEpoch !== p.epoch || accountEpoch < current.account_epoch || current.epoch !== from) return fail(409, 'epoch_conflict');
+    if (dataVersion < current.data_floor) return fail(409, 'stale_grant');
+    const listed = new Map(apps.map(app => [app.deviceId, app.wrapper]));
+    const removed: string[] = [];
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec('UPDATE access SET epoch = ?, wrapper = ?, account_epoch = ?, data_floor = ? WHERE principal = ?', from + 1, wrapper, accountEpoch, Math.max(dataVersion, current.data_floor), account);
+      this.sql.exec('INSERT INTO previous_keys VALUES (?, ?)', from, previous);
+      for (const row of this.sql.exec<{ principal: string }>("SELECT principal FROM access WHERE principal LIKE 'dev:%'")) {
+        const deviceId = row.principal.slice(4);
+        const appWrapper = listed.get(deviceId);
+        if (appWrapper !== undefined) this.sql.exec('UPDATE access SET epoch = ?, wrapper = ?, account_epoch = ? WHERE principal = ?', from + 1, appWrapper, accountEpoch, row.principal);
+        else {
+          this.sql.exec('DELETE FROM access WHERE principal = ?', row.principal);
+          removed.push(deviceId);
+        }
+      }
+    });
+    const message: LiveMessage = { t: 'epoch', epoch: from + 1 };
+    for (const ws of this.ctx.getWebSockets()) {
+      try { ws.send(JSON.stringify(message)); } catch { /* reconnect reads the new epoch */ }
+    }
+    for (const deviceId of removed) this.closeDevice(deviceId);
+    return { status: 200, body: {} };
+  }
+  grant(p: Principal, deviceId: string, mode: GrantMode, epoch: number, wrapper: string, accountEpoch: number, dataVersion: number): Result {
+    if (!this.owns(p)) return fail(403, 'forbidden');
+    const current = this.access(`acct:${p.accountId}`)!;
+    if (p.protocol === 1 && current.epoch > 1) return fail(426, 'needs_update');
+    if (accountEpoch !== p.epoch || accountEpoch < current.account_epoch || current.epoch !== epoch) return fail(409, 'epoch_conflict');
+    if (dataVersion < current.data_floor) return fail(409, 'stale_grant');
+    this.sql.exec('INSERT OR REPLACE INTO access (principal, mode, epoch, wrapper, account_epoch) VALUES (?, ?, ?, ?, ?)', `dev:${deviceId}`, mode, epoch, wrapper, accountEpoch);
     return { status: 200, body: {} };
   }
   revoke(p: Principal, deviceId: string): Result {
     if (!this.owns(p)) return fail(403, 'forbidden');
+    if (p.protocol === 1 && this.access(`acct:${p.accountId}`)!.epoch > 1) return fail(426, 'needs_update');
     this.sql.exec('DELETE FROM access WHERE principal = ?', `dev:${deviceId}`);
     this.closeDevice(deviceId);
     return { status: 200, body: {} };
@@ -207,6 +260,19 @@ export class BaseDO extends DurableObject<Env> {
     }
     return { changeId: c.changeId, seq, prevHead: object.head, tail, stale: false };
   }
+  private needsRekey(changes: NewChange[], p: Principal): boolean {
+    return p.epoch > this.access(`acct:${p.accountId}`)!.account_epoch && changes.some(c =>
+      !this.sql.exec('SELECT seq FROM changes WHERE change_id = ?', c.changeId).toArray().length);
+  }
+  private staleEpoch(changes: NewChange[], epoch: number): boolean {
+    return changes.some(c => {
+      // A stored change must keep its original answer even after a re-key.
+      if (this.sql.exec('SELECT seq FROM changes WHERE change_id = ?', c.changeId).toArray().length) return false;
+      if (c.body.length < 5 || c.body[0] !== 1) return false;
+      const sealedEpoch = new DataView(c.body.buffer, c.body.byteOffset + 1, 4).getUint32(0, false);
+      return sealedEpoch < epoch;
+    });
+  }
   async changes(p: Principal, changes: NewChange[]): Promise<Result<ChangesResponse>> {
     const denied = this.denied(p, true);
     if (denied) return denied;
@@ -215,14 +281,27 @@ export class BaseDO extends DurableObject<Env> {
     try {
       if (!changes.some(c => c.keep || c.body.length > INLINE_MAX)) {
         // One synchronous span: no other request runs between a read and the write that depends on it.
+        if (this.needsRekey(changes, p)) return fail(409, 'rekey_needed');
+        if (this.staleEpoch(changes, this.access(`acct:${p.accountId}`)!.epoch)) return fail(409, 'stale_epoch');
         for (const c of changes) results.push(this.apply(p.deviceId, c, null, deletes));
       } else {
         // Writing to R2 needs awaits, so hold every other request until the batch is stored.
         // The body goes to R2 before its row exists, so a stored row always has its body.
         let failure: unknown;
         let failed = false;
+        let refusal: Result<ChangesResponse> | null = null;
         await this.ctx.blockConcurrencyWhile(async () => {
           try {
+            refusal = this.denied(p, true);
+            if (refusal) return;
+            if (this.needsRekey(changes, p)) {
+              refusal = fail(409, 'rekey_needed');
+              return;
+            }
+            if (this.staleEpoch(changes, this.access(`acct:${p.accountId}`)!.epoch)) {
+              refusal = fail(409, 'stale_epoch');
+              return;
+            }
             for (const c of changes) {
               const decision = c.keep || c.body.length > INLINE_MAX ? this.decide(c) : null;
               const r2Key = decision && 'seq' in decision ? `b/${this.ctx.id.name}/${c.objectId}/${decision.seq}` : null;
@@ -249,6 +328,7 @@ export class BaseDO extends DurableObject<Env> {
           }
         });
         if (failed) throw failure;
+        if (refusal) return refusal;
       }
       return { status: 200, body: { results, head: this.head() } };
     } finally {
@@ -281,7 +361,8 @@ export class BaseDO extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const p: Principal = {
       accountId: request.headers.get('BH-Account') ?? '', deviceId: request.headers.get('BH-Device') ?? '',
-      kind: request.headers.get('BH-Kind') === 'app' ? 'app' : 'full', status: request.headers.get('BH-Status') ?? '',
+      kind: request.headers.get('BH-Kind') === 'app' ? 'app' : 'full', status: request.headers.get('BH-Status') ?? '', epoch: 1,
+      protocol: request.headers.get('BH-Protocol') === '1' ? 1 : 2,
     };
     const denied = this.denied(p);
     if (denied) return answer(denied);

@@ -1,5 +1,6 @@
 pub mod account;
 pub mod approval;
+pub mod backup;
 pub mod base;
 #[cfg(debug_assertions)]
 pub mod dev_probe;

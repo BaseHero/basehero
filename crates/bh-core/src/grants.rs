@@ -149,13 +149,30 @@ pub(crate) fn edit(data: &mut Data, change: impl FnOnce(&mut Data)) {
 /// Apps that can read `base` now, or could before a pending change.
 pub(crate) fn readers(data: &Data, base: BaseId) -> BTreeSet<DeviceId> {
     let mounts = mounts(data);
-    apps(data)
+    let mut readers: BTreeSet<_> = apps(data)
         .map(|(device, _)| device)
         .filter(|&device| {
             effective(&direct(data, device), &mounts).contains_key(&base)
                 || was(data, device).is_some_and(|was| was.contains_key(&base))
         })
-        .collect()
+        .collect();
+    if let Some(pending) = data.get("pendingRemovals").and_then(Value::as_object) {
+        for (device, entry) in pending {
+            if entry
+                .get("bases")
+                .and_then(Value::as_array)
+                .is_some_and(|bases| {
+                    bases
+                        .iter()
+                        .any(|id| id.as_str() == Some(&base.to_string()))
+                })
+                && let Ok(id) = device.parse()
+            {
+                readers.insert(id);
+            }
+        }
+    }
+    readers
 }
 
 /// Apps with a grant change the server hasn't confirmed yet.

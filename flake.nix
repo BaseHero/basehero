@@ -180,7 +180,8 @@
         {
           default = pkgs.mkShell {
             # perl builds the OpenSSL that SQLCipher vendors.
-            nativeBuildInputs = with pkgs; [ rust pkg-config perl nodejs_22 cargo-tauri playwright-driver.browsers ];
+            # curl too: on other Linux hosts, LD_LIBRARY_PATH below breaks the host's curl (the deploy's health check).
+            nativeBuildInputs = with pkgs; [ rust pkg-config perl nodejs_22 cargo-tauri playwright-driver.browsers curl ];
             buildInputs = [ sodium ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
               webkitgtk_4_1 gtk3 libsoup_3 glib glib-networking cairo pango
               gdk-pixbuf atk librsvg openssl dbus

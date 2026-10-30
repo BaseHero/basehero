@@ -213,7 +213,7 @@ async fn failed_name_write_after_activation_removes_the_account_store() {
     a.approve(open, &digits).await.unwrap();
     core.inject_fault(bh_core::test_support::Fault {
         method: "GET",
-        path: "v1/account",
+        path: "v1/account?afterEpoch=1",
         lost_reply: false,
         times: 1,
     });
@@ -259,7 +259,7 @@ async fn failed_second_install_preserves_the_first_device() {
     a.approve(open, &digits).await.unwrap();
     core.inject_fault(bh_core::test_support::Fault {
         method: "GET",
-        path: "v1/account",
+        path: "v1/account?afterEpoch=1",
         lost_reply: false,
         times: 1,
     });

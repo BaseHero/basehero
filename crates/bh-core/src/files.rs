@@ -279,6 +279,8 @@ pub(crate) struct Uploader {
     #[cfg(feature = "test-support")]
     fail_after: Arc<AtomicU32>,
     #[cfg(feature = "test-support")]
+    hold_after: Arc<AtomicU32>,
+    #[cfg(feature = "test-support")]
     pub(crate) probe: Probe,
 }
 
@@ -333,12 +335,16 @@ impl Uploader {
         let paused = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "test-support")]
         let fail_after = Arc::new(AtomicU32::new(u32::MAX));
+        #[cfg(feature = "test-support")]
+        let hold_after = Arc::new(AtomicU32::new(u32::MAX));
         let owner = base.downgrade();
         let task_wake = wake.clone();
         #[cfg(feature = "test-support")]
         let task_paused = paused.clone();
         #[cfg(feature = "test-support")]
         let task_fail = fail_after.clone();
+        #[cfg(feature = "test-support")]
+        let task_hold_after = hold_after.clone();
         #[cfg(feature = "test-support")]
         let probe = Probe::default();
         #[cfg(feature = "test-support")]
@@ -355,6 +361,7 @@ impl Uploader {
                 let Some(base) = owner.upgrade() else { break; };
                 let result = upload_next(&base, &api, &root,
                     #[cfg(feature = "test-support")] &task_fail,
+                    #[cfg(feature = "test-support")] &task_hold_after,
                     #[cfg(feature = "test-support")] &task_probe).await;
                 drop(base);
                 let _ = task_progress.send_replace(result.as_ref().map(|_| ()).map_err(Clone::clone));
@@ -385,6 +392,8 @@ impl Uploader {
             paused,
             #[cfg(feature = "test-support")]
             fail_after,
+            #[cfg(feature = "test-support")]
+            hold_after,
             #[cfg(feature = "test-support")]
             probe,
         }
@@ -425,6 +434,10 @@ impl Uploader {
     pub(crate) fn fail_after(&self, count: u32) {
         self.fail_after.store(count, Ordering::SeqCst);
     }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_after(&self, count: u32) {
+        self.hold_after.store(count, Ordering::SeqCst);
+    }
 }
 
 async fn upload_next(
@@ -432,6 +445,7 @@ async fn upload_next(
     api: &Api,
     root: &Path,
     #[cfg(feature = "test-support")] fail_after: &AtomicU32,
+    #[cfg(feature = "test-support")] hold_after: &AtomicU32,
     #[cfg(feature = "test-support")] probe: &Probe,
 ) -> Result<bool, Error> {
     let rows = base.db()?.file_rows()?;
@@ -462,7 +476,7 @@ async fn upload_next(
     };
     let bytes = std::fs::read(root.join(id.to_string()).join(n.to_string()))?;
     #[cfg(feature = "test-support")]
-    if probe.hold.load(Ordering::SeqCst) {
+    if probe.hold.load(Ordering::SeqCst) || n >= hold_after.load(Ordering::SeqCst) {
         probe.held.store(true, Ordering::SeqCst);
         std::future::pending::<()>().await;
     }

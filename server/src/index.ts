@@ -2,7 +2,7 @@ import type { SignupRequest } from './proto/gen/SignupRequest';
 import type { LoginRequest } from './proto/gen/LoginRequest';
 import type { CredentialsRequest } from './proto/gen/CredentialsRequest';
 import type { HealthResponse } from './proto/gen/HealthResponse';
-import { accountStub, answer, b64, body, bytes, equal, error, hex, HttpError, id, json, randomBytes, removalNotice, requireDevice, sha, str, testBypass, testMode, verifier } from './http';
+import { accountStub, answer, b64, body, bytes, declaredEpoch, equal, error, hex, HttpError, id, json, randomBytes, removalBody, requireDevice, sha, str, testBypass, testMode, verifier } from './http';
 import { handleBases } from './bases';
 import { handleApprovals, message } from './approvals';
 import type { ConnectCreateRequest } from './proto/gen/ConnectCreateRequest';
@@ -36,6 +36,14 @@ function kdf(value: unknown): { opsLimit: number; memLimitKib: number } {
   return { opsLimit, memLimitKib };
 }
 function token(accountId: string): string { return `${accountId}.${b64(randomBytes(32))}`; }
+function afterEpoch(request: Request): number {
+  const values = new URL(request.url).searchParams.getAll('afterEpoch');
+  if (!values.length) return 0;
+  if (values.length !== 1 || !/^(0|[1-9][0-9]*)$/.test(values[0])) throw new HttpError(400, 'bad_request');
+  const epoch = Number(values[0]);
+  if (epoch > 0xffffffff) throw new HttpError(400, 'bad_request');
+  return epoch;
+}
 function operator(request: Request, env: Env): boolean {
   const supplied = request.headers.get('Authorization');
   if (!env.OPERATOR_TOKEN || !supplied?.startsWith('Bearer ')) return false;
@@ -55,9 +63,9 @@ async function fakeParams(env: Env, email: string) {
 }
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname;
-  if (request.headers.get('BH-Protocol') !== '1') throw new HttpError(426, 'needs_update', 'Protocol version 1 is required');
+  if (request.headers.get('BH-Protocol') !== '1' && request.headers.get('BH-Protocol') !== '2') throw new HttpError(426, 'needs_update', 'Protocol version 1 or 2 is required');
   if (request.method === 'GET' && path === '/v1/health') {
-    const response: HealthResponse = { ok: true, protocol: 1 };
+    const response: HealthResponse = { ok: true, protocol: 2 };
     return json(response);
   }
   if (request.method === 'POST' && path === '/v1/models/tinfoil/v1/chat/completions') return handleModels(request, env, ctx);
@@ -187,15 +195,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (request.method === 'POST' && path === '/v1/devices/activate') {
     const raw = await body(request); const activation = str(raw.activation); bytes(activation, 32);
     result = await account.activate(principal, activation);
-  } else if (request.method === 'GET' && path === '/v1/me') result = await account.me(principal);
-  else if (request.method === 'GET' && path === '/v1/account') result = await account.account(principal);
+  } else if (request.method === 'GET' && path === '/v1/me') result = await account.me(principal, afterEpoch(request));
+  else if (request.method === 'GET' && path === '/v1/account') result = await account.account(principal, afterEpoch(request));
   else if (request.method === 'PUT' && path === '/v1/account/data') {
     const raw = await body(request); const ciphertext = str(raw.ciphertext);
     const maxDataBytes = 1024 * 1024;
     if (ciphertext.length > 4 * Math.ceil(maxDataBytes / 3)) throw new HttpError(413, 'too_large');
     if (bytes(ciphertext).length > maxDataBytes) throw new HttpError(413, 'too_large');
     if (!Number.isSafeInteger(raw.expectedVersion) || (raw.expectedVersion as number) < 0) throw new HttpError(400, 'bad_request');
-    result = await account.data(principal, ciphertext, raw.expectedVersion as number);
+    result = await account.data(principal, ciphertext, raw.expectedVersion as number, declaredEpoch(raw.accountEpoch));
   } else if (request.method === 'PUT' && path === '/v1/account/credentials') {
     const raw = await body(request);
     const input: CredentialsRequest = { currentLoginKey: str(raw.currentLoginKey), loginKey: str(raw.loginKey), salt: str(raw.salt), kdf: kdf(raw.kdf), accountKeyEnvelope: str(raw.accountKeyEnvelope) };
@@ -220,7 +228,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     result = await account.failRemovalOnce(principal);
   } else if (request.method === 'DELETE' && path.startsWith('/v1/devices/')) {
     const deviceId = id(path.slice('/v1/devices/'.length));
-    result = await account.removeDevice(principal, deviceId, await removalNotice(request));
+    result = await account.removeDevice(principal, deviceId, await removalBody(request));
   } else throw new HttpError(404, 'not_found');
   return answer(result);
 }

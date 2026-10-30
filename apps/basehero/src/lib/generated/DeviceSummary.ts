@@ -34,6 +34,10 @@ lastSeenAt: number,
  */
 thisDevice: boolean, 
 /**
+ * Revoked access is still being removed from ordinary bases.
+ */
+pendingRemoval: boolean, 
+/**
  * An app device's monthly model spending cap in micro-dollars; `None` for full devices.
  */
 capMicroUsd: number | null, };

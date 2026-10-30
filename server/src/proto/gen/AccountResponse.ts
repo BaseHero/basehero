@@ -3,5 +3,6 @@ import type { AccountData } from "./AccountData";
 import type { AccountDevice } from "./AccountDevice";
 import type { BaseId } from "./BaseId";
 import type { Bytes } from "./Bytes";
+import type { DeviceKeyDelivery } from "./DeviceKeyDelivery";
 
-export type AccountResponse = { devices: Array<AccountDevice>, bases: Array<BaseId>, data: AccountData | null, accountKeyEnvelope: Bytes, };
+export type AccountResponse = { devices: Array<AccountDevice>, bases: Array<BaseId>, data: AccountData | null, accountKeyEnvelope: Bytes, epoch: number, deviceKeys: Array<DeviceKeyDelivery>, };

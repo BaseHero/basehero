@@ -145,12 +145,12 @@ impl fmt::Debug for RecoveryKit {
 }
 
 /// The associated data of an account key envelope.
-pub(crate) fn account_key_aad(account: &bh_proto::AccountId) -> Aad {
+pub(crate) fn account_key_aad(account: &bh_proto::AccountId, epoch: u32) -> Aad {
     Aad {
         purpose: Purpose::AccountKey,
         base: [0; 16],
         object: account.0,
-        epoch: 1,
+        epoch,
     }
 }
 
@@ -216,6 +216,19 @@ pub(crate) fn app_wrapper_aad(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_key_aad_binds_the_epoch() {
+        let account = bh_proto::AccountId([9; 16]);
+        let key = Secret::<32>::random();
+        let sealed = crate::envelope::seal(&key, &account_key_aad(&account, 2), b"account key");
+        assert_eq!(crate::envelope::epoch(&sealed), Some(2));
+        assert_eq!(
+            &*crate::envelope::open(&key, &account_key_aad(&account, 2), &sealed).unwrap(),
+            b"account key"
+        );
+        assert!(crate::envelope::open(&key, &account_key_aad(&account, 1), &sealed).is_err());
+    }
 
     #[test]
     fn kit_displays_and_parses_forgivingly() {

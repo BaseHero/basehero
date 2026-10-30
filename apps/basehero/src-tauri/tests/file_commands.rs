@@ -93,15 +93,9 @@ async fn opening_writes_plain_bytes_under_the_cache_and_the_next_start_clears_th
         )
         .unwrap();
     let path = files::open_copy(&state, &r, id).await.unwrap();
-    assert!(
-        path.starts_with(
-            events
-                .data_dir()
-                .join("cache/open")
-                .join(r.base.to_string())
-                .join(id.to_string())
-        )
-    );
+    // open_copy resolves symlinks, as macOS's temporary folders are (/var is /private/var).
+    let open = events.data_dir().join("cache/open").canonicalize().unwrap();
+    assert!(path.starts_with(open.join(r.base.to_string()).join(id.to_string())));
     assert_eq!(std::fs::read(&path).unwrap(), PNG);
     drop(state);
     let _reopened = common::open_at(events.data_dir(), _server.url(), &events);
@@ -124,15 +118,8 @@ async fn hostile_names_stay_inside_the_file_directory() {
         )
         .unwrap();
     let path = files::open_copy(&state, &r, id).await.unwrap();
-    assert!(
-        path.starts_with(
-            state
-                .cache_dir
-                .join("open")
-                .join(r.base.to_string())
-                .join(id.to_string())
-        )
-    );
+    let open = state.cache_dir.join("open").canonicalize().unwrap();
+    assert!(path.starts_with(open.join(r.base.to_string()).join(id.to_string())));
     assert_eq!(std::fs::read(path).unwrap(), b"not executable here");
 }
 

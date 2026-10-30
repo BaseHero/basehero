@@ -8,7 +8,8 @@ use bh_core::{
 };
 use bh_testkit::{
     LocalServer, app_identity, approve_next_app, device, device_with_clock, found_under,
-    new_signup, pending_device_for, random_id, raw_device, two_devices, wait_for_base,
+    new_signup, note_with_text, pending_device_for, random_id, raw_device, two_devices,
+    wait_for_base,
 };
 use serde_json::json;
 use std::{future::Future, sync::Arc, time::Duration};
@@ -138,6 +139,93 @@ async fn an_app_connects_with_typed_digits() {
     let apps = full.apps();
     let entry = apps.iter().find(|a| a.device_id == device).unwrap();
     assert_eq!(entry.app_id.as_deref(), Some("app.basehero.sample"));
+}
+
+#[tokio::test]
+async fn an_app_approved_after_rotation_reads_old_and_new_notes() {
+    let (full, personal) = full_with_bases().await;
+    let base = full.base(personal).unwrap();
+    let old = note_with_text(&base, "before rotation");
+    base.flush().await.unwrap();
+    full.test_rotate_account(None).await.unwrap();
+    let (app, _) = connect(&full, &device("phone"), &full.email(), defaults).await;
+    let new = note_with_text(&base, "after rotation");
+    base.flush().await.unwrap();
+    let reader = app.base(personal).unwrap();
+    wait_for_base(&reader, || {
+        reader.note(old).is_ok() && reader.note(new).is_ok()
+    })
+    .await;
+    let ring = app
+        .test_secrets()
+        .get(&format!("acct.{}.appkey", app.id()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(u32::from_be_bytes(ring[..4].try_into().unwrap()), 2);
+}
+
+#[tokio::test]
+async fn an_app_connected_by_approval_has_its_public_key_recorded() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let full_dir = tempfile::tempdir().unwrap();
+    let full_secrets = Arc::new(FileSecretStore::new(full_dir.path().join("secrets")).unwrap());
+    let full_core = Core::open(CoreConfig {
+        data_dir: full_dir.path().join("data"),
+        secrets: full_secrets.clone(),
+    })
+    .unwrap();
+    let (full, _) = full_core
+        .sign_up(bh_core::SignUp {
+            device_name: "mac".into(),
+            ..new_signup()
+        })
+        .await
+        .unwrap();
+    full.create_base("Personal").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(FileSecretStore::new(dir.path().join("secrets")).unwrap());
+    let core = Core::open(CoreConfig {
+        data_dir: dir.path().join("data"),
+        secrets: secrets.clone(),
+    })
+    .unwrap();
+    let (app, id) = connect(&full, &core, &full.email(), defaults).await;
+    let seed = secrets
+        .get(&format!("acct.{}.kem", app.id()))
+        .unwrap()
+        .unwrap();
+    let public = URL_SAFE_NO_PAD.encode(
+        bh_crypto::KemKey::from_seed(&bh_crypto::Secret::<32>::from_slice(&seed).unwrap()).public(),
+    );
+    let dbkey = full
+        .test_secrets()
+        .get(&format!("acct.{}.dbkey", full.id()))
+        .unwrap()
+        .unwrap();
+    let db = full_dir
+        .path()
+        .join("data/accounts")
+        .join(full.id().to_string())
+        .join("account.sqlite");
+    let dump = bh_testkit::inspect::dump_store(&db, &dbkey);
+    assert!(
+        dump.contains(&public),
+        "approver must record the requesting app's public key"
+    );
+    assert!(
+        !dump.contains(&URL_SAFE_NO_PAD.encode(&seed)),
+        "the approving device must not retain the requesting app's seed"
+    );
+    assert!(
+        dump.contains(&id.to_string()),
+        "approver must record the app device ID"
+    );
+    assert!(
+        full.test_secrets()
+            .get(&format!("acct.{}.kem", full.id()))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -822,7 +910,9 @@ async fn a_disconnected_app_erases_its_copy() {
     let account_dir = dir.path().join("data/accounts").join(app.id().to_string());
     assert!(account_dir.exists());
     let mut events = app.events();
-    full.remove_device(id).await.unwrap();
+    full.remove_device(id, bh_core::Removal::Plain)
+        .await
+        .unwrap();
     assert_eq!(app.refresh().await, Err(Error::Revoked));
     assert_eq!(wait(events.recv()).await.unwrap(), AccountEvent::Removed);
     assert!(app_core.accounts().is_empty());

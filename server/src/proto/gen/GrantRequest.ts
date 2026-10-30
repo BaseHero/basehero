@@ -2,4 +2,4 @@
 import type { Bytes } from "./Bytes";
 import type { GrantMode } from "./GrantMode";
 
-export type GrantRequest = { mode: GrantMode, epoch: number, wrapper: Bytes, };
+export type GrantRequest = { mode: GrantMode, epoch: number, wrapper: Bytes, accountEpoch: number, dataVersion: number, };

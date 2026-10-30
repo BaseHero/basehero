@@ -3,8 +3,9 @@ import { handleFiles } from './files';
 import type { VersionResponse } from './proto/gen/VersionResponse';
 import type { FetchResponse } from './proto/gen/FetchResponse';
 import type { GrantMode } from './proto/gen/GrantMode';
+import type { AppWrapper } from './proto/gen/AppWrapper';
 import type { Env, Principal, Result } from './http';
-import { accountStub, answer, b64, body, bytes, HttpError, id, json, requireDevice, str, testBypass } from './http';
+import { accountStub, answer, b64, body, bytes, dataVersion, declaredEpoch, HttpError, id, json, requireDevice, str, testBypass } from './http';
 
 const MIB = 1024 * 1024;
 /** The bodies of one changes request total at most this, so one change is at most this too. */
@@ -15,12 +16,13 @@ const SINCE_LIMIT_MAX = 1000;
 const VERSIONS_LIMIT_MAX = 200;
 
 type BaseRpc = {
-  create(p: Principal, epoch: number, wrapper: string): Promise<Created>;
+  create(p: Principal, epoch: number, wrapper: string, accountEpoch: number): Promise<Created>;
   key(p: Principal): Promise<Result>;
-  grant(p: Principal, deviceId: string, mode: GrantMode, epoch: number, wrapper: string): Promise<Result>;
+  rekey(p: Principal, from: number, wrapper: string, previous: string, apps: AppWrapper[], accountEpoch: number, dataVersion: number): Promise<Result>;
+  grant(p: Principal, deviceId: string, mode: GrantMode, epoch: number, wrapper: string, accountEpoch: number, dataVersion: number): Promise<Result>;
   revoke(p: Principal, deviceId: string): Promise<Result>;
   changes(p: Principal, changes: NewChange[]): Promise<Result>;
-  fileAccess(p: Principal, write: boolean): Promise<Result>;
+  fileAccess(p: Principal, write: boolean, changesRetry?: boolean): Promise<Result>;
   since(p: Principal, after: number, limit: number): Promise<Result>;
   fetchObjects(p: Principal, objectIds: string[]): Promise<Result<Fetched>>;
   versions(p: Principal, objectId: string, before: number | null, limit: number): Promise<Result>;
@@ -77,7 +79,8 @@ async function create(request: Request, env: Env): Promise<Response> {
   const baseId = id(raw.baseId);
   const input = { epoch: epoch(raw.epoch), wrapper: wrapper(raw.wrapper) };
   if (principal.kind !== 'full') throw new HttpError(403, 'forbidden');
-  const outcome = await baseStub(env, baseId).create(principal, input.epoch, input.wrapper);
+  const outcome = await baseStub(env, baseId).create(principal, input.epoch, input.wrapper, declaredEpoch(raw.accountEpoch));
+  if (outcome === 'epoch_conflict') throw new HttpError(409, 'epoch_conflict');
   // Listing it again heals an account that missed the base after an interrupted create.
   if (outcome !== 'taken') await accountStub(env, principal.accountId).addBase(principal, baseId);
   if (outcome !== 'created') throw new HttpError(409, 'exists');
@@ -93,7 +96,7 @@ async function changes(request: Request, env: Env, baseId: string): Promise<Resp
   const input = raw.changes.map(change);
   if (input.reduce((n, c) => n + c.body.length, 0) > CHANGES_BODY_MAX) throw new HttpError(413, 'too_large');
   const base = baseStub(env, baseId);
-  const access = await base.fileAccess(principal, true);
+  const access = await base.fileAccess(principal, true, true);
   if (access.status !== 200) return answer(access);
   if (!await accountStub(env, principal.accountId).reserveStorage(input.reduce((n, c) => n + c.body.length, 0))) {
     throw new HttpError(413, 'storage_limit');
@@ -170,7 +173,7 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
     if (limit < 1) throw new HttpError(400, 'bad_request');
     return answer(await base.versions(principal, objectId, before === null ? null : positiveSequence(before), Math.min(limit, VERSIONS_LIMIT_MAX)));
   }
-  const match = /^\/v1\/bases\/([^/]+)\/(key|changes|since|fetch|stored|live|drop-next-live|miss-next-fetch|short-next-fetch|hold-change-reply|release-change-reply|live-count|fail-next-device-close|grants\/([^/]+))$/.exec(path);
+  const match = /^\/v1\/bases\/([^/]+)\/(key|rekey|changes|since|fetch|stored|live|drop-next-live|miss-next-fetch|short-next-fetch|hold-change-reply|release-change-reply|live-count|fail-next-device-close|grants\/([^/]+))$/.exec(path);
   if (!match) throw new HttpError(404, 'not_found');
   const baseId = id(match[1]);
   const action = match[3] === undefined ? match[2] : 'grants';
@@ -181,7 +184,7 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') throw new HttpError(400, 'bad_request');
     return env.BASE.get(env.BASE.idFromName(baseId)).fetch('https://base/live', { headers: {
       Upgrade: 'websocket', 'BH-Device': principal.deviceId, 'BH-Account': principal.accountId,
-      'BH-Kind': principal.kind, 'BH-Status': principal.status,
+      'BH-Kind': principal.kind, 'BH-Status': principal.status, 'BH-Protocol': String(principal.protocol),
     } });
   }
   if (action === 'fail-next-device-close' && method === 'POST' && testBypass(request, env)) {
@@ -218,6 +221,19 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
     return access.status === 200 ? json({ count: await base.liveCount() }) : answer(access);
   }
   if (action === 'key' && method === 'GET') return answer(await base.key(await requireDevice(request, env)));
+  if (action === 'rekey' && method === 'POST') {
+    const principal = await requireDevice(request, env);
+    const raw = await body(request);
+    const from = epoch(raw.from);
+    if (from === 0xffffffff || !Array.isArray(raw.apps)) throw new HttpError(400, 'bad_request');
+    const apps: AppWrapper[] = raw.apps.map((value: unknown) => {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new HttpError(400, 'bad_request');
+      const app = value as Record<string, unknown>;
+      return { deviceId: id(app.deviceId), wrapper: wrapper(app.wrapper) };
+    });
+    return answer(await base.rekey(principal, from, wrapper(raw.wrapper), wrapper(raw.previous), apps,
+      declaredEpoch(raw.accountEpoch), dataVersion(raw.dataVersion)));
+  }
   if (action === 'changes' && method === 'POST') return changes(request, env, baseId);
   if (action === 'fetch' && method === 'POST') return fetchObjects(request, env, baseId);
   if (action === 'since' && method === 'GET') {
@@ -238,10 +254,12 @@ export async function handleBases(request: Request, env: Env, path: string): Pro
     }
     const raw = await body(request);
     if (raw.mode !== 'rw' && raw.mode !== 'ro') throw new HttpError(400, 'bad_request');
-    const input = { mode: raw.mode as GrantMode, epoch: epoch(raw.epoch), wrapper: wrapper(raw.wrapper) };
+    const input = { mode: raw.mode as GrantMode, epoch: epoch(raw.epoch), wrapper: wrapper(raw.wrapper),
+      accountEpoch: declaredEpoch(raw.accountEpoch), dataVersion: dataVersion(raw.dataVersion) };
     const listed = await account.grantApp(principal, baseId, deviceId);
     if (listed.status !== 200) return answer(listed);
-    return answer(await base.grant(principal, deviceId, input.mode, input.epoch, input.wrapper));
+    return answer(await base.grant(principal, deviceId, input.mode, input.epoch, input.wrapper,
+      input.accountEpoch, input.dataVersion));
   }
   if (action === 'stored' && method === 'GET' && testBypass(request, env)) {
     const objectId = id(new URL(request.url).searchParams.get('object'));

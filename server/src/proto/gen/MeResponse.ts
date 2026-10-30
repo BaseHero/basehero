@@ -2,6 +2,7 @@
 import type { AccountId } from "./AccountId";
 import type { BaseId } from "./BaseId";
 import type { DeviceId } from "./DeviceId";
+import type { DeviceKeyDelivery } from "./DeviceKeyDelivery";
 import type { DeviceKind } from "./DeviceKind";
 
-export type MeResponse = { accountId: AccountId, deviceId: DeviceId, kind: DeviceKind, bases: Array<BaseId>, };
+export type MeResponse = { accountId: AccountId, deviceId: DeviceId, kind: DeviceKind, bases: Array<BaseId>, epoch: number, deviceKeys: Array<DeviceKeyDelivery>, };

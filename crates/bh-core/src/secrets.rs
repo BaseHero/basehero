@@ -18,7 +18,8 @@ pub trait SecretStore: Send + Sync + 'static {
     /// I/O failures, [`Error::Crypto`] for unreadable sealed data, or
     /// [`Error::NeedsUpdate`] for a newer sealed format.
     fn get(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, Error>;
-    /// Replaces a named secret.
+    /// Atomically replaces a named secret. A failed write must keep the old
+    /// value whole; key rings must never be partially replaced.
     ///
     /// # Errors
     /// Returns [`Error::Invalid`] for an invalid name or [`Error::Storage`]
@@ -191,6 +192,19 @@ mod tests {
         store.delete("acct.x.key").unwrap();
         store.delete("acct.x.key").unwrap();
         assert_eq!(store.get("acct.x.key").unwrap(), None);
+    }
+
+    #[test]
+    fn failed_replacement_keeps_the_previous_secret_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("secrets");
+        let store = FileSecretStore::new(&dir).unwrap();
+        store.put("acct.test.key", &[7; 36]).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let attempted = store.put("acct.test.key", &[8; 72]);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(attempted.is_err(), "test must run as an unprivileged user");
+        assert_eq!(&**store.get("acct.test.key").unwrap().unwrap(), &[7; 36]);
     }
 
     #[test]

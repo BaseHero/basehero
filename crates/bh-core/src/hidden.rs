@@ -27,6 +27,10 @@ const HIDDEN_KDF: Kdf = Kdf {
 pub struct HiddenKey(Secret<32>);
 
 impl HiddenKey {
+    pub(crate) fn duplicate(&self) -> Self {
+        Self(Secret::from_slice(self.0.expose()).expect("hidden key length"))
+    }
+
     /// Derives a hidden key on the caller's thread; asynchronous callers must use `spawn_blocking`.
     pub fn derive(account_key: &Secret<32>, password: &str) -> Result<Self, Error> {
         if password.is_empty() {
@@ -76,6 +80,65 @@ impl HiddenKey {
             },
             key.secret().expose(),
         )
+    }
+
+    /// Seals a hidden base under its password and the account key for this epoch.
+    pub(crate) fn wrap_v2(
+        &self,
+        account_key: &Secret<32>,
+        account: AccountId,
+        base: BaseId,
+        epoch: u32,
+        key: &BaseKey,
+    ) -> Vec<u8> {
+        envelope::seal(
+            &self.wrap_key_v2(account_key, base),
+            &Aad {
+                purpose: Purpose::HiddenBaseKey,
+                base: base.0,
+                object: account.0,
+                epoch,
+            },
+            key.secret().expose(),
+        )
+    }
+
+    fn wrap_key_v2(&self, account_key: &Secret<32>, base: BaseId) -> Secret<32> {
+        let mix = bh_crypto::kdf(account_key, b"bhhidnk1", 1);
+        let digest = Zeroizing::new(bh_crypto::generichash(
+            Some(self.0.expose()),
+            &[b"bh.v2.hidden-base", &base.0, mix.expose()],
+        ));
+        Secret::from_slice(&*digest).expect("32-byte hash")
+    }
+
+    /// Opens a legacy wrapper first, otherwise tries the supplied account keys in order.
+    /// Returns the index of the account key used, or `None` for a legacy wrapper.
+    pub(crate) fn open_any(
+        &self,
+        account_keys: &[&Secret<32>],
+        account: AccountId,
+        base: BaseId,
+        epoch: u32,
+        wrapper: &[u8],
+    ) -> Option<(BaseKey, Option<usize>)> {
+        if let Some(key) = self.open(account, base, epoch, wrapper) {
+            return Some((key, None));
+        }
+        let aad = Aad {
+            purpose: Purpose::HiddenBaseKey,
+            base: base.0,
+            object: account.0,
+            epoch,
+        };
+        account_keys
+            .iter()
+            .enumerate()
+            .find_map(|(index, account_key)| {
+                let bytes =
+                    envelope::open(&self.wrap_key_v2(account_key, base), &aad, wrapper).ok()?;
+                Some((BaseKey::new(&bytes).ok()?, Some(index)))
+            })
     }
 
     /// Opens a matching hidden wrapper, returning nothing on an invalid or unrelated wrapper.
@@ -139,6 +202,40 @@ mod tests {
     }
     fn base(n: u8) -> BaseId {
         BaseId([n; 16])
+    }
+
+    #[test]
+    fn a_v2_hidden_wrapper_needs_the_account_key_it_was_made_under() {
+        let first = ak(1);
+        let current = ak(2);
+        let unrelated = ak(3);
+        let hk = HiddenKey::derive(&first, "ferry lantern quartz").unwrap();
+        let wrapper = hk.wrap_v2(&current, acct(1), base(2), 2, &bk());
+        assert!(
+            hk.open_any(&[&first, &unrelated], acct(1), base(2), 2, &wrapper)
+                .is_none()
+        );
+        let (opened, index) = hk
+            .open_any(&[&first, &current], acct(1), base(2), 2, &wrapper)
+            .unwrap();
+        assert_eq!(opened.secret().expose(), bk().secret().expose());
+        assert_eq!(index, Some(1));
+        assert!(
+            hk.open_any(&[&current], acct(2), base(2), 2, &wrapper)
+                .is_none()
+        );
+        assert!(
+            hk.open_any(&[&current], acct(1), base(3), 2, &wrapper)
+                .is_none()
+        );
+        assert!(
+            hk.open_any(&[&current], acct(1), base(2), 1, &wrapper)
+                .is_none()
+        );
+        let legacy = hk.wrap(acct(1), base(2), 1, &bk());
+        let (opened, index) = hk.open_any(&[], acct(1), base(2), 1, &legacy).unwrap();
+        assert_eq!(opened.secret().expose(), bk().secret().expose());
+        assert_eq!(index, None);
     }
 
     #[test]

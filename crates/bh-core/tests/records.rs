@@ -449,7 +449,7 @@ fn interrupted_search_backfill_retries_all_records_on_reopen() {
     )
     .unwrap();
     db.execute_batch(
-        "DROP TABLE object_search; DROP INDEX set_aside_unique; PRAGMA user_version = 2;",
+        "ALTER TABLE backup_base DROP COLUMN snapshot_epoch; DROP TABLE object_search; DROP INDEX set_aside_unique; PRAGMA user_version = 2;",
     )
     .unwrap();
     assert!(Base::open_local(dir.path(), [7; 32]).is_err());
@@ -492,7 +492,7 @@ fn migrating_foundation_version_3_store_adds_search() {
             .collect::<String>()
     ))
     .unwrap();
-    db.execute_batch("DROP TABLE object_search; PRAGMA user_version = 3;")
+    db.execute_batch("ALTER TABLE backup_base DROP COLUMN snapshot_epoch; DROP TABLE object_search; PRAGMA user_version = 3;")
         .unwrap();
     drop(db);
     let reopened = Base::open_local(dir.path(), [7; 32]).unwrap();
@@ -520,7 +520,7 @@ fn migrating_main_version_4_store_keeps_future_changes_and_adds_search() {
             .collect::<String>()
     ))
     .unwrap();
-    db.execute_batch("DROP TABLE object_search; PRAGMA user_version = 4;")
+    db.execute_batch("ALTER TABLE backup_base DROP COLUMN snapshot_epoch; DROP TABLE object_search; PRAGMA user_version = 4;")
         .unwrap();
     db.execute(
         "INSERT INTO future_changes (object_id, seq, state, device_id, body) VALUES (?, 1, 0, 'device', x'01')",
@@ -554,7 +554,7 @@ fn migrating_early_search_version_4_store_adds_future_changes() {
             .collect::<String>()
     ))
     .unwrap();
-    db.execute_batch("DROP TABLE future_changes; PRAGMA user_version = 4;")
+    db.execute_batch("ALTER TABLE backup_base DROP COLUMN snapshot_epoch; DROP TABLE future_changes; PRAGMA user_version = 4;")
         .unwrap();
     drop(db);
     let reopened = Base::open_local(dir.path(), [7; 32]).unwrap();
@@ -583,7 +583,7 @@ fn migrating_a_version_2_store_adds_search() {
             .collect::<String>()
     ))
     .unwrap();
-    db.execute_batch("DROP TABLE IF EXISTS object_search; DROP INDEX IF EXISTS set_aside_unique; PRAGMA user_version = 2;")
+    db.execute_batch("ALTER TABLE backup_base DROP COLUMN snapshot_epoch; DROP TABLE IF EXISTS object_search; DROP INDEX IF EXISTS set_aside_unique; PRAGMA user_version = 2;")
         .unwrap();
     drop(db);
     let base = Base::open_local(dir.path(), [7; 32]).unwrap();
@@ -599,7 +599,7 @@ fn migrating_a_version_2_store_adds_search() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        9
     );
     assert_eq!(base.search("ferry", 10).unwrap()[0].id, id);
 }

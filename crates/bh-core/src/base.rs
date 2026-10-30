@@ -1,5 +1,6 @@
 //! `Base`: one base's objects, kept in its own encrypted store.
 
+use crate::basekeys::BaseKeys;
 use crate::client::Api;
 use crate::envelope::{self, Aad, Purpose};
 use crate::files::{
@@ -11,11 +12,12 @@ use crate::query::{self, Query};
 use crate::search::{self, SearchHit};
 use crate::store::{BaseDb, ObjectRow};
 use crate::sync::{BaseEvent, Incoming, SyncState, SyncTask};
-use crate::types::{self, BASE, FOLDER, NOTE, PROJECT, TYPE, TypeDef, TypeRef};
+use crate::types::{self, BASE, FILE, FOLDER, NOTE, PROJECT, TYPE, TypeDef, TypeRef};
 use crate::versions::VersionTicker;
 use crate::{Error, SecretStore};
 use bh_crypto::Secret;
 use bh_proto::{BaseId, DeviceId, ObjectId};
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -32,7 +34,7 @@ use zeroize::Zeroizing;
 /// The largest local update: sealed, it is the largest change the server takes.
 pub(crate) const MAX_UPDATE: usize = (8 << 20) - envelope::OVERHEAD;
 
-/// The key epoch; every base has only its first key.
+/// The initial key epoch for newly created bases.
 pub(crate) const EPOCH: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -105,12 +107,22 @@ impl std::ops::DerefMut for OpenStore {
         self.0.as_mut().expect("closed store")
     }
 }
-struct KeyGuard<'a>(MutexGuard<'a, Option<BaseKey>>);
+struct KeyGuard<'a>(MutexGuard<'a, Option<BaseKeys>>);
+impl KeyGuard<'_> {
+    fn first(&self) -> &BaseKey {
+        self.0.as_ref().expect("closed key").first()
+    }
+}
 impl std::ops::Deref for KeyGuard<'_> {
     type Target = BaseKey;
     fn deref(&self) -> &BaseKey {
-        self.0.as_ref().expect("closed key")
+        self.0.as_ref().expect("closed key").current().1
     }
+}
+
+/// Reloads only the key row, without waiting on this base's sync task.
+pub(crate) trait KeySource: Send + Sync {
+    fn reload(&self, base: BaseId) -> BoxFuture<'static, Result<BaseKeys, Error>>;
 }
 fn closed_receiver<T: Clone>() -> broadcast::Receiver<T> {
     let (sender, receiver) = broadcast::channel(1);
@@ -133,7 +145,8 @@ struct Inner {
     mode: Mode,
     device: Option<DeviceId>,
     full: std::sync::atomic::AtomicBool,
-    key: Mutex<Option<BaseKey>>,
+    key: Mutex<Option<BaseKeys>>,
+    key_source: OnceLock<Arc<dyn KeySource>>,
     /// The yrs client ID of this process's core edits, used only under the
     /// store lock against the stored state, so its clock never repeats.
     client: u64,
@@ -155,6 +168,8 @@ struct Inner {
     file_api: OnceLock<Api>,
     version_device_name: OnceLock<Arc<dyn Fn(DeviceId) -> Option<String> + Send + Sync>>,
     download_lock: tokio::sync::Mutex<()>,
+    backup_lock: tokio::sync::Mutex<()>,
+    backup_signal: OnceLock<Arc<tokio::sync::Notify>>,
     downloads_stopped: std::sync::atomic::AtomicBool,
     /// The server signed this device out: local edits stay queued, never sent.
     sync_stopped: std::sync::atomic::AtomicBool,
@@ -258,7 +273,8 @@ impl Base {
                 mode,
                 device,
                 full: std::sync::atomic::AtomicBool::new(true),
-                key: Mutex::new(Some(key)),
+                key: Mutex::new(Some(BaseKeys::from_chain(1, key, &[], &id)?)),
+                key_source: OnceLock::new(),
                 client: u64::from(u32::from_le_bytes(bh_crypto::random::<4>())),
                 db: Mutex::new(OpenStore(Some(db))),
                 parts_root: files::part_root(path),
@@ -275,6 +291,8 @@ impl Base {
                 file_api: OnceLock::new(),
                 version_device_name: OnceLock::new(),
                 download_lock: tokio::sync::Mutex::new(()),
+                backup_lock: tokio::sync::Mutex::new(()),
+                backup_signal: OnceLock::new(),
                 downloads_stopped: std::sync::atomic::AtomicBool::new(false),
                 sync_stopped: std::sync::atomic::AtomicBool::new(false),
                 download_stop: tokio::sync::watch::channel(false).0,
@@ -320,6 +338,10 @@ impl Base {
         Self::open_store(&path, db_key.expose(), id, key, Mode::ReadWrite, None)
     }
 
+    pub(crate) fn set_backup_signal(&self, signal: Arc<tokio::sync::Notify>) {
+        let _ = self.inner.backup_signal.set(signal);
+    }
+
     pub(crate) fn set_full(&self, full: bool) {
         self.inner.full.store(full, Ordering::SeqCst);
     }
@@ -334,6 +356,7 @@ impl Base {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.stop_sync().await;
         let _downloads = self.inner.download_lock.lock().await;
+        let _backup = self.inner.backup_lock.lock().await;
         let mut db = crate::store::in_use(&self.inner.db);
         for weak in lock(&self.inner.live).drain().map(|(_, weak)| weak) {
             if let Some(live) = weak.upgrade() {
@@ -347,6 +370,63 @@ impl Base {
 
     fn key(&self) -> KeyGuard<'_> {
         KeyGuard(lock(&self.inner.key))
+    }
+
+    pub(crate) fn set_key_source(&self, source: Arc<dyn KeySource>) {
+        self.inner.key_source.set(source).ok();
+    }
+
+    pub(crate) fn install_keys(&self, keys: BaseKeys) {
+        let mut guard = lock(&self.inner.key);
+        if guard
+            .as_ref()
+            .is_none_or(|old| old.current().0 <= keys.current().0)
+        {
+            *guard = Some(keys);
+        }
+    }
+
+    pub(crate) async fn reload_keys(&self) -> Result<(), Error> {
+        let source = self
+            .inner
+            .key_source
+            .get()
+            .ok_or_else(|| Error::Network("no key source".into()))?;
+        self.install_keys(source.reload(self.id()).await?);
+        Ok(())
+    }
+
+    pub(crate) fn newest_epoch(&self) -> u32 {
+        lock(&self.inner.key)
+            .as_ref()
+            .expect("closed key")
+            .current()
+            .0
+    }
+
+    pub(crate) fn missing_epoch(&self, objects: &[(ObjectId, u64, Vec<Incoming>)]) -> bool {
+        let newest = lock(&self.inner.key)
+            .as_ref()
+            .expect("closed key")
+            .current()
+            .0;
+        objects.iter().any(|(_, _, changes)| {
+            changes.iter().any(|change| {
+                change.body.first() == Some(&envelope::FORMAT)
+                    && envelope::epoch(&change.body).is_some_and(|epoch| epoch > newest)
+            })
+        })
+    }
+
+    pub(crate) fn reseal_sending(&self) -> Result<bool, Error> {
+        let current = self.newest_epoch();
+        self.db()?.reseal_sending(|id, state, body| {
+            if envelope::epoch(body).ok_or(Error::Crypto)? >= current {
+                return Ok(None);
+            }
+            let plain = self.open_change(id, state, body)?;
+            Ok(Some(self.seal_change(id, state, &plain)))
+        })
     }
 
     pub(crate) fn downgrade(&self) -> BaseWeak {
@@ -370,6 +450,21 @@ impl Base {
     /// Access mode granted to this device.
     pub fn mode(&self) -> Mode {
         self.inner.mode
+    }
+
+    pub(crate) async fn backup_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.backup_lock.lock().await
+    }
+
+    pub(crate) fn backup_open(&self) -> bool {
+        !self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn part_file(&self, id: ObjectId, n: u32) -> std::path::PathBuf {
+        self.inner
+            .parts_root
+            .join(id.to_string())
+            .join(n.to_string())
     }
 
     pub(crate) fn db(&self) -> Result<crate::store::InUse<'_, OpenStore>, Error> {
@@ -1055,6 +1150,9 @@ impl Base {
 
     /// After a local edit is stored: tells listeners and the sync task.
     fn edited(&self, id: ObjectId) {
+        if let Some(signal) = self.inner.backup_signal.get() {
+            signal.notify_one();
+        }
         self.emit(BaseEvent::ObjectsChanged(vec![id]));
         if let Some(sync) = self.inner.sync.get() {
             sync.changed();
@@ -1069,7 +1167,7 @@ impl Base {
     }
 
     /// The associated data of a change to `id`: an update or a whole state.
-    fn change_aad(&self, id: ObjectId, state: bool) -> Aad {
+    fn change_aad(&self, id: ObjectId, state: bool, epoch: u32) -> Aad {
         Aad {
             purpose: if state {
                 Purpose::ObjectState
@@ -1078,17 +1176,15 @@ impl Base {
             },
             base: self.inner.id.0,
             object: id.0,
-            epoch: EPOCH,
+            epoch,
         }
     }
 
-    /// `CK = kdf(BK, "bhcntnt1", epoch)`, which seals changes.
-    fn content_key(&self) -> Secret<32> {
-        bh_crypto::kdf(self.key().secret(), b"bhcntnt1", EPOCH.into())
-    }
-
     pub(crate) fn seal_change(&self, id: ObjectId, state: bool, update: &[u8]) -> Vec<u8> {
-        envelope::seal(&self.content_key(), &self.change_aad(id, state), update)
+        let guard = lock(&self.inner.key);
+        let (epoch, key) = guard.as_ref().expect("closed key").current();
+        let content = bh_crypto::kdf(key.secret(), b"bhcntnt1", epoch.into());
+        envelope::seal(&content, &self.change_aad(id, state, epoch), update)
     }
 
     fn open_change(
@@ -1097,7 +1193,45 @@ impl Base {
         state: bool,
         body: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        envelope::open(&self.content_key(), &self.change_aad(id, state), body)
+        let epoch = envelope::epoch(body).ok_or(Error::Crypto)?;
+        let guard = lock(&self.inner.key);
+        let key = guard
+            .as_ref()
+            .expect("closed key")
+            .get(epoch)
+            .ok_or(Error::Crypto)?;
+        let content = bh_crypto::kdf(key.secret(), b"bhcntnt1", epoch.into());
+        envelope::open(&content, &self.change_aad(id, state, epoch), body)
+    }
+
+    /// Applies backup changes without server sequence numbers or outbox entries.
+    /// A bad change leaves the last successfully saved state untouched.
+    pub(crate) fn apply_backup(
+        &self,
+        changes: &[(ObjectId, bool, Vec<u8>)],
+    ) -> Result<Vec<ObjectId>, Error> {
+        let mut failed = Vec::new();
+        let mut db = self.db()?;
+        for (id, state, body) in changes {
+            let opened = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let update = self.open_change(*id, *state, body)?;
+                let decoded = Update::decode_v1(&update).map_err(|_| Error::Crypto)?;
+                let doc = match db.state(*id)? {
+                    Some((_, current)) => self.load(&current)?,
+                    None => Doc::with_client_id(self.inner.client),
+                };
+                doc.transact_mut()
+                    .apply_update(decoded)
+                    .map_err(|_| Error::Crypto)?;
+                self.save(&mut db, *id, &doc, &[], None, None)
+            }));
+            match opened {
+                Ok(Ok(())) => {}
+                Ok(Err(error @ Error::Storage(_))) => return Err(error),
+                _ => failed.push(*id),
+            }
+        }
+        Ok(failed)
     }
 
     fn writable(&self) -> Result<(), Error> {
@@ -1113,7 +1247,7 @@ impl Base {
         if types::is_core(&ty.name) {
             return Ok(types::core_def(ty));
         }
-        let id = types::type_object_id(&self.key(), &ty.name, ty.version);
+        let id = types::type_object_id(self.key().first(), &ty.name, ty.version);
         Ok(db
             .summary(id)?
             .and_then(|s| serde_json::from_value::<TypeDef>(s.fields.get("def")?.clone()).ok())
@@ -1151,7 +1285,7 @@ impl Base {
         self.newer_type(db, ty)
     }
 
-    fn load(&self, state: &[u8]) -> Result<Doc, Error> {
+    pub(crate) fn load(&self, state: &[u8]) -> Result<Doc, Error> {
         let unreadable = |_| Error::Storage("unreadable object state".into());
         let doc = Doc::with_client_id(self.inner.client);
         let update = Update::decode_v1(state).map_err(unreadable)?;
@@ -1272,7 +1406,7 @@ impl Base {
             )
             .map_err(|_| Error::invalid("invalid definition"))?;
             types::check_def(&def)?;
-            if types::type_object_id(&self.key(), &def.name, def.version) != id {
+            if types::type_object_id(self.key().first(), &def.name, def.version) != id {
                 return Err(Error::invalid("definition ID does not match"));
             }
             if let Some(old) = db.summary(id)? {
@@ -1816,6 +1950,47 @@ impl Base {
         Ok(true)
     }
 
+    /// Recreates an object in a new base, retaining its ID and document state.
+    /// Move markers name the restored target; file parts are attached separately.
+    pub(crate) fn restore_object(
+        &self,
+        id: ObjectId,
+        state: &[u8],
+        moved: &HashMap<BaseId, BaseId>,
+    ) -> Result<(), Error> {
+        self.writable()?;
+        let incoming = Update::decode_v1(state).map_err(|_| Error::Crypto)?;
+        let doc = Doc::with_client_id(self.inner.client);
+        {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(incoming).map_err(|_| Error::Crypto)?;
+            let meta = objects::read_meta(&txn)?;
+            if let Some(target) = meta.moved {
+                objects::write_moved(&mut txn, moved.get(&target).copied());
+            }
+            if meta.ty.name == FILE {
+                objects::write_fields(
+                    &mut txn,
+                    &Map::from_iter([("uploaded".into(), Value::Null)]),
+                )?;
+            }
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        if update.len() > MAX_UPDATE {
+            return Err(Error::TooLarge);
+        }
+        let mut db = self.db()?;
+        if db.state(id)?.is_some() {
+            return Err(Error::Conflict("restore_existing_object".into()));
+        }
+        self.save(&mut db, id, &doc, &[&update], self.inner.device, None)?;
+        drop(db);
+        self.edited(id);
+        Ok(())
+    }
+
     /// Leaves a deleted marker of `id` naming the base it moved to.
     pub(crate) fn mark_moved(&self, id: ObjectId, to: BaseId) -> Result<(), Error> {
         self.edit(id, |_, meta, _, txn| {
@@ -1987,6 +2162,11 @@ impl Base {
                 }
             }
         }
+        if !applied.is_empty()
+            && let Some(signal) = self.inner.backup_signal.get()
+        {
+            signal.notify_one();
+        }
         Ok((applied.into_iter().map(|a| a.id).collect(), needs_update))
     }
 
@@ -2144,7 +2324,7 @@ impl Base {
         self.writable()?;
         types::check_def(&def)?;
         let mut db = self.db()?;
-        let id = types::type_object_id(&self.key(), &def.name, def.version);
+        let id = types::type_object_id(self.key().first(), &def.name, def.version);
         let fields =
             Map::from_iter([("def".to_string(), serde_json::to_value(&def).expect("JSON"))]);
         if db.needs_update(id)? {
@@ -2220,7 +2400,8 @@ impl Base {
             .filter(|s| !s.deleted)
             .filter_map(|s| {
                 let def: TypeDef = serde_json::from_value(s.fields.get("def")?.clone()).ok()?;
-                (types::type_object_id(&self.key(), &def.name, def.version) == s.id).then_some(def)
+                (types::type_object_id(self.key().first(), &def.name, def.version) == s.id)
+                    .then_some(def)
             })
             .collect();
         defs.sort_by(|a, b| (&a.name, a.version).cmp(&(&b.name, b.version)));
@@ -2463,6 +2644,19 @@ impl Base {
             .clone()
     }
 
+    /// Holds the uploader before part `n` is sent, so an interrupted upload
+    /// can be tested without racing a remote GET against the PUT response.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_file_put_after(&self, n: u32) -> Arc<std::sync::atomic::AtomicBool> {
+        let task = self
+            .inner
+            .uploader
+            .get()
+            .expect("the base's sync has started");
+        task.hold_after(n);
+        task.probe.held.clone()
+    }
+
     /// Injects a lost reply after `n` successful part uploads in tests.
     #[cfg(feature = "test-support")]
     pub fn fail_file_put_after(&self, n: u32) {
@@ -2503,6 +2697,16 @@ impl Base {
         }
     }
 
+    /// Holds outgoing sends but allows live notifications to install newer keys.
+    pub fn test_hold_sends(&self) {
+        self.inner.sync.get().expect("sync task").hold_sends(true);
+    }
+
+    /// Resumes sends held by [`Self::test_hold_sends`].
+    pub fn test_resume_sends(&self) {
+        self.inner.sync.get().expect("sync task").hold_sends(false);
+    }
+
     /// The seq up to which this device has applied every change to `id`.
     pub fn test_confirmed_seq(&self, id: ObjectId) -> u64 {
         self.db()
@@ -2540,9 +2744,28 @@ impl Base {
         self.apply_remote(id, update, None)
     }
 
+    /// Whether an object's outgoing change is still in the sending table.
+    pub fn test_sending(&self, id: ObjectId) -> bool {
+        self.db()
+            .unwrap()
+            .sending()
+            .expect("readable sending table")
+            .iter()
+            .any(|row| row.object_id == id)
+    }
+
     /// The outbox's object IDs and updates, oldest first.
     pub fn test_outbox(&self) -> Vec<(ObjectId, Vec<u8>)> {
         self.db().unwrap().outbox().expect("readable outbox")
+    }
+
+    /// Total current object-state bytes in this base for backup size checks.
+    pub fn test_backup_state_bytes(&self) -> u64 {
+        self.db()
+            .unwrap()
+            .backup_estimate()
+            .expect("readable store")
+            .0
     }
 
     /// Test kit only: create a moved marker as an app could in base content.
@@ -2559,7 +2782,7 @@ impl Base {
 
     /// The object ID of a type definition in this base.
     pub fn test_type_id(&self, name: &str, version: u32) -> ObjectId {
-        types::type_object_id(&self.key(), name, version)
+        types::type_object_id(self.key().first(), name, version)
     }
 }
 

@@ -55,6 +55,22 @@ impl ActiveApproval {
     }
 }
 
+/// An offline restore handle associated with its source and destination accounts.
+pub struct OpenRestore {
+    pub source: AccountId,
+    pub destinations: HashSet<AccountId>,
+    pub backup: Arc<tokio::sync::Mutex<bh_core::OpenedBackup>>,
+}
+
+type OpenRestores = Arc<Mutex<HashMap<String, OpenRestore>>>;
+
+fn retain_other_restores(restores: &OpenRestores, account: AccountId) {
+    restores
+        .lock()
+        .unwrap()
+        .retain(|_, entry| entry.source != account && !entry.destinations.contains(&account));
+}
+
 /// One per process: the core, the server new accounts use, and the sink.
 pub struct AppState {
     pub core: Core,
@@ -63,10 +79,14 @@ pub struct AppState {
     pub sink: Sink,
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    /// Home folder the Mac's default backup folder is chosen in: the person's
+    /// own in the app, and a temporary one in tests.
+    pub backup_home: PathBuf,
     pub pending: Arc<Mutex<HashMap<String, Arc<PendingSignIn>>>>,
     pub approvals: Arc<Mutex<HashMap<String, Arc<ActiveApproval>>>>,
     pub open_requests: Mutex<HashMap<(AccountId, ApprovalId), OpenRequest>>,
     pub open_app_requests: Mutex<HashMap<(AccountId, ApprovalId), OpenAppRequest>>,
+    pub open_backups: OpenRestores,
     pub active_pending: Arc<Mutex<HashSet<String>>>,
     pub starting_approvals: Mutex<HashSet<String>>,
     pub pending_lifetime: Duration,
@@ -99,9 +119,14 @@ impl Drop for CachedBase {
 }
 
 impl AppState {
-    pub fn open(config: CoreConfig, server: Url, sink: Sink) -> Result<AppState, CommandError> {
+    pub fn open(
+        config: CoreConfig,
+        server: Url,
+        sink: Sink,
+        backup_home: PathBuf,
+    ) -> Result<AppState, CommandError> {
         let cache_dir = config.data_dir.join("cache");
-        Self::open_with_cache(config, server, sink, cache_dir)
+        Self::open_with_cache(config, server, sink, cache_dir, backup_home)
     }
 
     pub fn open_with_cache(
@@ -109,8 +134,16 @@ impl AppState {
         server: Url,
         sink: Sink,
         cache_dir: PathBuf,
+        backup_home: PathBuf,
     ) -> Result<AppState, CommandError> {
-        Self::open_with_cleanup(config, server, sink, cache_dir, kit_store::delete_all)
+        Self::open_with_cleanup(
+            config,
+            server,
+            sink,
+            cache_dir,
+            backup_home,
+            kit_store::delete_all,
+        )
     }
 
     fn open_with_cleanup(
@@ -118,6 +151,7 @@ impl AppState {
         server: Url,
         sink: Sink,
         cache_dir: PathBuf,
+        backup_home: PathBuf,
         cleanup: impl FnOnce() -> Result<(), CommandError> + Send + 'static,
     ) -> Result<AppState, CommandError> {
         // Delete old Android entries once per process, even if opening the account fails.
@@ -135,10 +169,12 @@ impl AppState {
             sink,
             data_dir,
             cache_dir,
+            backup_home,
             pending: Arc::default(),
             approvals: Arc::default(),
             open_requests: Mutex::default(),
             open_app_requests: Mutex::default(),
+            open_backups: Arc::default(),
             active_pending: Arc::default(),
             starting_approvals: Mutex::default(),
             pending_lifetime: Duration::from_secs(10 * 60),
@@ -147,6 +183,10 @@ impl AppState {
             bases: Arc::new(Mutex::new(HashMap::new())),
             heroes: Arc::default(),
         };
+        #[cfg(target_os = "android")]
+        state
+            .core
+            .set_document_folders(Arc::new(crate::backup::android::AndroidFolders));
         for account in state.core.accounts() {
             state.listen(account.id)?;
         }
@@ -185,7 +225,17 @@ impl AppState {
         if listeners.contains_key(&id) {
             return Ok(());
         }
-        let mut events = self.core.account(id)?.events();
+        let account = self.core.account(id)?;
+        if account.kind() == bh_core::DeviceKind::Full {
+            #[cfg(target_os = "macos")]
+            {
+                crate::backup::prepare_mac_account(&account, &self.backup_home)?;
+                account.start_backups(bh_core::BackupSchedule::MAC);
+            }
+            #[cfg(target_os = "android")]
+            account.start_backups(bh_core::BackupSchedule::PHONE);
+        }
+        let mut events = account.events();
         let core = Arc::downgrade(&self.listener_core);
         let sink = self.sink.clone();
         let active = Arc::downgrade(&self.listeners);
@@ -193,6 +243,7 @@ impl AppState {
         let notes = Arc::downgrade(&self.notes);
         let cache_dir = self.cache_dir.clone();
         let heroes = Arc::downgrade(&self.heroes);
+        let restores = Arc::downgrade(&self.open_backups);
         let token = Arc::new(());
         let task_token = token.clone();
         let task = tauri::async_runtime::spawn(async move {
@@ -222,6 +273,9 @@ impl AppState {
                             retain_listed_bases(&bases, &notes, &cache_dir, id, &listed);
                         }
                         if removed {
+                            if let Some(restores) = restores.upgrade() {
+                                retain_other_restores(&restores, id);
+                            }
                             if let Some(bases) = bases.upgrade() {
                                 bases.lock().unwrap().retain(|(owner, base), _| {
                                     if *owner != id {
@@ -362,9 +416,35 @@ impl AppState {
         Ok(hero)
     }
 
+    /// Retain an opened backup unless a locally signed-in source left during the open.
+    pub fn insert_open_restore(
+        &self,
+        source: AccountId,
+        source_was_present: bool,
+        opened: bh_core::OpenedBackup,
+    ) -> Result<String, CommandError> {
+        let mut restores = self.open_backups.lock().unwrap();
+        // Removal clears handles under this same lock. Offline backups from an
+        // account never installed here can still be opened for new-account restore.
+        if source_was_present {
+            self.core.account(source)?;
+        }
+        let handle = AccountId::random().to_string();
+        restores.insert(
+            handle.clone(),
+            OpenRestore {
+                source,
+                destinations: Default::default(),
+                backup: Arc::new(tokio::sync::Mutex::new(opened)),
+            },
+        );
+        Ok(handle)
+    }
+
     /// Release this account's bases and stop their event forwarders. Call it after the
     /// core has removed the account, so no later `base()` call can cache one again.
     pub fn forget_account(&self, account: AccountId) {
+        retain_other_restores(&self.open_backups, account);
         self.heroes.lock().unwrap().remove(&account);
         self.bases
             .lock()
@@ -407,6 +487,10 @@ impl Drop for AppState {
         for (_, (handle, _)) in self.listeners.lock().unwrap().drain() {
             handle.abort();
         }
+        // The state owns the core. Its background work, such as a scheduled
+        // backup holding an account, must not keep the data folder locked after
+        // this returns, since the app may open the folder again in-process.
+        self.core.shutdown();
     }
 }
 
@@ -558,7 +642,13 @@ fn open(app: &AppHandle) -> Result<AppState, CommandError> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("bh:event", event);
     });
-    AppState::open_with_cache(CoreConfig { data_dir, secrets }, server, sink, cache_dir)
+    AppState::open_with_cache(
+        CoreConfig { data_dir, secrets },
+        server,
+        sink,
+        cache_dir,
+        crate::backup::home_dir(),
+    )
 }
 
 #[cfg(test)]
@@ -595,6 +685,7 @@ mod tests {
             },
             "https://dev-api.basehero.com".parse().unwrap(),
             Arc::new(|_| {}),
+            data_dir.parent().unwrap().join("home"),
         )
     }
 
@@ -732,6 +823,7 @@ mod tests {
             server.url(),
             Arc::new(|_| {}),
             dir.path().join("cache"),
+            dir.path().join("home"),
             move || {
                 let _ = sent.send(());
                 Err(storage_error("Google Play services unavailable".into()))
@@ -756,6 +848,7 @@ mod tests {
             },
             server.url(),
             Arc::new(|_| {}),
+            dir.path().join("home"),
         )
         .unwrap();
         let (account, _) = state
@@ -815,6 +908,7 @@ mod tests {
             Arc::new(move |event| {
                 let _ = tx.send(event);
             }),
+            dir.path().join("home"),
         )
         .unwrap();
         let (account, kit) = state
@@ -849,7 +943,16 @@ mod tests {
             .with_kit(&kit.display())
             .await
             .unwrap();
-        other.remove_device(account.device_id()).await.unwrap();
+        other
+            .remove_device(
+                account.device_id(),
+                bh_core::Removal::Full {
+                    password: TEST_PASSWORD.to_string().into(),
+                    lost: false,
+                },
+            )
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if matches!(
@@ -894,6 +997,7 @@ mod tests {
             Arc::new(move |event| {
                 let _ = tx.send(event);
             }),
+            dir.path().join("home"),
         )
         .unwrap();
         let (account, _) = state
@@ -943,6 +1047,7 @@ mod tests {
             },
             server.url(),
             Arc::new(|_| {}),
+            owner_dir.path().join("home"),
         )
         .unwrap();
         let signed = account::sign_up(
@@ -967,6 +1072,7 @@ mod tests {
             Arc::new(move |event| {
                 let _ = tx.send(event);
             }),
+            dir.path().join("home"),
         )
         .unwrap();
         let pending = account::sign_in_start(
@@ -991,7 +1097,13 @@ mod tests {
             .core
             .account(installed.id)
             .unwrap()
-            .remove_device(signed_in.device_id())
+            .remove_device(
+                signed_in.device_id(),
+                bh_core::Removal::Full {
+                    password: TEST_PASSWORD.to_string().into(),
+                    lost: false,
+                },
+            )
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -1033,6 +1145,7 @@ mod tests {
             Arc::new(move |event| {
                 let _ = sink_tx.send(event);
             }),
+            dir.path().join("home"),
         )
         .unwrap();
         let (account, _kit) = state

@@ -27,8 +27,10 @@ getrandom.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 zeroize.workspace = true
+time = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 bh-mac-keychain-helper = { path = "../../../crates/bh-mac-keychain-helper" }
@@ -41,6 +43,7 @@ ndk-context = "0.1.1"
 rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tauri = { version = "2.12", features = ["macos-private-api", "test"] }
 tauri-plugin-updater = "2"
 tempfile = "3"

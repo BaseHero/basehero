@@ -162,6 +162,7 @@ pub(crate) struct Shared {
     #[allow(dead_code, reason = "used by the approval exchange")]
     pub clock: Clock,
     pub(crate) accounts: Mutex<Weak<Mutex<BTreeMap<AccountId, Account>>>>,
+    pub(crate) document_folders: Mutex<Option<Arc<dyn crate::DocumentFolders>>>,
     /// Serializes the account check, local writes and failure cleanup across sign-ins.
     install_lock: tokio::sync::Mutex<()>,
     runtime: Runtime,
@@ -234,6 +235,22 @@ pub struct Core {
 }
 
 impl Core {
+    /// Registers the host's document-tree opener for backup destinations.
+    pub fn set_document_folders(&self, folders: Arc<dyn crate::DocumentFolders>) {
+        *self.shared.document_folders.lock().unwrap() = Some(folders);
+    }
+
+    /// Opens a saved backup destination.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] when no document opener is registered.
+    pub fn open_folder(
+        &self,
+        location: &crate::BackupLocation,
+    ) -> Result<Arc<dyn crate::BackupFolder>, Error> {
+        self.shared.open_folder(location)
+    }
+
     /// Opens the core on `config.data_dir`, which one core at a time may use:
     /// a second open, in this process or another, fails until the first core
     /// and its accounts and bases are dropped.
@@ -268,6 +285,11 @@ impl Core {
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
+        // Clean only after taking the exclusive lock: another core may be restoring.
+        let restore = config.data_dir.join("restore");
+        if restore.exists() {
+            std::fs::remove_dir_all(restore)?;
+        }
         let runtime = Runtime::build()?;
         let shared = Arc::new(Shared {
             data_dir: config.data_dir,
@@ -275,6 +297,7 @@ impl Core {
             handle: runtime.handle(),
             clock,
             accounts: Mutex::new(Weak::new()),
+            document_folders: Mutex::new(None),
             install_lock: tokio::sync::Mutex::new(()),
             runtime,
             _lock: lock,
@@ -380,6 +403,14 @@ impl Core {
     /// server ([`Error::Unauthorized`], [`Error::Revoked`], [`Error::NeedsUpdate`])
     /// or the local store ([`Error::Storage`], [`Error::Crypto`]).
     pub async fn install_app(&self, creds: AppCredentials) -> Result<Account, Error> {
+        self.install_app_with_seed(creds, None).await
+    }
+
+    pub(crate) async fn install_app_with_seed(
+        &self,
+        creds: AppCredentials,
+        pending_seed: Option<bh_crypto::Secret<32>>,
+    ) -> Result<Account, Error> {
         let core = self.clone();
         self.shared
             .run(async move {
@@ -411,35 +442,66 @@ impl Core {
                 }
                 let id = creds.account_id;
                 let secrets = &core.shared.secrets;
-                secrets.put(&format!("acct.{id}.appkey"), key.expose())?;
-                secrets.put(&format!("acct.{id}.token"), creds.token.as_bytes())?;
-                let db_key = Zeroizing::new(bh_crypto::random::<32>().to_vec());
-                secrets.put(&format!("acct.{id}.dbkey"), &db_key)?;
-                let db =
-                    AccountDb::open(&core.shared.account_dir(id).join("account.sqlite"), &db_key)?;
-                {
-                    let _pass = crate::store::Pass::new();
-                    db.set_account(&AccountRow {
-                        id,
-                        email: creds.email,
-                        server: creds.server,
-                        kind: DeviceKind::App,
-                        device_id: creds.device_id,
-                    })?;
-                }
-                let account = Account::load(core.shared.clone(), db)?;
-                if let Err(error) = account.refresh().await {
-                    // This attempt installed the files, but must not be restored as a
-                    // signed-in account on the next open or block an immediate retry.
-                    drop(account);
-                    std::fs::remove_dir_all(core.shared.account_dir(id))?;
-                    for suffix in ["appkey", "token", "dbkey"] {
-                        secrets.delete(&format!("acct.{id}.{suffix}"))?;
+                let seed = match pending_seed {
+                    Some(seed) if creds.kem_seed.is_none() => seed,
+                    Some(_) => return Err(Error::invalid("unexpected app key pair seed")),
+                    None => match &creds.kem_seed {
+                        Some(encoded) => {
+                            let bytes = Zeroizing::new(
+                                URL_SAFE_NO_PAD
+                                    .decode(encoded.as_bytes())
+                                    .map_err(|_| Error::invalid("key pair seed"))?,
+                            );
+                            bh_crypto::Secret::<32>::from_slice(&bytes)
+                                .map_err(|_| Error::invalid("key pair seed"))?
+                        }
+                        None => bh_crypto::Secret::<32>::random(),
+                    },
+                };
+                let installed = async {
+                    secrets.put(&format!("acct.{id}.kem"), seed.expose())?;
+                    let ring = crate::rotation::KeyRing::from_key(creds.epoch, key)?;
+                    secrets.put(&format!("acct.{id}.appkey"), &ring.to_bytes())?;
+                    secrets.put(&format!("acct.{id}.token"), creds.token.as_bytes())?;
+                    let db_key = Zeroizing::new(bh_crypto::random::<32>().to_vec());
+                    secrets.put(&format!("acct.{id}.dbkey"), &db_key)?;
+                    let db = AccountDb::open(
+                        &core.shared.account_dir(id).join("account.sqlite"),
+                        &db_key,
+                    )?;
+                    {
+                        let _pass = crate::store::Pass::new();
+                        db.set_account(&AccountRow {
+                            id,
+                            email: creds.email,
+                            server: creds.server,
+                            kind: DeviceKind::App,
+                            device_id: creds.device_id,
+                        })?;
                     }
-                    return Err(error);
+                    let account = Account::load(core.shared.clone(), db)?;
+                    account.refresh().await?;
+                    Ok::<Account, Error>(account)
                 }
-                core.accounts.lock().unwrap().insert(id, account.clone());
-                Ok(account)
+                .await;
+                match installed {
+                    Ok(account) => {
+                        core.accounts.lock().unwrap().insert(id, account.clone());
+                        Ok(account)
+                    }
+                    Err(error) => {
+                        // Never restore an incomplete install on the next open.
+                        for suffix in ["appkey", "token", "dbkey", "kem"] {
+                            secrets.delete(&format!("acct.{id}.{suffix}"))?;
+                        }
+                        match std::fs::remove_dir_all(core.shared.account_dir(id)) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        Err(error)
+                    }
+                }
             })
             .await
     }
@@ -485,7 +547,7 @@ impl Core {
         let account_key = Secret::<32>::random();
         let envelope = envelope::seal(
             &password.wrap_key(&kit),
-            &keys::account_key_aad(&account_id),
+            &keys::account_key_aad(&account_id, 1),
             account_key.expose(),
         );
         let envelope_hash = account::envelope_hash(&envelope);
@@ -500,13 +562,13 @@ impl Core {
                 salt: Bytes(salt.to_vec()),
                 kdf: DEFAULT_KDF,
                 login_key: Bytes(password.login_key().to_vec()),
-                account_key_envelope: Bytes(envelope),
+                account_key_envelope: Bytes(envelope.clone()),
                 activation_hash: Bytes(activation_hash.to_vec()),
                 device_id,
             })
             .await?;
         let _install = self.shared.install_lock.lock().await;
-        let account = self.install(
+        let account = match self.install(
             AccountRow {
                 id: account_id,
                 email,
@@ -516,14 +578,23 @@ impl Core {
             },
             Zeroizing::new(response.token),
             &account_key,
-        )?;
+            1,
+        ) {
+            Ok(account) => account,
+            Err(error) => {
+                self.remove_partial_install(account_id, device_id)?;
+                return Err(error);
+            }
+        };
+        // The account exists now, so a local backup-cache failure must not hide the kit.
+        let _ = account.remember_backup_credentials(envelope.clone(), salt);
         // The account exists now, so the kit must reach the user: an unnamed
         // device is the lesser loss if the name can't be written.
         let copy = kit.clone();
         let _ = account
             .update_data(move |data| {
                 account::set_device_name(data, device_id, &device_name);
-                account::set_kit(data, &copy, false, &envelope_hash);
+                account::set_kit(data, &copy, false, &envelope_hash, &salt);
             })
             .await;
         Ok((account, kit))
@@ -534,7 +605,8 @@ impl Core {
         let email = normalize_email(&req.email)?;
         let api = self.shared.api(req.server.clone(), None);
         let params = api.login_params(&email).await?;
-        let password = derive(req.password, login_salt(&params)?, params.kdf).await?;
+        let salt = login_salt(&params)?;
+        let password = derive(req.password, salt, params.kdf).await?;
         let device_id = DeviceId::random();
         let response = api
             .login(&LoginRequest {
@@ -560,6 +632,7 @@ impl Core {
             email,
             server: req.server,
             password: Arc::new(password),
+            salt,
             envelope: Arc::new(response.account_key_envelope.0),
             completion: Arc::new(tokio::sync::Mutex::new(false)),
         })
@@ -586,13 +659,22 @@ impl Core {
         row: AccountRow,
         token: Zeroizing<String>,
         account_key: &Secret<32>,
+        epoch: u32,
     ) -> Result<Account, Error> {
         let id = row.id;
         if self.accounts.lock().unwrap().contains_key(&id) {
             return Err(Error::invalid("already signed in"));
         }
         let secrets = &self.shared.secrets;
-        secrets.put(&format!("acct.{id}.key"), account_key.expose())?;
+        let ring =
+            crate::rotation::KeyRing::from_key(epoch, Secret::from_slice(account_key.expose())?)?;
+        secrets.put(&format!("acct.{id}.key"), &ring.to_bytes())?;
+        if secrets.get(&format!("acct.{id}.kem"))?.is_none() {
+            secrets.put(
+                &format!("acct.{id}.kem"),
+                bh_crypto::Secret::<32>::random().expose(),
+            )?;
+        }
         secrets.put(&format!("acct.{id}.token"), token.as_bytes())?;
         let db_key = match secrets.get(&format!("acct.{id}.dbkey"))? {
             Some(key) => key,
@@ -624,7 +706,7 @@ impl Core {
         accounts.remove(&id);
         let secrets = &self.shared.secrets;
         let mut failure = None;
-        for suffix in ["key", "token", "dbkey"] {
+        for suffix in ["key", "token", "dbkey", "kem"] {
             if let Err(error) = secrets.delete(&format!("acct.{id}.{suffix}")) {
                 failure.get_or_insert(error);
             }
@@ -735,6 +817,7 @@ pub struct PendingSignIn {
     email: String,
     server: Url,
     password: Arc<PasswordSecret>,
+    salt: [u8; 16],
     envelope: Arc<Vec<u8>>,
     /// True once a `finish` has succeeded; held across `finish` so only one activates.
     completion: Arc<tokio::sync::Mutex<bool>>,
@@ -779,7 +862,10 @@ impl PendingSignIn {
         let kit = RecoveryKit::parse(kit)?;
         let account_key = envelope::open(
             &self.password.wrap_key(&kit),
-            &keys::account_key_aad(&self.account_id),
+            &keys::account_key_aad(
+                &self.account_id,
+                envelope::epoch(&self.envelope).ok_or(Error::Crypto)?,
+            ),
             &self.envelope,
         )
         .map_err(|e| match e {
@@ -788,9 +874,12 @@ impl PendingSignIn {
         })?;
         let account_key = Secret::<32>::from_slice(&account_key).map_err(|_| Error::BadKit)?;
         let account = self.snapshot().finish(account_key).await?;
+        // Activation succeeded: a local backup-cache failure must not hide the account.
+        let _ = account.remember_backup_credentials(self.envelope.to_vec(), self.salt);
         // Activation succeeded: failing to record the typed kit must not hide
         // the installed account. The person still has the kit they just used.
         let copy = kit.clone();
+        let salt = self.salt;
         let opened_hash = account::envelope_hash(&self.envelope);
         let _ = account
             .update_data_with_envelope(move |data, current_hash| {
@@ -806,8 +895,10 @@ impl PendingSignIn {
                     .and_then(|v| v.get("code"))
                     .and_then(serde_json::Value::as_str)
                     .and_then(|text| RecoveryKit::parse(text).ok());
-                if current.as_ref() != Some(&copy) {
-                    account::set_kit(data, &copy, true, current_hash);
+                if current.as_ref() != Some(&copy)
+                    || data.get("kit").and_then(|v| v.get("salt")).is_none()
+                {
+                    account::set_kit(data, &copy, true, current_hash, &salt);
                     true
                 } else {
                     false
@@ -827,6 +918,7 @@ impl PendingSignIn {
             email: self.email.clone(),
             server: self.server.clone(),
             password: self.password.clone(),
+            salt: self.salt,
             envelope: self.envelope.clone(),
             completion: self.completion.clone(),
         }
@@ -836,6 +928,15 @@ impl PendingSignIn {
     /// the account database, and writes the device's name into account data.
     /// Safe to retry after a failure part way.
     pub(crate) async fn finish(self, account_key: Secret<32>) -> Result<Account, Error> {
+        let epoch = envelope::epoch(&self.envelope).ok_or(Error::Crypto)?;
+        self.finish_at(account_key, epoch).await
+    }
+
+    pub(crate) async fn finish_at(
+        self,
+        account_key: Secret<32>,
+        epoch: u32,
+    ) -> Result<Account, Error> {
         let shared = self.core.shared.clone();
         shared
             .run(async move {
@@ -843,14 +944,14 @@ impl PendingSignIn {
                 if *done {
                     return Err(Error::invalid("signed in"));
                 }
-                let account = self.complete(&account_key).await?;
+                let account = self.complete(&account_key, epoch).await?;
                 *done = true;
                 Ok(account)
             })
             .await
     }
 
-    async fn complete(self, account_key: &Secret<32>) -> Result<Account, Error> {
+    async fn complete(self, account_key: &Secret<32>, epoch: u32) -> Result<Account, Error> {
         let activation = keys::activation(account_key);
         match self
             .api
@@ -899,6 +1000,7 @@ impl PendingSignIn {
                 },
                 token,
                 account_key,
+                epoch,
             )?;
             let (device_id, name) = (self.device_id, self.device_name);
             account

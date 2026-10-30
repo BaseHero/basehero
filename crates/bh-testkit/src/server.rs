@@ -2,7 +2,7 @@ use std::{
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{OnceLock, mpsc},
+    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -17,7 +17,7 @@ pub struct LocalServerOptions {
 pub struct LocalServer {
     url: Url,
     persist: Option<TempDir>,
-    child: Option<Child>,
+    child: Mutex<Option<Child>>,
     birth: Option<String>,
     marker: String,
     vars: Vec<(String, String)>,
@@ -54,6 +54,35 @@ fn birth(pid: u32) -> Option<String> {
     child_ps(pid, "lstart=")
 }
 
+static EXIT_SERVERS: OnceLock<Mutex<Vec<&'static LocalServer>>> = OnceLock::new();
+
+extern "C" fn clean_exit_servers() {
+    if let Some(servers) = EXIT_SERVERS.get() {
+        for server in servers.lock().unwrap().iter() {
+            server.stop_shared();
+            if let Some(dir) = &server.persist {
+                let _ = std::fs::remove_dir_all(dir.path());
+            }
+        }
+    }
+}
+
+/// Register a static local server for cleanup on normal process exit. A killed
+/// process cannot run this hook; check.sh's temporary directory covers its tests.
+pub fn register_exit_cleanup(server: &'static LocalServer) {
+    let servers = EXIT_SERVERS.get_or_init(|| {
+        assert_eq!(unsafe { libc::atexit(clean_exit_servers) }, 0);
+        Mutex::new(Vec::new())
+    });
+    let mut servers = servers.lock().unwrap();
+    if !servers
+        .iter()
+        .any(|registered| std::ptr::eq(*registered, server))
+    {
+        servers.push(server);
+    }
+}
+
 impl LocalServer {
     pub fn start() -> Self {
         Self::start_with(LocalServerOptions::default())
@@ -76,7 +105,7 @@ impl LocalServer {
             url: Url::parse("http://127.0.0.1/").unwrap(),
             marker: persist.path().to_string_lossy().into_owned(),
             persist: Some(persist),
-            child: None,
+            child: Mutex::new(None),
             birth: None,
             vars: opts.vars,
             remote_token: None,
@@ -131,7 +160,7 @@ impl LocalServer {
         std::thread::spawn(move || {
             let _ = io::copy(&mut BufReader::new(stderr), &mut io::sink());
         });
-        self.child = Some(child);
+        *self.child.get_mut().unwrap() = Some(child);
         self.birth = Some(born);
         // Bundling and launching workerd can exceed 30 s when parallel checks
         // contend for CPU; this bounds startup, not any HTTP/test wait.
@@ -156,7 +185,9 @@ impl LocalServer {
 
     pub fn shared() -> &'static Self {
         static SERVER: OnceLock<LocalServer> = OnceLock::new();
-        SERVER.get_or_init(Self::start)
+        let server = SERVER.get_or_init(Self::start);
+        register_exit_cleanup(server);
+        server
     }
 
     pub fn from_env() -> &'static Self {
@@ -174,7 +205,7 @@ impl LocalServer {
                     std::env::var("BH_TEST_OPERATOR_TOKEN").expect("BH_TEST_OPERATOR_TOKEN"),
                 ),
                 persist: None,
-                child: None,
+                child: Mutex::new(None),
                 birth: None,
                 marker: String::new(),
                 vars: vec![],
@@ -212,8 +243,8 @@ impl LocalServer {
         self.launch();
     }
 
-    fn verified(&self) -> bool {
-        let (Some(child), Some(expected)) = (&self.child, &self.birth) else {
+    fn verified(&self, child: &Child) -> bool {
+        let Some(expected) = &self.birth else {
             return false;
         };
         let pid = child.id();
@@ -246,39 +277,33 @@ impl LocalServer {
 
     /// Stops the verified local Worker, preserving its port and persisted data for restart.
     pub fn stop(&mut self) {
-        if self.child.is_none() {
-            return;
-        }
-        if !self.verified() {
-            if self
-                .child
-                .as_mut()
-                .unwrap()
-                .try_wait()
-                .ok()
-                .flatten()
-                .is_none()
-            {
+        self.stop_shared();
+    }
+
+    fn stop_shared(&self) {
+        let mut guard = self.child.lock().unwrap();
+        let Some(child) = guard.as_mut() else { return };
+        if !self.verified(child) {
+            if child.try_wait().ok().flatten().is_none() {
                 eprintln!("local Worker PID could not be verified; refusing to stop it");
             }
-            self.child.take();
+            guard.take();
             return;
         }
-        let child = self.child.as_mut().unwrap();
         child.stdin.take(); // stdin close disposes Miniflare and its workerd child
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if child.try_wait().ok().flatten().is_some() {
-                self.child.take();
+                guard.take();
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if self.verified() {
-            let _ = self.child.as_mut().unwrap().kill();
-            let _ = self.child.as_mut().unwrap().wait();
+        if self.verified(child) {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        self.child.take();
+        guard.take();
     }
 }
 
@@ -301,6 +326,44 @@ macro_rules! local_only {
 #[cfg(test)]
 mod tests {
     use super::LocalServer;
+
+    #[test]
+    fn shared_server_is_cleaned_on_normal_exit() {
+        if std::env::var_os("BH_TESTKIT_EXIT_CHILD").is_some() {
+            let server = LocalServer::shared();
+            println!(
+                "BH_TESTKIT_EXIT_TEST {} {}",
+                server.persist_dir().display(),
+                server.child.lock().unwrap().as_ref().unwrap().id()
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "server::tests::shared_server_is_cleaned_on_normal_exit",
+                "--nocapture",
+            ])
+            .env("BH_TESTKIT_EXIT_CHILD", "1")
+            .env_remove("BH_TEST_SERVER")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let marker = text.split("BH_TESTKIT_EXIT_TEST ").nth(1).expect(&text);
+        let mut parts = marker.split_whitespace();
+        let path = parts.next().unwrap();
+        let pid: u32 = parts.next().unwrap().parse().unwrap();
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "left server folder: {path}"
+        );
+        assert!(super::birth(pid).is_none(), "left server process: {pid}");
+    }
 
     #[test]
     fn from_env_refuses_production_host() {

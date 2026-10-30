@@ -147,6 +147,11 @@ pub fn request_quit(app: &AppHandle) {
             // Drain has finished (or timed out); lock before replying to Cocoa or
             // allowing Tauri to exit. The bound applies even if sync stalls.
             if quit {
+                if let Some(startup) = app.try_state::<crate::state::Startup>()
+                    && let Ok(state) = startup.state()
+                {
+                    tauri::async_runtime::block_on(last_backup_before_quit(&state.core));
+                }
                 lock_hidden_bounded(&app);
             }
             let mut pending = state.pending.lock().unwrap();
@@ -176,6 +181,36 @@ pub fn request_quit(app: &AppHandle) {
             }
         }
     });
+}
+
+/// Wait up to five seconds for a writer, then request that it stop before its next write.
+pub async fn backup_bounded<F: std::future::Future<Output = ()>>(run: F, stop: impl FnOnce()) {
+    if tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .is_err()
+    {
+        stop();
+    }
+}
+
+/// Each destination gets at most five seconds; a stalled writer cannot hold up quitting.
+pub async fn last_backup_before_quit(core: &bh_core::Core) {
+    let jobs = core
+        .accounts()
+        .into_iter()
+        .filter(|entry| entry.kind == bh_core::DeviceKind::Full)
+        .map(|entry| async move {
+            if let Ok(account) = core.account(entry.id) {
+                backup_bounded(
+                    async {
+                        let _ = account.backup_now().await;
+                    },
+                    || account.stop_backup(),
+                )
+                .await;
+            }
+        });
+    futures_util::future::join_all(jobs).await;
 }
 
 #[cfg(target_os = "macos")]

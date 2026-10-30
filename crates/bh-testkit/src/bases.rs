@@ -58,6 +58,19 @@ pub async fn wait_for(mut condition: impl FnMut() -> bool) {
     .expect("condition not met within 30 s");
 }
 
+/// Waits for an operation to reach its test hold, consuming the signal permit.
+/// Panics with the calling test's location if the hold is not reached within 30 s.
+pub async fn wait_entered(
+    entered: &tokio::sync::Semaphore,
+    caller: &'static std::panic::Location<'static>,
+) {
+    tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+        .await
+        .unwrap_or_else(|_| panic!("operation never reached its hold within 30 s at {caller}"))
+        .expect("entered semaphore closed")
+        .forget();
+}
+
 /// Waits for an open base's sync events, with a safety deadline for a stuck sync.
 /// Subscribes before checking so quick changes cannot be lost.
 pub async fn wait_for_base(base: &Base, mut condition: impl FnMut() -> bool) {
@@ -156,4 +169,36 @@ pub fn found_under(dir: &Path, needle: &[u8]) -> bool {
                     .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
             }
         })
+}
+
+#[cfg(test)]
+mod entered_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_entered_consumes_the_signal() {
+        let entered = tokio::sync::Semaphore::new(0);
+        entered.add_permits(1);
+        wait_entered(&entered, std::panic::Location::caller()).await;
+        assert_eq!(entered.available_permits(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_entered_reports_the_call_site_after_thirty_seconds() {
+        let entered = tokio::sync::Semaphore::new(0);
+        let caller = std::panic::Location::caller();
+        let result = tokio::spawn(async move { wait_entered(&entered, caller).await }).await;
+        let panic = result.unwrap_err().into_panic();
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("panic message is a String");
+        assert!(
+            message.contains("never reached its hold within 30 s"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}:{}", caller.file(), caller.line())),
+            "{message}"
+        );
+    }
 }

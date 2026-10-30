@@ -2,4 +2,4 @@
 import type { BaseId } from "./BaseId";
 import type { Bytes } from "./Bytes";
 
-export type BasesRequest = { baseId: BaseId, epoch: number, wrapper: Bytes, };
+export type BasesRequest = { baseId: BaseId, epoch: number, wrapper: Bytes, accountEpoch: number, dataVersion: number, };

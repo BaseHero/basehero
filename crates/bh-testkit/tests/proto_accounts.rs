@@ -21,6 +21,12 @@ fn b64(bytes: &[u8]) -> String {
 fn email() -> String {
     format!("{}@example.test", id())
 }
+fn account_envelope(epoch: u32) -> String {
+    let mut bytes = [9; 64];
+    bytes[0] = 1;
+    bytes[1..5].copy_from_slice(&epoch.to_be_bytes());
+    b64(&bytes)
+}
 
 async fn request(
     server: &LocalServer,
@@ -29,9 +35,19 @@ async fn request(
     body: Value,
     token: Option<&str>,
 ) -> (StatusCode, Value) {
+    request_protocol(server, method, path, body, token, "1").await
+}
+async fn request_protocol(
+    server: &LocalServer,
+    method: Method,
+    path: &str,
+    body: Value,
+    token: Option<&str>,
+    protocol: &str,
+) -> (StatusCode, Value) {
     let mut r = reqwest::Client::new()
         .request(method, server.url().join(path).unwrap())
-        .header("BH-Protocol", "1")
+        .header("BH-Protocol", protocol)
         .header("BH-Test-Bypass", server.operator_token())
         .json(&body);
     if let Some(t) = token {
@@ -449,7 +465,7 @@ async fn credentials_rotate_the_verifier_and_envelope() {
     let f = registered(s).await;
     let new_key = b64(&random(32));
     let new_salt = b64(&random(16));
-    let new_envelope = b64(&random(64));
+    let new_envelope = account_envelope(1);
     let (status, body) = f
         .device(s)
         .put(
@@ -497,6 +513,72 @@ async fn credentials_rotate_the_verifier_and_envelope() {
     assert_eq!(account["accountKeyEnvelope"], new_envelope);
 }
 #[tokio::test]
+async fn deletion_with_an_empty_body_still_revokes() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let app_id = id();
+    let (_, created) = f
+        .device(s)
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    let app = RawDevice::new(
+        s,
+        f.account_id.clone(),
+        app_id.clone(),
+        created["token"].as_str().unwrap().to_owned(),
+    );
+    let response = reqwest::Client::new()
+        .delete(s.url().join(&format!("/v1/devices/{app_id}")).unwrap())
+        .header("BH-Protocol", "1")
+        .bearer_auth(&f.token)
+        .body(reqwest::Body::wrap_stream(futures_util::stream::empty::<
+            Result<Vec<u8>, std::io::Error>,
+        >()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    assert_eq!(
+        app.get("/v1/me", json!({})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn deletion_without_a_body_still_revokes() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let app_id = id();
+    let (_, created) = f
+        .device(s)
+        .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+        .await;
+    let app = RawDevice::new(
+        s,
+        f.account_id.clone(),
+        app_id.clone(),
+        created["token"].as_str().unwrap().to_owned(),
+    );
+    let response = reqwest::Client::new()
+        .delete(s.url().join(&format!("/v1/devices/{app_id}")).unwrap())
+        .header("BH-Protocol", "1")
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        app.get("/v1/me", json!({})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn deleted_device_token_is_revoked() {
     let s = LocalServer::from_env();
     let f = registered(s).await;
@@ -524,6 +606,701 @@ async fn deleted_device_token_is_revoked() {
         (StatusCode::UNAUTHORIZED, Some("revoked"))
     );
 }
+async fn full_device(s: &LocalServer, f: &Fixture) -> RawDevice {
+    let device_id = id();
+    let (status, login) = request(
+        s,
+        Method::POST,
+        "/v1/login",
+        json!({
+            "email": f.email, "loginKey": f.login_key, "deviceId": device_id
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    let token = login["token"].as_str().unwrap();
+    let (status, activated) = request(
+        s,
+        Method::POST,
+        "/v1/devices/activate",
+        json!({"activation": f.activation}),
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    RawDevice::new(s, f.account_id.clone(), device_id, token.to_owned())
+}
+
+fn rotation(f: &Fixture, epoch: u32, keys: &[(&str, &str)]) -> Value {
+    json!({"epoch": epoch, "loginKey": f.login_key,
+        "accountKeyEnvelope": account_envelope(epoch), "activationHash": b64(&Sha256::digest([8; 32])),
+        "deviceKeys": keys.iter().map(|(device_id, sealed)| json!({"deviceId": device_id, "sealed": sealed})).collect::<Vec<_>>()})
+}
+
+#[tokio::test]
+async fn removal_with_rotation_moves_the_epoch_and_hands_out_device_keys() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let b = full_device(s, &f).await;
+    let c = full_device(s, &f).await;
+    let pending = id();
+    let (_, login) = request(
+        s,
+        Method::POST,
+        "/v1/login",
+        json!({"email":f.email,"loginKey":f.login_key,"deviceId":pending}),
+        None,
+    )
+    .await;
+    let token = login["token"].as_str().unwrap();
+    let notice = b64(&[7; 32]);
+    let path = format!("/v1/devices/{}", c.device_id);
+    let (status, body) = request_protocol(s, Method::DELETE, &path, json!({
+        "notice": notice, "rotation": rotation(&f, 2, &[(&f.device_id, "AQI"), (&b.device_id, "AwQ")]),
+        "data": {"ciphertext":"BQY", "expectedVersion": 0, "accountEpoch": 2}
+    }), Some(&f.token), "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, me) =
+        request_protocol(s, Method::GET, "/v1/me", json!({}), Some(&b.token), "2").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["epoch"], 2);
+    assert_eq!(me["deviceKeys"], json!([{"epoch":2,"sealed":"AwQ"}]));
+    let (status, account) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/account",
+        json!({}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    assert_eq!(account["epoch"], 2);
+    assert_eq!(account["deviceKeys"], json!([{"epoch":2,"sealed":"AQI"}]));
+    assert_eq!(account["accountKeyEnvelope"], account_envelope(2));
+    assert_eq!(account["data"], json!({"ciphertext":"BQY", "version":1}));
+    let (status, revoked) = c.get("/v1/me", json!({})).await;
+    assert_eq!(
+        (
+            status,
+            revoked["error"].as_str(),
+            revoked["notice"].as_str()
+        ),
+        (
+            StatusCode::UNAUTHORIZED,
+            Some("revoked"),
+            Some(notice.as_str())
+        )
+    );
+    assert_eq!(
+        request_protocol(
+            s,
+            Method::POST,
+            "/v1/devices/activate",
+            json!({"activation":f.activation}),
+            Some(token),
+            "2"
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request_protocol(
+            s,
+            Method::POST,
+            "/v1/devices/activate",
+            json!({"activation":b64(&[8;32])}),
+            Some(token),
+            "2"
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn consecutive_rotations_keep_only_the_callers_history_and_filter_after_epoch() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let survivor = full_device(s, &f).await;
+    let removed_a = full_device(s, &f).await;
+    let removed_b = full_device(s, &f).await;
+    let (status, body) = request_protocol(s, Method::DELETE, &format!("/v1/devices/{}", removed_a.device_id), json!({
+        "rotation":rotation(&f, 2, &[(&f.device_id, "AQI"), (&survivor.device_id, "AwQ"), (&removed_b.device_id, "BQY")]),
+        "data":{"ciphertext":"AQI", "expectedVersion":0, "accountEpoch":2}
+    }), Some(&f.token), "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request_protocol(
+        s,
+        Method::DELETE,
+        &format!("/v1/devices/{}", removed_b.device_id),
+        json!({
+            "rotation":rotation(&f, 3, &[(&f.device_id, "Bwg"), (&survivor.device_id, "CQo")]),
+            "data":{"ciphertext":"AwQ", "expectedVersion":1, "accountEpoch":3}
+        }),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, me) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/me",
+        json!({}),
+        Some(&survivor.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(
+        me["deviceKeys"],
+        json!([{"epoch":2,"sealed":"AwQ"},{"epoch":3,"sealed":"CQo"}])
+    );
+    let (status, account) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/account?afterEpoch=2",
+        json!({}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    assert_eq!(account["deviceKeys"], json!([{"epoch":3,"sealed":"Bwg"}]));
+    let (status, me) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/me?afterEpoch=2",
+        json!({}),
+        Some(&survivor.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["deviceKeys"], json!([{"epoch":3,"sealed":"CQo"}]));
+    for bad in [
+        "-1",
+        "1.5",
+        "4294967296",
+        "NaN",
+        "",
+        "0x2",
+        "2&afterEpoch=1",
+    ] {
+        let path = format!("/v1/me?afterEpoch={bad}");
+        assert_eq!(
+            request_protocol(s, Method::GET, &path, json!({}), Some(&survivor.token), "2")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+    }
+    // Revoked recipients cannot fetch their history, even through a later query.
+    assert_eq!(
+        request_protocol(
+            s,
+            Method::GET,
+            "/v1/me?afterEpoch=0",
+            json!({}),
+            Some(&removed_b.token),
+            "2"
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn rotation_cannot_store_a_delivery_for_the_removed_device() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let removed = full_device(s, &f).await;
+    let (status, body) = request_protocol(
+        s,
+        Method::DELETE,
+        &format!("/v1/devices/{}", removed.device_id),
+        json!({
+            "rotation":rotation(&f, 2, &[(&f.device_id, "AQI"), (&removed.device_id, "AwQ")]),
+            "data":{"ciphertext":"AQI", "expectedVersion":0,"accountEpoch":2}
+        }),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
+    assert_eq!(removed.get("/v1/me", json!({})).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rotation_without_account_data_is_refused_without_revocation() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let c = full_device(s, &f).await;
+    let (status, body) = request_protocol(
+        s,
+        Method::DELETE,
+        &format!("/v1/devices/{}", c.device_id),
+        json!({"rotation":rotation(&f, 2, &[(&f.device_id, "AQI")])}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
+    assert_eq!(c.get("/v1/me", json!({})).await.0, StatusCode::OK);
+    let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(account["epoch"], 1);
+    assert_eq!(account["data"], Value::Null);
+}
+
+#[tokio::test]
+async fn rotation_refuses_an_envelope_from_the_old_epoch() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let c = full_device(s, &f).await;
+    let mut rotate = rotation(&f, 2, &[(&f.device_id, "AQI")]);
+    rotate["accountKeyEnvelope"] = json!(account_envelope(1));
+    let (status, body) = request_protocol(s, Method::DELETE,
+        &format!("/v1/devices/{}", c.device_id),
+        json!({"rotation":rotate, "data":{"ciphertext":"AQI", "expectedVersion":0, "accountEpoch":2}}),
+        Some(&f.token), "2").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("bad_request"))
+    );
+    assert_eq!(c.get("/v1/me", json!({})).await.0, StatusCode::OK);
+    let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(account["epoch"], 1);
+    assert_eq!(account["data"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_credentials_change_cannot_restore_the_old_epoch_envelope() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let c = full_device(s, &f).await;
+    let (status, body) = request_protocol(
+        s,
+        Method::DELETE,
+        &format!("/v1/devices/{}", c.device_id),
+        json!({"rotation":rotation(&f, 2, &[(&f.device_id, "AQI")]),
+            "data":{"ciphertext":"AQI", "expectedVersion":0,"accountEpoch":2}}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request_protocol(
+        s,
+        Method::PUT,
+        "/v1/account/credentials",
+        json!({
+            "currentLoginKey":f.login_key, "loginKey":b64(&[3;32]), "salt":b64(&[4;16]),
+            "kdf":{"opsLimit":3,"memLimitKib":65536}, "accountKeyEnvelope":account_envelope(1)
+        }),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("epoch_conflict"))
+    );
+    let (status, account) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/account",
+        json!({}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    assert_eq!(account["epoch"], 2);
+    assert_eq!(account["accountKeyEnvelope"], account_envelope(2));
+    assert_eq!(account["data"]["version"], 1);
+    // A write that passed the protocol gate before rotation cannot commit
+    // with its stale declared account epoch.
+    let (status, body) = request_protocol(
+        s,
+        Method::PUT,
+        "/v1/account/data",
+        json!({"ciphertext":"AwQ", "expectedVersion":0}),
+        Some(&f.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("epoch_conflict"))
+    );
+}
+
+#[tokio::test]
+async fn stale_account_key_cannot_write_data_with_the_current_version() {
+    let server = LocalServer::from_env();
+    let fixture = registered(server).await;
+    let removed = full_device(server, &fixture).await;
+    let path = format!("/v1/devices/{}", removed.device_id);
+    let (status, body) = request_protocol(
+        server,
+        Method::DELETE,
+        &path,
+        json!({"rotation":rotation(&fixture, 2, &[(&fixture.device_id,"AQI")]),
+            "data":{"ciphertext":"AQI","expectedVersion":0,"accountEpoch":2}}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request_protocol(
+        server,
+        Method::PUT,
+        "/v1/account/data",
+        json!({"ciphertext":"AwQ","expectedVersion":1,"accountEpoch":1}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("epoch_conflict"))
+    );
+    let (status, body) = request_protocol(
+        server,
+        Method::PUT,
+        "/v1/account/data",
+        json!({"ciphertext":"AwQ","expectedVersion":1,"accountEpoch":2}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, account) = request_protocol(
+        server,
+        Method::GET,
+        "/v1/account",
+        json!({}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(account["data"], json!({"ciphertext":"AwQ","version":2}));
+}
+
+#[tokio::test]
+async fn app_removal_data_is_fenced_after_account_rotation() {
+    let server = LocalServer::from_env();
+    let fixture = registered(server).await;
+    let full = full_device(server, &fixture).await;
+    let (status, body) = request_protocol(
+        server,
+        Method::DELETE,
+        &format!("/v1/devices/{}", full.device_id),
+        json!({"rotation":rotation(&fixture, 2, &[(&fixture.device_id,"AQI")]),
+            "data":{"ciphertext":"AQI","expectedVersion":0,"accountEpoch":2}}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let app = id();
+    assert_eq!(
+        request_protocol(
+            server,
+            Method::POST,
+            "/v1/devices",
+            json!({"deviceId":app,"kind":"app"}),
+            Some(&fixture.token),
+            "2"
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, body) = request_protocol(
+        server,
+        Method::DELETE,
+        &format!("/v1/devices/{app}"),
+        json!({"data":{"ciphertext":"AwQ","expectedVersion":1,"accountEpoch":1}}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("epoch_conflict"))
+    );
+    let (_, account) = request_protocol(
+        server,
+        Method::GET,
+        "/v1/account",
+        json!({}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(account["data"], json!({"ciphertext":"AQI","version":1}));
+}
+
+#[tokio::test]
+async fn rotation_rejects_data_with_the_old_declared_account_epoch() {
+    let server = LocalServer::from_env();
+    let fixture = registered(server).await;
+    let removed = full_device(server, &fixture).await;
+    let (status, body) = request_protocol(
+        server,
+        Method::DELETE,
+        &format!("/v1/devices/{}", removed.device_id),
+        json!({"rotation":rotation(&fixture, 2, &[(&fixture.device_id,"AQI")]),
+            "data":{"ciphertext":"AQI","expectedVersion":0,"accountEpoch":1}}),
+        Some(&fixture.token),
+        "2",
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("epoch_conflict"))
+    );
+    assert_eq!(removed.get("/v1/me", json!({})).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rotation_is_all_or_nothing() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let c = full_device(s, &f).await;
+    let path = format!("/v1/devices/{}", c.device_id);
+    let mut rotate = rotation(&f, 2, &[(&f.device_id, "AQI")]);
+    for (key, value, expected_status, code) in [
+        (
+            "loginKey",
+            json!(b64(&[1; 32])),
+            StatusCode::UNAUTHORIZED,
+            "bad_credentials",
+        ),
+        ("epoch", json!(3), StatusCode::CONFLICT, "epoch_conflict"),
+        ("epoch", json!(2), StatusCode::CONFLICT, "version_conflict"),
+    ] {
+        rotate["loginKey"] = json!(f.login_key);
+        rotate[key] = value;
+        rotate["accountKeyEnvelope"] =
+            json!(account_envelope(rotate["epoch"].as_u64().unwrap() as u32));
+        let (status, body) = request_protocol(
+            s,
+            Method::DELETE,
+            &path,
+            json!({"rotation":rotate,
+            "data":{"ciphertext":"AQI", "expectedVersion": 1, "accountEpoch":2}}),
+            Some(&f.token),
+            "2",
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (expected_status, Some(code)),
+            "{body}"
+        );
+        let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+        assert_eq!(account["epoch"], 1);
+        assert_eq!(account["deviceKeys"], json!([]));
+        assert_eq!(account["data"], Value::Null);
+        assert_eq!(c.get("/v1/me", json!({})).await.0, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn two_rotations_at_once_only_one_lands() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let b = full_device(s, &f).await;
+    let c = full_device(s, &f).await;
+    let d = full_device(s, &f).await;
+    let a_path = format!("/v1/devices/{}", c.device_id);
+    let b_path = format!("/v1/devices/{}", d.device_id);
+    let a_request = request_protocol(
+        s,
+        Method::DELETE,
+        &a_path,
+        json!({"rotation": rotation(&f, 2, &[(&f.device_id,"AQI")]), "data":{"ciphertext":"AQI", "expectedVersion":0, "accountEpoch":2}}),
+        Some(&f.token),
+        "2",
+    );
+    let b_request = request_protocol(
+        s,
+        Method::DELETE,
+        &b_path,
+        json!({"rotation": rotation(&f, 2, &[(&b.device_id,"AwQ")]), "data":{"ciphertext":"AwQ", "expectedVersion":0, "accountEpoch":2}}),
+        Some(&b.token),
+        "2",
+    );
+    let (a, b) = tokio::join!(a_request, b_request);
+    let statuses = [a.0, b.0];
+    assert_eq!(
+        statuses.iter().filter(|&&s| s == StatusCode::OK).count(),
+        1,
+        "{a:?} {b:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|&&s| s == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "{a:?} {b:?}"
+    );
+    assert_eq!(
+        if a.0 == StatusCode::CONFLICT {
+            &a.1["error"]
+        } else {
+            &b.1["error"]
+        },
+        "epoch_conflict"
+    );
+}
+
+#[tokio::test]
+async fn an_app_removal_can_carry_account_data() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let app_id = id();
+    assert_eq!(
+        f.device(s)
+            .post("/v1/devices", json!({"deviceId":app_id,"kind":"app"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, body) = f
+        .device(s)
+        .delete(
+            &format!("/v1/devices/{app_id}"),
+            json!({
+                "data":{"ciphertext":"AQI", "expectedVersion":0}
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, account) = f.device(s).get("/v1/account", json!({})).await;
+    assert_eq!(account["epoch"], 1);
+    assert_eq!(account["data"], json!({"ciphertext":"AQI","version":1}));
+}
+
+#[tokio::test]
+async fn rotation_fences_an_old_protocol_write_already_waiting_on_its_body() {
+    use futures_util::StreamExt;
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let b = full_device(s, &f).await;
+    let c = full_device(s, &f).await;
+    // Set the caller's last-seen marker so another device can observe that
+    // authentication (and its epoch check) happened before releasing the body.
+    assert_eq!(
+        b.post(
+            "/v1/devices/test-last-seen",
+            json!({"deviceId":f.device_id,"lastSeenAt":0})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    let stream = futures_util::stream::once(async {
+        Ok::<Vec<u8>, std::io::Error>(b"{\"ciphertext\":\"AwQ\",".to_vec())
+    })
+    .chain(futures_util::stream::once(async move {
+        held.await.unwrap();
+        Ok::<Vec<u8>, std::io::Error>(b"\"expectedVersion\":0}".to_vec())
+    }));
+    let path = s.url().join("/v1/account/data").unwrap();
+    let token = f.token.clone();
+    let old_write = tokio::spawn(async move {
+        reqwest::Client::new()
+            .put(path)
+            .header("BH-Protocol", "1")
+            .bearer_auth(token)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .unwrap()
+    });
+    let mut observed = false;
+    for _ in 0..200 {
+        let (_, account) = b.get("/v1/account", json!({})).await;
+        if account["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["deviceId"] == f.device_id && d["lastSeenAt"].as_i64().unwrap() > 0)
+        {
+            observed = true;
+            break;
+        }
+    }
+    assert!(observed, "the old request did not reach authentication");
+    let (status, body) = request_protocol(
+        s,
+        Method::DELETE,
+        &format!("/v1/devices/{}", c.device_id),
+        json!({"rotation":rotation(&f, 2, &[(&f.device_id,"AQI"), (&b.device_id,"AwQ")]),
+            "data":{"ciphertext":"AQI","expectedVersion":0,"accountEpoch":2}}),
+        Some(&b.token),
+        "2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    release.send(()).unwrap();
+    let response = old_write.await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "epoch_conflict"
+    );
+    let (_, account) = request_protocol(
+        s,
+        Method::GET,
+        "/v1/account",
+        json!({}),
+        Some(&b.token),
+        "2",
+    )
+    .await;
+    assert_eq!(account["data"], json!({"ciphertext":"AQI","version":1}));
+}
+
+#[tokio::test]
+async fn protocol_one_is_refused_once_an_account_has_rotated() {
+    let s = LocalServer::from_env();
+    let f = registered(s).await;
+    let c = full_device(s, &f).await;
+    assert_eq!(f.device(s).get("/v1/me", json!({})).await.0, StatusCode::OK);
+    let (status, body) = request_protocol(s, Method::DELETE,
+        &format!("/v1/devices/{}", c.device_id),
+        json!({"rotation":rotation(&f, 2, &[(&f.device_id,"AQI")]), "data":{"ciphertext":"AQI", "expectedVersion":0,"accountEpoch":2}}),
+        Some(&f.token), "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = f.device(s).get("/v1/me", json!({})).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::UPGRADE_REQUIRED, Some("needs_update"))
+    );
+    let (status, me) =
+        request_protocol(s, Method::GET, "/v1/me", json!({}), Some(&f.token), "2").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["epoch"], 2);
+}
+
 #[tokio::test]
 async fn invalid_invite_does_not_reserve_email() {
     let s = LocalServer::from_env();

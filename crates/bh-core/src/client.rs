@@ -1,4 +1,4 @@
-//! HTTP client for `/v1`. Every request carries `BH-Protocol: 1`; server error
+//! HTTP client for `/v1`. Every request carries `BH-Protocol: 2`; server error
 //! codes map to [`Error`].
 
 use crate::{EndReason, Error};
@@ -84,6 +84,10 @@ pub struct Fault {
 pub(crate) type Faults = Arc<std::sync::Mutex<Vec<Fault>>>;
 
 #[cfg(feature = "test-support")]
+type TestGate =
+    Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>;
+
+#[cfg(feature = "test-support")]
 pub(crate) struct ApprovalPostGate {
     pub entered: tokio::sync::oneshot::Sender<()>,
     pub release: tokio::sync::oneshot::Receiver<()>,
@@ -116,6 +120,14 @@ pub(crate) struct Api {
     held_account_get: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
     #[cfg(feature = "test-support")]
     held_grant: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    #[cfg(feature = "test-support")]
+    held_delete_reply: TestGate,
+    #[cfg(feature = "test-support")]
+    held_base_key_reply: TestGate,
+    #[cfg(feature = "test-support")]
+    held_rekey_reply: TestGate,
+    #[cfg(feature = "test-support")]
+    held_delete_send: TestGate,
 }
 
 impl Api {
@@ -143,6 +155,14 @@ impl Api {
             held_account_get: Arc::default(),
             #[cfg(feature = "test-support")]
             held_grant: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_delete_reply: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_base_key_reply: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_rekey_reply: Arc::default(),
+            #[cfg(feature = "test-support")]
+            held_delete_send: Arc::default(),
         }
     }
 
@@ -224,6 +244,46 @@ impl Api {
     }
 
     #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_delete_reply(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_delete_reply.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_base_key_reply(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_base_key_reply.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_rekey_reply(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_rekey_reply.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold_next_delete_send(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.held_delete_send.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
+    #[cfg(feature = "test-support")]
     pub(crate) fn count(&self, path: &str) -> usize {
         self.counts
             .lock()
@@ -282,6 +342,17 @@ impl Api {
                 .entry(path.to_string())
                 .or_default() += 1;
             self.fault(&method, path, false)?;
+            if method == Method::DELETE && path.starts_with("v1/devices/") {
+                let held = self.held_delete_send.lock().unwrap().take();
+                if let Some((release, entered)) = held {
+                    entered.add_permits(1);
+                    release
+                        .acquire()
+                        .await
+                        .expect("test DELETE send hold is open")
+                        .forget();
+                }
+            }
             if method == Method::GET && path == "v1/account" {
                 let held = self.held_account_get.lock().unwrap().take();
                 if let Some(held) = held {
@@ -319,7 +390,7 @@ impl Api {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok())
         {
-            Some(PROTOCOL) => {}
+            Some(1..=PROTOCOL) => {}
             Some(v) if v > PROTOCOL => return Err(Error::NeedsUpdate),
             _ if status == StatusCode::UPGRADE_REQUIRED => return Err(Error::NeedsUpdate),
             _ => return Err(Error::Network(format!("unexpected response ({status})"))),
@@ -340,7 +411,42 @@ impl Api {
             bytes.extend_from_slice(&chunk);
         }
         #[cfg(feature = "test-support")]
-        self.fault(&method, path, true)?;
+        {
+            if method == Method::DELETE && path.starts_with("v1/devices/") && status.is_success() {
+                let held = self.held_delete_reply.lock().unwrap().take();
+                if let Some((release, entered)) = held {
+                    entered.add_permits(1);
+                    release
+                        .acquire()
+                        .await
+                        .expect("test DELETE reply hold is open")
+                        .forget();
+                }
+            }
+            if method == Method::GET && path.ends_with("/key") && status.is_success() {
+                let held = self.held_base_key_reply.lock().unwrap().take();
+                if let Some((release, entered)) = held {
+                    entered.add_permits(1);
+                    release
+                        .acquire()
+                        .await
+                        .expect("test base key hold is open")
+                        .forget();
+                }
+            }
+            if method == Method::POST && path.ends_with("/rekey") && status.is_success() {
+                let held = self.held_rekey_reply.lock().unwrap().take();
+                if let Some((release, entered)) = held {
+                    entered.add_permits(1);
+                    release
+                        .acquire()
+                        .await
+                        .expect("test re-key reply hold is open")
+                        .forget();
+                }
+            }
+            self.fault(&method, path, true)?;
+        }
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(|_| Error::Network("malformed response".into()))
         } else {
@@ -417,7 +523,7 @@ impl Api {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok())
         {
-            Some(PROTOCOL) => {}
+            Some(1..=PROTOCOL) => {}
             Some(v) if v > PROTOCOL => return Err(Error::NeedsUpdate),
             _ if status == StatusCode::UPGRADE_REQUIRED => return Err(Error::NeedsUpdate),
             _ => return Err(Error::Network(format!("unexpected response ({status})"))),
@@ -483,7 +589,7 @@ impl Api {
             .get("BH-Protocol")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
-        if protocol != Some(PROTOCOL) {
+        if !matches!(protocol, Some(1..=PROTOCOL)) {
             return Err(
                 if protocol.is_some_and(|v| v > PROTOCOL) || status == StatusCode::UPGRADE_REQUIRED
                 {
@@ -689,7 +795,7 @@ impl Api {
             .map_err(|e| Error::Network(e.to_string()))?;
         request
             .headers_mut()
-            .insert("BH-Protocol", "1".parse().unwrap());
+            .insert("BH-Protocol", PROTOCOL.to_string().parse().unwrap());
         if let Some(token) = &self.token {
             request.headers_mut().insert(
                 "Authorization",
@@ -764,8 +870,26 @@ impl Api {
         self.call(Method::GET, "v1/me", None::<&()>).await
     }
 
+    pub(crate) async fn me_after(&self, epoch: u32) -> Result<MeResponse, Error> {
+        self.call(
+            Method::GET,
+            &format!("v1/me?afterEpoch={epoch}"),
+            None::<&()>,
+        )
+        .await
+    }
+
     pub(crate) async fn account(&self) -> Result<AccountResponse, Error> {
         self.call(Method::GET, "v1/account", None::<&()>).await
+    }
+
+    pub(crate) async fn account_after(&self, epoch: u32) -> Result<AccountResponse, Error> {
+        self.call(
+            Method::GET,
+            &format!("v1/account?afterEpoch={epoch}"),
+            None::<&()>,
+        )
+        .await
     }
 
     pub(crate) async fn usage(&self, month: Option<&str>) -> Result<UsageResponse, Error> {
@@ -831,6 +955,16 @@ impl Api {
             .await
     }
 
+    pub(crate) async fn rekey(&self, base: BaseId, request: &RekeyRequest) -> Result<(), Error> {
+        self.call::<RekeyResponse>(
+            Method::POST,
+            &format!("v1/bases/{base}/rekey"),
+            Some(request),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn grant(
         &self,
         base: BaseId,
@@ -878,13 +1012,15 @@ impl Api {
     pub(crate) async fn delete_device(
         &self,
         id: DeviceId,
-        notice: Option<[u8; 32]>,
-    ) -> Result<DeleteDeviceResponse, Error> {
-        let body = DeleteDeviceRequest {
-            notice: notice.map(|n| Bytes(n.to_vec())),
-        };
-        self.call(Method::DELETE, &format!("v1/devices/{id}"), Some(&body))
-            .await
+        request: &DeleteDeviceRequest,
+    ) -> Result<(), Error> {
+        self.call::<DeleteDeviceResponse>(
+            Method::DELETE,
+            &format!("v1/devices/{id}"),
+            Some(request),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -961,9 +1097,8 @@ fn map_error(status: StatusCode, code: &str, message: String) -> Error {
         "forbidden" => Error::Forbidden,
         "read_only" => Error::ReadOnly,
         "not_found" => Error::NotFound,
-        "email_taken" | "invite_used" | "exists" | "version_conflict" => {
-            Error::Conflict(code.to_string())
-        }
+        "email_taken" | "invite_used" | "exists" | "version_conflict" | "epoch_conflict"
+        | "stale_epoch" | "rekey_needed" | "stale_grant" => Error::Conflict(code.to_string()),
         "too_large" => Error::TooLarge,
         "storage_limit" => Error::StorageFull,
         "needs_update" => Error::NeedsUpdate,
@@ -1163,7 +1298,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_live_handshake_that_never_answers_times_out() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("http://{addr}/")).unwrap();
         // Accept, then hold the connection without ever answering the upgrade.
         let (held, release) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
@@ -1181,6 +1317,9 @@ mod tests {
             result.map(|_| ())
         );
         drop(held);
+        // On macOS the paused clock can time out before the client's connection
+        // completes; connecting here lets the server's accept return either way.
+        let _ = std::net::TcpStream::connect(addr);
         server.join().unwrap();
     }
 
@@ -1298,6 +1437,8 @@ mod tests {
                         Err(e) => panic!("test server accept failed: {e}"),
                     }
                 };
+                // On macOS an accepted socket inherits the listener's non-blocking mode.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

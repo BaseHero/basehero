@@ -404,8 +404,12 @@ pub struct KemKey {
 
 impl KemKey {
     pub fn generate() -> Self {
+        Self::from_seed(&Secret::<32>::random())
+    }
+
+    /// Reconstructs an X-Wing key pair from its 32-byte seed.
+    pub fn from_seed(seed: &Secret<32>) -> Self {
         init();
-        let seed = Secret::<32>::random();
         let mut key = Self {
             public: [0; XWING_PUBLIC_BYTES],
             secret: Secret(Box::new([0; KEM_SECRET_BYTES])),
@@ -461,6 +465,24 @@ pub fn decapsulate(key: &KemKey, ct: &[u8; XWING_CIPHERTEXT_BYTES]) -> Result<Se
         return Err(Error::KemFailure);
     }
     Ok(shared)
+}
+
+#[cfg(test)]
+mod kem_seed_tests {
+    use super::*;
+
+    #[test]
+    fn from_seed_matches_generate() {
+        let generated = KemKey::generate();
+        let seed = Secret::<32>::from_slice(generated.secret.expose()).unwrap();
+        let restored = KemKey::from_seed(&seed);
+        assert_eq!(restored.public(), generated.public());
+        let (ct, shared) = encapsulate(&generated.public()).unwrap();
+        assert_eq!(
+            decapsulate(&restored, &ct).unwrap().expose(),
+            shared.expose()
+        );
+    }
 }
 
 #[cfg(test)]

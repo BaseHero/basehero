@@ -8,12 +8,14 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// What a state sent to its sink, and the temporary directory it keeps its
-/// data in, which lasts as long as this does.
+/// What a state sent to its sink, and the temporary directories it keeps its
+/// data and its home in, which last as long as this does. No test state sees
+/// the real home folder.
 #[derive(Clone)]
 pub struct Events {
     seen: Arc<(Mutex<Vec<AppEvent>>, Condvar)>,
     dir: Arc<tempfile::TempDir>,
+    home: Arc<tempfile::TempDir>,
 }
 
 impl Events {
@@ -58,6 +60,11 @@ impl Events {
     pub fn data_dir(&self) -> &Path {
         self.dir.path()
     }
+
+    /// The home folder the state's Mac backup default is chosen in.
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
 }
 
 /// A state in a new temporary directory, with plain-file secrets and a sink
@@ -67,6 +74,7 @@ pub fn state_at(server: Url) -> (AppState, Events) {
     let events = Events {
         seen: Arc::default(),
         dir: Arc::new(dir),
+        home: Arc::new(tempfile::tempdir().unwrap()),
     };
     (open_at(events.data_dir(), server, &events), events)
 }
@@ -84,5 +92,5 @@ pub fn open_at(dir: &Path, server: Url, events: &Events) -> AppState {
         data_dir: dir.to_path_buf(),
         secrets,
     };
-    AppState::open(config, server, sink).unwrap()
+    AppState::open(config, server, sink, events.home().to_path_buf()).unwrap()
 }

@@ -78,7 +78,7 @@ async fn a_change_that_fails_to_apply_is_set_aside() {
             &format!("/v1/bases/{}/changes", a.base.id()),
             json!({ "changes": [{
                 "changeId": random_id(), "objectId": random_id(), "kind": "update",
-                "body": b64(&[vec![1], random(63)].concat()),
+                "body": b64(&[vec![1, 0, 0, 0, 1], random(59)].concat()),
             }] }),
         )
         .await;

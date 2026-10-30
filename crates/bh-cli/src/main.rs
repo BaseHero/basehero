@@ -1,3 +1,5 @@
+#[path = "commands/backup.rs"]
+mod backup;
 #[path = "commands/export.rs"]
 mod export;
 #[path = "commands/files.rs"]
@@ -19,6 +21,7 @@ use bh_core::{
 
 #[path = "commands/approve.rs"]
 mod approve;
+use backup::BackupCommand;
 use clap::{Parser, Subcommand};
 use files::FileCommand;
 use hero::HeroCommand;
@@ -30,13 +33,27 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     sync::Arc,
 };
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, Transact, Update, WriteTxn, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 use zeroize::Zeroizing;
+
+#[derive(Debug)]
+struct FinishingError {
+    message: String,
+    new_kit: Option<String>,
+}
+
+impl std::fmt::Display for FinishingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FinishingError {}
 
 #[derive(Parser)]
 #[command(name = "bh", about = "BaseHero command line client", version)]
@@ -55,6 +72,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     Signup {
         #[arg(long)]
         server: Url,
@@ -217,8 +238,17 @@ enum FolderCommand {
 }
 #[derive(Subcommand)]
 enum DeviceCommand {
-    Remove { id: String },
-    Cap { id: String, usd: String },
+    Remove {
+        id: String,
+        #[arg(long, conflicts_with = "kept")]
+        lost: bool,
+        #[arg(long)]
+        kept: bool,
+    },
+    Cap {
+        id: String,
+        usd: String,
+    },
 }
 #[derive(Subcommand)]
 enum AppCommand {
@@ -475,9 +505,35 @@ async fn execute(cli: &Cli) -> Result<Value> {
         None => PathBuf::from(env::var_os("HOME").ok_or_else(|| invalid("HOME is required"))?)
             .join(".local/share/basehero-cli"),
     };
+    if let Command::Backup {
+        command: BackupCommand::List { dir },
+    } = &cli.command
+    {
+        return backup::list(dir);
+    }
+    // Offline reads never open a signed-in account or contact its server.
+    let temporary = if matches!(
+        &cli.command,
+        Command::Backup {
+            command: BackupCommand::Restore { out: Some(_), .. }
+                | BackupCommand::Restore { check: true, .. }
+        }
+    ) {
+        if cli.app_credentials.is_some() || cli.unlock {
+            return Err(invalid(
+                "offline backup restore does not use --app-credentials or --unlock",
+            ));
+        }
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let data_dir = temporary
+        .as_ref()
+        .map_or(home.clone(), |dir| dir.path().to_path_buf());
     let core = Core::open(CoreConfig {
-        data_dir: home.clone(),
-        secrets: Arc::new(FileSecretStore::new(home.join("secrets"))?),
+        data_dir: data_dir.clone(),
+        secrets: Arc::new(FileSecretStore::new(data_dir.join("secrets"))?),
     })?;
     // Stop the core's threads before the process exits, on every return path:
     // a core thread still in SQLCipher when the process exits crashes it.
@@ -553,6 +609,7 @@ async fn execute(cli: &Cli) -> Result<Value> {
 
 async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
     match &cli.command {
+        Command::Backup { command } => backup::execute(&core, command, cli.json).await,
         Command::Signup {
             server,
             invite,
@@ -799,12 +856,70 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
             Ok(devices)
         }
         Command::Device {
-            command: DeviceCommand::Remove { id },
+            command: DeviceCommand::Remove { id, lost, kept },
         } => {
             let id: DeviceId = id.parse().map_err(|_| invalid("device ID"))?;
-            let this_device = account(&core)?.device_id() == id;
-            account(&core)?.remove_device(id).await?;
-            Ok(json!({ "removed": id, "localCopyErased": this_device }))
+            let account = account(&core)?;
+            let this_device = account.device_id() == id;
+            let full = if this_device {
+                false
+            } else {
+                account
+                    .devices()
+                    .await?
+                    .iter()
+                    .any(|d| d.id == id && d.kind == bh_core::DeviceKind::Full)
+            };
+            let removal = if full {
+                let lost = if *lost {
+                    true
+                } else if *kept {
+                    false
+                } else {
+                    if !io::stdin().is_terminal() {
+                        return Err(invalid("specify --lost or --kept when not on a terminal"));
+                    }
+                    eprint!(
+                        "Do you still have this device? [y = I still have it / n = It's lost or stolen] "
+                    );
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    match answer.trim().to_ascii_lowercase().as_str() {
+                        "y" => false,
+                        "n" => true,
+                        _ => return Err(invalid("answer y or n")),
+                    }
+                };
+                bh_core::Removal::Full {
+                    password: password()?,
+                    lost,
+                }
+            } else {
+                bh_core::Removal::Plain
+            };
+            let outcome = account.remove_device(id, removal).await?;
+            let new_kit = outcome.new_kit.map(|kit| kit.display());
+            if full {
+                if !cli.json {
+                    if let Some(kit) = &new_kit {
+                        println!(
+                            "Recovery kit: {kit}\nKeep this kit safe; it is required to sign in on another device."
+                        );
+                    }
+                    println!("Finishing…");
+                    io::stdout().flush()?;
+                }
+                account.wait_for_removals().await.map_err(|error| FinishingError {
+                    message: format!(
+                        "Removal committed; finishing failed: {error}. Finishing continues on the next refresh of any BaseHero device."
+                    ),
+                    new_kit: new_kit.clone(),
+                })?;
+            }
+            Ok(json!({ "removed": id, "localCopyErased": this_device,
+                "newKit": if cli.json { new_kit } else { None },
+                "pending": if full { false } else { outcome.pending } }))
         }
         Command::Device {
             command: DeviceCommand::Cap { id, usd },
@@ -910,7 +1025,9 @@ async fn execute_command(core: Core, cli: &Cli) -> Result<Value> {
                     .await?;
                 let bytes = serde_json::to_vec(&creds)?;
                 if let Err(error) = file.write_all(&bytes) {
-                    let _ = account.remove_device(creds.device_id).await;
+                    let _ = account
+                        .remove_device(creds.device_id, bh_core::Removal::Plain)
+                        .await;
                     return Err(error.into());
                 }
                 Ok(json!({ "deviceId": creds.device_id, "bases": creds.bases, "out": out }))
@@ -1042,6 +1159,27 @@ async fn main() {
             } if value["localCopyErased"] == true => {
                 println!("This device was removed; its home's local copy was erased.")
             }
+            Command::Device {
+                command: DeviceCommand::Remove { .. },
+            } => {
+                if let Some(kit) = value["newKit"].as_str() {
+                    println!(
+                        "Recovery kit: {kit}\nKeep this kit safe; it is required to sign in on another device."
+                    );
+                }
+                if value["pending"] == true {
+                    println!("Removal is still finishing.");
+                } else {
+                    println!("Device removed.");
+                }
+            }
+            Command::Backup {
+                command: BackupCommand::Restore { signup: true, .. },
+            } => println!(
+                "Recovery kit: {}\nKeep this kit safe; it is required to sign in on another device.\n{}",
+                value["kit"].as_str().unwrap_or(""),
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            ),
             Command::Signup { .. } => println!(
                 "Recovery kit: {}\nKeep this kit safe; it is required to sign in on another device.",
                 value["kit"].as_str().unwrap_or("")
@@ -1062,10 +1200,19 @@ async fn main() {
             };
             let formatted = message.unwrap_or("");
             if cli.json {
-                eprintln!(
-                    "{}",
-                    json!({ "error": if message.is_some() { formatted.to_owned() } else { error.to_string() } })
-                );
+                let detail = if message.is_some() {
+                    formatted.to_owned()
+                } else {
+                    error.to_string()
+                };
+                if let Some(finishing) = error.downcast_ref::<FinishingError>() {
+                    eprintln!(
+                        "{}",
+                        json!({ "error": detail, "newKit": finishing.new_kit })
+                    );
+                } else {
+                    eprintln!("{}", json!({ "error": detail }));
+                }
             } else if message.is_some() {
                 eprintln!("{formatted}");
             } else {

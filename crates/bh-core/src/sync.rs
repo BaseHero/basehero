@@ -150,6 +150,8 @@ pub(crate) struct SyncTask {
     #[cfg(feature = "test-support")]
     unmerged: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
+    hold_sends: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
     hold_kept_reply: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     kept_reply_entered: Arc<AtomicBool>,
@@ -170,6 +172,8 @@ impl SyncTask {
         #[cfg(feature = "test-support")]
         let unmerged = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "test-support")]
+        let hold_sends = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
         let hold_kept_reply = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "test-support")]
         let kept_reply_entered = Arc::new(AtomicBool::new(false));
@@ -185,6 +189,8 @@ impl SyncTask {
             paused: paused.clone(),
             #[cfg(feature = "test-support")]
             unmerged: unmerged.clone(),
+            #[cfg(feature = "test-support")]
+            hold_sends: hold_sends.clone(),
             #[cfg(feature = "test-support")]
             hold_kept_reply: hold_kept_reply.clone(),
             #[cfg(feature = "test-support")]
@@ -216,6 +222,8 @@ impl SyncTask {
             paused,
             #[cfg(feature = "test-support")]
             unmerged,
+            #[cfg(feature = "test-support")]
+            hold_sends,
             #[cfg(feature = "test-support")]
             hold_kept_reply,
             #[cfg(feature = "test-support")]
@@ -310,6 +318,14 @@ impl SyncTask {
     }
 
     #[cfg(feature = "test-support")]
+    pub(crate) fn hold_sends(&self, held: bool) {
+        self.hold_sends.store(held, Ordering::SeqCst);
+        if !held {
+            self.changed();
+        }
+    }
+
+    #[cfg(feature = "test-support")]
     pub(crate) fn pause(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
         if !paused {
@@ -335,6 +351,8 @@ struct Engine {
     paused: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     unmerged: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    hold_sends: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
     hold_kept_reply: Arc<AtomicBool>,
     #[cfg(feature = "test-support")]
@@ -592,6 +610,15 @@ impl Engine {
             .map(|row| row.change_id)
             .collect();
         for message in messages {
+            if let Ok(bh_proto::LiveMessage::Epoch { epoch }) = serde_json::from_str(&message) {
+                self.apply_batch(&mut batch, worked).await?;
+                by_id.clear();
+                if epoch > self.base().newest_epoch() {
+                    self.base().reload_keys().await?;
+                }
+                self.caught_up = false;
+                continue;
+            }
             let change: LiveChange = serde_json::from_str(&message)
                 .map_err(|_| Error::Network("malformed live message".into()))?;
             if change.t != "change" {
@@ -616,7 +643,7 @@ impl Engine {
                 .clone()
                 .filter(|_| change.prev_head == confirmed)
             else {
-                self.apply_batch(&mut batch, worked)?;
+                self.apply_batch(&mut batch, worked).await?;
                 by_id.clear();
                 self.apply_live(change, worked).await?;
                 continue;
@@ -635,16 +662,22 @@ impl Engine {
                 batch.push((change.object_id, change.seq, vec![incoming]));
             }
         }
-        self.apply_batch(&mut batch, worked)
+        self.apply_batch(&mut batch, worked).await
     }
 
-    fn apply_batch(
+    async fn apply_batch(
         &mut self,
         batch: &mut Vec<(ObjectId, u64, Vec<Incoming>)>,
         worked: &mut bool,
     ) -> Result<(), Error> {
         if batch.is_empty() {
             return Ok(());
+        }
+        if self.base().missing_epoch(batch) {
+            self.base().reload_keys().await?;
+            if self.base().missing_epoch(batch) {
+                return Err(Error::Network("waiting for base key".into()));
+            }
         }
         let (changed, needs_update) = self.base().apply_fetched(batch)?;
         self.observe_incoming(batch, &changed);
@@ -682,6 +715,7 @@ impl Engine {
             &mut vec![(change.object_id, change.seq, vec![incoming])],
             worked,
         )
+        .await
     }
 
     fn base(&self) -> &Base {
@@ -890,6 +924,12 @@ impl Engine {
                     .into_iter()
                     .map(|o| (o.object_id, o.head, Incoming::of(o)))
                     .collect();
+                if self.base().missing_epoch(&fetched) {
+                    self.base().reload_keys().await?;
+                    if self.base().missing_epoch(&fetched) {
+                        return Err(Error::Network("waiting for base key".into()));
+                    }
+                }
                 let (changed, needs_update) = self.base().apply_fetched(&fetched)?;
                 self.observe_incoming(&fetched, &changed);
                 if needs_update && !self.needs_update_reported {
@@ -912,6 +952,11 @@ impl Engine {
     /// unchanged, before any other. Edits made meanwhile wait for the next
     /// send, so an object goes out at most once a send.
     async fn send(&mut self, worked: &mut bool) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        if self.hold_sends.load(Ordering::SeqCst) {
+            self.dirty = false;
+            return Ok(());
+        }
         let end = self.base().db()?.outbox_end()?;
         loop {
             let batch = {
@@ -986,7 +1031,16 @@ impl Engine {
             for row in &batch {
                 self.last_sent.insert(row.object_id, sent_at);
             }
-            let reply = reply?;
+            let reply = match reply {
+                Err(Error::Conflict(code)) if code == "stale_epoch" || code == "rekey_needed" => {
+                    self.base().reload_keys().await?;
+                    if !self.base().reseal_sending()? {
+                        return Err(Error::Network("waiting for base re-key".into()));
+                    }
+                    continue;
+                }
+                other => other?,
+            };
             #[cfg(feature = "test-support")]
             if batch.iter().any(|row| row.keep)
                 && self.hold_kept_reply.swap(false, Ordering::SeqCst)

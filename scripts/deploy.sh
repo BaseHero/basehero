@@ -5,6 +5,10 @@ umask 077
 root=$(cd "$(dirname "$0")/.." && pwd)
 env_name=${1:-}
 [[ $# == 1 && ( $env_name == dev || $env_name == production ) ]] || { echo 'usage: deploy.sh dev|production' >&2; exit 2; }
+[[ ${GITHUB_ACTIONS:-} == true ]] || {
+  echo 'Deploy only through GitHub Actions: production deploys on every push to main; dev deploys with gh workflow run deploy-dev.yml --ref <branch>.' >&2
+  exit 2
+}
 [[ -n ${CLOUDFLARE_ACCOUNT_ID:-} && -n ${CLOUDFLARE_API_TOKEN:-} ]] || { echo 'Cloudflare account and token required' >&2; exit 2; }
 if [[ $env_name == production ]]; then
   [[ $(git -C "$root" branch --show-current) == main && -z $(git -C "$root" status --porcelain) &&
@@ -86,18 +90,29 @@ else
   echo 'TINFOIL_API_KEY not set' >&2
 fi
 wrangler deploy --env "$env_name"
-# DoH bypasses a host resolver's cached NXDOMAIN just after a custom domain is created.
-# Retry DNS propagation and worker startup for at most two minutes.
+# DoH bypasses a host resolver's cached NXDOMAIN just after a custom domain is created;
+# the host resolver covers networks where DoH fails. Retry DNS propagation and worker
+# startup for at most two minutes, and report the last answer.
+health() { curl "$@" --fail --silent --show-error --max-time 10 -H 'BH-Protocol: 1' "$url/v1/health" 2>&1; }
 deadline=$((SECONDS + 120))
+last=''
 while :; do
-  response=$(curl --doh-url https://cloudflare-dns.com/dns-query \
-    --fail --silent --max-time 10 -H 'BH-Protocol: 1' "$url/v1/health" 2>/dev/null) || response=''
-  if [[ $response == '{"ok":true,"protocol":1}' ]]; then
-    printf 'Health OK: %s/v1/health\n' "$url"
-    break
-  fi
+  for resolver in doh host; do
+    if [[ $resolver == doh ]]; then
+      response=$(health --doh-url https://cloudflare-dns.com/dns-query) || true
+    else
+      response=$(health) || true
+    fi
+    if [[ $response == '{"ok":true,"protocol":2}' ]]; then
+      printf 'Health OK: %s/v1/health\n' "$url"
+      [[ $resolver == doh ]] || printf 'Through the host resolver; DNS over HTTPS answered %s\n' "${last#doh: }"
+      break 2
+    fi
+    last="$resolver: ${response:0:200}"
+  done
   if (( SECONDS >= deadline )); then
     echo "Health check failed after two minutes: $url/v1/health" >&2
+    printf 'Last answer, %s\n' "$last" >&2
     exit 1
   fi
   sleep 2

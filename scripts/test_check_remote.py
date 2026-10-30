@@ -10,6 +10,39 @@ import unittest
 SCRIPT = Path(__file__).with_name("check.sh")
 
 
+class RunStageTest(unittest.TestCase):
+    def test_run_uses_and_removes_memory_directory_and_returns_command_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "scripts/check.sh").write_bytes(SCRIPT.read_bytes())
+            (root / "server/node_modules").mkdir(parents=True)
+            (root / "server/node_modules/.package-lock.json").touch()
+            (root / "server/package-lock.json").touch()
+            os.utime(root / "server/node_modules/.package-lock.json", (2_000_000_000, 2_000_000_000))
+            npm = root / "npm"
+            npm.write_text("#!/bin/sh\nexit 99\n")
+            npm.chmod(0o700)
+            probe = root / "probe"
+            probe.write_text("#!/bin/sh\n"
+                             "case \"$TMPDIR\" in /dev/shm/bh-check.*) ;; *) exit 42 ;; esac\n"
+                             "[ -d \"$TMPDIR\" ] || exit 43\n"
+                             "printf '%s\\n' \"$TMPDIR\"\n"
+                             "exit 17\n")
+            probe.chmod(0o700)
+            env = {"HOME": str(root), "GH_CONFIG_DIR": str(root / "gh"),
+                   "XDG_CONFIG_HOME": str(root / "xdg"),
+                   "PATH": f"{root}:{os.environ['PATH']}"}
+            for stub in ("npm", "probe"):
+                self.assertEqual(shutil.which(stub, path=env["PATH"]), str(root / stub))
+            result = subprocess.run(["unshare", "-rn", "--", "bash", "--noprofile", "--norc",
+                                     str(root / "scripts/check.sh"), "run", "probe"],
+                                    env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 17, result.stderr)
+            self.assertTrue(result.stdout.strip().startswith("/dev/shm/bh-check."), result.stdout)
+            self.assertFalse(Path(result.stdout.strip()).exists())
+
+
 class RemoteStageTest(unittest.TestCase):
     def test_remote_passes_dev_credentials_only_to_core_tests(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,7 +22,7 @@ fn local_core(dir: &std::path::Path) -> (Core, Arc<FileSecretStore>) {
 }
 
 #[tokio::test]
-async fn a_removed_device_is_refused_and_erases_itself() {
+async fn the_removed_device_erases_itself_on_its_notice() {
     let (a, kit) = bh_testkit::device("a").sign_up(new_signup()).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (core, secrets) = local_core(dir.path());
@@ -43,12 +43,29 @@ async fn a_removed_device_is_refused_and_erases_itself() {
     wait_for_base(&b_base, || b_base.sync_state().online).await;
     let old = raw_device(&b);
     let mut events = b.events();
-    let start = Instant::now();
-    a.remove_device(b.device_id()).await.unwrap();
-    wait_for(|| core.accounts().is_empty()).await;
+    let (returned, erased) = tokio::join!(
+        async {
+            a.remove_device(
+                b.device_id(),
+                bh_core::Removal::Full {
+                    password: bh_testkit::TEST_PASSWORD.to_string().into(),
+                    lost: false,
+                },
+            )
+            .await
+            .unwrap();
+            Instant::now()
+        },
+        async {
+            wait_for(|| core.accounts().is_empty()).await;
+            Instant::now()
+        }
+    );
+    // Full removal returns after the server commits, without waiting for base
+    // re-keys. Measure the removed device's reaction to that commit.
     assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "revocation was slow"
+        erased.saturating_duration_since(returned) < Duration::from_secs(2),
+        "erasure was slow after removal returned"
     );
     assert!(matches!(events.try_recv(), Ok(AccountEvent::Removed)));
     assert!(
@@ -57,7 +74,7 @@ async fn a_removed_device_is_refused_and_erases_itself() {
             .join(b.id().to_string())
             .exists()
     );
-    for suffix in ["key", "token", "dbkey"] {
+    for suffix in ["key", "token", "dbkey", "kem"] {
         assert!(
             secrets
                 .get(&format!("acct.{}.{suffix}", b.id()))
@@ -94,7 +111,15 @@ async fn removing_a_device_without_an_open_base_erases_it() {
     let mut events = b.events();
     // Ensure the approval listener is connected before triggering removal.
     wait_for(|| b.test_request_count("v1/approvals/live") > 0).await;
-    a.remove_device(b.device_id()).await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: bh_testkit::TEST_PASSWORD.to_string().into(),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
     wait_for(|| core.accounts().is_empty()).await;
     assert!(matches!(events.try_recv(), Ok(AccountEvent::Removed)));
     assert!(
@@ -113,7 +138,13 @@ async fn removal_closes_the_live_socket() {
         .live(&format!("/v1/bases/{}/live", b.base.id()))
         .await;
     a.account
-        .remove_device(b.account.device_id())
+        .remove_device(
+            b.account.device_id(),
+            bh_core::Removal::Full {
+                password: bh_testkit::TEST_PASSWORD.to_string().into(),
+                lost: false,
+            },
+        )
         .await
         .unwrap();
     let message = tokio::time::timeout(Duration::from_secs(30), socket.next())
@@ -157,7 +188,10 @@ async fn removing_this_device_signs_out() {
         .unwrap();
     let old = raw_device(&account);
     let mut events = account.events();
-    account.remove_device(account.device_id()).await.unwrap();
+    account
+        .remove_device(account.device_id(), bh_core::Removal::Plain)
+        .await
+        .unwrap();
     assert!(core.accounts().is_empty());
     assert!(
         !dir.path()
@@ -190,7 +224,7 @@ async fn a_network_error_does_not_erase_local_data() {
         .unwrap();
     core.inject_fault(bh_core::test_support::Fault {
         method: "GET",
-        path: "v1/account",
+        path: "v1/account?afterEpoch=1",
         lost_reply: false,
         times: 1,
     });
@@ -228,7 +262,10 @@ async fn a_fanout_502_still_erases_this_device() {
         old.post(&fault, serde_json::json!({})).await.0,
         reqwest::StatusCode::OK
     );
-    account.remove_device(account.device_id()).await.unwrap();
+    account
+        .remove_device(account.device_id(), bh_core::Removal::Plain)
+        .await
+        .unwrap();
     assert!(core.accounts().is_empty());
     assert_eq!(
         account.test_request_count("v1/me"),
@@ -259,7 +296,9 @@ async fn pre_revocation_502_keeps_the_device_and_original_error() {
         reqwest::StatusCode::OK
     );
     assert_eq!(
-        account.remove_device(account.device_id()).await,
+        account
+            .remove_device(account.device_id(), bh_core::Removal::Plain)
+            .await,
         Err(Error::Network("pre-revocation fault".into()))
     );
     assert_eq!(account.test_request_count("v1/me"), 1);
@@ -302,7 +341,9 @@ async fn ambiguous_removal_only_erases_after_revocation_is_confirmed() {
         times: 1,
     });
     assert!(matches!(
-        account.remove_device(account.device_id()).await,
+        account
+            .remove_device(account.device_id(), bh_core::Removal::Plain)
+            .await,
         Err(Error::Network(_))
     ));
     assert_eq!(core.accounts().len(), 1);
@@ -313,7 +354,10 @@ async fn ambiguous_removal_only_erases_after_revocation_is_confirmed() {
         lost_reply: true,
         times: 1,
     });
-    account.remove_device(account.device_id()).await.unwrap();
+    account
+        .remove_device(account.device_id(), bh_core::Removal::Plain)
+        .await
+        .unwrap();
     assert!(core.accounts().is_empty());
     assert!(secrets.get(&format!("acct.{id}.token")).unwrap().is_none());
 }
@@ -344,7 +388,9 @@ async fn a_removed_app_loses_its_grants() {
         token.get(&path, serde_json::json!({})).await.0,
         reqwest::StatusCode::OK
     );
-    a.remove_device(app.device_id()).await.unwrap();
+    a.remove_device(app.device_id(), bh_core::Removal::Plain)
+        .await
+        .unwrap();
     for path in ["/v1/me", path.as_str()] {
         let (status, body) = token.get(path, serde_json::json!({})).await;
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{path}: {body}");
@@ -379,6 +425,7 @@ async fn sign_out_erases_local_data() {
     assert!(!account_dir.exists());
     assert!(secrets.get(&format!("acct.{id}.key")).unwrap().is_none());
     assert!(secrets.get(&format!("acct.{id}.token")).unwrap().is_none());
+    assert!(secrets.get(&format!("acct.{id}.kem")).unwrap().is_none());
     assert!(
         secrets
             .get(&format!("base.{}.dbkey", base.id()))
@@ -507,8 +554,9 @@ async fn failed_erase_remains_blocked_and_core_open_finishes_it() {
 
 /// What a removing device sends: `generichash(key = kdf(K, "bhremov1", 1), account ‖ device)`.
 fn notice(key: &[u8], account: AccountId, device: DeviceId) -> String {
+    // Installed keys are rings (legacy installations held one bare 32-byte key).
     let key = bh_crypto::kdf(
-        &bh_crypto::Secret::<32>::from_slice(key).unwrap(),
+        &bh_crypto::Secret::<32>::from_slice(&key[key.len() - 32..]).unwrap(),
         b"bhremov1",
         1,
     );
@@ -534,10 +582,17 @@ async fn revoke(by: &Account, device: DeviceId, notice: Option<String>) {
         serde_json::json!({}),
         |n| serde_json::json!({ "notice": n }),
     );
-    let (status, body) = raw_device(by)
-        .delete(&format!("/v1/devices/{device}"), body)
-        .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let server = bh_testkit::LocalServer::from_env();
+    let reply = reqwest::Client::new()
+        .delete(server.url().join(&format!("/v1/devices/{device}")).unwrap())
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(raw_device(by).token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), reqwest::StatusCode::OK);
 }
 
 /// The first removal event: `SignedOutByServer` keeps the device, `Removed` erases it.
@@ -570,7 +625,7 @@ fn assert_kept(core: &Core, dir: &std::path::Path, secrets: &FileSecretStore, ac
         bh_core::DeviceKind::Full => "key",
         bh_core::DeviceKind::App => "appkey",
     };
-    for suffix in [key, "token", "dbkey"] {
+    for suffix in [key, "token", "dbkey", "kem"] {
         assert!(
             secrets
                 .get(&format!("acct.{id}.{suffix}"))
@@ -736,7 +791,11 @@ async fn an_app_erases_only_on_a_notice_from_its_own_key() {
                 let wrong = notice(&account_key(&a), a.id(), app.device_id());
                 revoke(&a, app.device_id(), Some(wrong)).await;
             }
-            _ => a.remove_device(app.device_id()).await.unwrap(),
+            _ => {
+                a.remove_device(app.device_id(), bh_core::Removal::Plain)
+                    .await
+                    .unwrap();
+            }
         }
         assert_eq!(
             app.refresh().await.unwrap_err(),
@@ -793,7 +852,9 @@ async fn an_app_removing_itself_erases_itself() {
         .unwrap()
         .unwrap()
         .to_vec();
-    app.remove_device(app.device_id()).await.unwrap();
+    app.remove_device(app.device_id(), bh_core::Removal::Plain)
+        .await
+        .unwrap();
     assert!(core.accounts().is_empty());
     assert!(
         secrets

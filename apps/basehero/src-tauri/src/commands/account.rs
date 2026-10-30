@@ -18,6 +18,21 @@ pub fn accounts(state: &AppState) -> Result<Vec<AccountSummary>, CommandError> {
 }
 
 pub async fn sign_up(state: &AppState, form: SignUpForm) -> Result<SignedUp, CommandError> {
+    sign_up_with_base(state, form, true).await
+}
+
+pub(crate) async fn sign_up_without_base(
+    state: &AppState,
+    form: SignUpForm,
+) -> Result<SignedUp, CommandError> {
+    sign_up_with_base(state, form, false).await
+}
+
+async fn sign_up_with_base(
+    state: &AppState,
+    form: SignUpForm,
+    create_default: bool,
+) -> Result<SignedUp, CommandError> {
     let (account, kit) = state
         .core
         .sign_up(SignUp {
@@ -31,7 +46,7 @@ pub async fn sign_up(state: &AppState, form: SignUpForm) -> Result<SignedUp, Com
     let id = account.id();
     // The account is installed already: never lose the one-time kit because
     // creating its first base failed. Retry when this account next signs in.
-    if account.bases().is_empty() {
+    if create_default && account.bases().is_empty() {
         let _ = account.create_base("Personal").await;
     }
     let summary = AccountSummary {
@@ -206,19 +221,48 @@ pub async fn usage(
     Ok(state.core.account(id)?.usage(month).await?)
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRemovalResult {
+    pub new_kit: Option<String>,
+    pub pending: bool,
+}
+
 /// Revokes a device; removing this device also signs out of the app shell.
 pub async fn remove_device(
     state: &AppState,
     id: AccountId,
     device: DeviceId,
-) -> Result<(), CommandError> {
-    let result = state.core.account(id)?.remove_device(device).await;
+    password: Option<String>,
+    lost: Option<bool>,
+) -> Result<DeviceRemovalResult, CommandError> {
+    let account = state.core.account(id)?;
+    let full = device != account.device_id()
+        && account
+            .devices()
+            .await?
+            .iter()
+            .any(|d| d.id == device && d.kind == bh_core::DeviceKind::Full);
+    let removal = if full {
+        bh_core::Removal::Full {
+            password: zeroize::Zeroizing::new(
+                password.ok_or(bh_core::Error::Invalid("password required".into()))?,
+            ),
+            lost: lost.ok_or(bh_core::Error::Invalid("answer required".into()))?,
+        }
+    } else {
+        bh_core::Removal::Plain
+    };
+    let result = account.remove_device(device, removal).await;
     if state.core.account(id).is_err() {
         state.forget_account(id);
         state.notes.close_account(id);
         state.stop_listening(id);
         crate::state::sync_hidden_recents(&state.core);
     }
-    result?;
-    Ok(())
+    let outcome = result?;
+    Ok(DeviceRemovalResult {
+        new_kit: outcome.new_kit.map(|kit| kit.display()),
+        pending: outcome.pending,
+    })
 }

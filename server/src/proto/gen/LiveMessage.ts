@@ -8,4 +8,4 @@ import type { ObjectId } from "./ObjectId";
 /**
  * WebSocket server messages; clients only send pings.
  */
-export type LiveMessage = { "t": "change", seq: number, objectId: ObjectId, prevHead: number, kind: ChangeKind, changeId: ChangeId, deviceId: DeviceId, body?: Bytes, } | { "t": "revoked", notice?: string, };
+export type LiveMessage = { "t": "epoch", epoch: number, } | { "t": "change", seq: number, objectId: ObjectId, prevHead: number, kind: ChangeKind, changeId: ChangeId, deviceId: DeviceId, body?: Bytes, } | { "t": "revoked", notice?: string, };

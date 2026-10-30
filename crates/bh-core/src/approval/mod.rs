@@ -204,12 +204,12 @@ impl Approval {
             let transfer = state
                 .transfer
                 .ok_or(Error::ApprovalEnded(EndReason::BadMessage))?;
-            let key = self
+            let (epoch, key) = self
                 .side
                 .take()
                 .ok_or(Error::ApprovalEnded(EndReason::Cancelled))?
-                .on_transfer(&transfer.0, self.pending.clock().now_ms())?;
-            self.pending.snapshot().finish(key).await
+                .on_transfer_at(&transfer.0, self.pending.clock().now_ms())?;
+            self.pending.snapshot().finish_at(key, epoch).await
         }
         .await;
         match result {

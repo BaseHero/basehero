@@ -167,7 +167,7 @@ async fn failed_reader_refresh_asks_instead_of_using_stale_free_access() {
     account.devices().await.unwrap();
     account.test_inject_fault(bh_core::test_support::Fault {
         method: "GET",
-        path: "v1/account",
+        path: "v1/account?afterEpoch=1",
         lost_reply: false,
         times: 100,
     });
@@ -532,6 +532,53 @@ async fn the_focus_note_is_in_the_first_request() {
             .unwrap_or("")
             .contains("Kyoto in March")
     }));
+}
+
+#[tokio::test]
+async fn hero_still_counts_an_app_during_its_pending_removal() {
+    use bh_core::{Removal, test_support::Fault};
+    let (account, health) = setup().await;
+    let personal = account.create_base("Personal").await.unwrap();
+    let private = note_with_text(&personal, "Private content");
+    let credentials = account
+        .connect_app(AppRequest {
+            app_name: "Health reader".into(),
+            app_id: None,
+            bases: vec![BaseGrantRequest::Existing {
+                base: health.id(),
+                mode: Mode::ReadOnly,
+            }],
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let app = device("reader").install_app(credentials).await.unwrap();
+    account.test_inject_fault(Fault {
+        method: "POST",
+        path: "v1/bases/",
+        lost_reply: false,
+        times: 1,
+    });
+    assert!(
+        account
+            .remove_device(app.device_id(), Removal::Plain)
+            .await
+            .unwrap()
+            .pending
+    );
+    let hero = account.hero_with_model(ScriptedModel::new(vec![
+        call("read", json!({"base": personal.id(), "id": private})),
+        reply("Done"),
+    ]));
+    let chat = hero.new_chat(health.id()).unwrap();
+    hero.send(health.id(), chat, "Read Personal", None).unwrap();
+    hero.wait_idle(chat).await;
+    let message = &hero.messages(health.id(), chat).unwrap()[1];
+    assert_eq!(message.state, MessageState::Asking);
+    assert_eq!(
+        message.ask.as_ref().unwrap().readers_without,
+        ["Health reader"]
+    );
 }
 
 #[tokio::test]

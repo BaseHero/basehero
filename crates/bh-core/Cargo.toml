@@ -16,12 +16,14 @@ base64.workspace = true
 futures-util.workspace = true
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+libc = "0.2"
 rusqlite = { version = "0.41", features = ["bundled-sqlcipher-vendored-openssl"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ts-rs.workspace = true
+time = "0.3"
 unicode-normalization = "0.1"
 url = { version = "2", features = ["serde"] }
 webpki-roots = "1"

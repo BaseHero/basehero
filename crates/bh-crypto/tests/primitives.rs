@@ -106,6 +106,16 @@ fn xwing_round_trips() {
 }
 
 #[test]
+fn a_seed_restores_the_same_xwing_recipient() {
+    let seed = Secret::<32>::from_slice(&[42; 32]).unwrap();
+    let first = KemKey::from_seed(&seed);
+    let second = KemKey::from_seed(&seed);
+    assert_eq!(first.public(), second.public());
+    let (ct, shared) = encapsulate(&first.public()).unwrap();
+    assert_eq!(decapsulate(&second, &ct).unwrap().expose(), shared.expose());
+}
+
+#[test]
 fn secret_enforces_length_and_random_and_constant_time_eq_work() {
     assert!(Secret::<32>::from_slice(&[1; 31]).is_err());
     assert_eq!(

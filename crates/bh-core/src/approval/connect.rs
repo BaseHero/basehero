@@ -6,6 +6,7 @@ use super::protocol::{AppHello, Digits, Exchange, Ids, NewSide, TTL_MS, email_sc
 use crate::client::{Api, ApprovalState};
 use crate::{Account, AppCredentials, AppGrant, BaseGrantRequest, Clock, Core, EndReason, Error};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bh_crypto::{KemKey, Secret};
 use bh_proto::{ApprovalId, Bytes, ConnectCreateRequest, DeviceId};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub struct PendingConnection {
     id: ApprovalId,
     device_id: DeviceId,
     hello: AppHello,
+    kem_seed: Option<Secret<32>>,
     side: Option<NewSide>,
     clock: Clock,
     deadline: u64,
@@ -56,9 +58,11 @@ impl Core {
         email: &str,
         app: AppIdentity,
     ) -> Result<PendingConnection, Error> {
+        let kem_seed = Secret::<32>::random();
         let hello = AppHello {
             name: app.name,
             app_id: app.app_id,
+            public: Some(URL_SAFE_NO_PAD.encode(KemKey::from_seed(&kem_seed).public())),
         };
         hello
             .validate()
@@ -95,6 +99,7 @@ impl Core {
             id,
             device_id,
             hello,
+            kem_seed: Some(kem_seed),
             side: Some(side),
             clock,
             deadline: started.saturating_add(TTL_MS),
@@ -197,7 +202,9 @@ impl PendingConnection {
             if credentials.device_id != self.device_id {
                 return Err(Error::ApprovalEnded(EndReason::BadMessage));
             }
-            self.core.install_app(credentials).await
+            self.core
+                .install_app_with_seed(credentials, self.kem_seed.take())
+                .await
         }
         .await;
         match result {
@@ -219,6 +226,7 @@ impl PendingConnection {
     /// Returns [`Error::Network`] if the relay cannot be reached.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.side = None;
+        self.kem_seed = None;
         self.digits = None;
         match self.api.connect_end(self.id, EndReason::Cancelled).await {
             Ok(()) | Err(Error::NotFound) => Ok(()),
@@ -278,6 +286,7 @@ pub struct OpenAppRequest {
     pub(crate) account: Account,
     pub(crate) deadline: u64,
     pub(crate) checked: Option<AppOffer>,
+    pub(crate) checked_public: Option<String>,
 }
 
 impl OpenAppRequest {
@@ -333,8 +342,9 @@ impl OpenAppRequest {
                         return Err(e);
                     }
                 };
+                let public = hello.public.clone();
                 match account.app_offer(hello).await {
-                    Ok(offer) => Ok((side, offer)),
+                    Ok(offer) => Ok((side, offer, public)),
                     Err(e) => {
                         let _ = api.approval_end(id, EndReason::BadMessage).await;
                         Err(e)
@@ -342,8 +352,9 @@ impl OpenAppRequest {
                 }
             })
             .await;
-        let (side, offer) = result?;
+        let (side, offer, public) = result?;
         self.side = Some(side);
+        self.checked_public = public;
         self.checked = Some(offer.clone());
         Ok(offer)
     }

@@ -1,0 +1,7 @@
+{
+  "identifier": "backup-macos",
+  "description": "Mac backup folder selection",
+  "platforms": ["macOS"],
+  "windows": ["main", "w-*"],
+  "permissions": ["dialog:allow-open"]
+}

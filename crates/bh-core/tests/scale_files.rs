@@ -268,13 +268,15 @@ async fn version_fixture(server: &mut LocalServer) -> (Account, Base, ObjectId, 
 static VERSIONS: tokio::sync::OnceCell<(LocalServer, Account, Base, ObjectId, u64, u64, u64)> =
     tokio::sync::OnceCell::const_new();
 async fn year_versions() -> &'static (LocalServer, Account, Base, ObjectId, u64, u64, u64) {
-    VERSIONS
+    let fixture = VERSIONS
         .get_or_init(|| async {
             let mut server = LocalServer::start();
             let (account, base, id, oldest, before, after) = version_fixture(&mut server).await;
             (server, account, base, id, oldest, before, after)
         })
-        .await
+        .await;
+    bh_testkit::register_exit_cleanup(&fixture.0);
+    fixture
 }
 
 #[tokio::test]

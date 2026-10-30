@@ -12,11 +12,11 @@ async function signedIn(page: Page) {
   return page.evaluate(() => window.__fake.accounts().then(accounts => accounts[0].id));
 }
 
-test('devices lists this device first and removes another after confirming', async ({ page }) => {
+test('removing a device asks for the password and whether you still have it', async ({ page }) => {
   const account = await signedIn(page);
   await page.evaluate(account => window.__fake.setDevices(account, [
-    { id: 'other', name: 'Other phone', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200 },
-    { id: 'mine', name: 'This Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300 },
+    { id: 'other', name: 'Other phone', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+    { id: 'mine', name: 'This Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
   ]), account);
   await page.getByRole('link', { name: 'Devices' }).click();
   const rows = page.locator('[data-device-id]');
@@ -25,20 +25,116 @@ test('devices lists this device first and removes another after confirming', asy
   await expect(rows.nth(0)).toContainText('Mac');
   await expect(rows.nth(0)).toContainText('Last seen');
   await expect(rows.nth(1)).toHaveAttribute('data-device-id', 'other');
-  page.once('dialog', dialog => void dialog.dismiss());
   await rows.nth(1).getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByText('Do you still have this device?')).toBeVisible();
+  const removalPassword = rows.nth(1).getByLabel('Password');
+  await expect(removalPassword).toBeFocused();
+  await page.screenshot({ path: '/tmp/bh-removal-question.png' });
+  await removalPassword.fill('wrong');
+  await page.getByRole('button', { name: 'I still have it' }).click();
+  await expect(page.getByRole('alert')).toContainText('Email or password is wrong.');
+  await expect(removalPassword).toHaveValue('');
+  await expect(removalPassword).toBeFocused();
   await expect(rows).toHaveCount(2);
-  page.once('dialog', dialog => void dialog.accept());
-  await rows.nth(1).getByRole('button', { name: 'Remove' }).click();
+  await page.getByLabel('Password').fill('correct horse battery staple');
+  await page.getByRole('button', { name: 'I still have it' }).click();
   await expect(rows).toHaveCount(1);
-  expect(await page.evaluate(() => window.__fake.calls.some(call => call === 'removeDevice other'))).toBe(true);
+  expect(await page.evaluate(() => window.__fake.calls.includes('removeDevice other kept'))).toBe(true);
+});
+
+test('a full device removal stays visibly busy until the backend returns', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => {
+    const fake = window.__fake;
+    fake.setDevices(account, [
+      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+      { id: 'other', name: 'Fold', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+    ]);
+    const original = fake.removeDevice.bind(fake);
+    fake.removeDevice = async (...args) => {
+      fake.calls.push('removeDevice held');
+      await new Promise<void>(resolve => { Object.assign(fake, { releaseRemoval: resolve }); });
+      return original(...args);
+    };
+  }, account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="other"]');
+  await row.getByRole('button', { name: 'Remove' }).click();
+  await row.getByLabel('Password').fill('correct horse battery staple');
+  await row.getByRole('button', { name: 'I still have it' }).click();
+  await expect.poll(() => page.evaluate(() => window.__fake.calls.filter(call => call === 'removeDevice held').length)).toBe(1);
+  await expect(row.getByRole('status')).toHaveText('Removing…');
+  await expect(row.getByRole('button', { name: 'I still have it' })).toBeDisabled();
+  await expect(row.getByRole('button', { name: "It's lost or stolen" })).toBeDisabled();
+  await row.getByRole('button', { name: 'I still have it' }).click({ force: true });
+  expect(await page.evaluate(() => window.__fake.calls.filter(call => call === 'removeDevice held').length)).toBe(1);
+  await page.evaluate(() => (window.__fake as typeof window.__fake & { releaseRemoval: () => void }).releaseRemoval());
+  await expect(row).toHaveCount(0);
+});
+
+test('the removal question stays beneath the device row on the Fold', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.setDevices(account, [
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+    { id: 'other', name: 'Fold', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+  ]), account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="other"]');
+  const button = row.getByRole('button', { name: 'Remove' });
+  await button.click();
+  const form = row.locator('form');
+  const buttonBox = (await button.boundingBox())!;
+  const formBox = (await form.boundingBox())!;
+  expect(formBox.y).toBeGreaterThanOrEqual(buttonBox.y + buttonBox.height);
+  expect(formBox.x + formBox.width).toBeLessThanOrEqual(390);
+  await expect(form.getByRole('button', { name: "It's lost or stolen" })).toBeVisible();
+  await page.screenshot({ path: '/tmp/bh-removal-question-fold.png', fullPage: true });
+});
+
+test('a lost device shows the new recovery kit', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.setDevices(account, [
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+    { id: 'other', name: 'Fold', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+  ]), account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  await page.locator('[data-device-id="other"]').getByRole('button', { name: 'Remove' }).click();
+  await page.getByLabel('Password').fill('correct horse battery staple');
+  await page.getByRole('button', { name: "It's lost or stolen" }).click();
+  await expect(page.getByRole('heading', { name: 'Your recovery kit' })).toBeVisible();
+  await page.screenshot({ path: '/tmp/bh-removal-new-kit.png' });
+  await expect(page.getByTestId('kit')).not.toContainText('7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC');
+  expect(await page.evaluate(() => window.__fake.calls.includes('removeDevice other lost'))).toBe(true);
+});
+
+test('a new kit is shown even while re-keying is pending', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => {
+    window.__fake.setDevices(account, [
+      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+      { id: 'other', name: 'Fold', kind: 'Android', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+    ]);
+    window.__fake.setNextRemovalPending(true);
+  }, account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  await page.locator('[data-device-id="other"]').getByRole('button', { name: 'Remove' }).click();
+  await page.getByLabel('Password').fill('correct horse battery staple');
+  await page.getByRole('button', { name: "It's lost or stolen" }).click();
+  await expect(page.getByRole('heading', { name: 'Your recovery kit' })).toBeVisible();
+  await expect(page.getByTestId('kit')).not.toContainText('7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC');
+  await page.getByRole('button', { name: 'Later' }).click();
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="other"]');
+  await expect(row.getByRole('status')).toHaveText('Removing…');
+  await expect(row.getByRole('button', { name: 'Remove' })).toBeDisabled();
 });
 
 test('Devices shows an app cap, changes it and disconnects', async ({ page }) => {
   const account = await signedIn(page);
   await page.evaluate(account => window.__fake.setDevices(account, [
-    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, capMicroUsd: null },
-    { id: 'sample', name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, capMicroUsd: 1000000 },
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false, capMicroUsd: null },
+    { id: 'sample', name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false, capMicroUsd: 1000000 },
   ]), account);
   await page.getByRole('link', { name: 'Devices' }).click();
   const row = page.locator('[data-device-id="sample"]');
@@ -50,8 +146,47 @@ test('Devices shows an app cap, changes it and disconnects', async ({ page }) =>
   await expect(row).toContainText('Cap $0.50 a month');
   page.once('dialog', async dialog => { expect(dialog.message()).toBe('Disconnect Dan - Sample? It erases its copy of your data.'); await dialog.accept(); });
   await row.getByRole('button', { name: 'Disconnect' }).click();
+  await expect(row).toContainText('Removing…');
+  await expect(row.getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+  await page.evaluate(({ account }) => window.__fake.finishRemoval(account, 'sample'), { account });
   await expect(row).toHaveCount(0);
   expect(await page.evaluate(() => window.__fake.calls.includes('removeDevice sample'))).toBe(true);
+});
+
+test('a newly pending app cannot save its already-open cap form', async ({ page }) => {
+  const account = await signedIn(page);
+  const mine = { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active' as const, thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false };
+  const app = { id: 'sample', name: 'Sample', kind: 'App', status: 'active' as const, thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false, capMicroUsd: 1_000_000 };
+  await page.evaluate(({ account, mine, app }) => window.__fake.setDevices(account, [mine, app]), { account, mine, app });
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="sample"]');
+  await row.getByRole('button', { name: 'Change cap' }).click();
+  await row.getByLabel('Monthly cap (USD)').fill('0.50');
+  await page.evaluate(({ account, mine, app }) => {
+    window.__fake.setDevices(account, [mine, { ...app, pendingRemoval: true }]);
+    window.__fake.emit({ kind: 'account', account, event: 'DevicesChanged' });
+  }, { account, mine, app });
+  await expect(row.getByRole('status')).toHaveText('Removing…');
+  await expect(row.getByRole('button', { name: 'Save' })).toHaveCount(0);
+  expect(await page.evaluate(() => window.__fake.calls.some(call => call.startsWith('setAppCap')))).toBe(false);
+});
+
+test('a newly pending app cannot use its already-open grant picker', async ({ page }) => {
+  const account = await signedIn(page);
+  const mine = { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active' as const, thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false };
+  const app = { id: 'sample', name: 'Sample', kind: 'App', status: 'active' as const, thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false };
+  await page.evaluate(({ account, mine, app }) => window.__fake.setDevices(account, [mine, app]), { account, mine, app });
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="sample"]');
+  await row.getByRole('button', { name: 'Add a base or folder' }).click();
+  await expect(row.locator('.grant-picker')).toBeVisible();
+  await page.evaluate(({ account, mine, app }) => {
+    window.__fake.setDevices(account, [mine, { ...app, pendingRemoval: true }]);
+    window.__fake.emit({ kind: 'account', account, event: 'DevicesChanged' });
+  }, { account, mine, app });
+  await expect(row.getByRole('status')).toHaveText('Removing…');
+  await expect(row.locator('.grant-picker')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__fake.calls.some(call => call.startsWith('appGrantAdd')))).toBe(false);
 });
 
 test('Devices adds and removes an app folder', async ({ page }) => {
@@ -62,8 +197,8 @@ test('Devices adds and removes an app folder', async ({ page }) => {
     window.__fake.setAppOffer('request', { name: 'Sample', appId: 'sample', deviceName: 'Dan - Sample', bases: [], capMicroUsd: 1000000, old: null, removeOld: false });
     const [device] = await window.__fake.connectApprove(account, 'request', { bases: [{ base: personal, mode: 'readWrite' }], capMicroUsd: 1000000, replaces: null });
     window.__fake.setDevices(account, [
-      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, capMicroUsd: null },
-      { id: device, name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, capMicroUsd: 1000000 },
+      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false, capMicroUsd: null },
+      { id: device, name: 'Dan - Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false, capMicroUsd: 1000000 },
     ]);
     return { personal, health, device };
   }, account);
@@ -82,6 +217,63 @@ test('Devices adds and removes an app folder', async ({ page }) => {
   await expect(row).not.toContainText('Health in Personal');
   expect(await page.evaluate(({ account, device, mounted }) => window.__fake.apps(account).then(list => !list.find(app => app.deviceId === device)!.bases.some(grant => grant.base === mounted)), { account, device, mounted })).toBe(true);
   expect(await page.evaluate(() => window.__fake.calls.some(call => call.startsWith('appGrantRemove')))).toBe(true);
+});
+
+test('pending folder removal remains visible until DevicesChanged and disables app actions', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.setDevices(account, [
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+    { id: 'sample', name: 'Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: true },
+  ]), account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="sample"]');
+  await expect(row).toContainText('Removing…');
+  await page.screenshot({ path: '/tmp/bh-removal-pending.png' });
+  await expect(row.getByRole('button', { name: 'Disconnect' })).toBeDisabled();
+  await expect(row.getByRole('button', { name: 'Add a base or folder' })).toBeDisabled();
+  await page.getByRole('link', { name: 'Personal' }).click();
+  await page.getByRole('link', { name: 'Devices' }).click();
+  await expect(row).toContainText('Removing…');
+  await page.evaluate(account => {
+    window.__fake.setDevices(account, [
+      { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+      { id: 'sample', name: 'Sample', kind: 'App', status: 'active', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: false },
+    ]);
+    window.__fake.emit({ kind: 'account', account, event: 'DevicesChanged' });
+  }, account);
+  await expect(row).not.toContainText('Removing…');
+  await expect(row.getByRole('button', { name: 'Disconnect' })).toBeEnabled();
+});
+
+test('a pending full device removal remains visible until re-keying finishes', async ({ page }) => {
+  const account = await signedIn(page);
+  await page.evaluate(account => window.__fake.setDevices(account, [
+    { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+    { id: 'other', name: 'Fold', kind: 'Android', status: 'revoked', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: true },
+  ]), account);
+  await page.getByRole('link', { name: 'Devices' }).click();
+  const row = page.locator('[data-device-id="other"]');
+  await expect(row.getByRole('status')).toHaveText('Removing…');
+  await expect(row.getByRole('button', { name: 'Remove' })).toBeDisabled();
+  await page.evaluate(account => window.__fake.finishRemoval(account, 'other'), account);
+  await expect(row).toHaveCount(0);
+});
+
+test('a pending app removal is restored when Devices first loads after a restart', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, '__fake', { configurable: true, set(fake: typeof window.__fake) {
+      Object.defineProperty(window, '__fake', { configurable: true, value: fake });
+      fake.accounts = async () => [{ id: 'known', email: 'known@example.com', kind: 'full', signedOutByServer: false }];
+      fake.setDevices('known', [
+        { id: 'mine', name: 'Mac', kind: 'Mac', status: 'active', thisDevice: true, createdAt: 100, lastSeenAt: 300, pendingRemoval: false },
+        { id: 'sample', name: 'Sample', kind: 'App', status: 'revoked', thisDevice: false, createdAt: 100, lastSeenAt: 200, pendingRemoval: true },
+      ]);
+    } });
+  });
+  await page.goto('/#/a/known/devices');
+  const row = page.locator('[data-device-id="sample"]');
+  await expect(row).toContainText('Removing…');
+  await expect(row.getByRole('button', { name: 'Disconnect' })).toBeDisabled();
 });
 
 test('removing this device confirms, erases it and shows Removed', async ({ page }) => {

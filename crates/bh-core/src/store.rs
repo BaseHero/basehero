@@ -55,8 +55,16 @@ pub(crate) struct Pass(());
 
 struct Passes {
     held: usize,
-    /// The thread running exit, once it has begun.
-    exiting: Option<std::thread::ThreadId>,
+    /// The thread running exit, once it has begun, as [`this_thread`] names it.
+    exiting: Option<usize>,
+}
+
+/// This thread, as the operating system names it. Exit can't use
+/// `std::thread::current`: on macOS a thread's Rust data is gone by the time its
+/// exit handlers run, and the panic would abort the process.
+fn this_thread() -> usize {
+    // SAFETY: pthread_self has no preconditions and never fails.
+    unsafe { libc::pthread_self() as usize }
 }
 
 static PASSES: (Mutex<Passes>, Condvar) = (
@@ -71,10 +79,8 @@ impl Pass {
     pub(crate) fn new() -> Pass {
         let (passes, changed) = &PASSES;
         let mut passes = passes.lock().unwrap_or_else(|e| e.into_inner());
-        while passes
-            .exiting
-            .is_some_and(|exiting| exiting != std::thread::current().id())
-        {
+        let this = this_thread();
+        while passes.exiting.is_some_and(|exiting| exiting != this) {
             passes = changed.wait(passes).unwrap_or_else(|e| e.into_inner());
         }
         passes.held += 1;
@@ -103,7 +109,7 @@ impl Drop for Pass {
 extern "C" fn wait_for_passes() {
     let (passes, changed) = &PASSES;
     let mut passes = passes.lock().unwrap_or_else(|e| e.into_inner());
-    passes.exiting = Some(std::thread::current().id());
+    passes.exiting = Some(this_thread());
     let _ = changed.wait_timeout_while(passes, Duration::from_secs(5), |p| p.held > 0);
 }
 
@@ -215,6 +221,36 @@ const ACCOUNT_MIGRATIONS: &[&str] = &[
     "CREATE TABLE credential_envelope (id INTEGER PRIMARY KEY CHECK (id = 1), hash TEXT NOT NULL);",
     // Whether the cached account data was sealed with its version.
     "ALTER TABLE account_data ADD COLUMN versioned INTEGER NOT NULL DEFAULT 0;",
+    "
+    CREATE TABLE backup_credentials (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        envelope BLOB NOT NULL,
+        salt BLOB NOT NULL,
+        checked INTEGER NOT NULL
+    );
+    CREATE TABLE backup (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        location TEXT,
+        enabled INTEGER NOT NULL,
+        acknowledged INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        last_run TEXT,
+        keys_hash TEXT,
+        keys_name TEXT,
+        bytes INTEGER NOT NULL,
+        merged_day TEXT,
+        problem TEXT
+    );
+    ",
+    "CREATE TABLE public_pins (device_id TEXT PRIMARY KEY, public BLOB NOT NULL);",
+    "ALTER TABLE bases ADD COLUMN chain TEXT NOT NULL DEFAULT '[]';
+     ALTER TABLE bases ADD COLUMN account_epoch INTEGER NOT NULL DEFAULT 1;
+     ALTER TABLE bases ADD COLUMN data_floor INTEGER NOT NULL DEFAULT 0;",
+    // NULL means the pre-rotation wrapper and epoch are also the store wrapper.
+    "ALTER TABLE hidden_bases ADD COLUMN store_wrapper BLOB;
+     ALTER TABLE hidden_bases ADD COLUMN store_epoch INTEGER;
+     ALTER TABLE hidden_bases ADD COLUMN chain TEXT NOT NULL DEFAULT '[]';
+     ALTER TABLE hidden_bases ADD COLUMN account_epoch INTEGER NOT NULL DEFAULT 1;",
 ];
 
 /// A base this device may open: its key as the server's wrapper, which only
@@ -225,7 +261,52 @@ pub(crate) struct BaseRow {
     pub epoch: u32,
     pub wrapper: Vec<u8>,
     pub mode: Mode,
+    pub chain: Vec<(u32, Vec<u8>)>,
+    pub account_epoch: u32,
+    pub data_floor: u64,
 }
+
+#[derive(Clone)]
+pub(crate) struct HiddenRow {
+    pub id: BaseId,
+    pub epoch: u32,
+    pub wrapper: Vec<u8>,
+    pub store_epoch: u32,
+    pub store_wrapper: Vec<u8>,
+    pub chain: Vec<(u32, Vec<u8>)>,
+}
+
+/// Saved destination and progress for this device.
+#[derive(Clone, Default)]
+pub(crate) struct BackupRow {
+    pub location: Option<crate::BackupLocation>,
+    pub enabled: bool,
+    pub acknowledged: bool,
+    pub generation: i64,
+    pub last_run: Option<String>,
+    pub keys_hash: Option<String>,
+    pub keys_name: Option<String>,
+    pub bytes: u64,
+    pub merged_day: Option<String>,
+    pub problem: Option<String>,
+}
+
+pub(crate) type BackupWrappers = (Vec<BaseRow>, Vec<HiddenRow>);
+
+type BackupRowColumns = (
+    Option<String>,
+    bool,
+    bool,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+type DirtyObject = (ObjectId, i64, Vec<u8>, Option<Vec<u8>>);
 
 pub(crate) struct AccountRow {
     pub id: AccountId,
@@ -285,6 +366,31 @@ impl AccountDb {
         })
     }
 
+    /// The public key first seen for this device, if any.
+    pub(crate) fn public_pin(&self, device: DeviceId) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT public FROM public_pins WHERE device_id = ?",
+                [device.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Remembers the first public key seen for a device across restarts.
+    pub(crate) fn pin_public(&self, device: DeviceId, public: &[u8]) -> Result<Vec<u8>, Error> {
+        self.0.execute(
+            "INSERT OR IGNORE INTO public_pins (device_id, public) VALUES (?, ?)",
+            params![device.to_string(), public],
+        )?;
+        Ok(self.0.query_row(
+            "SELECT public FROM public_pins WHERE device_id = ?",
+            [device.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The cached account data and its server version.
     #[allow(
         dead_code,
@@ -301,6 +407,26 @@ impl AccountDb {
             .optional()?)
     }
 
+    /// The cached account data with its version, and whether it was sealed with it.
+    pub(crate) fn account_data_versioned(
+        &self,
+    ) -> Result<Option<(u64, Zeroizing<String>, bool)>, Error> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT version, json, versioned FROM account_data WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        Zeroizing::new(r.get(1)?),
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     /// The cached account data's version, and whether it was sealed with it.
     pub(crate) fn account_data_seen(&self) -> Result<Option<(u64, bool)>, Error> {
         Ok(self
@@ -311,6 +437,130 @@ impl AccountDb {
                 |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub(crate) fn backup_credentials(&self) -> Result<Option<crate::account::Credentials>, Error> {
+        let row: Option<(Vec<u8>, Vec<u8>, bool)> = self
+            .0
+            .query_row(
+                "SELECT envelope, salt, checked FROM backup_credentials WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(envelope, salt, checked)| {
+            let salt = salt
+                .try_into()
+                .map_err(|_| Error::Storage("unreadable backup salt".into()))?;
+            Ok(crate::account::Credentials {
+                envelope,
+                salt,
+                checked,
+            })
+        })
+        .transpose()
+    }
+
+    pub(crate) fn set_backup_credentials(
+        &self,
+        credentials: &crate::account::Credentials,
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT INTO backup_credentials (id, envelope, salt, checked) VALUES (1, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET envelope = excluded.envelope,
+                salt = excluded.salt, checked = excluded.checked
+             WHERE backup_credentials.checked = 0 OR excluded.checked = 1",
+            params![
+                &credentials.envelope,
+                credentials.salt.as_slice(),
+                credentials.checked
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets sign-in details this device never checked.
+    pub(crate) fn clear_unchecked_backup_credentials(&self) -> Result<(), Error> {
+        self.0.execute(
+            "DELETE FROM backup_credentials WHERE id = 1 AND checked = 0",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn backup_row(&self) -> Result<BackupRow, Error> {
+        let row: Option<BackupRowColumns> = self.0.query_row(
+            "SELECT location, enabled, acknowledged, generation, last_run, keys_hash, keys_name, bytes, merged_day, problem FROM backup WHERE id = 1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+        ).optional()?;
+        row.map(
+            |(
+                location,
+                enabled,
+                acknowledged,
+                generation,
+                last_run,
+                keys_hash,
+                keys_name,
+                bytes,
+                merged_day,
+                problem,
+            )| {
+                Ok(BackupRow {
+                    location: location
+                        .map(|json| {
+                            serde_json::from_str(&json).map_err(|_| corrupt("backup location"))
+                        })
+                        .transpose()?,
+                    enabled,
+                    acknowledged,
+                    generation,
+                    last_run,
+                    keys_hash,
+                    keys_name,
+                    bytes: bytes.try_into().map_err(|_| corrupt("backup bytes"))?,
+                    merged_day,
+                    problem,
+                })
+            },
+        )
+        .transpose()
+        .map(|row| row.unwrap_or_default())
+    }
+
+    pub(crate) fn set_backup_row(&self, row: &BackupRow) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO backup (id, location, enabled, acknowledged, generation, last_run, keys_hash, keys_name, bytes, merged_day, problem) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![row.location.as_ref().map(serde_json::to_string).transpose().map_err(|_| corrupt("backup location"))?, row.enabled, row.acknowledged, row.generation,
+                row.last_run, row.keys_hash, row.keys_name, row.bytes.min(i64::MAX as u64) as i64, row.merged_day, row.problem],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn update_backup_progress(
+        &self,
+        row: &BackupRow,
+        expected_generation: i64,
+        expected_location: &crate::BackupLocation,
+    ) -> Result<bool, Error> {
+        let transaction = self.0.unchecked_transaction()?;
+        let current = self.backup_row()?;
+        let same = current.enabled
+            && current.generation == expected_generation
+            && current
+                .location
+                .as_ref()
+                .is_some_and(|location| location.same_destination(expected_location));
+        if !same {
+            return Ok(false);
+        }
+        let updated = transaction.execute(
+            "UPDATE backup SET generation = ?, last_run = ?, keys_hash = ?, keys_name = ?, bytes = ?, merged_day = ?, problem = ? WHERE id = 1",
+            params![row.generation, row.last_run, row.keys_hash, row.keys_name,
+                row.bytes.min(i64::MAX as u64) as i64, row.merged_day, row.problem],
+        )? != 0;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     /// The last fetched credential envelope's SHA-256, independent of account-data version.
@@ -382,15 +632,20 @@ impl AccountDb {
     /// Adds a base or updates its key and mode.
     pub(crate) fn put_base(&self, row: &BaseRow, added_at: i64) -> Result<(), Error> {
         self.0.execute(
-            "INSERT INTO bases (base_id, epoch, wrapper, mode, added_at) VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO bases (base_id, epoch, wrapper, mode, added_at, chain, account_epoch, data_floor)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (base_id) DO UPDATE SET epoch = excluded.epoch,
-                 wrapper = excluded.wrapper, mode = excluded.mode",
+                 wrapper = excluded.wrapper, mode = excluded.mode, chain = excluded.chain,
+                 account_epoch = excluded.account_epoch, data_floor = excluded.data_floor",
             params![
                 row.id.to_string(),
                 row.epoch,
                 row.wrapper,
                 mode_text(row.mode),
-                added_at
+                added_at,
+                serde_json::to_string(&row.chain).map_err(|_| corrupt("base chain"))?,
+                row.account_epoch,
+                i64::try_from(row.data_floor).map_err(|_| corrupt("base data floor"))?
             ],
         )?;
         Ok(())
@@ -404,44 +659,62 @@ impl AccountDb {
     }
 
     /// Remembers an unopened account wrapper without storing a base name or key.
-    #[allow(dead_code, reason = "used by upcoming hidden account operations")]
     pub(crate) fn remember_hidden(
         &self,
         base: BaseId,
         epoch: u32,
         wrapper: &[u8],
+        chain: &[(u32, Vec<u8>)],
+        account_epoch: u32,
     ) -> Result<(), Error> {
+        let chain = serde_json::to_string(chain).map_err(|_| Error::Crypto)?;
         self.0.execute(
-            "INSERT INTO hidden_bases (base_id, epoch, wrapper) VALUES (?, ?, ?)
-             ON CONFLICT (base_id) DO UPDATE SET epoch = excluded.epoch, wrapper = excluded.wrapper",
-            params![base.to_string(), epoch, wrapper],
+            "INSERT INTO hidden_bases (base_id, epoch, wrapper, store_wrapper, store_epoch, chain, account_epoch)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (base_id) DO UPDATE SET
+                store_wrapper = COALESCE(hidden_bases.store_wrapper, hidden_bases.wrapper),
+                store_epoch = COALESCE(hidden_bases.store_epoch, hidden_bases.epoch),
+                epoch = excluded.epoch, wrapper = excluded.wrapper,
+                chain = excluded.chain, account_epoch = excluded.account_epoch",
+            params![base.to_string(), epoch, wrapper, wrapper, epoch, chain, account_epoch],
         )?;
         Ok(())
     }
 
-    /// Returns locally indexed wrappers without decrypting them.
-    #[allow(dead_code, reason = "used by upcoming hidden account operations")]
-    pub(crate) fn hidden_wrappers(&self) -> Result<Vec<(BaseId, u32, Vec<u8>)>, Error> {
-        let mut statement = self
-            .0
-            .prepare("SELECT base_id, epoch, wrapper FROM hidden_bases ORDER BY base_id")?;
+    /// The first wrapper stays beside the current one to open this device's store.
+    pub(crate) fn hidden_wrappers(&self) -> Result<Vec<HiddenRow>, Error> {
+        let mut statement = self.0.prepare(
+            "SELECT base_id, epoch, wrapper, COALESCE(store_epoch, epoch),
+                    COALESCE(store_wrapper, wrapper), chain
+             FROM hidden_bases ORDER BY base_id",
+        )?;
         let rows = statement.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, u32>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, u32>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, epoch, wrapper) = row?;
-            Ok((parse_id(&id)?, epoch, wrapper))
+            let (id, epoch, wrapper, store_epoch, store_wrapper, chain) = row?;
+            Ok(HiddenRow {
+                id: parse_id(&id)?,
+                epoch,
+                wrapper,
+                store_epoch,
+                store_wrapper,
+                chain: serde_json::from_str(&chain).map_err(|_| corrupt("hidden chain"))?,
+            })
         })
         .collect()
     }
 
     pub(crate) fn bases(&self) -> Result<Vec<BaseRow>, Error> {
         let mut statement = self.0.prepare(
-            "SELECT base_id, epoch, wrapper, mode FROM bases ORDER BY added_at, base_id",
+            "SELECT base_id, epoch, wrapper, mode, chain, account_epoch, data_floor FROM bases ORDER BY added_at, base_id",
         )?;
         let rows = statement.query_map([], |r| {
             Ok((
@@ -449,14 +722,20 @@ impl AccountDb {
                 r.get::<_, u32>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, u32>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, epoch, wrapper, mode) = row?;
+            let (id, epoch, wrapper, mode, chain, account_epoch, data_floor) = row?;
             Ok(BaseRow {
                 id: parse_id(&id)?,
                 epoch,
                 wrapper,
+                chain: serde_json::from_str(&chain).map_err(|_| corrupt("base chain"))?,
+                account_epoch,
+                data_floor: u64::try_from(data_floor).map_err(|_| corrupt("base data floor"))?,
                 mode: match mode.as_str() {
                     "rw" => Mode::ReadWrite,
                     "ro" => Mode::ReadOnly,
@@ -548,7 +827,26 @@ const BASE_MIGRATIONS: &[&str] = &[
      CREATE UNIQUE INDEX IF NOT EXISTS set_aside_unique ON set_aside (object_id, seq) WHERE seq IS NOT NULL;
      CREATE VIRTUAL TABLE IF NOT EXISTS object_search USING fts5(object_id UNINDEXED, title, body);",
     "CREATE TABLE IF NOT EXISTS files (object_id TEXT PRIMARY KEY, parts INTEGER NOT NULL, have INTEGER NOT NULL, sent INTEGER, broken TEXT);
-     CREATE TABLE IF NOT EXISTS edits (object_id TEXT PRIMARY KEY, last_edit_at INTEGER NOT NULL, last_version_at INTEGER);"
+     CREATE TABLE IF NOT EXISTS edits (object_id TEXT PRIMARY KEY, last_edit_at INTEGER NOT NULL, last_version_at INTEGER);",
+    "CREATE TABLE IF NOT EXISTS backup_dirty (object_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+     CREATE TABLE IF NOT EXISTS backup_objects (object_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, sv BLOB NOT NULL);
+     CREATE TABLE IF NOT EXISTS backup_parts (object_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, copied INTEGER NOT NULL);
+     CREATE TABLE IF NOT EXISTS backup_base (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL,
+         snapshot_run TEXT, snapshot_bytes INTEGER NOT NULL, log_bytes INTEGER NOT NULL);
+     INSERT OR IGNORE INTO backup_dirty (object_id, seq) SELECT object_id, row_number() OVER (ORDER BY object_id) FROM objects;
+     CREATE TRIGGER IF NOT EXISTS backup_object_insert AFTER INSERT ON objects BEGIN
+         INSERT INTO backup_dirty VALUES (NEW.object_id, (SELECT coalesce(max(seq), 0) + 1 FROM backup_dirty))
+         ON CONFLICT (object_id) DO UPDATE SET seq = excluded.seq;
+     END;
+     CREATE TRIGGER IF NOT EXISTS backup_object_update AFTER UPDATE OF state ON objects BEGIN
+         INSERT INTO backup_dirty VALUES (NEW.object_id, (SELECT coalesce(max(seq), 0) + 1 FROM backup_dirty))
+         ON CONFLICT (object_id) DO UPDATE SET seq = excluded.seq;
+     END;",
+    // The dirty triggers query max(seq) for each inserted or edited object.
+    // Without this index, a large bulk insert repeatedly scans the entire table.
+    "CREATE INDEX IF NOT EXISTS backup_dirty_by_seq ON backup_dirty (seq);",
+    // A pre-rotation snapshot has no recorded epoch; write one fresh snapshot once.
+    "ALTER TABLE backup_base ADD COLUMN snapshot_epoch INTEGER;",
 ];
 
 /// Local progress for one sealed file.
@@ -669,6 +967,136 @@ impl BaseDb {
         })?;
         self.1 = false;
         migrate(&mut self.0, BASE_MIGRATIONS)
+    }
+
+    pub(crate) fn backup_state(
+        &self,
+        generation: i64,
+    ) -> Result<(Option<String>, u64, u64, Option<u32>), Error> {
+        type Cursor = (i64, Option<String>, i64, i64, Option<u32>);
+        let row: Option<Cursor> = self.0.query_row(
+            "SELECT generation, snapshot_run, snapshot_bytes, log_bytes, snapshot_epoch FROM backup_base WHERE id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional()?;
+        match row {
+            Some((g, run, size, log, epoch)) if g == generation => {
+                Ok((run, size.max(0) as u64, log.max(0) as u64, epoch))
+            }
+            _ => Ok((None, 0, 0, None)),
+        }
+    }
+
+    pub(crate) fn dirty_since(
+        &self,
+        generation: i64,
+        all: bool,
+    ) -> Result<Vec<DirtyObject>, Error> {
+        let mut stmt = self.0.prepare(
+            "SELECT o.object_id, coalesce(d.seq, 0), o.state, b.sv FROM objects o
+             LEFT JOIN backup_dirty d ON d.object_id = o.object_id
+             LEFT JOIN backup_objects b ON b.object_id = o.object_id AND b.generation = ?
+             WHERE ? OR d.object_id IS NOT NULL OR b.object_id IS NULL ORDER BY o.object_id",
+        )?;
+        let rows = stmt.query_map(params![generation, all], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.map(|row| {
+            let (id, seq, state, sv) = row?;
+            Ok((parse_id(&id)?, seq, state, sv))
+        })
+        .collect()
+    }
+
+    pub(crate) fn commit_backup(
+        &mut self,
+        generation: i64,
+        entries: &[(ObjectId, i64, Vec<u8>)],
+        log_bytes: u64,
+    ) -> Result<(), Error> {
+        self.batch(|db| {
+            for (id, seq, sv) in entries {
+                db.0.execute(
+                    "INSERT OR REPLACE INTO backup_objects VALUES (?, ?, ?)",
+                    params![id.to_string(), generation, sv],
+                )?;
+                db.0.execute(
+                    "DELETE FROM backup_dirty WHERE object_id = ? AND seq = ?",
+                    params![id.to_string(), seq],
+                )?;
+            }
+            db.0.execute(
+                "UPDATE backup_base SET log_bytes = log_bytes + ? WHERE id = 1 AND generation = ?",
+                params![log_bytes.min(i64::MAX as u64) as i64, generation],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn set_snapshot(
+        &self,
+        generation: i64,
+        run: &str,
+        size: u64,
+        epoch: u32,
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO backup_base (id, generation, snapshot_run, snapshot_bytes, log_bytes, snapshot_epoch) VALUES (1, ?, ?, ?, 0, ?)",
+            params![generation, run, size.min(i64::MAX as u64) as i64, epoch],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn backup_estimate(&self) -> Result<(u64, Vec<(ObjectId, u32)>), Error> {
+        let states: i64 = self.0.query_row(
+            "SELECT coalesce(sum(length(state)), 0) FROM objects",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self
+            .0
+            .prepare("SELECT object_id, have FROM files WHERE broken IS NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        let parts = rows
+            .map(|row| {
+                let (id, have) = row?;
+                Ok((parse_id(&id)?, have))
+            })
+            .collect::<Result<_, Error>>()?;
+        Ok((states.max(0) as u64, parts))
+    }
+
+    pub(crate) fn parts_to_copy(
+        &self,
+        generation: i64,
+    ) -> Result<Vec<(ObjectId, u32, u32)>, Error> {
+        let mut stmt = self.0.prepare(
+            "SELECT f.object_id, f.parts, coalesce(p.copied, 0) FROM files f
+             LEFT JOIN backup_parts p ON p.object_id = f.object_id AND p.generation = ?
+             WHERE f.have = f.parts AND f.broken IS NULL AND coalesce(p.copied, 0) < f.parts ORDER BY f.object_id",
+        )?;
+        let rows = stmt.query_map([generation], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.map(|row| {
+            let (id, parts, copied) = row?;
+            Ok((parse_id(&id)?, parts, copied))
+        })
+        .collect()
+    }
+
+    pub(crate) fn part_copied(
+        &self,
+        generation: i64,
+        id: ObjectId,
+        copied: u32,
+    ) -> Result<(), Error> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO backup_parts VALUES (?, ?, ?)",
+            params![id.to_string(), generation, copied],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn objects_for_backfill(&self) -> Result<Vec<(ObjectId, Vec<u8>)>, Error> {
@@ -1144,6 +1572,35 @@ impl BaseDb {
         .collect()
     }
 
+    /// Re-seals refused changes without replacing their IDs or outbox positions.
+    pub(crate) fn reseal_sending(
+        &mut self,
+        mut reseal: impl FnMut(ObjectId, bool, &[u8]) -> Result<Option<Vec<u8>>, Error>,
+    ) -> Result<bool, Error> {
+        let rows = self.sending()?;
+        let updates: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                Ok(reseal(row.object_id, row.state, &row.body)?.map(|body| (row.change_id, body)))
+            })
+            .collect::<Result<Vec<_>, Error>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        if updates.is_empty() {
+            return Ok(false);
+        }
+        let tx = self.0.transaction()?;
+        for (id, body) in updates {
+            tx.execute(
+                "UPDATE sending SET body = ? WHERE change_id = ?",
+                params![body, id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Records a batch of changes before it's sent, so a retry resends them unchanged.
     pub(crate) fn start_sending(&mut self, batch: &[SendingRow]) -> Result<(), Error> {
         let tx = self.0.transaction()?;
@@ -1391,8 +1848,15 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 6);
-        for table in ["files", "edits"] {
+        assert_eq!(version, BASE_MIGRATIONS.len() as u32);
+        for table in [
+            "files",
+            "edits",
+            "backup_dirty",
+            "backup_objects",
+            "backup_parts",
+            "backup_base",
+        ] {
             let count: i64 =
                 db.0.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1402,6 +1866,27 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "{table}");
         }
+    }
+
+    #[test]
+    fn migrating_a_version_7_store_indexes_dirty_sequence_lookups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("base.sqlite");
+        let mut conn = open_encrypted(&path, &[3; 32]).unwrap();
+        migrate(&mut conn, &BASE_MIGRATIONS[..7]).unwrap();
+        drop(conn);
+        let db = BaseDb::open(&path, &[3; 32]).unwrap();
+        let plan: String =
+            db.0.query_row(
+                "EXPLAIN QUERY PLAN SELECT max(seq) FROM backup_dirty",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING COVERING INDEX backup_dirty_by_seq"),
+            "{plan}"
+        );
     }
 
     #[test]
@@ -1569,7 +2054,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -1585,6 +2070,39 @@ mod tests {
         assert_eq!(json.as_str(), current);
         db.accept_account_data(2, older, true).unwrap();
         assert_eq!(db.account_data().unwrap().unwrap().1.as_str(), current);
+    }
+
+    #[test]
+    fn account_data_snapshot_keeps_the_version_with_its_app_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        db.accept_account_data(3, r#"{"apps":{"one":{}}}"#, true)
+            .unwrap();
+        let first = db.account_data().unwrap().unwrap();
+        db.accept_account_data(4, r#"{"apps":{"two":{}}}"#, true)
+            .unwrap();
+        let second = db.account_data().unwrap().unwrap();
+        assert_eq!((first.0, first.1.as_str()), (3, r#"{"apps":{"one":{}}}"#));
+        assert_eq!((second.0, second.1.as_str()), (4, r#"{"apps":{"two":{}}}"#));
+    }
+
+    #[test]
+    fn a_late_unchecked_pair_cannot_replace_a_checked_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = AccountDb::open(&tmp.path().join("account.sqlite"), &[1; 32]).unwrap();
+        let checked = crate::account::Credentials {
+            envelope: vec![1, 2, 3],
+            salt: [2; 16],
+            checked: true,
+        };
+        db.set_backup_credentials(&checked).unwrap();
+        db.set_backup_credentials(&crate::account::Credentials {
+            envelope: vec![9, 8, 7],
+            salt: [3; 16],
+            checked: false,
+        })
+        .unwrap();
+        assert_eq!(db.backup_credentials().unwrap(), Some(checked));
     }
 
     #[test]
@@ -1609,7 +2127,27 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 10);
+    }
+
+    #[test]
+    fn a_main_backup_store_migrates_to_rotation_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account_path = tmp.path().join("account.sqlite");
+        let base_path = tmp.path().join("base.sqlite");
+        let mut account = open_encrypted(&account_path, &[1; 32]).unwrap();
+        migrate(&mut account, &ACCOUNT_MIGRATIONS[..7]).unwrap();
+        account.execute("INSERT INTO bases (base_id, epoch, wrapper, mode, added_at) VALUES (?, 1, ?, 'rw', 1)", params![BaseId([3; 16]).to_string(), vec![5u8; 77]]).unwrap();
+        drop(account);
+        let mut base = open_encrypted(&base_path, &[1; 32]).unwrap();
+        migrate(&mut base, &BASE_MIGRATIONS[..8]).unwrap();
+        drop(base);
+        let account = AccountDb::open(&account_path, &[1; 32]).unwrap();
+        let row = account.bases().unwrap().remove(0);
+        assert_eq!((row.account_epoch, row.data_floor), (1, 0));
+        assert!(row.chain.is_empty());
+        assert_eq!(account.backup_row().unwrap().generation, 0);
+        BaseDb::open(&base_path, &[1; 32]).unwrap();
     }
 
     #[test]
@@ -1618,16 +2156,50 @@ mod tests {
         let path = tmp.path().join("account.sqlite");
         let id = BaseId([2; 16]);
         let db = AccountDb::open(&path, &[1; 32]).unwrap();
-        db.remember_hidden(id, 1, &[7; 77]).unwrap();
-        db.remember_hidden(id, 1, &[7; 77]).unwrap();
+        db.remember_hidden(id, 1, &[7; 77], &[], 1).unwrap();
+        db.remember_hidden(id, 1, &[7; 77], &[], 1).unwrap();
         drop(db);
         let db = AccountDb::open(&path, &[1; 32]).unwrap();
-        assert_eq!(db.hidden_wrappers().unwrap(), vec![(id, 1, vec![7; 77])]);
+        let hidden = db.hidden_wrappers().unwrap();
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].id, id);
+        assert_eq!(hidden[0].store_wrapper, vec![7; 77]);
+        assert_eq!(hidden[0].store_epoch, 1);
+        db.remember_hidden(id, 2, &[8; 77], &[(1, vec![9; 77])], 2)
+            .unwrap();
+        let updated = db.hidden_wrappers().unwrap();
+        assert_eq!(updated[0].wrapper, vec![8; 77]);
+        assert_eq!(updated[0].store_wrapper, vec![7; 77]);
+        assert_eq!(updated[0].store_epoch, 1);
+        assert_eq!(updated[0].chain, vec![(1, vec![9; 77])]);
         assert!(db.bases().unwrap().is_empty());
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 10);
+    }
+
+    #[test]
+    fn a_pre_rotation_hidden_index_keeps_its_store_wrapper_after_rekey() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("account.sqlite");
+        let id = BaseId([9; 16]);
+        let mut connection = open_encrypted(&path, &[1; 32]).unwrap();
+        migrate(&mut connection, &ACCOUNT_MIGRATIONS[..10]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO hidden_bases (base_id, epoch, wrapper) VALUES (?, 1, ?)",
+                params![id.to_string(), vec![7u8; 77]],
+            )
+            .unwrap();
+        drop(connection);
+        let db = AccountDb::open(&path, &[1; 32]).unwrap();
+        assert_eq!(db.hidden_wrappers().unwrap()[0].store_wrapper, vec![7; 77]);
+        db.remember_hidden(id, 2, &[8; 77], &[], 2).unwrap();
+        let row = db.hidden_wrappers().unwrap().remove(0);
+        assert_eq!(row.wrapper, vec![8; 77]);
+        assert_eq!(row.store_wrapper, vec![7; 77]);
+        assert_eq!(row.store_epoch, 1);
     }
 
     #[test]
@@ -1639,6 +2211,9 @@ mod tests {
             epoch: 1,
             wrapper: vec![1, 2, 3],
             mode: Mode::ReadOnly,
+            chain: vec![],
+            account_epoch: 1,
+            data_floor: 0,
         };
         db.put_base(&row, 5).unwrap();
         row.mode = Mode::ReadWrite;
@@ -1743,7 +2318,7 @@ mod tests {
         let version: u32 =
             db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 10);
         let count: u32 =
             db.0.query_row("SELECT count(*) FROM approvals_answered", [], |r| r.get(0))
                 .unwrap();
@@ -1780,7 +2355,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("account.sqlite");
         let db = AccountDb::open(&path, &[1; 32]).unwrap();
-        db.0.execute_batch("PRAGMA user_version = 9").unwrap();
+        db.0.execute_batch("PRAGMA user_version = 11").unwrap();
         drop(db);
         assert!(matches!(
             AccountDb::open(&path, &[1; 32]),

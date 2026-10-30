@@ -1,4 +1,6 @@
 //! Monotonic time for device-local approval deadlines.
+#[cfg(feature = "test-support")]
+use std::sync::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -12,7 +14,12 @@ pub struct Clock(Arc<Source>);
 
 enum Source {
     System(Instant),
-    Manual { millis: AtomicU64, changed: Notify },
+    Manual {
+        millis: AtomicU64,
+        changed: Notify,
+        #[cfg(feature = "test-support")]
+        deadlines: Mutex<Vec<u64>>,
+    },
 }
 
 /// Controllable clock handle; advancing it wakes deadline sleepers.
@@ -30,6 +37,8 @@ impl Clock {
         let clock = Self(Arc::new(Source::Manual {
             millis: AtomicU64::new(0),
             changed: Notify::new(),
+            #[cfg(feature = "test-support")]
+            deadlines: Mutex::new(Vec::new()),
         }));
         (clock.clone(), ManualClock(clock))
     }
@@ -62,23 +71,41 @@ impl Clock {
                     .unwrap_or(*start);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
             }
-            Source::Manual { changed, .. } => loop {
-                let notified = changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if self.now_ms() >= deadline {
-                    return;
+            Source::Manual { changed, .. } => {
+                #[cfg(feature = "test-support")]
+                if let Source::Manual { deadlines, .. } = &*self.0 {
+                    deadlines.lock().unwrap().push(deadline);
                 }
-                notified.await;
-            },
+                loop {
+                    let notified = changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.now_ms() >= deadline {
+                        return;
+                    }
+                    notified.await;
+                }
+            }
         }
     }
 }
 
 impl ManualClock {
+    /// Deadlines registered by manual-clock sleepers, for deterministic tests.
+    #[cfg(feature = "test-support")]
+    pub fn scheduled_deadlines(&self) -> Vec<u64> {
+        match &*self.0.0 {
+            Source::Manual { deadlines, .. } => deadlines.lock().unwrap().clone(),
+            Source::System(_) => unreachable!("manual clock must use manual source"),
+        }
+    }
+
     /// Advances a manual clock and wakes waiting operations.
     pub fn advance(&self, duration: Duration) {
-        if let Source::Manual { millis, changed } = &*self.0.0 {
+        if let Source::Manual {
+            millis, changed, ..
+        } = &*self.0.0
+        {
             millis
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     Some(n.saturating_add(duration.as_millis().min(u64::MAX as u128) as u64))

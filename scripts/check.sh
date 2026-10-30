@@ -18,6 +18,19 @@ memory_tmp() {
   fi
 }
 
+if [ "${1:-}" = run ]; then
+  shift
+  if (( $# == 0 )); then
+    printf 'Usage: check.sh run <command...>\n' >&2
+    exit 2
+  fi
+  memory_tmp
+  [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
+    (cd server && npm ci --no-audit --no-fund)
+  "$@"
+  exit
+fi
+
 for stage in "$@"; do
   case "$stage" in
     rust)
@@ -90,7 +103,7 @@ for stage in "$@"; do
       adb -s emulator-5580 shell pm clear app.basehero
       # One emulator and one app: test files take turns. The approval runner
       # creates a disposable dev approver and isolates its CLI credentials.
-      for file in lib keys shell model notes fold ime hero update approval kit hidden files; do
+      for file in lib keys shell model notes fold ime hero update approval kit hidden files backup; do
         if [ "$file" = approval ]; then
           node apps/basehero/tests/android/run-approval.mjs
         else
@@ -124,7 +137,7 @@ for stage in "$@"; do
       memory_tmp
       [ server/node_modules/.package-lock.json -nt server/package-lock.json ] ||
         (cd server && npm ci --no-audit --no-fund)
-      cargo test --release -p bh-core --test scale --test scale_files -- --nocapture --test-threads=1
+      cargo test --release -p bh-core --test scale --test scale_files --test scale_backup -- --nocapture --test-threads=1
       du -sh "$TMPDIR" # Fixture footprint before the check's in-memory directory is removed.
       ;;
     *)

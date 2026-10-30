@@ -5,7 +5,7 @@ use basehero_app_lib::commands::account::{
     sign_in_start, sign_in_with_kit, sign_out, sign_up,
 };
 use basehero_app_lib::views::{AppEvent, SignInForm, SignUpForm};
-use bh_core::{RecoveryKit, test_support::Fault};
+use bh_core::{BackupLocation, BackupSchedule, RecoveryKit, test_support::Fault};
 use bh_testkit::{LocalServer, TEST_PASSWORD, invite};
 use common::{open_at, state_at};
 use std::time::Duration;
@@ -269,7 +269,9 @@ async fn removing_this_device_signs_out_the_app_shell() {
     let (state, events) = state_at(server().url());
     let signed = sign_up(&state, form()).await.unwrap();
     let own = state.core.account(signed.account.id).unwrap().device_id();
-    remove_device(&state, signed.account.id, own).await.unwrap();
+    remove_device(&state, signed.account.id, own, None, None)
+        .await
+        .unwrap();
     assert!(accounts(&state).unwrap().is_empty());
     assert_eq!(
         kit_status(&state, signed.account.id).unwrap_err().kind,
@@ -281,6 +283,92 @@ async fn removing_this_device_signs_out_the_app_shell() {
             .join("accounts")
             .join(signed.account.id.to_string())
             .exists()
+    );
+}
+
+#[tokio::test]
+async fn remove_device_returns_a_kit_when_lost() {
+    let (state, _events) = state_at(server().url());
+    let signed = sign_up(&state, form()).await.unwrap();
+    let (other, _other_events) = state_at(server().url());
+    let pending = sign_in_start(
+        &other,
+        SignInForm {
+            email: signed.account.email.clone(),
+            password: TEST_PASSWORD.into(),
+            device_name: "Fold".into(),
+        },
+    )
+    .await
+    .unwrap();
+    sign_in_with_kit(&other, &pending, &signed.kit)
+        .await
+        .unwrap();
+    let target = other.core.account(signed.account.id).unwrap().device_id();
+    let wrong = remove_device(
+        &state,
+        signed.account.id,
+        target,
+        Some("wrong".into()),
+        Some(true),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(wrong.kind, "BadCredentials");
+    assert!(
+        devices(&state, signed.account.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == target)
+    );
+    let outcome = remove_device(
+        &state,
+        signed.account.id,
+        target,
+        Some(TEST_PASSWORD.into()),
+        Some(true),
+    )
+    .await
+    .unwrap();
+    assert_ne!(outcome.new_kit.as_deref(), Some(signed.kit.as_ref()));
+    assert_eq!(outcome.new_kit.unwrap().replace('-', "").len(), 26);
+}
+
+#[tokio::test]
+async fn dropping_the_state_releases_its_data_folder_while_backups_are_scheduled() {
+    let (state, events) = state_at(server().url());
+    let id = sign_up(&state, form()).await.unwrap().account.id;
+    let location = BackupLocation::Path {
+        path: events.data_dir().join("backup"),
+        label: "Backup".into(),
+    };
+    state
+        .core
+        .account(id)
+        .unwrap()
+        .set_backup(Some(location))
+        .unwrap();
+    drop(state);
+    // The schedule wakes as it starts and holds the account for a moment, so it can still
+    // hold it as the state drops. (The Mac's first run waits five minutes, so none runs here.)
+    for _ in 0..20 {
+        let state = open_at(
+            events.data_dir(),
+            "http://127.0.0.1:9".parse().unwrap(),
+            &events,
+        );
+        state
+            .core
+            .account(id)
+            .unwrap()
+            .start_backups(BackupSchedule::MAC);
+        drop(state);
+    }
+    open_at(
+        events.data_dir(),
+        "http://127.0.0.1:9".parse().unwrap(),
+        &events,
     );
 }
 

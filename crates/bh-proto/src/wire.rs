@@ -3,7 +3,11 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ts_rs::TS;
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
+
+fn default_epoch() -> u32 {
+    1
+}
 
 /// Opaque wire bytes, represented in JSON and TypeScript as unpadded base64url.
 #[derive(Clone, Debug, Default, Eq, PartialEq, TS)]
@@ -48,6 +52,7 @@ empty!(
     DeleteDeviceResponse,
     BasesResponse,
     BaseKeyRequest,
+    RekeyResponse,
     GrantResponse,
     DeleteGrantRequest,
     DeleteGrantResponse,
@@ -149,11 +154,23 @@ pub enum DeviceKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "server/src/proto/gen/")]
+pub struct DeviceKeyDelivery {
+    pub epoch: u32,
+    pub sealed: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
 pub struct MeResponse {
     pub account_id: AccountId,
     pub device_id: DeviceId,
     pub kind: DeviceKind,
     pub bases: Vec<BaseId>,
+    #[serde(default = "default_epoch")]
+    pub epoch: u32,
+    #[serde(default)]
+    pub device_keys: Vec<DeviceKeyDelivery>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -189,6 +206,10 @@ pub struct AccountResponse {
     pub bases: Vec<BaseId>,
     pub data: Option<AccountData>,
     pub account_key_envelope: Bytes,
+    #[serde(default = "default_epoch")]
+    pub epoch: u32,
+    #[serde(default)]
+    pub device_keys: Vec<DeviceKeyDelivery>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -198,6 +219,8 @@ pub struct AccountDataRequest {
     pub ciphertext: Bytes,
     #[ts(type = "number")]
     pub expected_version: u64,
+    #[serde(default = "default_epoch")]
+    pub account_epoch: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -259,6 +282,11 @@ pub struct BasesRequest {
     pub base_id: BaseId,
     pub epoch: u32,
     pub wrapper: Bytes,
+    #[serde(default = "default_epoch")]
+    pub account_epoch: u32,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub data_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -280,6 +308,44 @@ pub struct BaseKeyResponse {
     pub epoch: u32,
     pub wrapper: Bytes,
     pub mode: GrantMode,
+    #[serde(default)]
+    pub previous: Vec<PreviousKey>,
+    #[serde(default = "default_epoch")]
+    pub account_epoch: u32,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub data_floor: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct PreviousKey {
+    pub epoch: u32,
+    pub sealed: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct RekeyRequest {
+    pub from: u32,
+    pub wrapper: Bytes,
+    pub previous: Bytes,
+    pub apps: Vec<AppWrapper>,
+    #[serde(default = "default_epoch")]
+    pub account_epoch: u32,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub data_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct AppWrapper {
+    pub device_id: DeviceId,
+    pub wrapper: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -289,6 +355,11 @@ pub struct GrantRequest {
     pub mode: GrantMode,
     pub epoch: u32,
     pub wrapper: Bytes,
+    #[serde(default = "default_epoch")]
+    pub account_epoch: u32,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub data_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -469,6 +540,9 @@ pub struct VersionResponse {
 #[serde(tag = "t", rename_all = "camelCase", rename_all_fields = "camelCase")]
 #[ts(export, export_to = "server/src/proto/gen/")]
 pub enum LiveMessage {
+    Epoch {
+        epoch: u32,
+    },
     Change {
         #[ts(type = "number")]
         seq: u64,
@@ -713,4 +787,29 @@ pub struct DeleteDeviceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub notice: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub data: Option<AccountDataRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rotation: Option<RotationRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct RotationRequest {
+    pub epoch: u32,
+    pub login_key: Bytes,
+    pub account_key_envelope: Bytes,
+    pub activation_hash: Bytes,
+    pub device_keys: Vec<DeviceKeyEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "server/src/proto/gen/")]
+pub struct DeviceKeyEntry {
+    pub device_id: DeviceId,
+    pub sealed: Bytes,
 }

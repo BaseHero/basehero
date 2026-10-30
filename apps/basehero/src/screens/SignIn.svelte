@@ -1,7 +1,7 @@
 <script lang="ts">
   import { getBackend } from '../lib/backend';
   import { errorMessage } from '../lib/errors';
-  let { deviceName, onpending, onback }: { deviceName: string; onpending: (id: string) => void; onback: () => void } = $props();
+  let { deviceName, onpending, onback, onrestore }: { deviceName: string; onpending: (id: string) => void; onback: () => void; onrestore: () => void } = $props();
   let email = $state('');
   let password = $state('');
   let device = $state('');
@@ -31,4 +31,5 @@
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <div class="actions"><button class="primary" type="submit" disabled={busy}>Continue</button><button type="button" onclick={onback}>Back</button></div>
   </form>
+  <button type="button" onclick={onrestore}>Restore from a backup</button>
 </section></main>

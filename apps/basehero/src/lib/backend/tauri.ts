@@ -6,6 +6,14 @@ import { BackendError, type Backend, type AppEvent, type BaseRef, type NoteOpene
 // The core-backed commands are introduced by later shell tasks. Keep their mapping here.
 const commands: Record<string, [string, string[]]> = {
   appInfo: ['app_info', []], accounts: ['accounts', []], resetDevice: ['reset_device', []], signUp: ['sign_up', ['form']],
+  backupStatus: ['backup_status', ['account']], setBackup: ['set_backup', ['account', 'location']],
+  acknowledgeBackup: ['acknowledge_backup', ['account']], backupNow: ['backup_now', ['account']],
+  backupEstimate: ['backup_estimate', ['account']], pickBackupFolder: ['pick_backup_folder', []],
+  restoreList: ['restore_list', ['location']], restoreOpen: ['restore_open', ['location', 'listing', 'password', 'kit']],
+  restoreUnlock: ['restore_unlock', ['handle', 'password']], restorePoints: ['restore_points', ['handle']],
+  restoreBases: ['restore_bases', ['handle', 'at']], restoreCheck: ['restore_check', ['handle', 'at']],
+  restoreInto: ['restore_into', ['handle', 'account', 'at', 'bases', 'label']],
+  restoreSignUp: ['restore_sign_up', ['handle', 'form', 'at', 'label']], restoreClose: ['restore_close', ['handle']],
   signInStart: ['sign_in_start', ['form']], signInWithKit: ['sign_in_with_kit', ['pending', 'kit']],
   signInCancel: ['sign_in_cancel', ['pending']], signOut: ['sign_out', ['account']],
   approvalStart: ['approval_start', ['pending']], approvalDigits: ['approval_digits', ['pending']],
@@ -51,6 +59,9 @@ function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
 }
 
 export const tauriBackend: Backend = new Proxy({
+  removeDevice(account: string, device: string, options?: { password: string; lost: boolean }): Promise<{ newKit: string | null; pending: boolean }> {
+    return call('remove_device', { account, device, password: options?.password ?? null, lost: options?.lost ?? null });
+  },
   fileAdd(r: BaseRef, parent: string | null, name: string, mime: string, bytes: Uint8Array): Promise<FileInfo> {
     return invoke<FileInfo>('file_add', bytes, { headers: {
       'bh-account': r.account, 'bh-base': r.base, 'bh-parent': parent ?? '',

@@ -1,6 +1,6 @@
 import type { ErrorBody } from './proto/gen/ErrorBody';
 
-export type Principal = { accountId: string; deviceId: string; kind: 'full' | 'app'; status: string; capMicroUsd?: number };
+export type Principal = { accountId: string; deviceId: string; kind: 'full' | 'app'; status: string; epoch: number; protocol: 1 | 2; capMicroUsd?: number };
 export type Env = {
   ACCOUNT: DurableObjectNamespace;
   BASE: DurableObjectNamespace;
@@ -60,17 +60,50 @@ export function fail(status: number, code: string, message = code): Result<never
 export function revoked(notice: string | null): Result<never> {
   return { status: 401, body: { error: 'revoked', message: 'revoked', ...(notice ? { notice } : {}) } };
 }
-/** `{ notice }` from a removal's optional body; older clients send none. */
-export async function removalNotice(request: Request): Promise<string | null> {
-  const text = await request.text();
-  if (!text) return null;
-  let value: unknown;
-  try { value = JSON.parse(text); } catch { throw new HttpError(400, 'bad_request'); }
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new HttpError(400, 'bad_request');
-  const notice = (value as Record<string, unknown>).notice;
-  if (notice === undefined) return null;
-  bytes(notice, 32);
-  return notice as string;
+export function declaredEpoch(value: unknown): number {
+  if (value === undefined) return 1;
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 0xffffffff) throw new HttpError(400, 'bad_request');
+  return value as number;
+}
+export function dataVersion(value: unknown): number {
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new HttpError(400, 'bad_request');
+  return value as number;
+}
+/** Optional removal body; old clients send no body. */
+export async function removalBody(request: Request): Promise<import('./proto/gen/DeleteDeviceRequest').DeleteDeviceRequest> {
+  const raw = await body(request, 2 * 1024 * 1024, true);
+  const notice = raw.notice === undefined ? undefined : str(raw.notice);
+  if (notice !== undefined) bytes(notice, 32);
+  let data: import('./proto/gen/AccountDataRequest').AccountDataRequest | undefined;
+  if (raw.data !== undefined) {
+    if (!raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data)) throw new HttpError(400, 'bad_request');
+    const entry = raw.data as Record<string, unknown>;
+    const ciphertext = str(entry.ciphertext);
+    if (ciphertext.length > 4 * Math.ceil(1024 * 1024 / 3)) throw new HttpError(413, 'too_large');
+    if (bytes(ciphertext).length > 1024 * 1024) throw new HttpError(413, 'too_large');
+    if (!Number.isSafeInteger(entry.expectedVersion) || (entry.expectedVersion as number) < 0) throw new HttpError(400, 'bad_request');
+    data = { ciphertext, expectedVersion: entry.expectedVersion as number, accountEpoch: declaredEpoch(entry.accountEpoch) };
+  }
+  let rotation: import('./proto/gen/RotationRequest').RotationRequest | undefined;
+  if (raw.rotation !== undefined) {
+    if (!raw.rotation || typeof raw.rotation !== 'object' || Array.isArray(raw.rotation)) throw new HttpError(400, 'bad_request');
+    const entry = raw.rotation as Record<string, unknown>;
+    if (!Number.isSafeInteger(entry.epoch) || (entry.epoch as number) < 2 || (entry.epoch as number) > 0xffffffff) throw new HttpError(400, 'bad_request');
+    const loginKey = str(entry.loginKey), accountKeyEnvelope = str(entry.accountKeyEnvelope), activationHash = str(entry.activationHash);
+    bytes(loginKey, 32); bytes(accountKeyEnvelope); bytes(activationHash, 32);
+    if (!Array.isArray(entry.deviceKeys) || entry.deviceKeys.length > 100) throw new HttpError(400, 'bad_request');
+    const deviceKeys = entry.deviceKeys.map(value => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, 'bad_request');
+      const item = value as Record<string, unknown>;
+      const deviceId = id(item.deviceId), sealed = str(item.sealed);
+      if (sealed.length > 4 * Math.ceil(2048 / 3) || bytes(sealed).length > 2048) throw new HttpError(400, 'bad_request');
+      return { deviceId, sealed };
+    });
+    if (new Set(deviceKeys.map(key => key.deviceId)).size !== deviceKeys.length) throw new HttpError(400, 'bad_request');
+    rotation = { epoch: entry.epoch as number, loginKey, accountKeyEnvelope, activationHash, deviceKeys };
+  }
+  return { notice, data, rotation };
 }
 export function answer(result: Result): Response { return json(result.body, result.status); }
 /** Reads no more than `max` actual bytes, regardless of Content-Length. */
@@ -98,9 +131,13 @@ export async function limitedBytes(request: Request, max: number): Promise<Uint8
   for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
   return result;
 }
-export async function body(request: Request, max = 2 * 1024 * 1024): Promise<Record<string, unknown>> {
+export async function body(request: Request, max = 2 * 1024 * 1024, emptyAllowed = false): Promise<Record<string, unknown>> {
   let value: unknown;
-  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await limitedBytes(request, max))); }
+  try {
+    const raw = await limitedBytes(request, max);
+    if (emptyAllowed && raw.length === 0) return {};
+    value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+  }
   catch (error) {
     if (error instanceof HttpError) throw error;
     throw new HttpError(400, 'bad_request');
@@ -132,6 +169,11 @@ export function bytes(value: unknown, length?: number): Uint8Array {
   if (b64(decoded) !== value || (length !== undefined && decoded.length !== length)) throw new HttpError(400, 'bad_request');
   return decoded;
 }
+/** Account envelope format 1 prefixes its u32 epoch in big-endian order. */
+export function envelopeEpoch(value: string): number | null {
+  const decoded = bytes(value);
+  return decoded.length >= 5 && decoded[0] === 1 ? new DataView(decoded.buffer, decoded.byteOffset, decoded.byteLength).getUint32(1, false) : null;
+}
 export function b64(value: Uint8Array): string {
   let encoded = '';
   // Avoid passing an unbounded array as function arguments (Workers impose a limit).
@@ -162,15 +204,15 @@ export type AccountRpc = {
   login(key: string, deviceId: string, token: string, tokenHash: string): Promise<Result>;
   auth(tokenHash: string, countChange: boolean): Promise<Principal | Revoked | 'rate_limited' | null>;
   activate(principal: Principal, activation: string): Promise<Result>;
-  me(principal: Principal): Promise<Result>;
-  account(principal: Principal): Promise<Result>;
+  me(principal: Principal, afterEpoch: number): Promise<Result>;
+  account(principal: Principal, afterEpoch: number): Promise<Result>;
   usageBases(principal: Principal): Promise<string[]>;
   reserveStorage(bytes: number): Promise<boolean>;
-  data(principal: Principal, ciphertext: string, expectedVersion: number): Promise<Result>;
+  data(principal: Principal, ciphertext: string, expectedVersion: number, accountEpoch: number): Promise<Result>;
   credentials(principal: Principal, input: import('./proto/gen/CredentialsRequest').CredentialsRequest): Promise<Result>;
   addDevice(principal: Principal, deviceId: string, token: string, tokenHash: string, capMicroUsd?: number): Promise<Result>;
   setCap(principal: Principal, deviceId: string, cap: number): Promise<Result>;
-  removeDevice(principal: Principal, deviceId: string, notice: string | null): Promise<Result>;
+  removeDevice(principal: Principal, deviceId: string, input: import('./proto/gen/DeleteDeviceRequest').DeleteDeviceRequest): Promise<Result>;
   failRemovalOnce(principal: Principal): Promise<Result>;
   testLastSeen(principal: Principal, deviceId: string, lastSeenAt: number): Promise<Result>;
   addBase(principal: Principal, baseId: string): Promise<void>;
@@ -195,10 +237,11 @@ export async function requireDevice(request: Request, env: Env, countChange = fa
   if (principal === 'rate_limited') throw new HttpError(429, 'rate_limited');
   if (!principal) throw new HttpError(401, 'unauthorized');
   if ('revoked' in principal) throw new HttpError(401, 'revoked', 'revoked', principal.revoked);
+  if (request.headers.get('BH-Protocol') === '1' && principal.epoch > 1) throw new HttpError(426, 'needs_update');
   if (principal.status === 'pending' && !pendingMayReach(request.method, new URL(request.url).pathname)) {
     throw new HttpError(403, 'pending');
   }
-  return principal;
+  return { ...principal, protocol: request.headers.get('BH-Protocol') === '1' ? 1 : 2 };
 }
 /** A pending device reaches only activation and its own approval's steps; `AccountDO` checks the approval is its. */
 function pendingMayReach(method: string, path: string): boolean {

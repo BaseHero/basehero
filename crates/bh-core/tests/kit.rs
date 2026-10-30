@@ -96,6 +96,8 @@ async fn signing_in_with_the_kit_records_it_as_saved() {
 async fn failed_kit_record_after_rotation_does_not_advertise_the_old_kit() {
     let (a, old) = device("mac").sign_up(new_signup()).await.unwrap();
     a.set_kit_saved(&old).await.unwrap();
+    // Publish this device's key before faulting the specific kit-data write.
+    a.refresh().await.unwrap();
     a.test_inject_fault(Fault {
         method: "PUT",
         path: "v1/account/data",

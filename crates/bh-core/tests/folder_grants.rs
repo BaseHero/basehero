@@ -5,8 +5,9 @@ use bh_core::{
     Account, AccountEvent, AppRequest, Base, BaseGrantRequest, BaseId, Error, FileStatus, Mode,
     Mount, NewFile, NewObject, ObjectId, TypeRef,
 };
-use bh_testkit::{device, new_signup, note_with_text, two_devices, wait_for_base};
+use bh_testkit::{device, new_signup, note_with_text, two_devices, wait_for, wait_for_base};
 use serde_json::{Value, json};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 struct Setup {
@@ -96,6 +97,24 @@ async fn connect(full: &Account, name: &str, bases: Vec<BaseGrantRequest>) -> Ac
 
 fn ids(account: &Account) -> Vec<BaseId> {
     account.bases().iter().map(|base| base.id).collect()
+}
+
+async fn base_epoch(account: &Account, base: BaseId) -> u64 {
+    let server = bh_testkit::LocalServer::from_env();
+    let response: Value = reqwest::Client::new()
+        .get(server.url().join(&format!("/v1/bases/{base}/key")).unwrap())
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(bh_testkit::raw_device(account).token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    response["epoch"].as_u64().unwrap()
 }
 
 fn live(base: &Base, id: ObjectId) -> bool {
@@ -281,6 +300,85 @@ async fn a_folder_inside_a_granted_folder_gets_every_grant_above() {
 }
 
 #[tokio::test]
+async fn interrupted_folder_removal_stays_pending_until_refresh() {
+    let (full, other) = two_devices().await;
+    let s = setup_on(full).await;
+    let app = connect(
+        &s.full,
+        "Health App",
+        vec![folder_grant(&s.personal, s.folder, Mode::ReadWrite)],
+    )
+    .await;
+    let health = ids(&app)[0];
+    other.refresh().await.unwrap();
+    s.full.test_inject_fault(bh_core::test_support::Fault {
+        method: "POST",
+        path: "v1/bases/",
+        lost_reply: false,
+        times: 1,
+    });
+    s.full
+        .remove_app_grant(app.device_id(), health)
+        .await
+        .unwrap();
+    assert!(
+        s.full
+            .devices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == app.device_id() && d.pending_removal)
+    );
+    assert!(s.full.test_app_readers(health).contains(&app.device_id()));
+    other.refresh().await.unwrap();
+    assert!(
+        !other
+            .devices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == app.device_id() && d.pending_removal)
+    );
+    assert!(!other.test_app_readers(health).contains(&app.device_id()));
+}
+
+#[tokio::test]
+async fn taking_a_folder_from_an_app_rekeys_that_folder() {
+    let s = setup().await;
+    let removed = connect(
+        &s.full,
+        "Health App",
+        vec![folder_grant(&s.personal, s.folder, Mode::ReadWrite)],
+    )
+    .await;
+    let health = ids(&removed)[0];
+    let remaining = connect(
+        &s.full,
+        "Other App",
+        vec![folder_grant(&s.personal, s.folder, Mode::ReadOnly)],
+    )
+    .await;
+    let old_epoch = base_epoch(&s.full, health).await;
+    s.full
+        .remove_app_grant(removed.device_id(), health)
+        .await
+        .unwrap();
+    let new_epoch = base_epoch(&s.full, health).await;
+    assert!(
+        new_epoch > old_epoch,
+        "folder removal must re-key rather than just revoke"
+    );
+    let base = s.full.base(health).unwrap();
+    let fresh = note_with_text(&base, "written after removal");
+    base.flush().await.unwrap();
+    remaining.refresh().await.unwrap();
+    let on_remaining = remaining.base(health).unwrap();
+    wait_for_base(&on_remaining, || on_remaining.note(fresh).is_ok()).await;
+    removed.refresh().await.unwrap();
+    assert!(removed.base(health).is_err());
+}
+
+#[tokio::test]
 async fn removing_a_folder_grant_erases_it_from_the_app() {
     let s = setup().await;
     let app = connect(
@@ -326,6 +424,46 @@ async fn deleting_a_granted_folder_keeps_access_and_restoring_brings_it_back() {
 }
 
 #[tokio::test]
+async fn renaming_a_granted_folder_syncs_without_reopening_its_base() {
+    let s = setup().await;
+    let app = connect(
+        &s.full,
+        "Health App",
+        vec![folder_grant(&s.personal, s.folder, Mode::ReadWrite)],
+    )
+    .await;
+    let health = ids(&app)[0];
+    let theirs = app.base(health).unwrap();
+    wait_for_base(&theirs, || theirs.name() == "Health").await;
+    wait_for(|| !s.full.test_base_is_open(health)).await;
+
+    // Freeze the full device's two sync workers (`WORKERS` in core.rs) during the
+    // synchronous rename, so a racing send can't rescue a short-lived handle.
+    let (ready, blocked) = std::sync::mpsc::channel();
+    for _ in 0..2 {
+        let ready = ready.clone();
+        s.full.test_runtime_handle().spawn(async move {
+            ready.send(std::thread::current()).unwrap();
+            std::thread::park();
+        });
+    }
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            blocked
+                .recv_timeout(Duration::from_secs(30))
+                .expect("sync workers")
+        })
+        .collect();
+    let renamed = s.full.rename(s.personal.id(), s.folder, "Wellbeing");
+    for thread in threads {
+        thread.unpark();
+    }
+    renamed.unwrap();
+    app.refresh().await.unwrap();
+    wait_for_base(&theirs, || theirs.name() == "Wellbeing").await;
+}
+
+#[tokio::test]
 async fn renaming_a_granted_folder_renames_its_base() {
     let s = setup().await;
     let app = connect(
@@ -342,10 +480,10 @@ async fn renaming_a_granted_folder_renames_its_base() {
         s.personal.get(s.folder).unwrap().unwrap().title,
         "Wellbeing"
     );
-    assert_eq!(s.full.base(health).unwrap().name(), "Wellbeing");
     app.refresh().await.unwrap();
     let theirs = app.base(health).unwrap();
     wait_for_base(&theirs, || theirs.name() == "Wellbeing").await;
+    assert_eq!(s.full.base(health).unwrap().name(), "Wellbeing");
     assert_eq!(app.bases()[0].name, "Wellbeing");
     assert!(matches!(
         s.full.rename(s.personal.id(), s.outside, "Elsewhere"),

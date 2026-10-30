@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type AppOffer, type AppChoiceInput, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type TreeItem, type AppSummary, type BaseChoiceInput, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage } from './types';
+import { BackendError, type Backend, type KitStatus, type AppEvent, type AppInfo, type AccountSummary, type SignUpForm, type SignInForm, type SignedUp, type ApprovalRequest, type OpenedRequest, type AppOffer, type AppChoiceInput, type DeviceSummary, type BaseSummary, type BaseRef, type NewItem, type ObjectSummary, type TreeItem, type AppSummary, type BaseChoiceInput, type SearchResult, type SyncState, type NoteOpened, type UpdateInfo, type ChatMessage, type ChatSummary, type PasswordStrength, type AccountUsage, type UsageRow, type FileInfo, type FileStatus, type FileImage, type ObjectVersion, type VersionsPage, type BackupLocation, type BackupStatus, type BackupProblem, type BackupListing, type BackupBase, type CheckReport, type RestoreSummary } from './types';
 
 export class FakeBackend implements Backend {
   calls: string[] = [];
@@ -21,6 +21,12 @@ export class FakeBackend implements Backend {
   private appList = new Map<string, AppSummary[]>();
   private movedOrigins = new Map<string, string>();
   private hiddenList = new Map<string, { base: BaseSummary; password: string; open: boolean }[]>();
+  private backupStatuses = new Map<string, BackupStatus>();
+  private backupProblems = new Map<string, BackupProblem['kind']>();
+  private backupFolders = new Map<string, { listing: BackupListing; points: number[]; bases: BackupBase[]; password: string; kit: string }[]>();
+  private openedBackups = new Map<string, { archive: { listing: BackupListing; points: number[]; bases: BackupBase[]; password: string; kit: string }; unlocked: boolean }>();
+  openRestoreCount() { return this.openedBackups.size; }
+  private pickedBackupFolder: BackupLocation | null = null;
   private hiddenChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('basehero-fake-hidden');
   private deviceList = new Map<string, DeviceSummary[]>();
   private usageList = new Map<string, AccountUsage>();
@@ -28,6 +34,8 @@ export class FakeBackend implements Backend {
   private approvalList = new Map<string, ApprovalRequest[]>();
   private appOffers = new Map<string, AppOffer>();
   private failAppRemoval = false;
+  private nextRemovalPending = false;
+  setNextRemovalPending(pending: boolean) { this.nextRemovalPending = pending; }
   appChoices: { account: string; id: string; choice: AppChoiceInput }[] = [];
   private approvalDigitsValues = new Map<string, string>();
   private digitWaiters = new Map<string, (digits: string) => void>();
@@ -105,6 +113,7 @@ export class FakeBackend implements Backend {
       this.baseList.delete(e.account);
       this.appList.delete(e.account);
       this.hiddenList.delete(e.account);
+      this.backupStatuses.delete(e.account);
       for (const key of this.heroByProject.keys()) if (key.startsWith(`${e.account}:`)) this.heroByProject.delete(key);
       for (const key of this.heroChatsByBase.keys()) if (key.startsWith(`${e.account}:`)) this.heroChatsByBase.delete(key);
       for (const key of this.heroMessagesByChat.keys()) if (key.startsWith(`${e.account}:`)) this.heroMessagesByChat.delete(key);
@@ -213,9 +222,115 @@ export class FakeBackend implements Backend {
     this.platform = platform;
     return { version: '0.1.0', server: 'https://dev-api.basehero.com', platform };
   }
+  private backupKey(location: BackupLocation): string { return location.kind === 'path' ? location.path : location.uri; }
+  setBackupFolderProblem(location: BackupLocation, problem: BackupProblem['kind'] | null) {
+    const key = this.backupKey(location);
+    if (problem) this.backupProblems.set(key, problem); else this.backupProblems.delete(key);
+  }
+  setPickedBackupFolder(location: BackupLocation | null) { this.pickedBackupFolder = location; }
+  async pickBackupFolder(): Promise<BackupLocation | null> { this.log('pickBackupFolder'); return this.pickedBackupFolder; }
+  private backupAccount(account: string): AccountSummary {
+    const entry = this.accountList.find(a => a.id === account);
+    if (!entry) throw new BackendError('NotFound', 'Account not found');
+    if (entry.kind !== 'full') throw new BackendError('Forbidden', 'App devices cannot back up');
+    return entry;
+  }
+  async backupStatus(account: string): Promise<BackupStatus> {
+    this.log('backupStatus', account);
+    const entry = this.accountList.find(entry => entry.id === account);
+    if (!entry) throw new BackendError('NotFound', 'Account not found');
+    if (!this.backupStatuses.has(account) && this.platform === 'macos' && entry.kind === 'full') {
+      this.backupStatuses.set(account, { location: { kind: 'path', path: '~/Library/Mobile Documents/com~apple~CloudDocs/BaseHero', label: 'iCloud Drive › BaseHero' }, enabled: true, acknowledged: false, lastRunAt: null, bytes: 0, problem: null, stale: true });
+    }
+    const status = this.backupStatuses.get(account) ?? { location: null, enabled: false, acknowledged: false, lastRunAt: null, bytes: 0, problem: null, stale: false };
+    return { ...status, location: status.location && { ...status.location }, problem: status.problem && { ...status.problem }, stale: status.enabled && (status.lastRunAt === null || Date.now() - status.lastRunAt >= 7 * 86_400_000) };
+  }
+  async setBackup(account: string, location: BackupLocation | null): Promise<void> {
+    this.log('setBackup', account);
+    this.backupAccount(account);
+    const status = await this.backupStatus(account);
+    const changed = location && (!status.location || this.backupKey(location) !== this.backupKey(status.location));
+    this.backupStatuses.set(account, { ...status, location: location ? { ...location } : status.location, enabled: location !== null, bytes: changed ? 0 : status.bytes, lastRunAt: changed ? null : status.lastRunAt, problem: null });
+  }
+  async acknowledgeBackup(account: string): Promise<void> { this.log('acknowledgeBackup', account); this.backupAccount(account); const status = await this.backupStatus(account); this.backupStatuses.set(account, { ...status, acknowledged: true }); }
+  async backupEstimate(account: string): Promise<number> { this.log('backupEstimate', account); this.backupAccount(account); return 1_400_000_000; }
+  async backupNow(account: string): Promise<void> {
+    this.log('backupNow', account);
+    const entry = this.backupAccount(account);
+    const status = await this.backupStatus(account);
+    if (!status.enabled || !status.location) return;
+    const key = this.backupKey(status.location);
+    const problem = this.backupProblems.get(key);
+    if (problem) { this.backupStatuses.set(account, { ...status, problem: { kind: problem } }); return; }
+    const archives = this.backupFolders.get(key) ?? [];
+    let archive = archives.find(value => value.listing.account === account);
+    if (!archive) {
+      const personal = this.baseList.get(account) ?? [];
+      archive = { listing: { account, device: this.deviceList.get(account)?.find(d => d.thisDevice)?.id ?? this.id(), email: entry.email, server: 'https://dev-api.basehero.com/', writtenAt: Date.now() }, points: [], password: this.passwords.get(account) ?? '', kit: this.kits.get(account) ?? '', bases: [
+        ...personal.map(base => ({ id: base.id, name: base.name, hidden: false, mount: base.mount ?? null, notes: 1, records: 0, files: 0 })),
+        { id: this.id(), name: 'Private', hidden: true, mount: null, notes: 1, records: 0, files: 1 },
+      ] };
+      archives.push(archive);
+      this.backupFolders.set(key, archives);
+    }
+    archive.points.unshift(Math.max(Date.now(), (archive.points[0] ?? 0) + 1));
+    archive.points = archive.points.slice(0, 2);
+    archive.listing.writtenAt = archive.points[0];
+    this.backupStatuses.set(account, { ...status, lastRunAt: archive.points[0], bytes: 1_400_000_000, problem: null, stale: false });
+  }
+  async restoreList(location: BackupLocation): Promise<BackupListing[]> {
+    this.log('restoreList');
+    const key = this.backupKey(location);
+    if (this.backupProblems.has(key)) throw new BackendError('Storage', 'Backup folder unavailable');
+    return (this.backupFolders.get(key) ?? []).map(value => ({ ...value.listing }));
+  }
+  async restoreOpen(location: BackupLocation, listing: BackupListing, password: string, kit: string): Promise<string> {
+    this.log('restoreOpen');
+    const archive = this.backupFolders.get(this.backupKey(location))?.find(value => value.listing.account === listing.account && value.listing.device === listing.device);
+    if (!archive) throw new BackendError('NotFound', 'Backup not found');
+    if (archive.password !== password || archive.kit !== kit) throw new BackendError('BadKit', 'Wrong password or recovery kit');
+    const handle = this.id(); this.openedBackups.set(handle, { archive, unlocked: false }); return handle;
+  }
+  private openedBackup(handle: string) { const open = this.openedBackups.get(handle); if (!open) throw new BackendError('NotFound', 'Backup not open'); return open; }
+  async restoreUnlock(handle: string, password: string): Promise<number> {
+    this.log('restoreUnlock'); const open = this.openedBackup(handle);
+    if (password !== 'hidden password' || open.unlocked) throw new BackendError('NothingUnlocked', 'No new base opened');
+    open.unlocked = true; return 1;
+  }
+  async restorePoints(handle: string): Promise<number[]> { this.log('restorePoints'); return [...this.openedBackup(handle).archive.points]; }
+  async restoreBases(handle: string, at: number): Promise<BackupBase[]> {
+    this.log('restoreBases'); const open = this.openedBackup(handle);
+    if (!open.archive.points.includes(at)) throw new BackendError('NotFound', 'Point not found');
+    return open.archive.bases.filter(base => !base.hidden || open.unlocked).map(base => ({ ...base }));
+  }
+  async restoreCheck(handle: string, at: number): Promise<CheckReport> {
+    this.log('restoreCheck'); const open = this.openedBackup(handle);
+    const bases = await this.restoreBases(handle, at);
+    return { bases: bases.map(base => ({ id: base.id, name: base.name, objects: base.notes + base.files, unreadable: 0, missingFiles: base.hidden ? ['damaged-file'] : [] })), locked: open.unlocked ? 0 : 1, missing: 0, ignoredFiles: ['damaged-log.bhl'] };
+  }
+  async restoreInto(handle: string, account: string, at: number, bases: string[], label: string): Promise<RestoreSummary> {
+    this.log('restoreInto', account); this.backupAccount(account);
+    const available = await this.restoreBases(handle, at);
+    if (bases.some(id => !available.some(base => base.id === id))) throw new BackendError('NotFound', 'Base not found');
+    const restored: [string, string][] = [];
+    for (const id of new Set(bases)) {
+      const base = available.find(row => row.id === id)!;
+      const created = base.hidden ? await this.createHiddenBase(account, `${base.name} (${label})`, 'hidden password') : await this.createBase(account, `${base.name} (${label})`);
+      restored.push([id, created.id]);
+    }
+    const report = await this.restoreCheck(handle, at);
+    return { restored, locked: report.locked, missing: report.missing, missingFiles: bases.some(id => available.find(base => base.id === id)?.hidden) ? ['damaged-file'] : [], unreadable: report.bases.reduce((count, base) => count + base.unreadable, 0), ignoredFiles: report.ignoredFiles };
+  }
+  async restoreSignUp(handle: string, form: SignUpForm, at: number, label: string): Promise<SignedUp & { summary: RestoreSummary | null; error: { kind: string; message: string } | null }> {
+    this.log('restoreSignUp'); const bases = (await this.restoreBases(handle, at)).map(base => base.id);
+    const signed = await this.signUp(form);
+    try { return { ...signed, summary: await this.restoreInto(handle, signed.account.id, at, bases, label), error: null }; }
+    catch (cause) { return { ...signed, summary: null, error: { kind: 'Storage', message: cause instanceof Error ? cause.message : 'Restore failed' } }; }
+  }
+  async restoreClose(handle: string): Promise<void> { this.log('restoreClose'); if (!this.openedBackups.delete(handle)) throw new BackendError('NotFound', 'Backup not open'); }
   async accounts() { this.log('accounts'); if (this.keyUnavailable) throw new BackendError('KeyUnavailable', 'Keychain status -25308'); return this.accountList.map(account => ({ ...account, signedOutByServer: this.signedOut.has(account.id) })); }
   async resetDevice() { this.log('resetDevice'); if (!this.keyUnavailable) throw new BackendError('Invalid', 'No key error'); this.keyUnavailable = false; this.accountList = []; }
-  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full', signedOutByServer: false }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now() }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); return { account, kit };  }
+  async signUp(form: SignUpForm): Promise<SignedUp> { this.log('signUp'); const account: AccountSummary = { id: this.id(), email: form.email, kind: 'full', signedOutByServer: false }; this.accountList.push(account); this.deviceList.set(account.id, [Object.assign({ id: this.id(), name: form.deviceName, kind: 'Mac', status: 'active', thisDevice: true, createdAt: Date.now(), lastSeenAt: Date.now(), pendingRemoval: false }, { capMicroUsd: null })]); this.passwords.set(account.id, form.password); this.kitStates.set(account.id, { known: true, saved: false, madeAt: Date.now() }); const kit = '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC'; this.kits.set(account.id, kit); return { account, kit };  }
   async signInStart(form: SignInForm) { this.log('signInStart'); return form.email; }
   async signInWithKit(pending: string, kit: string) { this.log('signInWithKit'); const existing = this.accountList.find(a => a.email === pending); if (kit !== (existing ? this.kits.get(existing.id) : '7KQ2-M9XD-4F8P-2L6R-V3TN-H5YA-ZC')) throw new BackendError('BadKit', 'Bad kit'); if (existing) return existing; const account: AccountSummary = { id: this.id(), email: pending, kind: 'full', signedOutByServer: false }; this.accountList.push(account); this.passwords.set(account.id, 'correct horse battery staple'); this.kits.set(account.id, kit); this.kitStates.set(account.id, { known: true, saved: true, madeAt: Date.now() }); return account; }
   async signInCancel(pending: string) { this.log('signInCancel', pending); }
@@ -276,6 +391,8 @@ export class FakeBackend implements Backend {
     const app = this.appList.get(account)?.find(app => app.deviceId === device);
     if (!app) throw new BackendError('NotFound', 'App not found');
     app.bases = app.bases.filter(grant => grant.base !== base);
+    const row = this.deviceList.get(account)?.find(row => row.id === device);
+    if (row) row.pendingRemoval = true;
     this.emit({ kind: 'account', account, event: 'DevicesChanged' });
   }
   async grantFolder(account: string, base: string, folder: string, app: string): Promise<string> {
@@ -333,12 +450,32 @@ export class FakeBackend implements Backend {
     const report = this.usageList.get(account) ?? { months: [], days: [], baseNames: {}, deviceNames: {} };
     return { ...report, days: this.usageDays.get(`${account}:${selected}`) ?? report.days.filter(row => row.period.startsWith(`${selected}-`)) };
   }
-  async removeDevice(account: string, device: string) {
-    this.log('removeDevice', device);
-    const mine = this.deviceList.get(account)?.find(item => item.id === device)?.thisDevice;
-    this.deviceList.set(account, (this.deviceList.get(account) ?? []).filter(item => item.id !== device));
-    this.appList.set(account, (this.appList.get(account) ?? []).filter(item => item.deviceId !== device));
-    this.emit({ kind: 'account', account, event: mine ? 'Removed' : 'DevicesChanged' });
+  finishRemoval(account: string, device: string) {
+    const row = this.deviceList.get(account)?.find(row => row.id === device);
+    if (row) row.pendingRemoval = false;
+    this.emit({ kind: 'account', account, event: 'DevicesChanged' });
+  }
+  async removeDevice(account: string, device: string, options?: { password: string; lost: boolean }) {
+    const row = this.deviceList.get(account)?.find(item => item.id === device);
+    if (!row) throw new BackendError('NotFound', 'Not found');
+    if (!row.thisDevice && row.kind.toLowerCase() !== 'app') {
+      if (!options) throw new BackendError('Invalid', 'Password and answer required');
+      if (this.passwords.get(account) !== options.password) throw new BackendError('BadCredentials', 'Wrong password');
+    }
+    this.calls.push(`removeDevice ${device}${options ? options.lost ? ' lost' : ' kept' : ''}`);
+    if (!row.thisDevice) {
+      row.status = 'revoked';
+      if (this.nextRemovalPending) row.pendingRemoval = true;
+      if (row.kind.toLowerCase() === 'app') {
+        row.pendingRemoval = true;
+        this.appList.set(account, (this.appList.get(account) ?? []).filter(item => item.deviceId !== device));
+      }
+    } else this.deviceList.set(account, (this.deviceList.get(account) ?? []).filter(item => item.id !== device));
+    const newKit = options?.lost ? await this.newKit(account, options.password) : null;
+    this.emit({ kind: 'account', account, event: row.thisDevice ? 'Removed' : 'DevicesChanged' });
+    const pending = row.pendingRemoval || this.nextRemovalPending;
+    this.nextRemovalPending = false;
+    return { newKit, pending };
   }
   async bases(account: string) { this.log('bases', account); return [...(this.baseList.get(account) ?? []), ...(this.hiddenList.get(account) ?? []).filter(entry => entry.open).map(entry => entry.base)]; }
   async createBase(account: string, name: string) { this.log('createBase', account); const base: BaseSummary = { id: this.id(), name, mode: 'readWrite', hidden: false, mount: null }; this.baseList.set(account, [...(this.baseList.get(account) ?? []), base]); this.emit({ kind: 'account', account, event: 'BasesChanged' }); return base; }

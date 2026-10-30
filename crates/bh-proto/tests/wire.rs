@@ -124,10 +124,15 @@ fn responses_preserve_nullable_and_optional_fields() {
         bases: vec![],
         data: None,
         account_key_envelope: Bytes(vec![1, 2]),
+        epoch: 1,
+        device_keys: vec![DeviceKeyDelivery {
+            epoch: 2,
+            sealed: Bytes(vec![1, 2]),
+        }],
     };
     assert_eq!(
         serde_json::to_value(account).unwrap(),
-        serde_json::json!({"devices":[],"bases":[],"data":null,"accountKeyEnvelope":"AQI"})
+        serde_json::json!({"devices":[],"bases":[],"data":null,"accountKeyEnvelope":"AQI","epoch":1,"deviceKeys":[{"epoch":2,"sealed":"AQI"}]})
     );
     let fetch = FetchResponse {
         objects: vec![FetchObject {
@@ -187,7 +192,7 @@ fn signup_and_grant_wire_fields_are_camel_case() {
 
 #[test]
 fn protocol_constants_and_empty_bodies() {
-    assert_eq!(PROTOCOL, 1);
+    assert_eq!(PROTOCOL, 2);
     assert_eq!(
         serde_json::to_value(ActivateResponse {}).unwrap(),
         serde_json::json!({})
@@ -198,7 +203,7 @@ fn protocol_constants_and_empty_bodies() {
             protocol: PROTOCOL
         })
         .unwrap(),
-        serde_json::json!({"ok":true,"protocol":1})
+        serde_json::json!({"ok":true,"protocol":2})
     );
     assert_eq!(
         serde_json::to_value(ErrorBody {
@@ -220,7 +225,8 @@ fn protocol_constants_and_empty_bodies() {
     );
     assert_eq!(
         serde_json::to_value(DeleteDeviceRequest {
-            notice: Some(Bytes(vec![1, 2]))
+            notice: Some(Bytes(vec![1, 2])),
+            ..Default::default()
         })
         .unwrap(),
         serde_json::json!({"notice":"AQI"})
@@ -229,6 +235,23 @@ fn protocol_constants_and_empty_bodies() {
         serde_json::from_value::<DeleteDeviceRequest>(serde_json::json!({})).unwrap(),
         DeleteDeviceRequest::default()
     );
+}
+
+#[test]
+fn old_account_responses_default_to_epoch_one() {
+    let me: MeResponse = serde_json::from_value(serde_json::json!({
+        "accountId":"01010101010101010101010101010101",
+        "deviceId":"02020202020202020202020202020202", "kind":"full", "bases":[]
+    }))
+    .unwrap();
+    assert_eq!(me.epoch, 1);
+    assert!(me.device_keys.is_empty());
+    let account: AccountResponse = serde_json::from_value(serde_json::json!({
+        "devices":[], "bases":[], "data":null, "accountKeyEnvelope":"AQI"
+    }))
+    .unwrap();
+    assert_eq!(account.epoch, 1);
+    assert!(account.device_keys.is_empty());
 }
 
 #[test]

@@ -3,11 +3,15 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getBackend } from './lib/backend';
-  import type { AccountSummary, BaseRef, KitStatus, SearchResult, SignedUp } from './lib/backend/types';
+  import type { AccountSummary, BackupStatus, BaseRef, KitStatus, SearchResult, SignedUp } from './lib/backend/types';
   import { SyncStatus } from './lib/sync.svelte';
   import Search from './screens/Search.svelte';
   import Devices from './screens/Devices.svelte';
   import Usage from './screens/Usage.svelte';
+  import Backup from './screens/Backup.svelte';
+  import BackupCard from './components/BackupCard.svelte';
+  import BackupStatusLine from './components/BackupStatusLine.svelte';
+  import RestoreFlow from './components/RestoreFlow.svelte';
   import Removed from './screens/Removed.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import KeyError from './screens/KeyError.svelte';
@@ -24,7 +28,7 @@
   import PendingSignIn from './screens/PendingSignIn.svelte';
   import ApprovalRequests from './components/ApprovalRequests.svelte';
 
-  type Screen = 'welcome' | 'signup' | 'kit' | 'signin' | 'pending' | 'account' | 'search' | 'devices' | 'usage' | 'removed';
+  type Screen = 'welcome' | 'signup' | 'kit' | 'signin' | 'pending' | 'account' | 'search' | 'devices' | 'usage' | 'backup' | 'restore' | 'removed';
   let screen = $state<Screen>('welcome');
   let keyError = $state<{ kind: string; message: string } | null>(null);
   // Accounts the server refused without a notice from the person's devices: from
@@ -39,6 +43,42 @@
   let kitStatus = $state<KitStatus>({ known: false, saved: false, madeAt: null });
   let kitStatusAccount = $state<string | null>(null);
   let kitRevision = $state(0);
+  let newKitRevision = $state(0);
+  let backupStatus = $state<BackupStatus | null>(null);
+  let backupError = $state('');
+  let backupBusy = $state(false);
+  $effect(() => { const id = session.account?.id; if (id) void refreshBackup(id); });
+  async function refreshBackup(account = session.account?.id) {
+    if (!account) return;
+    try { const status = await getBackend().backupStatus(account); if (session.account?.id === account) backupStatus = status; }
+    catch (cause) { backupError = errorMessage(cause); }
+  }
+  async function changeBackupFolder() {
+    if (!session.account || backupBusy) return;
+    const account = session.account.id;
+    backupBusy = true; backupError = '';
+    try {
+      const folder = await getBackend().pickBackupFolder();
+      if (folder) {
+        await getBackend().setBackup(account, folder);
+        await getBackend().acknowledgeBackup(account);
+        await refreshBackup(account);
+      }
+    } catch (cause) { backupError = errorMessage(cause); }
+    finally { backupBusy = false; }
+  }
+  async function acknowledgeBackup() {
+    if (!session.account || backupBusy) return;
+    backupBusy = true; backupError = '';
+    try { await getBackend().acknowledgeBackup(session.account.id); await refreshBackup(); }
+    catch (cause) { backupError = errorMessage(cause); }
+    finally { backupBusy = false; }
+  }
+  function startNewKit() {
+    if (!session.account) return;
+    newKitRevision++;
+    void requestRoute(`#/a/${session.account.id}/devices`);
+  }
   let reminderDue = $state(false);
   let olderKitOffer = $state(false);
   let kitReturn = $state<'account' | 'devices'>('account');
@@ -150,7 +190,7 @@
   let requestedHash = '';
   let transitioning = false;
   let route = $derived(/^#\/a\/([^/]+)(?:\/b\/([^/]+)(?:\/n\/([^/?]+)(?:\?files=1)?)?)?$/.exec(hash));
-  let specialRoute = $derived(/^#\/a\/([^/]+)\/(search(?:\?q=[^#]*)?|devices|usage)$/.exec(hash));
+  let specialRoute = $derived(/^#\/a\/([^/]+)\/(search(?:\?q=[^#]*)?|devices|usage|backup)$/.exec(hash));
   let routeAccount = $derived(route?.[1] ?? specialRoute?.[1]);
   let knownRoute = $derived(accountsLoaded && !!routeAccount && knownAccounts.includes(routeAccount) && !removedAccounts.has(routeAccount));
   $effect(() => {
@@ -266,6 +306,7 @@
         screen = 'search';
       } else if (/^#\/a\/[^/]+\/devices$/.test(target)) screen = 'devices';
       else if (/^#\/a\/[^/]+\/usage$/.test(target)) screen = 'usage';
+      else if (/^#\/a\/[^/]+\/backup$/.test(target)) { screen = 'backup'; if (targetAccount) void refreshBackup(targetAccount); }
       else screen = target ? 'account' : (session.account ? 'account' : 'welcome');
       if (found && target === next) await openAccount(found);
       requestedHash = '';
@@ -277,6 +318,7 @@
     if (!knownAccounts.includes(account.id)) knownAccounts = [...knownAccounts, account.id];
     refreshAccount(account.id);
     await refreshKit(account);
+    await refreshBackup(account.id);
     if (session.account?.id === account.id) {
       currentBase = null;
       sync.clear();
@@ -286,6 +328,7 @@
         screen = 'search';
       } else if (specialRoute?.[2] === 'devices') screen = 'devices';
       else if (specialRoute?.[2] === 'usage') screen = 'usage';
+      else if (specialRoute?.[2] === 'backup') screen = 'backup';
       else if (route) screen = 'account'; // Keep a directly opened note route mounted.
       else navigate('account');
     }
@@ -353,6 +396,7 @@
     accountsLoaded = true;
     currentBase = null;
     sync.clear();
+    backupStatus = null;
     history.replaceState(null, '', '/');
     hash = '';
     screen = 'welcome';
@@ -394,7 +438,12 @@
     let unlistenClose: (() => void) | undefined;
     let unlistenDrain: (() => void) | undefined;
     let closing = false;
+    let backedUpAway = false;
     const stopAway = () => {
+      if (!backedUpAway && platform === 'android' && backupStatus?.enabled && session.account) {
+        backedUpAway = true;
+        void getBackend().backupNow(session.account.id).catch(() => {});
+      }
       // onPause and visibilitychange can fire for the same trip. Preserve a
       // failed lock's retry on the next stop; only pending work is a duplicate.
       if (lockTimer !== undefined || lockingAway) return;
@@ -411,6 +460,7 @@
       }
     };
     const resumeAway = (event: Event) => {
+      backedUpAway = false;
       const { awayMs } = (event as CustomEvent<{ awayMs?: number }>).detail ?? {};
       clearTimeout(lockTimer);
       lockTimer = undefined;
@@ -421,7 +471,7 @@
         away = false;
         resumeAll('away');
       }
-      if (session.account) refreshAccount(session.account.id);
+      if (session.account) { refreshAccount(session.account.id); void refreshBackup(session.account.id); }
     };
     window.addEventListener('bh:stop', stopAway);
     // The WebView can freeze before evaluateJavascript from onPause runs.
@@ -429,8 +479,9 @@
     const hideWhenBackgrounded = () => { if (document.visibilityState === 'hidden') stopAway(); };
     document.addEventListener('visibilitychange', hideWhenBackgrounded);
     window.addEventListener('bh:resume', resumeAway);
-    const focused = () => { if (session.account) refreshAccount(session.account.id); };
+    const focused = () => { if (session.account) { refreshAccount(session.account.id); void refreshBackup(session.account.id); } };
     window.addEventListener('focus', focused);
+    const backupTimer = setInterval(() => { if (session.account && !document.hidden) void refreshBackup(session.account.id); }, 60_000);
     async function drainForQuit(requestId: number) {
       let ok = false;
       try {
@@ -472,6 +523,7 @@
         serverSignedOut = serverSignedOut.filter(account => account !== event.account);
       }
       if (event.account !== session.account?.id) return;
+      if (event.kind.toLowerCase() === 'account' && event.event !== 'Removed') void refreshBackup(event.account);
       if (event.kind.toLowerCase() === 'account' && event.event === 'Removed') {
         removedAccounts.add(event.account);
         requestedHash = '';
@@ -483,6 +535,7 @@
         session.account = null;
         currentBase = null;
         sync.clear();
+        backupStatus = null;
         history.replaceState(null, '', '/');
         screen = 'removed';
       } else if (event.kind.toLowerCase() === 'kitchanged') {
@@ -519,7 +572,7 @@
       // Route both through the same guards, rather than treating it as kit Back.
       if (screen === 'removed') { history.replaceState(null, '', '/'); return; }
       if (popped && location.hash !== hash) { restoreRoute(location.hash); return; }
-      if ((route || specialRoute) && (screen === 'account' || screen === 'welcome' || screen === 'search' || screen === 'devices' || screen === 'usage')) {
+      if ((route || specialRoute) && (screen === 'account' || screen === 'welcome' || screen === 'search' || screen === 'devices' || screen === 'usage' || screen === 'backup')) {
         if (!popped) void requestRoute('');
       } else if (screen === 'kit') {
         void leaveKit();
@@ -540,6 +593,7 @@
       unlistenClose?.();
       unlistenDrain?.();
       clearTimeout(lockTimer);
+      clearInterval(backupTimer);
       window.removeEventListener('bh:stop', stopAway);
       document.removeEventListener('visibilitychange', hideWhenBackgrounded);
       window.removeEventListener('bh:resume', resumeAway);
@@ -554,7 +608,7 @@
   });
 </script>
 <div class:away-hidden={away && !!session.account}>
-{#if !keyError && session.account && ((screen === 'account' && (!routeAccount || knownRoute)) || (knownRoute && (screen === 'search' || screen === 'devices' || screen === 'usage')))}
+{#if !keyError && session.account && ((screen === 'account' && (!routeAccount || knownRoute)) || (knownRoute && (screen === 'search' || screen === 'devices' || screen === 'usage' || screen === 'backup')))}
   <header class="location-bar">
     <a href="/" onclick={(event) => { event.preventDefault(); void requestRoute(''); }}>BaseHero</a>
     <form role="search" onsubmit={submitSearch}><input type="search" aria-label="Search" placeholder="Search" bind:value={searchText} bind:this={searchField} /></form>
@@ -562,7 +616,10 @@
   </header>
   <nav class="workspace-nav"><a href={`#/a/${session.account.id}/b/${currentBase ?? ''}`} onclick={showBase}>Personal</a>
     <a href={`#/a/${session.account.id}/devices`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/devices`); }}>Devices</a>
-    <a href={`#/a/${session.account.id}/usage`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/usage`); }}>Usage</a></nav>
+    <a href={`#/a/${session.account.id}/usage`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/usage`); }}>Usage</a>
+    <a href={`#/a/${session.account.id}/backup`} onclick={(event) => { event.preventDefault(); void requestRoute(`#/a/${session.account?.id}/backup`); }}>Backup</a>
+    {#if backupStatus && (backupStatus.stale || backupStatus.problem)}<div class="sidebar-backup"><BackupStatusLine status={backupStatus} onnewkit={startNewKit} /></div>{/if}
+  </nav>
 {/if}
 {#if !keyError && session.account && serverSignedOut.includes(session.account.id)}
   {@const account = session.account.id}
@@ -585,18 +642,22 @@
 {:else if screen === 'kit' && signedUp}
   <Kit kit={signedUp.kit} mac={platform === 'macos'} notice={kitActionError} onsaved={acknowledgeKit} onlater={() => void leaveKit()} />
 {:else if screen === 'signin'}
-  <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onback={() => void navigate('welcome')} />
+  <SignIn {deviceName} onpending={(id) => { pending = id; void navigate('pending'); }} onrestore={() => void navigate('restore')} onback={() => void navigate('welcome')} />
+{:else if screen === 'restore'}
+  <main class="workspace"><RestoreFlow account={null} {deviceName} oncancel={() => void navigate(session.account ? 'account' : 'signin')} oncreated={(result) => { session.account = result.account; knownAccounts = [...knownAccounts, result.account.id]; kitReturn = 'account'; signedUp = result; void refreshKit(result.account); void refreshBackup(result.account.id); void navigate('kit'); }} /></main>
 {:else if screen === 'pending' && pending !== null}
   <PendingSignIn {pending} onapproved={entered} oncancel={() => void cancelPending()} onrestart={() => void cancelPending('signin')} />
 {:else if screen === 'removed'}
   <Removed oncontinue={() => void navigate('welcome')} />
-{:else if session.account && (screen === 'account' || (knownRoute && (screen === 'search' || screen === 'devices' || screen === 'usage')))}
+{:else if session.account && (screen === 'account' || (knownRoute && (screen === 'search' || screen === 'devices' || screen === 'usage' || screen === 'backup')))}
   {#if screen === 'search'}
     <Search account={session.account.id} base={currentBase} {query} open={openHit} />
   {:else if screen === 'devices'}
-    <Devices account={session.account.id} {kitRevision} onshow={showKit} onnewkit={madeKit} />
+    <Devices account={session.account.id} {kitRevision} {newKitRevision} onshow={showKit} onnewkit={madeKit} />
   {:else if screen === 'usage'}
     <Usage account={session.account.id} />
+  {:else if screen === 'backup'}
+    <Backup account={session.account.id} {platform} status={backupStatus} onrefresh={() => refreshBackup()} onnewkit={startNewKit} />
   {:else}
   <main class="entry-grid"><section class="entry-panel"><span class="eyebrow">YOUR SPACE</span><h1>BaseHero</h1>
     {#if reminderDue}
@@ -607,6 +668,10 @@
       </div>
     {/if}
     {#if olderKitOffer}<div class="kit-reminder" role="status"><p>BaseHero can now keep your recovery kit for you.</p><button onclick={() => { if (session.account) void requestRoute(`#/a/${session.account.id}/devices`); }}>Make a new kit</button></div>{/if}
+    {#if platform === 'macos' && backupStatus && !backupStatus.acknowledged}
+      <BackupCard label={backupStatus.location?.label ?? 'Documents › BaseHero Backup'} saved={kitStatus.saved} busy={backupBusy} onchange={changeBackupFolder} onok={acknowledgeBackup} onkit={showKit} />
+      {#if backupError}<p role="alert" class="error">{backupError}</p>{/if}
+    {/if}
     <ApprovalRequests account={session.account.id} />
     <Bases account={session.account.id} email={session.account.email} onopen={base => void requestRoute(`#/a/${session.account!.id}/b/${base}`)} />
   </section></main>
@@ -624,6 +689,7 @@
   .location-bar input { width: 100%; padding: .5rem; background: var(--bar-2); color: var(--on-bar); border: 1px solid var(--bar-line); font: .85rem var(--sans); }
   .server-signed-out { display: flex; align-items: center; gap: 1rem; padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
   .server-signed-out p { flex: 1; margin: 0; }
-  .workspace-nav { display: flex; gap: 1.5rem; padding: 1rem 1.5rem; border-bottom: 1px solid var(--line); }
+  .workspace-nav { display: flex; gap: 1.5rem; padding: 1rem 1.5rem; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .sidebar-backup { flex-basis: 100%; display: flex; gap: .8rem; align-items: center; }
   :global(.workspace) { padding: clamp(1rem, 4vw, 3rem); max-width: 60rem; margin: auto; }
 </style>

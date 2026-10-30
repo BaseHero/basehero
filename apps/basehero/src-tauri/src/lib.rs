@@ -1,5 +1,6 @@
 #[cfg(target_os = "android")]
 mod android_tls;
+pub mod backup;
 pub mod commands;
 pub mod error;
 pub mod hero;
@@ -15,6 +16,15 @@ pub mod windows;
 #[cfg(target_os = "macos")]
 use tauri::Emitter;
 use tauri::Manager;
+
+#[cfg(all(target_os = "android", debug_assertions))]
+#[tauri::command]
+fn release_backup_folder_for_test(uri: String) -> Result<(), error::CommandError> {
+    backup::android::release_for_test(&uri).map_err(|error| error::CommandError {
+        kind: "Storage".into(),
+        message: format!("{error:?}"),
+    })
+}
 
 #[tauri::command]
 fn app_info() -> views::AppInfo {
@@ -175,8 +185,10 @@ async fn remove_device(
     startup: tauri::State<'_, state::Startup>,
     account: bh_core::AccountId,
     device: bh_core::DeviceId,
-) -> Result<(), error::CommandError> {
-    commands::account::remove_device(startup.state()?, account, device).await
+    password: Option<String>,
+    lost: Option<bool>,
+) -> Result<commands::account::DeviceRemovalResult, error::CommandError> {
+    commands::account::remove_device(startup.state()?, account, device, password, lost).await
 }
 
 fn context() -> tauri::Context<tauri::Wry> {
@@ -236,8 +248,11 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     update::configure_context(&mut context);
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(backup::android::plugin());
     #[cfg(target_os = "macos")]
     let builder = builder
+        .plugin(tauri_plugin_dialog::init())
         .plugin(update::plugin())
         .plugin(tauri_plugin_process::init())
         .menu(windows::menu)
@@ -304,6 +319,23 @@ pub fn run() {
             app_grant_remove,
             usage,
             remove_device,
+            commands::backup::ipc::backup_status,
+            commands::backup::ipc::set_backup,
+            commands::backup::ipc::acknowledge_backup,
+            commands::backup::ipc::backup_now,
+            commands::backup::ipc::backup_estimate,
+            commands::backup::ipc::pick_backup_folder,
+            commands::backup::ipc::restore_list,
+            commands::backup::ipc::restore_open,
+            commands::backup::ipc::restore_unlock,
+            commands::backup::ipc::restore_points,
+            commands::backup::ipc::restore_bases,
+            commands::backup::ipc::restore_check,
+            commands::backup::ipc::restore_into,
+            commands::backup::ipc::restore_sign_up,
+            commands::backup::ipc::restore_close,
+            #[cfg(all(target_os = "android", debug_assertions))]
+            release_backup_folder_for_test,
             commands::note::note_open,
             commands::note::note_apply,
             commands::note::note_close,

@@ -865,19 +865,12 @@ async fn interrupted_upload_resumes_after_restart() {
     let id = base
         .add_file(new_file("large"), &vec![44; 5 * FILE_PART])
         .unwrap();
-    base.fail_file_put_after(2);
+    // Hold the third PUT before it starts: a remote GET becoming fetchable
+    // after a lost reply races the uploader's local progress bookkeeping.
+    // retry_after_a_lost_reply_keeps_identical_part_bytes covers that case.
+    let held = base.test_hold_file_put_after(2);
     base.resume_files();
-    let third = format!("/v1/bases/{base_id}/files/{id}/2");
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if raw_device(&account).get_bytes(&third).await.0 == StatusCode::OK {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    bh_testkit::wait_for(|| held.load(Ordering::SeqCst)).await;
     assert_eq!(
         base.file(id).unwrap().unwrap().status,
         FileStatus::Sending { done: 2, parts: 5 }
@@ -893,6 +886,7 @@ async fn interrupted_upload_resumes_after_restart() {
     })
     .await;
     assert_eq!(base.get(id).unwrap().unwrap().fields["uploaded"], true);
+    assert_eq!(base.file_bytes(id).await.unwrap(), vec![44; 5 * FILE_PART]);
 }
 
 #[test]
@@ -946,7 +940,15 @@ async fn removed_device_erases_its_files() {
         base.id()
     ));
     assert!(root.exists());
-    a.remove_device(b.device_id()).await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: zeroize::Zeroizing::new(bh_testkit::TEST_PASSWORD.into()),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
     bh_testkit::wait_for(|| !root.exists()).await;
 }
 

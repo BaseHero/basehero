@@ -18,6 +18,22 @@ fn ids(list: Vec<bh_core::BaseSummary>) -> Vec<bh_core::BaseId> {
     list.into_iter().map(|s| s.id).collect()
 }
 
+async fn hidden_epoch(a: &bh_core::Account, server: &LocalServer, id: bh_core::BaseId) -> u64 {
+    let response = reqwest::Client::new()
+        .get(server.url().join(&format!("/v1/bases/{id}/key")).unwrap())
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(raw_device(a).token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    response.json::<serde_json::Value>().await.unwrap()["epoch"]
+        .as_u64()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn a_hidden_base_is_listed_only_while_unlocked() {
     let (a, _) = device("mac").sign_up(new_signup()).await.unwrap();
@@ -295,6 +311,544 @@ async fn another_device_unlocks_offline_after_one_refresh() {
             .is_ok_and(|note| note.text() == "Gelato with Marguerite")
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_hidden_base_unlocked_offline_after_a_removal_opens_and_rekeys_online() {
+    let mut server = LocalServer::start();
+    let (a, kit) = device_on_server("a", &bh_core::Clock::system(), &server)
+        .sign_up(bh_core::SignUp {
+            server: server.url(),
+            invite: bh_testkit::invite(&server),
+            ..new_signup()
+        })
+        .await
+        .unwrap();
+    let b = device_on_server("b", &bh_core::Clock::system(), &server)
+        .sign_in(bh_core::SignIn {
+            server: server.url(),
+            ..signin_for(&a)
+        })
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let c = device_on_server("c", &bh_core::Clock::system(), &server)
+        .sign_in(bh_core::SignIn {
+            server: server.url(),
+            ..signin_for(&a)
+        })
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let h = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    let old = note_with_text(&h, "old");
+    h.flush().await.unwrap();
+    b.refresh().await.unwrap();
+    b.unlock_hidden(pw("extra password")).await.unwrap();
+    let from_b = b.base(h.id()).unwrap();
+    wait_for(|| from_b.note(old).is_ok()).await;
+    b.lock_hidden(h.id()).await.unwrap();
+    a.lock_hidden(h.id()).await.unwrap();
+    a.remove_device(
+        c.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden_epoch(&a, &server, h.id()).await, 1);
+    server.stop();
+    assert_eq!(
+        ids(b.unlock_hidden(pw("extra password")).await.unwrap()),
+        [h.id()]
+    );
+    assert_eq!(b.base(h.id()).unwrap().note(old).unwrap().text(), "old");
+    server.restart();
+    let online = b.base(h.id()).unwrap();
+    for _ in 0..20 {
+        let _ = online.sync_now().await;
+        if hidden_epoch(&a, &server, h.id()).await == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        hidden_epoch(&a, &server, h.id()).await,
+        2,
+        "the open hidden base did not re-key after reconnecting"
+    );
+    let fresh = note_with_text(&b.base(h.id()).unwrap(), "fresh");
+    b.base(h.id()).unwrap().flush().await.unwrap();
+    b.lock_hidden(h.id()).await.unwrap();
+    b.unlock_hidden(pw("extra password")).await.unwrap();
+    assert_eq!(b.base(h.id()).unwrap().note(fresh).unwrap().text(), "fresh");
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    a.refresh().await.unwrap();
+    let from_a = a.base(h.id()).unwrap();
+    wait_for(|| from_a.note(old).is_ok() && from_a.note(fresh).is_ok()).await;
+}
+
+#[tokio::test]
+async fn an_offline_hidden_edit_is_stored_only_at_the_new_epoch_after_removal() {
+    use base64::Engine as _;
+    let mut server = LocalServer::start();
+    let (a, kit) = device_on_server("a", &bh_core::Clock::system(), &server)
+        .sign_up(bh_core::SignUp {
+            server: server.url(),
+            invite: bh_testkit::invite(&server),
+            ..new_signup()
+        })
+        .await
+        .unwrap();
+    let b = device_on_server("b", &bh_core::Clock::system(), &server)
+        .sign_in(bh_core::SignIn {
+            server: server.url(),
+            ..signin_for(&a)
+        })
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let c = device_on_server("c", &bh_core::Clock::system(), &server)
+        .sign_in(bh_core::SignIn {
+            server: server.url(),
+            ..signin_for(&a)
+        })
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let diary = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    diary.flush().await.unwrap();
+    a.lock_hidden(diary.id()).await.unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    c.refresh().await.unwrap();
+    c.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hidden_epoch(&c, &server, diary.id()).await, 1);
+    server.stop();
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    let reopened = a.base(diary.id()).unwrap();
+    let edit = note_with_text(&reopened, "written after removal while offline");
+    assert!(
+        reopened.sync_state().pending > 0,
+        "edit must be queued before reconnect"
+    );
+    reopened.test_pause_sync();
+    let old_body = reopened.test_seal_update(edit, b"probe");
+    assert_eq!(u32::from_be_bytes(old_body[1..5].try_into().unwrap()), 1);
+    server.restart();
+    let refused = reqwest::Client::new()
+        .post(
+            server
+                .url()
+                .join(&format!("/v1/bases/{}/changes", diary.id()))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(raw_device(&c).token)
+        .json(&serde_json::json!({"changes": [{
+            "changeId": bh_testkit::random_id(), "objectId": edit.to_string(),
+            "kind": "update", "body": bh_testkit::b64(&old_body)
+        }]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["error"],
+        "rekey_needed"
+    );
+    reopened.test_resume_sync();
+    for _ in 0..20 {
+        let _ = reopened.sync_now().await;
+        if hidden_epoch(&c, &server, diary.id()).await == 2 && reopened.sync_state().pending == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        hidden_epoch(&c, &server, diary.id()).await,
+        2,
+        "no automatic re-key after the server refused the old-epoch send; rekey requests {}, key requests {}",
+        a.test_request_count(&format!("v1/bases/{}/rekey", diary.id())),
+        a.test_request_count(&format!("v1/bases/{}/key", diary.id()))
+    );
+    assert_eq!(
+        reopened.sync_state().pending,
+        0,
+        "queued edit was not resent at the new epoch"
+    );
+    reopened.flush().await.unwrap();
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(
+            server
+                .url()
+                .join(&format!("/v1/bases/{}/fetch", diary.id()))
+                .unwrap(),
+        )
+        .header("BH-Protocol", "2")
+        .header("BH-Test-Bypass", server.operator_token())
+        .bearer_auth(raw_device(&c).token)
+        .json(&serde_json::json!({"objectIds": [edit.to_string()]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let object = &response["objects"][0];
+    let mut bodies: Vec<&str> = object["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|update| update["body"].as_str().unwrap())
+        .collect();
+    if let Some(state) = object["state"]["body"].as_str() {
+        bodies.push(state);
+    }
+    assert!(!bodies.is_empty(), "server must hold the post-removal edit");
+    for body in bodies {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body)
+            .unwrap();
+        assert_eq!(
+            u32::from_be_bytes(bytes[1..5].try_into().unwrap()),
+            2,
+            "server accepted an old-epoch edit after removal"
+        );
+    }
+    assert_eq!(
+        reopened.note(edit).unwrap().text(),
+        "written after removal while offline"
+    );
+    c.unlock_hidden(pw("extra password")).await.unwrap();
+    let other = c.base(diary.id()).unwrap();
+    wait_for(|| {
+        other
+            .note(edit)
+            .is_ok_and(|note| note.text() == "written after removal while offline")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repeated_refusals_start_only_one_hidden_rekey() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let base = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    base.flush().await.unwrap();
+    a.lock_hidden(base.id()).await.unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    let (release, entered) = a.test_hold_hidden_rekey(base.id());
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    bh_testkit::wait_entered(&entered, std::panic::Location::caller()).await;
+    let open = a.base(base.id()).unwrap();
+    note_with_text(&open, "waiting for new key");
+    let path = format!("v1/bases/{}/changes", base.id());
+    for _ in 0..4 {
+        let before = a.test_request_count(&path);
+        let _ = open.sync_now().await;
+        assert!(
+            a.test_request_count(&path) > before,
+            "each refusal must reach the fence"
+        );
+    }
+    // Let all waiting re-keys proceed. Only one request may have started.
+    release.add_permits(32);
+    for _ in 0..20 {
+        let _ = open.sync_now().await;
+        if open.sync_state().pending == 0 {
+            break;
+        }
+    }
+    open.flush().await.unwrap();
+    assert_eq!(
+        entered.available_permits(),
+        0,
+        "a second re-key entered while the first was held"
+    );
+    assert_eq!(
+        a.test_request_count(&format!("v1/bases/{}/rekey", base.id())),
+        1
+    );
+}
+
+#[tokio::test]
+async fn locking_aborts_a_hidden_rekey_before_it_is_sent() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let base = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    base.flush().await.unwrap();
+    a.lock_hidden(base.id()).await.unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    let (release, entered) = a.test_hold_hidden_rekey(base.id());
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    bh_testkit::wait_entered(&entered, std::panic::Location::caller()).await;
+    let path = format!("v1/bases/{}/rekey", base.id());
+    a.lock_hidden(base.id()).await.unwrap();
+    release.add_permits(1);
+    assert_eq!(
+        a.test_request_count(&path),
+        0,
+        "a locked base sent a re-key"
+    );
+    a.refresh().await.unwrap();
+    assert_eq!(
+        a.test_request_count(&path),
+        0,
+        "a locked base retried its re-key"
+    );
+}
+
+#[tokio::test]
+async fn a_quick_reunlock_rekeys_while_the_canceled_task_still_holds_its_marker() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let kit = a.recovery_kit().unwrap().unwrap();
+    let c = device("c")
+        .sign_in(signin_for(&a))
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let diary = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    diary.flush().await.unwrap();
+    a.lock_hidden(diary.id()).await.unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    c.refresh().await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    let (release_send, entered_send) = a.test_hold_hidden_rekey(diary.id());
+    let (release_cancel, entered_cancel) = a.test_hold_canceled_hidden_rekey(diary.id());
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    bh_testkit::wait_entered(&entered_send, std::panic::Location::caller()).await;
+    a.lock_hidden(diary.id()).await.unwrap();
+    // Old task has not dropped its guard.
+    bh_testkit::wait_entered(&entered_cancel, std::panic::Location::caller()).await;
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered_send.acquire())
+        .await
+        .expect("new re-key did not start while the old guard was retained")
+        .unwrap()
+        .forget(); // New task must start before old guard drops.
+    let open = a.base(diary.id()).unwrap();
+    let note = note_with_text(&open, "after re-unlock");
+    release_cancel.add_permits(1); // Old guard drops while the new task is still held.
+    let changes = format!("v1/bases/{}/changes", diary.id());
+    for _ in 0..3 {
+        let before = a.test_request_count(&changes);
+        let _ = open.sync_now().await;
+        assert!(a.test_request_count(&changes) > before);
+    }
+    assert_eq!(
+        entered_send.available_permits(),
+        0,
+        "the old guard removed the new task's marker"
+    );
+    release_send.add_permits(1);
+    for _ in 0..20 {
+        if hidden_epoch(&a, LocalServer::from_env(), diary.id()).await == 2 {
+            break;
+        }
+        let _ = open.sync_now().await;
+    }
+    assert_eq!(
+        hidden_epoch(&a, LocalServer::from_env(), diary.id()).await,
+        2
+    );
+    assert_eq!(
+        a.test_request_count(&format!("v1/bases/{}/rekey", diary.id())),
+        1
+    );
+    open.flush().await.unwrap();
+    c.refresh().await.unwrap();
+    c.unlock_hidden(pw("extra password")).await.unwrap();
+    let other = c.base(diary.id()).unwrap();
+    wait_for(|| {
+        other
+            .note(note)
+            .is_ok_and(|item| item.text() == "after re-unlock")
+    })
+    .await;
+    assert_eq!(open.note(note).unwrap().text(), "after re-unlock");
+}
+
+#[tokio::test]
+async fn a_quick_reunlock_adopts_a_hidden_rekey_committed_before_its_reply() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let kit = a.recovery_kit().unwrap().unwrap();
+    let c = device("c")
+        .sign_in(signin_for(&a))
+        .await
+        .unwrap()
+        .with_kit(&kit.display())
+        .await
+        .unwrap();
+    let diary = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    let before = note_with_text(&diary, "before");
+    diary.flush().await.unwrap();
+    a.lock_hidden(diary.id()).await.unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    c.refresh().await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    let (release_reply, entered_reply) = a.test_hold_next_hidden_rekey_reply();
+    let (release_cancel, entered_cancel) = a.test_hold_canceled_hidden_rekey(diary.id());
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    // Server has committed epoch 2.
+    bh_testkit::wait_entered(&entered_reply, std::panic::Location::caller()).await;
+    assert_eq!(
+        hidden_epoch(&a, LocalServer::from_env(), diary.id()).await,
+        2
+    );
+    a.lock_hidden(diary.id()).await.unwrap();
+    bh_testkit::wait_entered(&entered_cancel, std::panic::Location::caller()).await;
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    let open = a.base(diary.id()).unwrap();
+    for _ in 0..20 {
+        let _ = open.sync_now().await;
+        if open.note(before).is_ok() && open.sync_state().online {
+            break;
+        }
+    }
+    assert_eq!(open.note(before).unwrap().text(), "before");
+    let after = note_with_text(&open, "after committed reply");
+    open.flush().await.unwrap();
+    assert_eq!(
+        hidden_epoch(&a, LocalServer::from_env(), diary.id()).await,
+        2
+    );
+    assert_eq!(
+        a.test_request_count(&format!("v1/bases/{}/rekey", diary.id())),
+        1
+    );
+    c.refresh().await.unwrap();
+    c.unlock_hidden(pw("extra password")).await.unwrap();
+    let other = c.base(diary.id()).unwrap();
+    wait_for(|| other.note(before).is_ok() && other.note(after).is_ok()).await;
+    assert_eq!(open.note(after).unwrap().text(), "after committed reply");
+    release_cancel.add_permits(1);
+    release_reply.add_permits(1);
+}
+
+#[tokio::test]
+async fn a_hidden_base_open_during_the_removal_rekeys_without_relocking() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let h = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    a.refresh().await.unwrap();
+    b.refresh().await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    a.refresh().await.unwrap();
+    assert_eq!(hidden_epoch(&a, LocalServer::from_env(), h.id()).await, 2);
+    let note = note_with_text(&h, "after removal");
+    h.flush().await.unwrap();
+    assert_eq!(h.note(note).unwrap().text(), "after removal");
+}
+
+#[tokio::test]
+async fn a_wrong_extra_password_opens_nothing_after_rotation() {
+    let (a, b) = bh_testkit::two_devices().await;
+    let h = a
+        .create_hidden_base("Diary", pw("extra password"))
+        .await
+        .unwrap();
+    a.lock_hidden(h.id()).await.unwrap();
+    a.remove_device(
+        b.device_id(),
+        bh_core::Removal::Full {
+            password: pw(bh_testkit::TEST_PASSWORD),
+            lost: false,
+        },
+    )
+    .await
+    .unwrap();
+    a.unlock_hidden(pw("extra password")).await.unwrap();
+    a.lock_hidden(h.id()).await.unwrap();
+    assert!(matches!(
+        a.unlock_hidden(pw("wrong password")).await,
+        Err(Error::NothingUnlocked)
+    ));
 }
 
 #[tokio::test]

@@ -183,6 +183,8 @@ struct Inner {
     idle: Notify,
     running: Arc<Running>,
     events: broadcast::Sender<HeroEvent>,
+    #[cfg(feature = "test-support")]
+    held_reader_refresh: Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -317,6 +319,18 @@ impl Account {
     }
 }
 impl Hero {
+    /// Suspend one turn's reader refresh after its account request completes,
+    /// until released or cancelled; unrelated account reads are never held.
+    #[cfg(feature = "test-support")]
+    pub fn test_hold_next_reader_refresh(
+        &self,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.inner.held_reader_refresh.lock().unwrap() = Some((release.clone(), entered.clone()));
+        (release, entered)
+    }
+
     fn new(account: Account, model: Option<Arc<dyn ChatModel>>) -> Self {
         let (events, _) = broadcast::channel(128);
         let hero = Self {
@@ -329,6 +343,8 @@ impl Hero {
                 idle: Notify::new(),
                 running: Arc::new(Running::default()),
                 events,
+                #[cfg(feature = "test-support")]
+                held_reader_refresh: Mutex::new(None),
             }),
         };
         let weak = Arc::downgrade(&hero.inner);
@@ -709,7 +725,15 @@ impl Hero {
             let readers_fresh = tokio::select! {
                 biased;
                 _ = cancel.changed() => return,
-                result = hero.inner.account.refresh_account_data() => result.is_ok(),
+                result = async {
+                    #[cfg(feature = "test-support")]
+                    {
+                        let hold = hero.inner.held_reader_refresh.lock().unwrap().take();
+                        hero.inner.account.refresh_account_data_held(hold).await
+                    }
+                    #[cfg(not(feature = "test-support"))]
+                    hero.inner.account.refresh_account_data().await
+                } => result.is_ok(),
                 _ = clock.sleep_until(clock.now_ms().saturating_add(10_000)) => false,
             };
             if *cancel.borrow() {

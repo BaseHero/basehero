@@ -49,6 +49,9 @@ pub struct AppHello {
     pub name: String,
     /// Claimed app identifier.
     pub app_id: String,
+    /// Base64url X-Wing public key of the requesting app, when supported.
+    #[serde(default)]
+    pub public: Option<String>,
 }
 
 /// Whether a character can change or hide the rendering of a device name.
@@ -484,7 +487,10 @@ impl Message {
                     payload: body.to_vec(),
                 })
             }
-            kind if kind == transfer && exchange == Exchange::Device && fixed(TRANSFER_LEN) => {
+            kind if kind == transfer
+                && exchange == Exchange::Device
+                && (fixed(TRANSFER_LEN) || fixed(TRANSFER_LEN + 4)) =>
+            {
                 Ok(Self::Transfer {
                     approval,
                     account_key: body.to_vec(),
@@ -673,6 +679,11 @@ impl NewSide {
     /// Returns [`Error::ApprovalEnded`] for an expired, malformed or ended
     /// exchange, or [`Error::NeedsUpdate`] for an unsupported message format.
     pub fn on_transfer(self, transfer: &[u8], now_ms: u64) -> Result<Secret<32>, Error> {
+        self.on_transfer_at(transfer, now_ms).map(|(_, key)| key)
+    }
+
+    /// Opens the key and its account epoch together from the authenticated transfer.
+    pub fn on_transfer_at(self, transfer: &[u8], now_ms: u64) -> Result<(u32, Secret<32>), Error> {
         if self.exchange != Exchange::Device {
             return Err(bad());
         }
@@ -692,7 +703,20 @@ impl NewSide {
             &account_key,
         )
         .map_err(|_| bad())?;
-        Secret::from_slice(&opened).map_err(|_| bad())
+        let (epoch, key) = if opened.len() == 32 {
+            (1, opened.as_slice())
+        } else if opened.len() == 36 {
+            (
+                u32::from_be_bytes(opened[..4].try_into().expect("epoch length")),
+                &opened[4..],
+            )
+        } else {
+            return Err(bad());
+        };
+        if epoch == 0 {
+            return Err(bad());
+        }
+        Ok((epoch, Secret::from_slice(key).map_err(|_| bad())?))
     }
 
     /// Opens the app credentials only under this exchange's transfer key.
@@ -897,6 +921,20 @@ impl ApproverSide {
         account_key: &Secret<32>,
         now_ms: u64,
     ) -> Result<Vec<u8>, Error> {
+        self.confirm_at(typed, account_key, 1, now_ms)
+    }
+
+    /// Seals the current epoch and key in the approval exchange.
+    pub fn confirm_at(
+        self,
+        typed: &Digits,
+        account_key: &Secret<32>,
+        epoch: u32,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, Error> {
+        if epoch == 0 {
+            return Err(bad());
+        }
         if self.exchange != Exchange::Device {
             return Err(bad());
         }
@@ -914,12 +952,19 @@ impl ApproverSide {
         if *typed != digits {
             return end(EndReason::WrongDigits);
         }
+        // Preserve the original 32-byte epoch-one transfer for updated and
+        // older devices that are still sharing an unrotated account.
+        let payload = Zeroizing::new(if epoch == 1 {
+            account_key.expose().to_vec()
+        } else {
+            [epoch.to_be_bytes().as_slice(), account_key.expose()].concat()
+        });
         Ok(Message::Transfer {
             approval: self.ids.approval,
             account_key: envelope::seal(
                 &transfer_key,
                 &aad(Purpose::ApprovalTransfer, &self.ids),
-                account_key.expose(),
+                &payload,
             ),
         }
         .encode())
@@ -1055,6 +1100,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn epoch_one_approval_keeps_the_original_transfer_format() {
+        let r = to_reveal(ids());
+        let key = Secret::<32>::random();
+        let transfer = r
+            .approver
+            .confirm_at(&r.digits, &key, 1, RESPOND + 2)
+            .unwrap();
+        assert_eq!(transfer.len(), TRANSFER_LEN);
+        let (epoch, received) = r.new.on_transfer_at(&transfer, START + 2).unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(received.expose(), key.expose());
+    }
+
+    #[test]
+    fn an_approved_device_receives_the_authenticated_account_epoch() {
+        let r = to_reveal(ids());
+        let key = Secret::<32>::random();
+        let transfer = r
+            .approver
+            .confirm_at(&r.digits, &key, 3, RESPOND + 2)
+            .unwrap();
+        let (epoch, received) = r.new.on_transfer_at(&transfer, START + 2).unwrap();
+        assert_eq!(epoch, 3);
+        assert_eq!(received.expose(), key.expose());
+    }
+
     /// An honest exchange: both devices agree on the digits and account key.
     fn honest() -> (Digits, Secret<32>, Secret<32>) {
         let r = to_reveal(ids());
@@ -1073,6 +1145,7 @@ mod tests {
         AppHello {
             name: "Sample".into(),
             app_id: "app.basehero.sample".into(),
+            public: None,
         }
     }
 
